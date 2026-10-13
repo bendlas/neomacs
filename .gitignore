@@ -30,6 +30,9 @@
 !.github/workflows/*.yml
 !crates/neovm-core/fuzz/.gitignore
 
+*~
+\#*\#
+
 # Built by 'autogen.sh'.
 /aclocal.m4
 /configure
