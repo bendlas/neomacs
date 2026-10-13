@@ -37,6 +37,10 @@ pkgs.mkShell {
     pkgs.wtype
     pkgs.grim
     pkgs.sway
+    # Nested-X fixture for the EXWM/XCB spike (docs/exwm/harness).
+    # Xephyr embeds a private X server in the desktop session; Xvfb is the
+    # headless fallback.
+    pkgs.xorg-server
   ];
 
   buildInputs =
@@ -44,6 +48,12 @@ pkgs.mkShell {
     ++ lib.optionals isLinux [
       pkgs.gcc
       pkgs.xwininfo
+      # Nested-X fixture support and manual EXWM test-driving.
+      pkgs.xauth
+      pkgs.xdpyinfo
+      pkgs.xprop
+      pkgs.xdotool
+      pkgs.xterm
     ];
 
   # Keep the explicit development header set visible to pkg-config. This is
