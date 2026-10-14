@@ -433,12 +433,6 @@ create the graphical child frame `exwm-floating--set-floating' requires."
                                "_NET_WM_WINDOW_TYPE_DIALOG")))
 
 (defun excp--check-floating ()
-  (excp--note "floating: make-frame can create a graphical child frame"
-              (lambda ()
-                (let ((f (make-frame '((width . 20) (height . 10)))))
-                  (prog1 (list :outer (frame-parameter f 'outer-window-id)
-                               :window (frame-parameter f 'window-id))
-                    (delete-frame f)))))
   (excp--floating-check "floating: dialog id is managed"
                         (lambda () (assoc excp--wf exwm--id-buffer-alist)))
   (excp--floating-check "floating: exwm--floating-frame is a live frame"
@@ -459,8 +453,9 @@ create the graphical child frame `exwm-floating--set-floating' requires."
       (excp--log "floating diag: frame-edges=%S emacs-win=%S win-frame=%S"
                  (ignore-errors (frame-edges frame 'outer-edges))
                  win (and win (window-frame win)))
-      (excp--log "floating diag: client-tree=%S client-geom-pending"
-                 (ignore-errors (excp--query-tree excp--wf))))))
+      (excp--log "floating diag: client-tree=%S wscf=%S"
+                 (ignore-errors (excp--query-tree excp--wf))
+                 excp--wscf))))
 
 (defun excp--floating-resize ()
   (excp--log "resize floating dialog to 500x400")
@@ -477,9 +472,22 @@ create the graphical child frame `exwm-floating--set-floating' requires."
          (actual (list (slot-value reply 'width) (slot-value reply 'height))))
     (excp--log "floating geometry after resize: %S" actual)
     (with-current-buffer (exwm--id->buffer excp--wf)
-      (excp--log "floating resize diag: frame-edges=%S tree=%S"
+      (excp--log "floating resize diag: client=%S frame-edges=%S frame=%S current=%S exwm-frame=%S win=%S wscf=%S"
+                 actual
                  (ignore-errors (frame-edges exwm--floating-frame 'outer-edges))
-                 (ignore-errors (excp--query-tree excp--wf))))
+                 (ignore-errors (frame-parameter exwm--floating-frame 'exwm-outer-id))
+                 (ignore-errors (frame-parameter exwm-workspace--current 'exwm-outer-id))
+                 (ignore-errors (frame-parameter exwm--frame 'exwm-outer-id))
+                 (ignore-errors
+                   (exwm--window-inside-absolute-pixel-edges
+                    (get-buffer-window (current-buffer) t)))
+                 excp--wscf)
+      (excp--note "floating: forced exwm-layout--refresh after configure"
+                  (lambda ()
+                    (exwm-layout--refresh exwm--floating-frame)
+                    (xcb:flush exwm--connection)
+                    (sit-for 0.1)
+                    (excp--geometry excp--wf))))
     (excp--floating-check "floating: configure request resizes the client"
                           (lambda () (excp--expect (list 500 400) actual)))))
 
@@ -558,6 +566,102 @@ create the graphical child frame `exwm-floating--set-floating' requires."
                (lambda ()
                  (excp--expect nil (assoc excp--wfocus exwm--id-buffer-alist)))))
 
+;;; --- EWMH / ICCCM properties (Milestone 4) --------------------------------
+
+(defun excp--prop-value (window class)
+  "Fetch property on WINDOW using the xelb getter CLASS."
+  (with-slots (value)
+      (xcb:+request-unchecked+reply excp--conn
+        (make-instance class :window window))
+    value))
+
+(defun excp--prop-seq (value)
+  "Normalize a property VALUE (vector, list or scalar) to a list."
+  (cond ((vectorp value) (append value nil))
+        ((listp value) value)
+        (t (list value))))
+
+(defun excp--check-ewmh ()
+  (excp--log "--- EWMH / ICCCM properties (M4) ---")
+  (let ((root (exwm-harness-root-window excp--conn)))
+    (excp--check "ewmh: _NET_SUPPORTING_WM_CHECK is a window"
+                 (lambda ()
+                   (let ((v (excp--prop-value
+                             root 'xcb:ewmh:get-_NET_SUPPORTING_WM_CHECK)))
+                     (excp--expect t (and (integerp v) (/= 0 v))))))
+    (excp--check "ewmh: supporting window points back at itself"
+                 (lambda ()
+                   (let* ((v (excp--prop-value
+                              root 'xcb:ewmh:get-_NET_SUPPORTING_WM_CHECK))
+                          (back (and (integerp v) (/= 0 v)
+                                     (excp--prop-value
+                                      v 'xcb:ewmh:get-_NET_SUPPORTING_WM_CHECK))))
+                     (excp--expect v back))))
+    (excp--check "ewmh: _NET_SUPPORTED advertises the EWMH atoms"
+                 (lambda ()
+                   (let ((v (excp--prop-seq
+                             (excp--prop-value
+                              root 'xcb:ewmh:get-_NET_SUPPORTED))))
+                     (excp--log "ewmh: %d supported atoms" (length v))
+                     (excp--expect t (> (length v) 8)))))
+    (excp--check "ewmh: _NET_NUMBER_OF_DESKTOPS >= 1"
+                 (lambda ()
+                   (let ((v (excp--prop-value
+                             root 'xcb:ewmh:get-_NET_NUMBER_OF_DESKTOPS)))
+                     (excp--expect t (and (integerp v) (>= v 1))))))
+    (excp--check "ewmh: _NET_CURRENT_DESKTOP is a desktop index"
+                 (lambda ()
+                   (let ((v (excp--prop-value
+                             root 'xcb:ewmh:get-_NET_CURRENT_DESKTOP)))
+                     (excp--expect t (and (integerp v) (>= v 0))))))
+    (excp--check "ewmh: _NET_DESKTOP_GEOMETRY reports a screen size"
+                 (lambda ()
+                   (with-slots (width height)
+                       (xcb:+request-unchecked+reply
+                        excp--conn
+                        (make-instance 'xcb:ewmh:get-_NET_DESKTOP_GEOMETRY
+                                       :window root))
+                     (excp--log "ewmh: desktop geometry %Sx%S" width height)
+                     (excp--expect t (and (integerp width) (> width 0)
+                                          (integerp height) (> height 0))))))
+    (excp--check "ewmh: _NET_DESKTOP_VIEWPORT covers every desktop"
+                 (lambda ()
+                   (let ((v (excp--prop-seq
+                             (excp--prop-value
+                              root 'xcb:ewmh:get-_NET_DESKTOP_VIEWPORT))))
+                     (excp--expect t (>= (length v) 2)))))
+    (excp--check "ewmh: _NET_ACTIVE_WINDOW is a window"
+                 (lambda ()
+                   (let ((v (excp--prop-value
+                             root 'xcb:ewmh:get-_NET_ACTIVE_WINDOW)))
+                     (excp--expect t (and (integerp v) (/= 0 v))))))
+    (excp--note "ewmh: _NET_WORKAREA is absent (unsupported by upstream EXWM)"
+                (lambda ()
+                  (excp--expect nil
+                                (excp--prop-value
+                                 root 'xcb:ewmh:get-_NET_WORKAREA))))
+    (excp--check "ewmh: _NET_CLIENT_LIST contains the managed client"
+                 (lambda ()
+                   (let ((v (excp--prop-seq
+                             (excp--prop-value
+                              root 'xcb:ewmh:get-_NET_CLIENT_LIST))))
+                     (excp--expect t (and (seq-contains-p v excp--w1) t)))))
+    (excp--check "ewmh: _NET_CLIENT_LIST_STACKING contains the managed client"
+                 (lambda ()
+                   (let ((v (excp--prop-seq
+                             (excp--prop-value
+                              root 'xcb:ewmh:get-_NET_CLIENT_LIST_STACKING))))
+                     (excp--expect t (and (seq-contains-p v excp--w1) t)))))
+    (excp--check "icccm: WM_STATE is NormalState for the managed client"
+                 (lambda ()
+                   (with-slots (state)
+                       (xcb:+request-unchecked+reply
+                        excp--conn
+                        (make-instance 'xcb:icccm:get-WM_STATE
+                                       :window excp--w1))
+                     (excp--log "icccm: WM_STATE state=%S" state)
+                     (excp--expect 1 state))))))
+
 (defun excp--post-stages ()
   (setq excp--pending
         (list (cons 0.2 #'excp--close-no-protocol)
@@ -597,10 +701,16 @@ create the graphical child frame `exwm-floating--set-floating' requires."
 
 (defun excp--begin ()
   (excp--install-debug)
+  (setq excp--wscf nil)
+  (add-hook 'window-size-change-functions
+            (lambda (fr)
+              (push (ignore-errors (frame-parameter fr 'exwm-outer-id))
+                    excp--wscf)))
   (setq excp--pending
         (list (cons 0.5 #'excp--start-exwm)
               (cons 1.0 #'excp--create-w1)
               (cons 2.0 #'excp--check-managed)
+              (cons 0.3 #'excp--check-ewmh)
               (cons 0.2 #'excp--rename-w1)
               (cons 1.0 #'excp--check-title)
               (cons 0.2 #'excp--layout)
