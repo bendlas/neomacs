@@ -25,6 +25,8 @@
 
 (exwm-harness-load-path)
 (require 'xcb)
+(require 'xcb-xtest)
+(require 'xcb-keysyms)
 (require 'cl-lib)
 (require 'exwm)
 
@@ -44,6 +46,20 @@
 (defvar excp--wproto-delete nil "Non-nil once the client got WM_DELETE_WINDOW.")
 (defvar excp--wproto-alive-at-msg nil "Non-nil if the client was alive on receipt.")
 (defvar excp--pending nil "Remaining (delay . function) lifecycle stages.")
+
+;;; Window-layout propagation (Milestone 4: split-window -> client resize).
+(defvar excp--wcch-count 0 "Times `window-configuration-change-hook' ran.")
+(defvar excp--wscf-count 0 "Times `window-size-change-functions' ran.")
+(defvar excp--split-before nil "Client X geometry before the split.")
+(defvar excp--split-immediate nil "Client X geometry immediately after `split-window'.")
+(defvar excp--split-after-sleep nil "Client geometry after an event pump without redisplay.")
+(defvar excp--split-before-sleep nil "Client geometry when the no-redisplay stage began.")
+(defvar excp--split-after-pump nil "Client X geometry after an input-free sit-for.")
+(defvar excp--split-after-input nil "Client X geometry after a real input event.")
+(defvar excp--split-after-refresh nil "Client X geometry after `exwm-layout--refresh'.")
+(defvar excp--split-window nil "Emacs window that held the client when split.")
+(defvar excp--split-before-edges nil "Emacs edges of the client window before split.")
+(defvar excp--split-after-edges nil "Emacs edges of the client window after split.")
 
 (defun excp--log (fmt &rest args)
   "Append a formatted line to the trace file and stdout."
@@ -161,14 +177,24 @@ lives on `excp--conn'."
   (xcb:+request-unchecked+reply excp--conn
     (make-instance 'xcb:GetGeometry :drawable window)))
 
+(defun excp--geometry-list (reply)
+  "Normalize a GetGeometry REPLY to (X Y WIDTH HEIGHT)."
+  (and reply
+       (list (slot-value reply 'x) (slot-value reply 'y)
+             (slot-value reply 'width) (slot-value reply 'height))))
+
+(defun excp--window-edges (win)
+  "Return (X Y WIDTH HEIGHT) for Emacs window WIN."
+  (let* ((edges (exwm--window-inside-absolute-pixel-edges win))
+         (x (elt edges 0))
+         (y (elt edges 1)))
+    (list x y (- (elt edges 2) x) (- (elt edges 3) y))))
+
 (defun excp--emacs-edges (window)
   "Return (X Y WIDTH HEIGHT) for the Emacs window showing client WINDOW."
   (with-current-buffer (exwm--id->buffer window)
-    (let* ((win (get-buffer-window (current-buffer) t))
-           (edges (exwm--window-inside-absolute-pixel-edges win))
-           (x (elt edges 0))
-           (y (elt edges 1)))
-      (list x y (- (elt edges 2) x) (- (elt edges 3) y)))))
+    (let ((win (get-buffer-window (current-buffer) t)))
+      (excp--window-edges win))))
 
 (defun excp--next ()
   "Run the next pending lifecycle stage."
@@ -274,6 +300,138 @@ lives on `excp--conn'."
     (excp--log "after configure: emacs-edges=%S x-window=%S" edges actual)
     (excp--check "configure request: tiled window keeps fitted geometry"
                  (lambda () (excp--expect edges actual)))))
+
+;;; --- Window-layout propagation: split-window -> client resize -------------
+
+(defun excp--split-begin ()
+  "Split the Emacs window showing the tiled client, recording geometry."
+  (excp--log "--- split-window layout propagation ---")
+  (let* ((buffer (exwm--id->buffer excp--w1))
+         (window (and buffer (get-buffer-window buffer t))))
+    (when window
+      (select-window window)
+      (setq excp--split-window window
+            excp--split-before (excp--geometry-list (excp--geometry excp--w1))
+            excp--split-before-edges (excp--window-edges window))
+      (excp--log "split diag: before=%S emacs-edges=%S"
+                 excp--split-before excp--split-before-edges)
+      (let ((new-window (split-window window)))
+        ;; Keep exactly one window showing the client so the expected client
+        ;; geometry is unambiguous (the new window shows another buffer).
+        (set-window-buffer new-window (get-buffer-create "*split-other*"))
+        (select-window window))
+      ;; Read the client *before* any redisplay: EXWM's relayout is driven by
+      ;; the redisplay window-change hooks, so the X window must still be at
+      ;; its old geometry here.
+      (setq excp--split-immediate (excp--geometry-list (excp--geometry excp--w1)))
+      (setq excp--split-after-edges (excp--window-edges excp--split-window))
+      (excp--log "split diag: immediate=%S wcch=%d wscf=%d emacs-edges-after-split=%S window-count=%S"
+                 excp--split-immediate excp--wcch-count excp--wscf-count
+                 excp--split-after-edges
+                 (length (window-list (window-frame window) 'nomini))))))
+
+(defun excp--split-pump-no-redisplay ()
+  "Wait without redisplay (`sleep-for'), then re-read the geometry."
+  (when excp--split-window
+    ;; Captured at stage entry, i.e. after the command loop's input-wait
+    ;; redisplay but before `sleep-for'.  If this already matches the
+    ;; shrunken window, the re-fit came from `read_char''s redisplay and no
+    ;; X input was required.
+    (setq excp--split-before-sleep (excp--geometry-list (excp--geometry excp--w1)))
+    (sleep-for 0.5)
+    (setq excp--split-after-sleep (excp--geometry-list (excp--geometry excp--w1)))
+    (excp--log "split diag: before-sleep=%S after-sleep=%S wcch=%d wscf=%d"
+               excp--split-before-sleep excp--split-after-sleep
+               excp--wcch-count excp--wscf-count)))
+
+(defun excp--split-pump-no-input ()
+  "Redisplay/wait without any X input event, then re-read the geometry."
+  (when excp--split-window
+    (sit-for 1.0)
+    (setq excp--split-after-pump (excp--geometry-list (excp--geometry excp--w1)))
+    (excp--log "split diag: after-pump=%S wcch=%d wscf=%d"
+               excp--split-after-pump excp--wcch-count excp--wscf-count)))
+
+(defun excp--split-xinput ()
+  "Inject an XTEST key press/release on the managed client's connection."
+  (when (and excp--split-window (fboundp 'xcb:xtest:FakeInput))
+    (let ((root (exwm-harness-root-window excp--conn))
+          (keycode (xcb:keysyms:keysym->keycode exwm--connection ?x)))
+      (when (and root keycode (> keycode 0))
+        (xcb:+request excp--conn
+          (make-instance 'xcb:xtest:FakeInput
+                         :type 2 :detail keycode :time xcb:Time:CurrentTime
+                         :root root :rootX 0 :rootY 0 :deviceid 0))
+        (xcb:+request excp--conn
+          (make-instance 'xcb:xtest:FakeInput
+                         :type 3 :detail keycode :time xcb:Time:CurrentTime
+                         :root root :rootX 0 :rootY 0 :deviceid 0))
+        (xcb:flush excp--conn)
+        (excp--log "split diag: injected XTEST keycode=%S" keycode)))))
+
+(defun excp--split-pump-input ()
+  "Inject a real X input event, pump, then re-read the geometry."
+  (when excp--split-window
+    (excp--split-xinput)
+    (sit-for 1.0)
+    (setq excp--split-after-input (excp--geometry-list (excp--geometry excp--w1)))
+    (excp--log "split diag: after-input=%S wcch=%d wscf=%d"
+               excp--split-after-input excp--wcch-count excp--wscf-count)))
+
+(defun excp--split-pump-refresh ()
+  "Force `exwm-layout--refresh', pump, then re-read the geometry."
+  (when excp--split-window
+    (excp--check "split: exwm-layout--refresh runs without error"
+                 (lambda ()
+                   (exwm-layout--refresh (window-frame excp--split-window))
+                   'ok))
+    (sit-for 0.2)
+    (setq excp--split-after-refresh (excp--geometry-list (excp--geometry excp--w1)))
+    (excp--log "split diag: after-refresh=%S" excp--split-after-refresh)
+    (excp--log "split diag: before=%S after-pump=%S after-input=%S after-refresh=%S hooks-fired=wcch:%d,wscf:%d emacs-edges=%S->%S immediate=%S after-sleep=%S"
+               excp--split-before excp--split-after-pump excp--split-after-input
+               excp--split-after-refresh excp--wcch-count excp--wscf-count
+               excp--split-before-edges excp--split-after-edges
+               excp--split-immediate excp--split-after-sleep)))
+
+(defun excp--check-split-propagation ()
+  "Assert the empirically observed split propagation invariant.
+
+Neomacs commits the Emacs window tree synchronously, but EXWM only re-fits
+its client X window from the redisplay window-change hooks
+(`window-configuration-change-hook' / `window-size-change-functions').  The
+command loop's input-wait `redisplay' runs those hooks, so the X window is
+re-fitted with no input event at all; `sit-for', a real X input event, and an
+explicit `exwm-layout--refresh' are equivalent additional triggers."
+  (when excp--split-window
+    (excp--check "split: Emacs window really shrank"
+                 (lambda ()
+                   (excp--expect t
+                                (and excp--split-before-edges
+                                     excp--split-after-edges
+                                     (< (nth 3 excp--split-after-edges)
+                                        (nth 3 excp--split-before-edges))))))
+    ;; The X client is re-fitted by EXWM's redisplay hooks, not synchronously
+    ;; by `split-window'.  This is the GNU invariant: geometry changes
+    ;; propagate at the next redisplay.
+    (excp--check "split: client is unchanged before any redisplay"
+                 (lambda ()
+                   (excp--expect excp--split-before excp--split-immediate)))
+    ;; After redisplay (input-free sit-for) the client matches the shrunken
+    ;; Emacs window -- no input event is required.
+    (excp--check "split: command-loop redisplay re-fits the client without input"
+                 (lambda ()
+                   ;; `before-sleep' is captured after `read_char''s
+                   ;; input-wait redisplay, before any explicit sit-for or X
+                   ;; input event.
+                   (excp--expect
+                    (excp--window-edges excp--split-window)
+                    excp--split-before-sleep)))
+    (excp--check "split: redisplay re-fits the client without input"
+                 (lambda ()
+                   (excp--expect
+                    (excp--window-edges excp--split-window)
+                    (excp--geometry-list (excp--geometry excp--w1)))))))
 
 (defun excp--close-w1 ()
   (excp--log "--- close (DestroyNotify) ---")
@@ -717,10 +875,15 @@ create the graphical child frame `exwm-floating--set-floating' requires."
 (defun excp--begin ()
   (excp--install-debug)
   (setq excp--wscf nil)
+  (setq excp--wcch-count 0
+        excp--wscf-count 0)
   (add-hook 'window-size-change-functions
             (lambda (fr)
+              (setq excp--wscf-count (1+ excp--wscf-count))
               (push (ignore-errors (frame-parameter fr 'exwm-outer-id))
                     excp--wscf)))
+  (add-hook 'window-configuration-change-hook
+            (lambda () (setq excp--wcch-count (1+ excp--wcch-count))))
   (setq excp--pending
         (list (cons 0.5 #'excp--start-exwm)
               (cons 1.0 #'excp--create-w1)
@@ -732,6 +895,13 @@ create the graphical child frame `exwm-floating--set-floating' requires."
               (cons 1.0 #'excp--check-geometry)
               (cons 0.2 #'excp--configure)
               (cons 1.0 #'excp--check-configure)
+              ;; M4: does a split relayout the tiled client without input?
+              (cons 0.2 #'excp--split-begin)
+              (cons 0.2 #'excp--split-pump-no-redisplay)
+              (cons 0.2 #'excp--split-pump-no-input)
+              (cons 0.2 #'excp--split-pump-input)
+              (cons 0.3 #'excp--split-pump-refresh)
+              (cons 0.2 #'excp--check-split-propagation)
               (cons 0.2 #'excp--close-w1)
               (cons 1.5 #'excp--check-closed)
               (cons 0.2 #'excp--rapid-map)
