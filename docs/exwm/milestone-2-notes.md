@@ -59,14 +59,14 @@ emacs-edges=(0 51 1280 545) x-window=(0 51 1280 545)
   `exwm-manage--scan`) has no map-state guard and will still manage the
   withdrawn window.  This is an EXWM semantic, not a Neomacs event-loop
   failure; the harness does not assert on it.
-- **Floating/transient windows are blocked on `make-frame` (Milestone 4).**
-  EXWM's `exwm-floating--set-floating` calls `make-frame` and then reads the
-  new frame's `outer-window-id`/`window-id` to create its container.  In
-  Neomacs `make-frame` currently signals `(wrong-type-argument stringp nil)`
-  and the new frame exposes no X window id, so a `_NET_WM_WINDOW_TYPE_DIALOG`
-  client is managed but stays tiled.  The probe reports this as `NOTE:` lines
-  instead of failures; set `EXWM_EXPECT_FLOATING=1` to make them hard checks
-  once multi-frame X windows exist.  This is the main known M4 prerequisite.
+- **Floating/transient windows are partially unblocked (Milestone 4).**
+  After the "expose real X11 window ids as frame parameters" merge,
+  `make-frame` returns real `window-id`/`outer-window-id`s and
+  `exwm-floating--set-floating` gets a live `exwm--floating-frame` for a
+  `_NET_WM_WINDOW_TYPE_DIALOG` client.  The client still keeps tiled geometry
+  because Neomacs does not sync an externally issued X `ConfigureWindow` back
+  into Emacs frame state; see `milestone-4-notes.md`.  These checks stay
+  `NOTE:` lines unless `EXWM_EXPECT_FLOATING=1`.
 - **Keyboard/pointer grabs are not covered.**  Passive grabs, char/line mode,
   and `FocusIn`/`FocusOut` handling are Milestone 3; only the focus-transfer
   primitive is asserted here.

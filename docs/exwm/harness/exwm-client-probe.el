@@ -421,6 +421,12 @@ create the graphical child frame `exwm-floating--set-floating' requires."
       (excp--check name thunk)
     (excp--note name thunk)))
 
+(defun excp--query-tree (window)
+  "Return (parent . root) for WINDOW."
+  (let ((r (xcb:+request-unchecked+reply excp--conn
+             (make-instance 'xcb:QueryTree :window window))))
+    (cons (slot-value r 'parent) (slot-value r 'root))))
+
 (defun excp--floating-create ()
   (excp--log "--- floating dialog (M4 preview) ---")
   (setq excp--wf (excp--create "Floating Dialog" "NeomacsDialog" 300 200
@@ -440,7 +446,21 @@ create the graphical child frame `exwm-floating--set-floating' requires."
                           (with-current-buffer (exwm--id->buffer excp--wf)
                             (excp--expect t (and exwm--floating-frame
                                                  (frame-live-p exwm--floating-frame)
-                                                 t))))))
+                                                 t)))))
+  (with-current-buffer (exwm--id->buffer excp--wf)
+    (let* ((frame exwm--floating-frame)
+           (buf (current-buffer))
+           (win (get-buffer-window buf t)))
+      (excp--log "floating diag: frame=%S outer=%S id=%S container=%S"
+                 frame
+                 (ignore-errors (frame-parameter frame 'exwm-outer-id))
+                 (ignore-errors (frame-parameter frame 'exwm-id))
+                 (ignore-errors (frame-parameter frame 'exwm-container)))
+      (excp--log "floating diag: frame-edges=%S emacs-win=%S win-frame=%S"
+                 (ignore-errors (frame-edges frame 'outer-edges))
+                 win (and win (window-frame win)))
+      (excp--log "floating diag: client-tree=%S client-geom-pending"
+                 (ignore-errors (excp--query-tree excp--wf))))))
 
 (defun excp--floating-resize ()
   (excp--log "resize floating dialog to 500x400")
@@ -456,6 +476,10 @@ create the graphical child frame `exwm-floating--set-floating' requires."
   (let* ((reply (excp--geometry excp--wf))
          (actual (list (slot-value reply 'width) (slot-value reply 'height))))
     (excp--log "floating geometry after resize: %S" actual)
+    (with-current-buffer (exwm--id->buffer excp--wf)
+      (excp--log "floating resize diag: frame-edges=%S tree=%S"
+                 (ignore-errors (frame-edges exwm--floating-frame 'outer-edges))
+                 (ignore-errors (excp--query-tree excp--wf))))
     (excp--floating-check "floating: configure request resizes the client"
                           (lambda () (excp--expect (list 500 400) actual)))))
 
