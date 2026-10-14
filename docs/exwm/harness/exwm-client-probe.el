@@ -472,7 +472,7 @@ create the graphical child frame `exwm-floating--set-floating' requires."
          (actual (list (slot-value reply 'width) (slot-value reply 'height))))
     (excp--log "floating geometry after resize: %S" actual)
     (with-current-buffer (exwm--id->buffer excp--wf)
-      (excp--log "floating resize diag: client=%S frame-edges=%S frame=%S current=%S exwm-frame=%S win=%S wscf=%S"
+      (excp--log "floating resize diag: client=%S frame-edges=%S frame=%S current=%S exwm-frame=%S win=%S bufwin=%S wscf=%S"
                  actual
                  (ignore-errors (frame-edges exwm--floating-frame 'outer-edges))
                  (ignore-errors (frame-parameter exwm--floating-frame 'exwm-outer-id))
@@ -481,6 +481,9 @@ create the graphical child frame `exwm-floating--set-floating' requires."
                  (ignore-errors
                    (exwm--window-inside-absolute-pixel-edges
                     (get-buffer-window (current-buffer) t)))
+                 (ignore-errors
+                   (mapcar (lambda (w) (frame-parameter (window-frame w) 'exwm-outer-id))
+                           (get-buffer-window-list (current-buffer) 'nomini)))
                  excp--wscf)
       (excp--note "floating: forced exwm-layout--refresh after configure"
                   (lambda ()

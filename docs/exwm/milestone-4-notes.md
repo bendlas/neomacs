@@ -57,6 +57,17 @@ asynchronous resize landed) is never corrected.  An explicit
 between Neomacs' asynchronous external resize and EXWM's synchronous
 expectation.
 
+Evidence from the probe diagnostics:
+
+- The frame-size-change hook fires for the floating frame with the correct
+  `window-inside-absolute-pixel-edges` (e.g. 500x200).
+- The floating client's buffer is *not* displayed in the workspace frame
+  (`bufwin=nil`), so a workspace refresh is not what moves it back.
+- After the client's `ConfigureRequest`, the client is still 1280x341 while
+  the Emacs window inside the floating frame is 500x200.
+- An explicit `exwm-layout--refresh`/`exwm-layout--show` then sets the client
+  to the requested 500x400.
+
 Candidate fix: when Lisp queries a GUI frame's geometry, reconcile the frame
 with the real X window geometry (or wait for the pending external configure),
 so the initial `exwm-layout--show` inside `exwm-floating--set-floating` sees
