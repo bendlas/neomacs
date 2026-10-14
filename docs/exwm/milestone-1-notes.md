@@ -140,7 +140,32 @@ Inside the nested window, `s-r` returns to line mode, `s-&` launches a program,
 and `C-x C-c` quits. Neomacs stays responsive and EXWM owns the root as the
 probe reports; hosting launched clients is Milestone 2.
 
-## 5. Known gaps and next steps (Milestone 2 candidates)
+## 5. Follow-up fix: GUI frame geometry accessors
+
+Tagging X11-backed frames with `x` made `frame-edges` and `frame-geometry`
+(lisp/frame.el) dispatch to `x-frame-edges`/`x-frame-geometry`, which were
+permanent-`NIL` batch stubs. Any caller that consumed an edge as a number then
+signalled `(wrong-type-argument number-or-marker-p nil)`.
+
+EXWM hit this the moment a client was managed: `exwm-layout--refresh` ->
+`exwm-layout--show` -> `exwm--window-inside-absolute-pixel-edges` ->
+`window-edges` -> `(frame-edges FRAME 'native-edges)`, which returned nil, so
+`(- (pop edges) x)` failed. It surfaced both as the
+`window-size-change-functions` hook error and as the XELB process-filter error.
+The fix makes `x-frame-edges`/`x-frame-geometry` share the backend geometry
+with `neomacs-frame-edges`/`neomacs-frame-geometry`:
+
+- `crates/neovm-core/src/emacs_core/display/window_cmds/mod.rs` add
+  `builtin_neomacs_frame_geometry`, an alist mirroring `tty-frame-geometry`.
+- `crates/neovm-core/src/emacs_core/display/display/mod.rs` turn
+  `builtin_x_frame_edges`/`builtin_x_frame_geometry` into context-aware
+  delegators; non-graphical/batch frames still yield nil.
+
+Acceptance is now part of `exwm-init-probe.el`, which reports numeric
+`frame-edges`/`frame-geometry` and a numeric
+`window-inside-absolute-pixel-edges` before running EXWM.
+
+## 6. Known gaps and next steps (Milestone 2 candidates)
 
 - `x-send-client-message`, `x-window-property`, `x-window-property-attributes`,
   `x-change-window-property`, `x-delete-window-property`, `x-synchronize`,

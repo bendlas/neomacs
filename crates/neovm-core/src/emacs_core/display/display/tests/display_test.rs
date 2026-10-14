@@ -3175,19 +3175,26 @@ fn x_frame_mouse_and_dnd_batch_semantics() {
         other => panic!("expected wrong-number-of-arguments signal, got {other:?}"),
     }
 
-    assert!(builtin_x_frame_edges(vec![]).unwrap().is_nil());
-    assert!(builtin_x_frame_edges(vec![Value::NIL]).unwrap().is_nil());
+    // A bare evaluator's selected frame has no window system, so the GUI
+    // geometry accessors fall through to nil like `neomacs-frame-edges'.
+    assert!(builtin_x_frame_edges(&mut focus_eval, vec![]).unwrap().is_nil());
+    assert!(builtin_x_frame_edges(&mut focus_eval, vec![Value::NIL]).unwrap().is_nil());
+    match builtin_x_frame_edges(&mut focus_eval, vec![Value::make_frame(1)]).kinded() {
+        Err(FlowKind::Signal(sig)) => {
+            assert_eq!(sig.symbol_name(), "wrong-type-argument");
+            assert_eq!(
+                sig.data,
+                vec![Value::symbol("frame-live-p"), Value::make_frame(1)]
+            );
+        }
+        other => panic!("expected wrong-type-argument signal, got {other:?}"),
+    }
     assert!(
-        builtin_x_frame_edges(vec![Value::make_frame(1)])
+        builtin_x_frame_edges(&mut focus_eval, vec![Value::NIL, Value::NIL])
             .unwrap()
             .is_nil()
     );
-    assert!(
-        builtin_x_frame_edges(vec![Value::NIL, Value::NIL])
-            .unwrap()
-            .is_nil()
-    );
-    match builtin_x_frame_edges(vec![Value::fixnum(1)]).kinded() {
+    match builtin_x_frame_edges(&mut focus_eval, vec![Value::fixnum(1)]).kinded() {
         Err(FlowKind::Signal(sig)) => {
             assert_eq!(sig.symbol_name(), "wrong-type-argument");
             assert_eq!(
@@ -3197,7 +3204,7 @@ fn x_frame_mouse_and_dnd_batch_semantics() {
         }
         other => panic!("expected wrong-type-argument signal, got {other:?}"),
     }
-    match builtin_x_frame_edges(vec![Value::string("x")]).kinded() {
+    match builtin_x_frame_edges(&mut focus_eval, vec![Value::string("x")]).kinded() {
         Err(FlowKind::Signal(sig)) => {
             assert_eq!(sig.symbol_name(), "wrong-type-argument");
             assert_eq!(
@@ -3207,19 +3214,24 @@ fn x_frame_mouse_and_dnd_batch_semantics() {
         }
         other => panic!("expected wrong-type-argument signal, got {other:?}"),
     }
-    match builtin_x_frame_edges(vec![Value::NIL, Value::NIL, Value::NIL]).kinded() {
+    match builtin_x_frame_edges(&mut focus_eval, vec![Value::NIL, Value::NIL, Value::NIL]).kinded() {
         Err(FlowKind::Signal(sig)) => assert_eq!(sig.symbol_name(), "wrong-number-of-arguments"),
         other => panic!("expected wrong-number-of-arguments signal, got {other:?}"),
     }
 
-    assert!(builtin_x_frame_geometry(vec![]).unwrap().is_nil());
-    assert!(builtin_x_frame_geometry(vec![Value::NIL]).unwrap().is_nil());
-    assert!(
-        builtin_x_frame_geometry(vec![Value::make_frame(1)])
-            .unwrap()
-            .is_nil()
-    );
-    match builtin_x_frame_geometry(vec![Value::fixnum(1)]).kinded() {
+    assert!(builtin_x_frame_geometry(&mut focus_eval, vec![]).unwrap().is_nil());
+    assert!(builtin_x_frame_geometry(&mut focus_eval, vec![Value::NIL]).unwrap().is_nil());
+    match builtin_x_frame_geometry(&mut focus_eval, vec![Value::make_frame(1)]).kinded() {
+        Err(FlowKind::Signal(sig)) => {
+            assert_eq!(sig.symbol_name(), "wrong-type-argument");
+            assert_eq!(
+                sig.data,
+                vec![Value::symbol("frame-live-p"), Value::make_frame(1)]
+            );
+        }
+        other => panic!("expected wrong-type-argument signal, got {other:?}"),
+    }
+    match builtin_x_frame_geometry(&mut focus_eval, vec![Value::fixnum(1)]).kinded() {
         Err(FlowKind::Signal(sig)) => {
             assert_eq!(sig.symbol_name(), "wrong-type-argument");
             assert_eq!(
@@ -3229,7 +3241,7 @@ fn x_frame_mouse_and_dnd_batch_semantics() {
         }
         other => panic!("expected wrong-type-argument signal, got {other:?}"),
     }
-    match builtin_x_frame_geometry(vec![Value::string("x")]).kinded() {
+    match builtin_x_frame_geometry(&mut focus_eval, vec![Value::string("x")]).kinded() {
         Err(FlowKind::Signal(sig)) => {
             assert_eq!(sig.symbol_name(), "wrong-type-argument");
             assert_eq!(
@@ -3239,7 +3251,7 @@ fn x_frame_mouse_and_dnd_batch_semantics() {
         }
         other => panic!("expected wrong-type-argument signal, got {other:?}"),
     }
-    match builtin_x_frame_geometry(vec![Value::NIL, Value::NIL]).kinded() {
+    match builtin_x_frame_geometry(&mut focus_eval, vec![Value::NIL, Value::NIL]).kinded() {
         Err(FlowKind::Signal(sig)) => assert_eq!(sig.symbol_name(), "wrong-number-of-arguments"),
         other => panic!("expected wrong-number-of-arguments signal, got {other:?}"),
     }

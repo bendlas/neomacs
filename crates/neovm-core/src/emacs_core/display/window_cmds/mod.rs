@@ -2053,6 +2053,64 @@ pub(crate) fn builtin_neomacs_frame_edges(
     ]))
 }
 
+/// `(neomacs-frame-geometry &optional FRAME)` -> GUI frame geometry alist.
+///
+/// `frame-geometry' (lisp/frame.el) dispatches here for frames Neomacs tags
+/// with `x' (and `neo'); the shape mirrors `tty-frame-geometry' below so
+/// callers see the same keys on every backend.  Returns nil for the initial
+/// frame or a non-graphical frame, like `neomacs-frame-edges'.
+pub(crate) fn builtin_neomacs_frame_geometry(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
+    expect_max_args("neomacs-frame-geometry", &args, 1)?;
+    let fid = resolve_frame_id(
+        eval,
+        args.first(),
+        crate::emacs_core::window_cmds::FrameDomain::Live,
+    )?;
+    let frame = eval
+        .frames
+        .get(fid)
+        .ok_or_else(|| signal("error", vec![Value::string("Frame not found")]))?;
+    if frame.initial || frame.effective_window_system().is_none() {
+        return Ok(Value::NIL);
+    }
+    let (left, top) = eval.frames.frame_origin_in_root(fid).ok_or_else(|| {
+        signal(
+            "error",
+            vec![Value::string("Frame origin unavailable for frame geometry")],
+        )
+    })?;
+    let left = left.round() as i64;
+    let top = top.round() as i64;
+    let width = i64::from(frame.width);
+    let height = i64::from(frame.height);
+    let border = frame.internal_border_width().max(0);
+    let native_edges = Value::list(vec![
+        Value::fixnum(left),
+        Value::fixnum(top),
+        Value::fixnum(left.saturating_add(width)),
+        Value::fixnum(top.saturating_add(height)),
+    ]);
+    Ok(Value::list(vec![
+        Value::cons(
+            Value::symbol("outer-position"),
+            Value::cons(Value::fixnum(left), Value::fixnum(top)),
+        ),
+        Value::cons(
+            Value::symbol("outer-size"),
+            Value::cons(Value::fixnum(width), Value::fixnum(height)),
+        ),
+        Value::cons(Value::symbol("outer-border-width"), Value::fixnum(0)),
+        Value::cons(
+            Value::symbol("internal-border-width"),
+            Value::fixnum(border),
+        ),
+        Value::cons(Value::symbol("native-edges"), native_edges),
+    ]))
+}
+
 /// `(tty-frame-geometry &optional FRAME)` -> terminal frame geometry alist.
 pub(crate) fn builtin_tty_frame_geometry(
     eval: &mut super::eval::Context,

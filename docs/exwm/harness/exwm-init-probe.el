@@ -84,6 +84,19 @@
                              (lambda () (frame-parameter nil 'window-id)))
     (exwm-init-probe--report "frame-param outer-window-id"
                              (lambda () (frame-parameter nil 'outer-window-id)))
+    ;; EXWM lays clients out with `frame-edges' (exwm-layout.el exwm-layout--show).
+    ;; A GUI frame must report numeric native/outer edges here; a nil or missing
+    ;; edge makes `window-edges' signal (wrong-type-argument number-or-marker-p nil).
+    (exwm-init-probe--report "frame-edges native"
+                             (lambda () (frame-edges (selected-frame) 'native-edges)))
+    (exwm-init-probe--report "frame-edges outer"
+                             (lambda () (frame-edges (selected-frame) 'outer-edges)))
+    (exwm-init-probe--report "frame-geometry"
+                             (lambda () (frame-geometry (selected-frame))))
+    (exwm-init-probe--report "window-inside-absolute-pixel-edges"
+                             (lambda ()
+                               (window-inside-absolute-pixel-edges
+                                (selected-window))))
     ;; Load the pinned XELB/EXWM from the harness directory.
     (add-to-list 'load-path (expand-file-name "../xelb" exwm-init-probe--dir))
     (add-to-list 'load-path (expand-file-name "../exwm" exwm-init-probe--dir))

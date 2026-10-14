@@ -1352,9 +1352,9 @@ pub(crate) fn builtin_x_display_list(args: Vec<Value>) -> EvalResult {
     Ok(Value::NIL)
 }
 
-/// (x-frame-edges &optional FRAME TYPE) -> nil in batch/no-X context.
-pub(crate) fn builtin_x_frame_edges(args: Vec<Value>) -> EvalResult {
-    expect_max_args("x-frame-edges", &args, 2)?;
+/// Reject a non-frame, non-nil FRAME argument the way GNU's X geometry
+/// accessors do (`frame-live-p` wrong-type-argument).
+fn validate_x_frame_designator(args: &[Value]) -> Result<(), Flow> {
     if let Some(frame) = args.first()
         && !frame.is_nil()
         && !frame.is_frame()
@@ -1364,22 +1364,34 @@ pub(crate) fn builtin_x_frame_edges(args: Vec<Value>) -> EvalResult {
             vec![Value::symbol("frame-live-p"), *frame],
         ));
     }
-    Ok(Value::NIL)
+    Ok(())
 }
 
-/// (x-frame-geometry &optional FRAME) -> nil in batch/no-X context.
-pub(crate) fn builtin_x_frame_geometry(args: Vec<Value>) -> EvalResult {
+/// `(x-frame-edges &optional FRAME TYPE)` -> FRAME's edge list.
+///
+/// Neomacs tags graphical frames with `x', so `frame-edges' (lisp/frame.el)
+/// dispatches here for GUI frames.  Share the backend geometry computation
+/// with `neomacs-frame-edges'; the initial/batch frame has no window system
+/// and yields nil.
+pub(crate) fn builtin_x_frame_edges(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
+    expect_max_args("x-frame-edges", &args, 2)?;
+    validate_x_frame_designator(&args)?;
+    crate::emacs_core::window_cmds::builtin_neomacs_frame_edges(eval, args)
+}
+
+/// `(x-frame-geometry &optional FRAME)` -> GUI frame geometry alist.
+///
+/// Counterpart of `x-frame-edges' for `frame-geometry' (lisp/frame.el).
+pub(crate) fn builtin_x_frame_geometry(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
     expect_max_args("x-frame-geometry", &args, 1)?;
-    if let Some(frame) = args.first()
-        && !frame.is_nil()
-        && !frame.is_frame()
-    {
-        return Err(signal(
-            LispCondition::WrongTypeArgument,
-            vec![Value::symbol("frame-live-p"), *frame],
-        ));
-    }
-    Ok(Value::NIL)
+    validate_x_frame_designator(&args)?;
+    crate::emacs_core::window_cmds::builtin_neomacs_frame_geometry(eval, args)
 }
 
 /// (x-frame-list-z-order &optional DISPLAY) -> error in batch/no-X context.
