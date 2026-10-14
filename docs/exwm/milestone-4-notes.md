@@ -162,3 +162,111 @@ NESTED_X_DISPLAY=:66 docs/exwm/harness/run-client-probe.sh --server xvfb
 EXWM_EXPECT_FLOATING=1 NESTED_X_DISPLAY=:66 \
   docs/exwm/harness/run-client-probe.sh --server xvfb
 ```
+
+## 7. Floating resize: exact root cause and proposed fix (legacy redisplay driver)
+
+**Status: not committed as a fix.**  The floating check fails only in the
+*legacy* redisplay-hook driver (the default).  It passes unchanged when the
+GNU driver is selected with `NEOMACS_REDISPLAY_GNU_HOOKS=1`, so the gap is in
+Neomacs' legacy redisplay scheduling, not in X event delivery, frame geometry
+queries, or EXWM.
+
+### Experiment (clean build from the committed source, no Rust changes)
+
+| probe | driver | result |
+| --- | --- | --- |
+| default (no env) | legacy | `HARNESS-RESULT: exwm-client PASS (47 checks)` |
+| `EXWM_EXPECT_FLOATING=1` | legacy | `FAIL (1)` -- `floating: configure request resizes the client signalled (error "expected (500 400), got (1280 128)")` |
+| default (no env) | `NEOMACS_REDISPLAY_GNU_HOOKS=1` | `PASS (47 checks)` |
+| `EXWM_EXPECT_FLOATING=1` | `NEOMACS_REDISPLAY_GNU_HOOKS=1` | `PASS (51 checks)` -- `floating: configure request resizes the client => (:ok (500 400))` |
+
+So the acceptance test passes once the GNU redisplay-hook driver is active,
+and the default 47 checks stay green.  The floating check is the *only*
+difference.
+
+### Root cause: the legacy redisplay skip ignores non-selected frames
+
+The floating frame (`exwm--floating-frame`) is never the selected frame; the
+workspace frame is (`floating resize diag: current=2097156 exwm-frame=2097156`,
+while the floating frame is `2097163`).
+
+1. EXWM's `ConfigureRequest` handler only resizes the *frame*
+   (`docs/exwm/exwm/exwm-manage.el:676`; the floating branch at the end calls
+   `exwm--set-geometry frame-id ...`).  It does not resize the client window
+   directly; the client is re-fitted by `exwm-layout--show`
+   (`docs/exwm/exwm/exwm-layout.el:115`), which EXWM runs from
+   `window-size-change-functions` / `window-configuration-change-hook` via
+   `exwm-layout--refresh` (`docs/exwm/exwm/exwm-layout.el:314`, `:648`).
+2. Neomacs applies the external frame `ConfigureWindow` on the render thread
+   (`crates/neomacs-display-runtime/src/render_thread/surface_resize.rs:59`
+   `apply_native_surface_resize` -> `InputEvent::WindowResize`) and the core
+   installs it in `apply_resize_input_event_in_keyboard_runtime`
+   (`crates/neovm-core/src/keyboard.rs:2852`), which updates the frame's window
+   tree.  That is the state EXWM's hook must see.
+3. The command loop's input-wait redisplay only reaches
+   `run_redisplay_window_change_hooks`
+   (`crates/neovm-core/src/emacs_core/runtime/eval/command_loop.rs:1807`,
+   `crates/neovm-core/src/emacs_core/lisp/native/builtins/hooks.rs:318`) if
+   `redisplay_with_force` does not early-return.  The early-return gate
+   (`command_loop.rs:1777`) compares
+   `last_redisplay_signature == redisplay_signature()`, and
+   `redisplay_signature` (`command_loop.rs:1935`) serializes **only the
+   selected frame** (its `frame` field is built from `selected_frame`, and the
+   legacy driver's real window-change detection happens later, inside
+   `run_redisplay_window_change_hooks_inner`, `hooks.rs:339`).
+   The floating frame's window-tree change is therefore invisible to the gate,
+   the redisplay is skipped (`redisplay skipped: visible state unchanged`),
+   and the hook never runs before the probe reads the client 1.0 s later.
+   The client keeps its creation-time geometry `1280x128`, although the Emacs
+   window inside the floating frame is already `500x400`
+   (`floating resize diag: ... win=(-100000 -39949 -99500 -39549)`).
+4. With `NEOMACS_REDISPLAY_GNU_HOOKS=1`, step 3 goes through
+   `gnu_mark_frame_redisplay` / `gnu_mark_frame_window_change`
+   (`crates/neovm-core/src/emacs_core/runtime/eval/redisplay_hooks.rs:465`,
+   `:474`) via `sync_pending_resize_events` (`keyboard.rs:4030`), the frame
+   change participates in the redisplay decision, the hooks run, and the
+   client becomes `500x400` before the check.
+
+Secondary observation from the same run: if the legacy path is *forced* to
+redisplay (`sit-for`, `exwm-layout--refresh`), it re-fits the client but to
+`500x349` instead of `500x400`.  The missing 51 px is exactly the frame's top
+chrome (`chrome_top_height`), which suggests the legacy layout path also
+subtracts the top chrome twice somewhere between `resize_pixelwise`
+(`crates/neovm-core/src/window/mod.rs:5899`), `sync_window_area_bounds`
+(`window/mod.rs:4967`) and `window_area_bounds_with_chrome`
+(`window/mod.rs:4921`).  The GNU driver does not show this, so fixing the skip
+gate above is the primary change; the 51 px discrepancy should be re-checked
+afterwards.
+
+### Proposed patch (candidate, not committed)
+
+1. **Demonstrated:** make the GNU redisplay-hook driver the default for the
+   GUI path, i.e. flip the `parse_redisplay_hooks` fallback
+   (`redisplay_hooks.rs:49`, currently `_ => RedisplayHookPolicy::Legacy`) or
+   the `gnu_redisplay_hooks_enabled` policy default.  With
+   `NEOMACS_REDISPLAY_GNU_HOOKS=1` both the default `PASS (47)` and the floating
+   `PASS (51)` hold, so this is sufficient and non-regressing for these probes.
+2. **Minimal legacy alternative:** include non-selected frames with pending
+   window-tree changes in the redisplay decision -- e.g. carry the resize
+   `publications` produced by
+   `apply_resize_input_event_in_keyboard_runtime` (`keyboard.rs:2942`) into a
+   legacy `frame.window_hook_record`-dirty predicate, and let the skip gate at
+   `command_loop.rs:1777` see it (or set `last_redisplay_signature = None` when
+   a resize was applied).  This needs its own layout pass to avoid the 51 px
+   shrink described above.
+
+### What blocks a safe committed fix
+
+- Option 1 changes a process-wide redisplay policy for every GUI user, not
+  just EXWM, and the legacy driver exists deliberately; the rest of the suite
+  does not exercise the GNU driver, so a silent regression elsewhere is
+  plausible.  It is demonstrably correct for this probe but not
+  demonstrably safe for all callers.
+- Option 2 touches `redisplay_signature` / the shared redisplay skip gate,
+  which governs redraw scheduling for all frames and buffers.  A wrong
+  predicate causes either missed redraws or extra full redisplays, and the
+  legacy layout path still needs the `chrome_top_height` audit above.
+- Per the milestone safety guard, neither was committed speculatively.  The
+  probe keeps its gating behind `EXWM_EXPECT_FLOATING=1`; the default 47
+  checks are unchanged.
+
