@@ -163,6 +163,13 @@ impl RenderApp {
                     let window: Arc<dyn winit::window::Window> = Arc::from(window);
                     NativeTextInputPolicy::for_gui_frame().apply_to_window(window.as_ref());
                     apply_option_key_policy(window.as_ref(), self.frame_windows.option_as_alt);
+                    // Publish the X11 window ids under the pending primary id
+                    // (0); AdoptPrimaryFrame rekeys them to the real frame id.
+                    crate::thread_comm::record_native_window_ids(
+                        &self.comms.native_window_ids,
+                        0,
+                        window.as_ref(),
+                    );
 
                     if self.clipboard.is_err() {
                         self.clipboard = crate::clipboard::ClipboardService::for_display(

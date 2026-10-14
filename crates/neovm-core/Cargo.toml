@@ -101,6 +101,9 @@ windows-sys.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 inotify.workspace = true
+# Real X11 connection for the GNU-compatible `x-*` compatibility subrs.  Linux
+# only: Neomacs GUI sessions on macOS/Windows never present as X11.
+x11rb.workspace = true
 
 # GNU's configure probes `dbus-1 >= 1.0` (`configure.ac:3919-3944`) and simply
 # sets `HAVE_DBUS=no` when it is missing, so dbusbind is absent rather than

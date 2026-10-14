@@ -967,10 +967,22 @@ fn bootstrap_gui_display_config(
 impl BootstrapDisplayConfig {
     fn window_system_symbol(&self) -> Option<&'static str> {
         match self.frontend() {
-            FrontendKind::Gui => Some(gui_window_system_symbol()),
+            // A GUI session whose native backend is X11 presents its frames and
+            // terminals as `x`, so X-only packages (notably EXWM) can drive the
+            // real display.  Other GUI backends stay `neo`.
+            FrontendKind::Gui => Some(match &self.kind {
+                BootstrapDisplayKind::Gui { identity, .. }
+                    if identity.backend()
+                        == neomacs_display_protocol::GraphicalBackend::X11 =>
+                {
+                    "x"
+                }
+                _ => gui_window_system_symbol(),
+            }),
             FrontendKind::Tty => None,
         }
     }
+
 
     fn display_type_symbol(&self) -> &'static str {
         if self.color_cells > 0 {
@@ -1211,6 +1223,8 @@ struct PrimaryWindowDisplayHost {
     font_sizing: FontSizing,
     primary_window_adopted: bool,
     primary_frame_id: Option<neovm_core::window::FrameId>,
+    /// X11 window ids published by the render thread, keyed by Emacs frame id.
+    native_window_ids: neomacs_display_runtime::thread_comm::SharedNativeWindowIds,
     last_window_titles: Mutex<HashMap<neovm_core::window::FrameId, LispString>>,
     font_metrics: Option<FontMetricsService>,
     font_entities: FontEntityCatalog,
@@ -1713,6 +1727,18 @@ impl DisplayHost for PrimaryWindowDisplayHost {
 
     fn opening_gui_frame_pending(&self) -> bool {
         !self.primary_window_adopted
+    }
+
+    fn native_x11_window_ids(&self, frame_id: neovm_core::window::FrameId) -> Option<(u64, u64)> {
+        let ids = self.native_window_ids.lock().ok()?;
+        // The primary window is recorded under id 0 until the render thread
+        // processes AdoptPrimaryFrame; fall back to it only for that frame.
+        let entry = ids.get(&frame_id.0).or_else(|| {
+            (self.primary_frame_id == Some(frame_id))
+                .then(|| ids.get(&0))
+                .flatten()
+        })?;
+        Some((entry.window_id, entry.outer_window_id))
     }
 
     fn remove_gui_child_frame(
@@ -3868,6 +3894,7 @@ fn run_gui_evaluator_worker(
         font_sizing: bootstrap_display.font_sizing(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        native_window_ids: Arc::clone(&emacs_comms.native_window_ids),
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
         font_entities: FontEntityCatalog::default(),

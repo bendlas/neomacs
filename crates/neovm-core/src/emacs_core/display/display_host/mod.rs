@@ -446,6 +446,14 @@ pub trait DisplayHost {
     fn opening_gui_frame_pending(&self) -> bool {
         false
     }
+
+    /// Native X11 window ids `(window-id, outer-window-id)` for `frame_id`.
+    ///
+    /// Only the X11 GUI host knows these; every other host answers `None`, so
+    /// the `window-id` / `outer-window-id` frame parameters stay nil.
+    fn native_x11_window_ids(&self, _frame_id: crate::window::FrameId) -> Option<(u64, u64)> {
+        None
+    }
     fn destroy_gui_frame(&mut self, _frame_id: crate::window::FrameId) -> Result<(), String> {
         Ok(())
     }

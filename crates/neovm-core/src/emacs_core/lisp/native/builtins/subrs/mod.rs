@@ -7918,9 +7918,7 @@ pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
     ));
     ctx.register_subr(SubrSpec::new(
         "x-get-atom-name",
-        NativeFn::ContextVec(|_ctx, args| {
-            crate::emacs_core::display::builtin_x_get_atom_name(args)
-        }),
+        NativeFn::ContextVec(crate::emacs_core::display::builtin_x_get_atom_name),
         SubrArity::new(1, Some(2)),
     ));
     ctx.register_subr(SubrSpec::new(

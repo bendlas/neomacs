@@ -1772,6 +1772,7 @@ fn x_geometry_fonts_and_resource_batch_semantics() {
 #[test]
 fn x_property_and_frame_arg_batch_semantics() {
     crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::Context::new();
     for args in [vec![], vec![Value::NIL], vec![Value::make_frame(1)]] {
         match builtin_x_backspace_delete_keys_p(args).kinded() {
             Err(FlowKind::Signal(sig)) => {
@@ -1795,7 +1796,7 @@ fn x_property_and_frame_arg_batch_semantics() {
         other => panic!("expected wrong-type-argument signal, got {other:?}"),
     }
 
-    match builtin_x_get_atom_name(vec![Value::symbol("WM_CLASS")]).kinded() {
+    match builtin_x_get_atom_name(&mut eval, vec![Value::symbol("WM_CLASS")]).kinded() {
         Err(FlowKind::Signal(sig)) => {
             assert_eq!(sig.symbol_name(), "error");
             assert_eq!(
@@ -1805,7 +1806,9 @@ fn x_property_and_frame_arg_batch_semantics() {
         }
         other => panic!("expected error signal, got {other:?}"),
     }
-    match builtin_x_get_atom_name(vec![Value::symbol("WM_CLASS"), Value::fixnum(1)]).kinded() {
+    match builtin_x_get_atom_name(&mut eval, vec![Value::symbol("WM_CLASS"), Value::fixnum(1)])
+        .kinded()
+    {
         Err(FlowKind::Signal(sig)) => {
             assert_eq!(sig.symbol_name(), "wrong-type-argument");
             assert_eq!(

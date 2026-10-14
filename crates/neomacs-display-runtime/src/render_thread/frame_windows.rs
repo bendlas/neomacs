@@ -2189,6 +2189,13 @@ impl GuiFrameWindowManager {
                     apply_window_geometry_hints(window.as_ref(), req.geometry_hints);
 
                     let winit_id = window.id();
+                    // Publish this frame's X11 window ids (if any) before the
+                    // window moves into the lifecycle state.
+                    crate::thread_comm::record_native_window_ids(
+                        &comms.native_window_ids,
+                        req.emacs_frame_id,
+                        window.as_ref(),
+                    );
                     tracing::info!(
                         "Created window for frame {} (winit {:?}, {}x{}, raw_scale={}, effective_scale={})",
                         req.emacs_frame_id,

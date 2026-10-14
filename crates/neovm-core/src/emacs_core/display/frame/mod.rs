@@ -1392,6 +1392,26 @@ pub(crate) fn builtin_frame_parameter(
         Some(&args[0]),
         crate::emacs_core::window_cmds::FrameDomain::Any,
     )?;
+    // GNU reports the frame's X window ids from C state, not a frame parameter
+    // (frame.c `Fframe_parameter` special-cases Qwindow_id / Qouter_window_id).
+    // EXWM reads them to reparent its workspace frames, so source them from the
+    // GUI host.
+    if let Some(name) = args[1].as_bare_symbol_name() {
+        if name == "window-id" || name == "outer-window-id" {
+            let ids = eval
+                .display_host
+                .as_ref()
+                .and_then(|host| host.native_x11_window_ids(fid));
+            let value = match (name, ids) {
+                ("window-id", Some((window_id, _))) => Value::string(window_id.to_string()),
+                ("outer-window-id", Some((_, outer_window_id))) => {
+                    Value::string(outer_window_id.to_string())
+                }
+                _ => Value::NIL,
+            };
+            return Ok(value);
+        }
+    }
     let Some(param_key) = FrameParamKey::from_symbol_value(args[1]) else {
         return Ok(Value::NIL);
     };

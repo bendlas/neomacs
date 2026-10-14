@@ -19,6 +19,7 @@ use strum::{EnumString, IntoStaticStr};
 
 mod desktop;
 mod tooltip;
+mod x11_compat;
 pub(crate) use tooltip::{builtin_x_hide_tip_eval, builtin_x_show_tip_eval};
 
 /// Clear cached thread-local display values (must be called when heap changes).
@@ -363,6 +364,32 @@ fn window_system_not_initialized_error() -> Flow {
 
 pub fn gui_window_system_symbol() -> &'static str {
     "neo"
+}
+
+/// Resolve the X display string for a subr's optional FRAME argument.
+///
+/// `None` means either no frame was found or the frame is not backed by a real
+/// X11 connection (for example a Wayland `neo` session).  Callers then keep the
+/// GNU batch/no-X error contract.
+fn gui_x_display_for_frame(
+    eval: &super::eval::Context,
+    frame_arg: Option<&Value>,
+) -> Option<String> {
+    let frame = match frame_arg {
+        Some(value) if !value.is_nil() => {
+            let id = value.as_frame_id()?;
+            eval.frames.get(FrameId(id))
+        }
+        _ => eval.frames.selected_frame(),
+    };
+    frame
+        .and_then(|frame| frame.display_identity().x_display())
+        .map(str::to_owned)
+}
+
+/// Signal a hard X connection/protocol failure in GNU's shape.
+fn x11_signal(error: x11_compat::X11Error) -> Flow {
+    signal("error", vec![Value::string(error.message())])
 }
 
 pub(crate) fn gui_window_system_active_value(value: Value) -> bool {
@@ -2636,10 +2663,30 @@ pub(crate) fn builtin_x_family_fonts(args: Vec<Value>) -> EvalResult {
 }
 
 /// (x-get-atom-name ATOM &optional FRAME) -> error in batch/no-X context.
-pub(crate) fn builtin_x_get_atom_name(args: Vec<Value>) -> EvalResult {
+///
+/// A live X11 frame transparently queries the server; all other contexts keep
+/// GNU's "Window system frame should be used" shape.
+pub(crate) fn builtin_x_get_atom_name(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
     expect_args_range("x-get-atom-name", &args, 1, 2)?;
     if let Some(frame) = args.get(1) {
         expect_optional_window_system_frame_arg(frame)?;
+    }
+    if let Some(display) = gui_x_display_for_frame(eval, args.get(1)) {
+        let Some(atom) = args[0].as_int() else {
+            return Err(signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("integerp"), args[0]],
+            ));
+        };
+        let atom = u32::try_from(atom).unwrap_or(0);
+        return match x11_compat::atom_name(&display, atom) {
+            Ok(Some(name)) => Ok(Value::string(name)),
+            Ok(None) => Ok(Value::NIL),
+            Err(error) => Err(x11_signal(error)),
+        };
     }
     Err(x_window_system_frame_error())
 }
@@ -2918,6 +2965,21 @@ pub(crate) fn builtin_x_server_version(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if gui_x_query_target_eval(eval, "x-server-version", &args)?
+        && let Some(display) = gui_x_display_for_frame(eval, args.first())
+    {
+        match x11_compat::server_info(&display) {
+            Ok(info) => {
+                let (major, minor, release) = info.version;
+                return Ok(Value::list(vec![
+                    Value::fixnum(i64::from(major)),
+                    Value::fixnum(i64::from(minor)),
+                    Value::fixnum(i64::from(release)),
+                ]));
+            }
+            Err(error) => return Err(x11_signal(error)),
+        }
+    }
     x_optional_display_query_error_eval(eval, "x-server-version", args)
 }
 
@@ -3015,10 +3077,21 @@ pub(crate) fn builtin_x_display_save_under(
 }
 
 /// Context-aware variant of `x-display-screens`.
+///
+/// Real X11 sessions query the server's screen count; every other session keeps
+/// the GNU batch/no-X error shape.
 pub(crate) fn builtin_x_display_screens(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if gui_x_query_target_eval(eval, "x-display-screens", &args)?
+        && let Some(display) = gui_x_display_for_frame(eval, args.first())
+    {
+        match x11_compat::server_info(&display) {
+            Ok(info) => return Ok(Value::fixnum(info.screens as i64)),
+            Err(error) => return Err(x11_signal(error)),
+        }
+    }
     x_optional_display_query_error_eval(eval, "x-display-screens", args)
 }
 
@@ -3046,6 +3119,14 @@ pub(crate) fn builtin_x_server_vendor(
     eval: &mut super::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if gui_x_query_target_eval(eval, "x-server-vendor", &args)?
+        && let Some(display) = gui_x_display_for_frame(eval, args.first())
+    {
+        match x11_compat::server_info(&display) {
+            Ok(info) => return Ok(Value::string(info.vendor)),
+            Err(error) => return Err(x11_signal(error)),
+        }
+    }
     x_optional_display_query_error_eval(eval, "x-server-vendor", args)
 }
 
@@ -3160,6 +3241,17 @@ pub(crate) fn builtin_x_display_pixel_width(
     args: Vec<Value>,
 ) -> EvalResult {
     if gui_x_query_target_eval(eval, "x-display-pixel-width", &args)? {
+        if let Ok(extent) = graphical_desktop_extent() {
+            return Ok(Value::fixnum(extent.width));
+        }
+        // The winit monitor snapshot can be empty (for example a nested Xephyr
+        // server before any monitor event); fall back to the X server's own
+        // root geometry, which is what GNU reports.
+        if let Some(display) = gui_x_display_for_frame(eval, args.first())
+            && let Ok((width, _)) = x11_compat::screen_size(&display)
+        {
+            return Ok(Value::fixnum(width));
+        }
         return Ok(Value::fixnum(graphical_desktop_extent()?.width));
     }
     x_optional_display_query_error_eval(eval, "x-display-pixel-width", args)
@@ -3174,6 +3266,14 @@ pub(crate) fn builtin_x_display_pixel_height(
     args: Vec<Value>,
 ) -> EvalResult {
     if gui_x_query_target_eval(eval, "x-display-pixel-height", &args)? {
+        if let Ok(extent) = graphical_desktop_extent() {
+            return Ok(Value::fixnum(extent.height));
+        }
+        if let Some(display) = gui_x_display_for_frame(eval, args.first())
+            && let Ok((_, height)) = x11_compat::screen_size(&display)
+        {
+            return Ok(Value::fixnum(height));
+        }
         return Ok(Value::fixnum(graphical_desktop_extent()?.height));
     }
     x_optional_display_query_error_eval(eval, "x-display-pixel-height", args)

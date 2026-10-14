@@ -7433,9 +7433,16 @@ pub(crate) fn x_create_frame_impl(
         frame.char_height = metrics.char_height;
         frame.font_pixel_size = metrics.font_pixel_size;
         frame.device_scale_factor = metrics.device_scale_factor;
-        frame.set_window_system(Some(Value::symbol(
-            crate::emacs_core::display::gui_window_system_symbol(),
-        )));
+        // A frame inherits its window system from the frame it was created
+        // from (or the selected frame): an X11-backed parent yields an `x`
+        // frame so X-only packages such as EXWM can manage it, every other
+        // GUI backend stays `neo`.
+        let window_system_symbol = if inherited_display_identity.x_display().is_some() {
+            "x"
+        } else {
+            crate::emacs_core::display::gui_window_system_symbol()
+        };
+        frame.set_window_system(Some(Value::symbol(window_system_symbol)));
         frame.set_display_identity(inherited_display_identity);
         // NO `display-type' and NO `background-mode' here either.  GNU's
         // `x-create-frame' (src/xfns.c:4916) does not set them; its Lisp

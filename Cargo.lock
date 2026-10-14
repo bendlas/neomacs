@@ -4355,6 +4355,7 @@ dependencies = [
  "webpki-roots",
  "whoami",
  "windows-sys 0.61.2",
+ "x11rb",
  "x509-parser",
 ]
 

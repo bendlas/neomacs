@@ -2,7 +2,8 @@
 
 **Status:** implemented; runtime verification recorded below.  
 **Scope:** Linux/X11, including Xwayland where the same X11 protocol path applies.  
-**Related:** [`roadmap.md`](./roadmap.md), [`feature-request.md`](./feature-request.md).
+**Related:** [`roadmap.md`](./roadmap.md), [`feature-request.md`](./feature-request.md),
+[`milestone-1-notes.md`](./milestone-1-notes.md).
 
 This document records the Milestone 0 architecture decisions and how to run the
 nested-X spike. The harness lives in [`harness/`](./harness).
@@ -282,7 +283,8 @@ acceptance criteria on this build.
   `exwm--init` can run.
 
   **Confirmed boundary:** under the fixture, after a successful `xcb:connect`,
-  `(xcb:icccm:init conn)` signals
+  `(xcb:icccm:init conn)` signalled
   `(error "X windows are not in use or not initialized")` from the
-  `x-display-screens` stub. That call is the first thing `exwm--init` does after
-  connecting, so it is the concrete first task of Milestone 1.
+  `x-display-screens` stub. **Resolved in Milestone 1** (real
+  `x-display-screens`, X11 frame identity, and frame X window ids); see
+  [`milestone-1-notes.md`](./milestone-1-notes.md).

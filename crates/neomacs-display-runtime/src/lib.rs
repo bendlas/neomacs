@@ -22,6 +22,7 @@ pub mod font_defaults;
 pub mod gui_resources;
 pub mod macos_bundle_runtime;
 mod menus;
+pub mod native_window_id;
 mod presentation;
 mod presentation_feedback;
 pub mod redisplay;
