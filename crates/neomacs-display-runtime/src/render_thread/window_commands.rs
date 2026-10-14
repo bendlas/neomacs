@@ -288,6 +288,10 @@ impl RenderApp {
             WindowCommand::DestroyWindow { frame } => {
                 let emacs_frame_id = frame.raw_id();
                 tracing::info!("DestroyWindow request: frame_id=0x{:x}", emacs_frame_id);
+                crate::thread_comm::remove_native_window_ids(
+                    &self.comms.native_window_ids,
+                    emacs_frame_id,
+                );
                 let mut retirements = Vec::new();
                 if let Some(window) = self.frame_windows.get_mut(emacs_frame_id) {
                     // Destruction cancels capture first, flushing any older
@@ -322,6 +326,11 @@ impl RenderApp {
                 let emacs_frame_id = frame.raw_id();
                 tracing::info!("AdoptPrimaryFrame request: frame_id=0x{:x}", emacs_frame_id);
                 self.frame_windows.adopt_primary_frame_id(emacs_frame_id);
+                crate::thread_comm::rekey_native_window_ids(
+                    &self.comms.native_window_ids,
+                    0,
+                    emacs_frame_id,
+                );
                 if self
                     .frame_windows
                     .get(emacs_frame_id)

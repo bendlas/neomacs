@@ -23,6 +23,7 @@ pub mod gui_resources;
 pub mod macos_bundle_runtime;
 mod menus;
 mod presentation;
+pub mod native_window_id;
 mod presentation_feedback;
 pub mod redisplay;
 pub mod thread_comm;

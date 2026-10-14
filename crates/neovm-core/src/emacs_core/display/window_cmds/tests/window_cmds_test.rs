@@ -343,6 +343,7 @@ struct RecordingDisplayHost {
         Rc<RefCell<Vec<(crate::window::FrameId, crate::window::GuiFrameGeometryHints)>>>,
     primary_size: Option<GuiFrameHostSize>,
     resolved_frame_font: Option<ResolvedFrameFont>,
+    native_x11_ids: Rc<RefCell<Vec<(crate::window::FrameId, (u64, u64))>>>,
 }
 
 impl RecordingDisplayHost {
@@ -439,6 +440,14 @@ impl DisplayHost for RecordingDisplayHost {
     fn resize_gui_frame(&mut self, request: GuiFrameHostRequest) -> Result<(), String> {
         self.resized.borrow_mut().push(request);
         Ok(())
+    }
+
+    fn native_x11_window_ids(&self, frame_id: crate::window::FrameId) -> Option<(u64, u64)> {
+        self.native_x11_ids
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == frame_id)
+            .map(|(_, ids)| *ids)
     }
 
     fn set_gui_frame_fullscreen(
@@ -7038,6 +7047,47 @@ fn x_create_frame_creates_live_frame_and_preserves_char_geometry_params() {
     assert_eq!(frame.visibility, crate::window::FrameVisibility::Invisible);
     assert_eq!(frame.char_width, 8.0);
     assert_eq!(frame.char_height, 16.0);
+}
+
+#[test]
+fn frame_parameter_reads_native_x11_window_ids_from_display_host() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    let scratch = ev.buffers.create_buffer("*scratch*");
+    let fid = ev.frames.create_frame("GUI", 800, 600, scratch);
+    ev.frames
+        .get_mut(fid)
+        .expect("frame")
+        .set_window_system(Some(Value::symbol("x")));
+
+    let host = RecordingDisplayHost::new();
+    let ids = host.native_x11_ids.clone();
+    ev.set_display_host(Box::new(host));
+    ids.borrow_mut().push((fid, (20_971_56, 20_971_56)));
+
+    let frame_value = Value::make_frame(fid.0);
+    let window_id = crate::emacs_core::frame::builtin_frame_parameter(
+        &mut ev,
+        vec![frame_value, Value::symbol("window-id")],
+    )
+    .expect("window-id");
+    let outer_id = crate::emacs_core::frame::builtin_frame_parameter(
+        &mut ev,
+        vec![frame_value, Value::symbol("outer-window-id")],
+    )
+    .expect("outer-window-id");
+    assert_eq!(window_id.as_utf8_str(), Some("2097156"));
+    assert_eq!(outer_id.as_utf8_str(), Some("2097156"));
+
+    // A frame the host knows nothing about stays nil, like a non-X11 backend.
+    let other = ev.frames.create_frame("Other", 40, 10, scratch);
+    let other_value = Value::make_frame(other.0);
+    let missing = crate::emacs_core::frame::builtin_frame_parameter(
+        &mut ev,
+        vec![other_value, Value::symbol("window-id")],
+    )
+    .expect("missing window-id");
+    assert!(missing.is_nil());
 }
 
 #[test]

@@ -1211,6 +1211,10 @@ struct PrimaryWindowDisplayHost {
     font_sizing: FontSizing,
     primary_window_adopted: bool,
     primary_frame_id: Option<neovm_core::window::FrameId>,
+    /// X11 window ids published by the render thread, keyed by Emacs frame id.
+    native_window_ids: neomacs_display_runtime::thread_comm::SharedNativeWindowIds,
+    /// Whether the native backend is X11 (only then are window ids published).
+    x11_backend: bool,
     last_window_titles: Mutex<HashMap<neovm_core::window::FrameId, LispString>>,
     font_metrics: Option<FontMetricsService>,
     font_entities: FontEntityCatalog,
@@ -1496,6 +1500,36 @@ impl PrimaryWindowDisplayHost {
         Ok(())
     }
 
+    /// Block until the render thread publishes FRAME_ID's X11 window ids.
+    ///
+    /// Additional top-level windows are realized asynchronously on the render
+    /// thread.  `x-create-frame` must not return before the frame carries its
+    /// `window-id`/`outer-window-id`, otherwise `frame-parameter` readers (and
+    /// X clients built on them) observe nil.  The wait is bounded so a failed
+    /// realization degrades to nil instead of hanging the evaluator.
+    fn await_native_window_ids(&self, frame_id: FrameId) {
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let ready = self
+                .native_window_ids
+                .lock()
+                .map(|ids| ids.contains_key(&frame_id.0))
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    frame_id = frame_id.0,
+                    "timed out waiting for GUI frame X11 window ids"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn await_clipboard_reply<T>(
         &self,
         command: ClipboardCommand,
@@ -1615,6 +1649,9 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                 }),
                 "failed to create additional GUI window",
             )?;
+            if self.x11_backend {
+                self.await_native_window_ids(request.frame_id);
+            }
             if let Some(fullscreen) = request.fullscreen {
                 self.send_render_command(
                     RenderCommand::Window(WindowCommand::SetWindowFullscreen {
@@ -1713,6 +1750,18 @@ impl DisplayHost for PrimaryWindowDisplayHost {
 
     fn opening_gui_frame_pending(&self) -> bool {
         !self.primary_window_adopted
+    }
+
+    fn native_x11_window_ids(&self, frame_id: neovm_core::window::FrameId) -> Option<(u64, u64)> {
+        let ids = self.native_window_ids.lock().ok()?;
+        // The primary window is recorded under id 0 until the render thread
+        // processes AdoptPrimaryFrame; fall back to it only for that frame.
+        let entry = ids.get(&frame_id.0).or_else(|| {
+            (self.primary_frame_id == Some(frame_id))
+                .then(|| ids.get(&0))
+                .flatten()
+        })?;
+        Some((entry.window_id, entry.outer_window_id))
     }
 
     fn remove_gui_child_frame(
@@ -3862,6 +3911,9 @@ fn run_gui_evaluator_worker(
         font_sizing: bootstrap_display.font_sizing(),
         primary_window_adopted: false,
         primary_frame_id: None,
+        native_window_ids: Arc::clone(&emacs_comms.native_window_ids),
+        x11_backend: identity.backend()
+            == neomacs_display_protocol::GraphicalBackend::X11,
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
         font_entities: FontEntityCatalog::default(),

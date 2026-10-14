@@ -5,6 +5,7 @@
 //! bridge queues a converted event.
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -973,6 +974,62 @@ impl SharedRenderCapabilities {
     }
 }
 
+/// Native X11 window ids for one Emacs GUI frame.
+///
+/// `window_id` is the frame's own X window (GNU's `window-id`); for a winit
+/// top-level with no window manager yet, `outer_window_id` is the same XID and
+/// answers GNU's `outer-window-id`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeWindowIds {
+    pub window_id: u64,
+    pub outer_window_id: u64,
+}
+
+/// Emacs frame id -> native X11 window ids.  Written by the render thread when
+/// an OS window is realized; read by the evaluator to answer the `window-id`
+/// and `outer-window-id` frame parameters.  `0` holds the adopted primary
+/// window until it learns its Emacs frame id.
+pub type SharedNativeWindowIds = Arc<Mutex<HashMap<u64, NativeWindowIds>>>;
+
+/// Store the X11 window ids of a freshly realized winit window under FRAME_ID.
+///
+/// A backend with no X11 handle records nothing, which keeps `window-id` nil
+/// there.
+pub fn record_native_window_ids(
+    ids: &SharedNativeWindowIds,
+    frame_id: u64,
+    window: &dyn winit::window::Window,
+) {
+    let Some((window_id, outer_window_id)) = crate::native_window_id::x11_window_ids(window) else {
+        return;
+    };
+    if let Ok(mut map) = ids.lock() {
+        map.insert(
+            frame_id,
+            NativeWindowIds {
+                window_id,
+                outer_window_id,
+            },
+        );
+    }
+}
+
+/// Move the ids recorded under the pending primary id (0) to the real frame id.
+pub fn rekey_native_window_ids(ids: &SharedNativeWindowIds, from: u64, to: u64) {
+    if let Ok(mut map) = ids.lock()
+        && let Some(ids) = map.remove(&from)
+    {
+        map.insert(to, ids);
+    }
+}
+
+/// Forget the window ids of a destroyed frame.
+pub fn remove_native_window_ids(ids: &SharedNativeWindowIds, frame_id: u64) {
+    if let Ok(mut map) = ids.lock() {
+        map.remove(&frame_id);
+    }
+}
+
 /// Communication channels between threads
 pub struct ThreadComms {
     /// Frame display state: Emacs → Render
@@ -990,6 +1047,7 @@ pub struct ThreadComms {
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
     pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
+    pub native_window_ids: SharedNativeWindowIds,
 }
 
 impl ThreadComms {
@@ -1009,6 +1067,7 @@ impl ThreadComms {
             capabilities,
             tooltip_context: Arc::default(),
             frame_opacity: Arc::default(),
+            native_window_ids: Arc::default(),
         }
     }
 
@@ -1021,6 +1080,7 @@ impl ThreadComms {
             cmd_tx: self.cmd_tx,
             input_rx: self.input_rx,
             capabilities: Arc::clone(&self.capabilities),
+            native_window_ids: Arc::clone(&self.native_window_ids),
         };
 
         let render = RenderComms {
@@ -1031,6 +1091,7 @@ impl ThreadComms {
             cmd_rx: self.cmd_rx,
             input_tx: self.input_tx,
             capabilities: self.capabilities,
+            native_window_ids: self.native_window_ids,
         };
 
         (emacs, render)
@@ -1051,6 +1112,7 @@ pub struct EmacsComms {
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
     pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
+    pub native_window_ids: SharedNativeWindowIds,
 }
 
 /// Render thread communication handle
@@ -1062,6 +1124,7 @@ pub struct RenderComms {
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
     pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
+    pub native_window_ids: SharedNativeWindowIds,
 }
 
 impl RenderComms {
