@@ -660,7 +660,19 @@ create the graphical child frame `exwm-floating--set-floating' requires."
                         (make-instance 'xcb:icccm:get-WM_STATE
                                        :window excp--w1))
                      (excp--log "icccm: WM_STATE state=%S" state)
-                     (excp--expect 1 state))))))
+                     (excp--expect 1 state))))
+    (excp--check "ewmh: _NET_WM_DESKTOP is 0 for the managed client"
+                 (lambda ()
+                   (let ((v (excp--prop-value
+                             excp--w1 'xcb:ewmh:get-_NET_WM_DESKTOP)))
+                     (excp--log "ewmh: _NET_WM_DESKTOP=%S" v)
+                     (excp--expect 0 v))))
+    (excp--check "ewmh: _NET_WM_STATE is empty for a normal tiled client"
+                 (lambda ()
+                   (let ((v (excp--prop-seq
+                             (excp--prop-value
+                              excp--w1 'xcb:ewmh:get-_NET_WM_STATE))))
+                     (excp--expect nil v))))))
 
 (defun excp--post-stages ()
   (setq excp--pending
