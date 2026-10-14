@@ -1,12 +1,12 @@
 # Milestone 2 notes: basic external-client management
 
-**Status:** First acceptance slice implemented and passing.
+**Status:** Implemented and passing.  The probe also covers the Milestone 3
+focus primitive and surfaces a Milestone 4 floating-window gap.
 
-The nested-X harness now drives a controllable top-level X11 client through
-EXWM and asserts the observable result at each step.  The client window is
-created on a *second* XELB connection opened by the probe process, so EXWM
-sees it exactly as it sees a foreign application (`MapRequest`, not an
-intra-process shortcut).
+The nested-X harness drives a controllable top-level X11 client through EXWM
+and asserts the observable result at each step.  The client window is created
+on a *second* XELB connection opened by the probe process, so EXWM sees it
+exactly as it sees a foreign application.
 
 ## 1. What is exercised
 
@@ -16,22 +16,27 @@ intra-process shortcut).
 1. **Manage** — `MapRequest` -> EXWM creates a buffer, `exwm-mode`,
    `exwm-class-name`/`exwm-instance-name`/`exwm-title` from `WM_CLASS`/`WM_NAME`.
 2. **Title change** — a `ChangeProperty WM_NAME` from the client updates
-   `exwm-title` through EXWM's `PropertyNotify` path.
+   `exwm-title` through `PropertyNotify`.
 3. **Layout (WM -> client)** — `exwm-layout--show` sets the X window geometry
-   to the Emacs window's inside-absolute-pixel edges; the server-side
-   `GetGeometry` matches exactly.
-4. **Configure request (client -> WM)** — a client `ConfigureWindow` is
-   redirected to EXWM, which preserves the tiled fit (no geometry corruption).
-5. **Close** — `DestroyNotify` removes the id from `exwm--id-buffer-alist` and
-   kills the EXWM buffer.
-6. **Rapid churn** — a burst of map+manage then destroy, and three
-   map -> displayed -> unmap cycles, all leave no managed leftovers and keep
-   the EXWM connection alive.
+   to the Emacs window's inside-absolute-pixel edges; `GetGeometry` matches.
+4. **Configure request (client -> WM)** — a client `ConfigureWindow` on a
+   tiled window is redirected and the tiled fit is preserved.
+5. **Close, no protocol** — `kill-buffer` with no `WM_DELETE_WINDOW` makes
+   EXWM `DestroyWindow` the client; the XID is dropped.
+6. **Close, with protocol** — with `WM_DELETE_WINDOW` advertised, EXWM sends
+   the ICCCM client message instead of destroying; the client handler observes
+   the message (window still alive at receipt), destroys itself, and EXWM
+   cleans up on `DestroyNotify`.
+7. **Rapid churn** — a map+manage burst, a destroy burst, and three
+   map -> displayed -> unmap cycles leave no managed leftovers and keep the
+   EXWM connection alive.
+8. **Focus (Milestone 3 preview)** — `exwm-input--set-focus` on a managed
+   client moves the X input focus to that client (`GetInputFocus`).
 
 ## 2. Result
 
 ```
-HARNESS-RESULT: exwm-client PASS (21 checks)
+HARNESS-RESULT: exwm-client PASS (29 checks)
 ```
 
 Sample geometry observed on the 1280x800 fixture:
@@ -45,33 +50,39 @@ emacs-edges=(0 51 1280 545) x-window=(0 51 1280 545)
 - **EXWM maps only the displayed tiled client.**  When several clients are
   managed at once, only the client shown in the selected Emacs window is
   X-mapped (`MapState: Viewable`); the others stay managed but X-unmapped.
-  Consequently `UnmapWindow` on a non-displayed managed client is a server
-  no-op, generates no `UnmapNotify`, and EXWM keeps it managed.  The probe
-  therefore unmaps a *displayed* client (three cycles) rather than asserting on
-  a burst of unmaps.
-- **Withdraw-before-manage race is upstream EXWM behavior.**  Because the
-  server does not map a client while `SubstructureRedirect` is active, a client
-  that issues `MapWindow` then immediately `UnmapWindow` is never
-  server-mapped, so no `UnmapNotify` is generated; `exwm-manage--on-MapRequest`
-  (unlike `exwm-manage--scan`) has no map-state guard and will still manage the
+  `UnmapWindow` on a non-displayed managed client is therefore a server no-op
+  that generates no `UnmapNotify`.  The probe unmaps a *displayed* client.
+- **Withdraw-before-manage is upstream EXWM behavior.**  Because the server
+  does not map a client while `SubstructureRedirect` is active, a client that
+  issues `MapWindow` then immediately `UnmapWindow` is never server-mapped, so
+  no `UnmapNotify` is generated; `exwm-manage--on-MapRequest` (unlike
+  `exwm-manage--scan`) has no map-state guard and will still manage the
   withdrawn window.  This is an EXWM semantic, not a Neomacs event-loop
-  failure; the harness does not assert on it.  If it ever matters, the fix
-  belongs upstream.
-- **Tiling path only.**  Floating/transient windows, `WM_DELETE_WINDOW`
-  close-vs-kill fallback, and pointer-driven move/resize are not yet covered.
-  Tiled `ConfigureRequest` is intentionally refused in favour of the Emacs
-  window fit; floating resize should be asserted separately.
-- **Focus is not asserted here.**  Keyboard focus and grabs are Milestone 3;
-  `x-focus-frame`/`SetInputFocus` are already wired (see milestone 1 notes).
-- The still-stubbed `x-*` subrs listed in `milestone-1-notes.md` §6 remain; the
-  client path above is exercised entirely through XELB.
+  failure; the harness does not assert on it.
+- **Floating/transient windows are blocked on `make-frame` (Milestone 4).**
+  EXWM's `exwm-floating--set-floating` calls `make-frame` and then reads the
+  new frame's `outer-window-id`/`window-id` to create its container.  In
+  Neomacs `make-frame` currently signals `(wrong-type-argument stringp nil)`
+  and the new frame exposes no X window id, so a `_NET_WM_WINDOW_TYPE_DIALOG`
+  client is managed but stays tiled.  The probe reports this as `NOTE:` lines
+  instead of failures; set `EXWM_EXPECT_FLOATING=1` to make them hard checks
+  once multi-frame X windows exist.  This is the main known M4 prerequisite.
+- **Keyboard/pointer grabs are not covered.**  Passive grabs, char/line mode,
+  and `FocusIn`/`FocusOut` handling are Milestone 3; only the focus-transfer
+  primitive is asserted here.
+- The still-stubbed `x-*` subrs listed in `milestone-1-notes.md` §6 remain; all
+  paths above are exercised through XELB.
 
 ## 4. How to run
 
 ```sh
 cargo xtask fresh-build --release
-NESTED_X_DISPLAY=:60 docs/exwm/harness/run-client-probe.sh --server xvfb
+NESTED_X_DISPLAY=:66 docs/exwm/harness/run-client-probe.sh --server xvfb
 ```
 
-Set `EXWM_CLIENT_DEBUG=1` to log the raw `UnmapNotify`/`DestroyNotify` events
-and every `exwm-manage--unmanage-window` call.
+Environment knobs:
+
+- `EXWM_CLIENT_DEBUG=1` — log raw `UnmapNotify`/`DestroyNotify` events and
+  every `exwm-manage--unmanage-window` call.
+- `EXWM_EXPECT_FLOATING=1` — turn the Milestone 4 floating NOTEs into checks.
+- `EXWM_CLIENT_OUT=/path` — trace destination (default `/tmp/exwm-client.out`).

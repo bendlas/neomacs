@@ -7,8 +7,9 @@
 ;; by this process, so EXWM sees it exactly as it sees a foreign application:
 ;;
 ;;   manage (MapRequest) -> class/title state -> layout geometry (WM -> client)
-;;   -> configure request (client -> WM) -> close (DestroyNotify) -> cleanup
-;;   -> a rapid map/unmap/destroy burst.
+;;   -> configure request (client -> WM) -> destroy cleanup
+;;   -> rapid map/unmap/destroy churn -> close semantics (with and without
+;;   WM_DELETE_WINDOW) -> X input focus -> floating (Milestone 4 preview).
 ;;
 ;; Results are written to $EXWM_CLIENT_OUT (and stdout), and the process exits
 ;; 0 on success / 1 on any failed check, so a supervising script can gate CI.
@@ -36,6 +37,12 @@
 (defvar excp--rapid-windows nil "Windows created by the rapid bursts.")
 (defvar excp--w2 nil "Transient client window for the unmap cycles.")
 (defvar excp--unmap-iter 0 "Current unmap-cycle index.")
+(defvar excp--wf nil "Floating dialog client window.")
+(defvar excp--wclose nil "Client used for the no-protocol close test.")
+(defvar excp--wclose2 nil "Client used for the WM_DELETE_WINDOW close test.")
+(defvar excp--wfocus nil "Client used for the focus test.")
+(defvar excp--wproto-delete nil "Non-nil once the client got WM_DELETE_WINDOW.")
+(defvar excp--wproto-alive-at-msg nil "Non-nil if the client was alive on receipt.")
 (defvar excp--pending nil "Remaining (delay . function) lifecycle stages.")
 
 (defun excp--log (fmt &rest args)
@@ -65,6 +72,12 @@
      (push (format "%s signalled %S" name err) exwm-harness-failures)
      (excp--log "FAIL: %s signalled %S" name err))))
 
+(defun excp--note (name thunk)
+  "Report NAME informationally without affecting the pass/fail result."
+  (condition-case err
+      (excp--log "NOTE: %s => %S" name (funcall thunk))
+    (error (excp--log "NOTE: %s unavailable => %S" name err))))
+
 (defun excp--set-prop (conn window atom type string)
   "Set STRING as an 8-bit property ATOM of TYPE on WINDOW."
   (xcb:+request conn
@@ -77,9 +90,24 @@
                    :data-len (length string)
                    :data string)))
 
-(defun excp--create (title class width height)
+(defun excp--set-atom-prop (conn window property-name type-name atom-names)
+  "Set ATOM-NAMES as a 32-bit ATOM property PROPERTY-NAME on WINDOW."
+  (let* ((property (exwm-harness-intern-atom conn property-name))
+         (type (exwm-harness-intern-atom conn type-name))
+         (atoms (mapcar (lambda (n) (exwm-harness-intern-atom conn n))
+                        atom-names))
+         (data (apply #'vconcat (mapcar #'xcb:-pack-u4-lsb atoms))))
+    (xcb:+request conn
+      (make-instance 'xcb:ChangeProperty
+                     :mode xcb:PropMode:Replace
+                     :window window :property property :type type
+                     :format 32 :data-len (length atoms) :data data))))
+
+(defun excp--create (title class width height &optional wm-type protocols)
   "Create and map a client window with TITLE, CLASS, WIDTH and HEIGHT.
-Return the new window id.  The window lives on `excp--conn'."
+WM-TYPE, if non-nil, is an _NET_WM_WINDOW_TYPE atom name; PROTOCOLS is a
+list of WM_PROTOCOLS atom names.  Return the new window id.  The window
+lives on `excp--conn'."
   (let* ((conn excp--conn)
          (root (exwm-harness-root-window conn))
          (window (xcb:generate-id conn))
@@ -97,6 +125,11 @@ Return the new window id.  The window lives on `excp--conn'."
     (excp--set-prop conn window wm-name string title)
     (excp--set-prop conn window wm-class string
                     (concat "neomacs-test\0" class "\0"))
+    (when wm-type
+      (excp--set-atom-prop conn window "_NET_WM_WINDOW_TYPE" "ATOM"
+                           (list wm-type)))
+    (when protocols
+      (excp--set-atom-prop conn window "WM_PROTOCOLS" "ATOM" protocols))
     (xcb:+request conn
       (make-instance 'xcb:ChangeWindowAttributes
                      :window window :value-mask xcb:CW:BackPixel
@@ -159,7 +192,8 @@ Return the new window id.  The window lives on `excp--conn'."
   (excp--log "connection=%S root=%S"
              (and (boundp 'exwm--connection) (not (null exwm--connection)))
              (and (boundp 'exwm--root) exwm--root))
-  (setq excp--conn (exwm-harness-connect)))
+  (setq excp--conn (exwm-harness-connect))
+  (xcb:+event excp--conn 'xcb:ClientMessage #'excp--on-client-message))
 
 (defun excp--create-w1 ()
   (setq excp--w1 (excp--create "Neomacs Test" "NeomacsTest" 400 300))
@@ -291,7 +325,7 @@ Return the new window id.  The window lives on `excp--conn'."
 
 (defun excp--unmap-step ()
   (if (>= excp--unmap-iter 3)
-      (excp--finish)
+      (excp--post-stages)
     (setq excp--w2 (excp--create (format "Unmap %d" excp--unmap-iter)
                                  "NeomacsUnmap" 200 150))
     (run-with-timer
@@ -345,6 +379,186 @@ Return the new window id.  The window lives on `excp--conn'."
                  w (and attrs (slot-value attrs 'map-state))
                  (and (assoc w exwm--id-buffer-alist) t)))))
 
+(defun excp--window-alive-p (window)
+  "Return non-nil if WINDOW still exists on the server."
+  (and (excp--geometry window) t))
+
+(defun excp--get-input-focus ()
+  "Return the server's current input focus window id."
+  (slot-value (xcb:+request-unchecked+reply
+               excp--conn (make-instance 'xcb:GetInputFocus))
+              'focus))
+
+(defun excp--on-client-message (data _synthetic)
+  "Client-side handler for ICCCM ClientMessage events on `excp--conn'.
+Simulates a compliant application: honours WM_DELETE_WINDOW by destroying
+its own window."
+  (let ((msg (ignore-errors (xcb:unmarshal-new 'xcb:ClientMessage data))))
+    (when msg
+      (let* ((type (slot-value msg 'type))
+             (d32 (ignore-errors
+                      (slot-value (slot-value msg 'data) 'data32)))
+             (delete-p (and d32 (> (length d32) 0)
+                            (= type (exwm-harness-intern-atom
+                                     excp--conn "WM_PROTOCOLS"))
+                            (= (elt d32 0)
+                               (exwm-harness-intern-atom
+                                excp--conn "WM_DELETE_WINDOW")))))
+        (excp--log "client-message #x%x type=%S data32=%S"
+                   (or (slot-value msg 'window) 0) type d32)
+        (when delete-p
+          (setq excp--wproto-delete t)
+          (setq excp--wproto-alive-at-msg (excp--window-alive-p excp--wclose2))
+          (excp--destroy excp--wclose2))))))
+
+;;; --- Floating dialog (Milestone 4 preview, informational) -----------------
+
+(defun excp--floating-check (name thunk)
+  "Check the floating path as PASS/FAIL when EXWM_EXPECT_FLOATING is set.
+Otherwise report it as a NOTE, because Neomacs `make-frame' cannot yet
+create the graphical child frame `exwm-floating--set-floating' requires."
+  (if (getenv "EXWM_EXPECT_FLOATING")
+      (excp--check name thunk)
+    (excp--note name thunk)))
+
+(defun excp--floating-create ()
+  (excp--log "--- floating dialog (M4 preview) ---")
+  (setq excp--wf (excp--create "Floating Dialog" "NeomacsDialog" 300 200
+                               "_NET_WM_WINDOW_TYPE_DIALOG")))
+
+(defun excp--check-floating ()
+  (excp--note "floating: make-frame can create a graphical child frame"
+              (lambda ()
+                (let ((f (make-frame '((width . 20) (height . 10)))))
+                  (prog1 (list :outer (frame-parameter f 'outer-window-id)
+                               :window (frame-parameter f 'window-id))
+                    (delete-frame f)))))
+  (excp--floating-check "floating: dialog id is managed"
+                        (lambda () (assoc excp--wf exwm--id-buffer-alist)))
+  (excp--floating-check "floating: exwm--floating-frame is a live frame"
+                        (lambda ()
+                          (with-current-buffer (exwm--id->buffer excp--wf)
+                            (excp--expect t (and exwm--floating-frame
+                                                 (frame-live-p exwm--floating-frame)
+                                                 t))))))
+
+(defun excp--floating-resize ()
+  (excp--log "resize floating dialog to 500x400")
+  (xcb:+request excp--conn
+    (make-instance 'xcb:ConfigureWindow
+                   :window excp--wf
+                   :value-mask (logior xcb:ConfigWindow:Width
+                                       xcb:ConfigWindow:Height)
+                   :width 500 :height 400))
+  (xcb:flush excp--conn))
+
+(defun excp--check-floating-resize ()
+  (let* ((reply (excp--geometry excp--wf))
+         (actual (list (slot-value reply 'width) (slot-value reply 'height))))
+    (excp--log "floating geometry after resize: %S" actual)
+    (excp--floating-check "floating: configure request resizes the client"
+                          (lambda () (excp--expect (list 500 400) actual)))))
+
+(defun excp--floating-destroy ()
+  (excp--destroy excp--wf))
+
+(defun excp--check-floating-destroyed ()
+  (excp--floating-check "floating: destroyed dialog is unmanaged"
+                        (lambda ()
+                          (excp--expect nil
+                                        (assoc excp--wf exwm--id-buffer-alist)))))
+
+;;; --- WM_DELETE_WINDOW close semantics -------------------------------------
+
+(defun excp--close-no-protocol ()
+  (excp--log "--- close without WM_DELETE_WINDOW ---")
+  (setq excp--wclose (excp--create "No Protocol" "NeomacsNoProto" 200 150)))
+
+(defun excp--run-close-no-protocol ()
+  (when (exwm--id->buffer excp--wclose)
+    (kill-buffer (exwm--id->buffer excp--wclose))))
+
+(defun excp--check-close-no-protocol ()
+  (excp--check "close: unsupported protocol -> WM destroys the window"
+               (lambda () (excp--expect nil (excp--window-alive-p excp--wclose))))
+  (excp--check "close: id removed after WM destroy"
+               (lambda ()
+                 (excp--expect nil (assoc excp--wclose exwm--id-buffer-alist)))))
+
+(defun excp--close-with-protocol ()
+  (excp--log "--- close with WM_DELETE_WINDOW ---")
+  (setq excp--wproto-delete nil
+        excp--wproto-alive-at-msg nil)
+  (setq excp--wclose2 (excp--create "With Protocol" "NeomacsProto" 200 150
+                                    nil '("WM_DELETE_WINDOW"))))
+
+(defun excp--run-close-with-protocol ()
+  (when (exwm--id->buffer excp--wclose2)
+    (kill-buffer (exwm--id->buffer excp--wclose2))))
+
+(defun excp--check-close-with-protocol ()
+  (excp--check "close: WM sent WM_DELETE_WINDOW instead of destroying"
+               (lambda () (excp--expect t excp--wproto-delete)))
+  (excp--check "close: client window was alive when the message arrived"
+               (lambda () (excp--expect t excp--wproto-alive-at-msg)))
+  (excp--check "close: client honoured the message (id unmanaged)"
+               (lambda ()
+                 (excp--expect nil (assoc excp--wclose2 exwm--id-buffer-alist)))))
+
+;;; --- Input focus (Milestone 3 preview) ------------------------------------
+
+(defun excp--focus-create ()
+  (excp--log "--- input focus (M3 preview) ---")
+  (setq excp--wfocus (excp--create "Focus Me" "NeomacsFocus" 300 200)))
+
+(defun excp--focus-request ()
+  (excp--check "focus: client is managed before focusing"
+               (lambda ()
+                 (with-current-buffer (exwm--id->buffer excp--wfocus)
+                   (excp--expect 'exwm-mode major-mode))))
+  (when (exwm--id->buffer excp--wfocus)
+    (with-current-buffer (exwm--id->buffer excp--wfocus)
+      (exwm-input--set-focus excp--wfocus))))
+
+(defun excp--check-focus ()
+  (let ((focus (excp--get-input-focus)))
+    (excp--log "input focus = #x%x (client #x%x)" (or focus 0) excp--wfocus)
+    (excp--check "focus: exwm-input--set-focus moves X input focus to client"
+                 (lambda () (excp--expect excp--wfocus focus)))))
+
+(defun excp--focus-destroy ()
+  (excp--destroy excp--wfocus))
+
+(defun excp--check-focus-destroyed ()
+  (excp--check "focus: client cleanup removes it from the alist"
+               (lambda ()
+                 (excp--expect nil (assoc excp--wfocus exwm--id-buffer-alist)))))
+
+(defun excp--post-stages ()
+  (setq excp--pending
+        (list (cons 0.2 #'excp--close-no-protocol)
+              (cons 1.5 #'excp--run-close-no-protocol)
+              (cons 1.5 #'excp--check-close-no-protocol)
+              (cons 0.2 #'excp--close-with-protocol)
+              (cons 1.5 #'excp--run-close-with-protocol)
+              (cons 1.5 #'excp--check-close-with-protocol)
+              (cons 0.2 #'excp--focus-create)
+              (cons 1.5 #'excp--focus-request)
+              (cons 1.0 #'excp--check-focus)
+              (cons 0.2 #'excp--focus-destroy)
+              (cons 1.5 #'excp--check-focus-destroyed)
+              ;; M4 preview last: `make-frame' currently cannot build the
+              ;; floating child frame, so a failure here must not disturb
+              ;; the M2/M3 checks above.
+              (cons 0.2 #'excp--floating-create)
+              (cons 2.0 #'excp--check-floating)
+              (cons 0.2 #'excp--floating-resize)
+              (cons 1.0 #'excp--check-floating-resize)
+              (cons 0.2 #'excp--floating-destroy)
+              (cons 1.5 #'excp--check-floating-destroyed)
+              (cons 0.2 #'excp--finish)))
+  (excp--next))
+
 (defun excp--finish ()
   (if exwm-harness-failures
       (progn
@@ -378,7 +592,7 @@ Return the new window id.  The window lives on `excp--conn'."
               (cons 0.2 #'excp--unmap-cycles)))
   ;; Hard watchdog in case an asynchronous stage stalls forever.
   (run-with-timer
-   60 nil
+   90 nil
    (lambda ()
      (excp--log "WATCHDOG: lifecycle did not finish")
      (kill-emacs 2)))
