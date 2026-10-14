@@ -194,6 +194,12 @@ pub(super) fn build_plan_with_sqrt_sites(
     } else {
         None
     };
+    if super::knobs::jit_opt_osr_entry() {
+        crate::emacs_core::jit::opt::passes::osr_entry::run(&mut func).map_err(|error| {
+            tracing::debug!(?error, "opt OSR entry speculation refused a compilation");
+            CompileError::UnsupportedOp("opt-osr-entry:verify")
+        })?;
+    }
     if jit_opt_passes().fold {
         let stats = crate::emacs_core::jit::opt::passes::fold::run(&mut func).map_err(|error| {
             tracing::debug!(?error, "opt fold pass refused a compilation");
@@ -218,6 +224,13 @@ pub(super) fn build_plan_with_sqrt_sites(
         })?;
         tracing::debug!(target: "neovm_jit::opt", ?stats, "opt GVN census");
         func.census.gvn = Some(stats);
+    } else if jit_opt_passes().reads {
+        let stats =
+            crate::emacs_core::jit::opt::passes::reads::run(&mut func).map_err(|error| {
+                tracing::debug!(?error, "opt read-reuse pass refused a compilation");
+                CompileError::UnsupportedOp("opt-reads:verify")
+            })?;
+        func.census.reads = Some(stats);
     }
     if jit_opt_passes().range {
         if jit_inline_aref_on()

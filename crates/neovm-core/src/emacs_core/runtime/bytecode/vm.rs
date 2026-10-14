@@ -6677,12 +6677,10 @@ impl<'a> Vm<'a> {
                 // `void-variable` instead of returning the sentinel
                 // to the caller. Mirrors GNU `Fsymbol_value` which
                 // signals when `find_symbol_value` returns
-                // `Qunbound`.
+                // `Qunbound`. A thread projection reads UNBOUND here too;
+                // its canonical value answers on this branch.
                 if val.is_unbound() {
-                    return Err(signal(
-                        LispCondition::VoidVariable,
-                        vec![Value::from_sym_id(name_id)],
-                    ));
+                    return self.ctx.projected_value_or_void(name_id, resolved);
                 }
                 return Ok(val);
             }
@@ -6806,10 +6804,8 @@ impl<'a> Vm<'a> {
             {
                 if let Some(buf_fwd) = buf_fwd {
                     let Some(slot) = buf_fwd.buffer_slot() else {
-                        return Err(signal(
-                            "error",
-                            vec![Value::string("Invalid buffer slot offset")],
-                        ));
+                        // Only a thread projection's header has no slot.
+                        return self.assign_projected_var_id(name_id, resolved, value);
                     };
                     let offset = slot.index();
                     let flags_idx = buf_fwd.local_flags_idx;
@@ -6909,6 +6905,21 @@ impl<'a> Vm<'a> {
         self.ctx
             .publish_runtime_binding_write_by_resolved_id(resolved, value);
         Ok(())
+    }
+
+    /// `Bvarset` of a thread-projected variable: GNU's `set_internal`
+    /// (`src/data.c:1678-1831`) through the evaluator's `setq` path, where
+    /// this owner's binding takes the write first. Watchers run on the
+    /// projected cell.
+    #[cold]
+    #[inline(never)]
+    fn assign_projected_var_id(
+        &mut self,
+        name_id: SymId,
+        _resolved: SymId,
+        value: Value,
+    ) -> Result<(), Flow> {
+        self.ctx.assign_setq_dynamic_by_id(name_id, value).map(drop)
     }
 
     #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -7155,7 +7166,7 @@ impl<'a> Vm<'a> {
         {
             return binding.as_value().unwrap_or(Value::NIL);
         }
-        if let Some(value) = self.ctx.obarray.symbol_value_copied(name) {
+        if let Some(value) = self.ctx.variable_value_by_name(name) {
             return value;
         }
         if name == "nil" {
@@ -9495,8 +9506,8 @@ impl<'a> Vm<'a> {
             "%%defvar" => {
                 if args.len() >= 2 {
                     let sym_name = args[1].as_bare_symbol_name().unwrap_or("nil").to_string();
-                    if !self.ctx.obarray.boundp(&sym_name) {
-                        self.ctx.obarray.set_symbol_value(&sym_name, args[0]);
+                    if !self.ctx.variables().boundp_by_name(&sym_name) {
+                        self.ctx.store_variable_by_name(&sym_name, args[0]);
                     }
                     self.ctx.obarray.make_special(&sym_name);
                     return Ok(Value::symbol(sym_name));

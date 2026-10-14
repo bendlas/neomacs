@@ -12,21 +12,7 @@ use super::symbol::SetInternalBind;
 use super::value::{Value, ValueKind};
 use crate::emacs_core::builtins::from_value::FromValue;
 use crate::emacs_core::error::{LispCondition, expect_args, signal};
-
-/// The storage descriptor for a GNU `BUFFER_OBJFWD` variable.
-///
-/// Keeping this lookup typed avoids turning a resolved symbol identity back
-/// into a string merely to recover the corresponding buffer slot.
-fn forwarded_buffer_slot_info(
-    ctx: &Context,
-    resolved: SymId,
-) -> Option<&'static crate::buffer::buffer::BufferSlotInfo> {
-    use super::forward::LispFwdType;
-
-    (ctx.obarray().forward_type(resolved) == Some(LispFwdType::BufferObj))
-        .then(|| crate::buffer::buffer::lookup_buffer_slot_by_sym_id(resolved))
-        .flatten()
-}
+use crate::emacs_core::symbol::CanonicalAccess;
 
 /// GNU `set_default_internal` (`src/data.c`).
 ///
@@ -50,7 +36,36 @@ pub(crate) fn set_default_internal(
             ));
         }
     };
+    // Only an alias walks (GNU's `start:` loop); any other symbol is its own
+    // base, as `resolve_variable_alias_id` would answer.
+    if ctx.obarray().is_alias_id(symbol) {
+        return set_default_internal_through_alias(ctx, reported_symbol, symbol, value, bindflag);
+    }
+    set_default_internal_with(ctx, reported_symbol, symbol, symbol, value, bindflag)
+}
+
+/// [`set_default_internal`] of an alias.
+///
+/// A thread-projected base runs the whole operation on the variable it
+/// projects. Its own store path ([`store_projected_default_internal`]) meets
+/// the projection only after the trapped-write phase, which can no longer
+/// tell an alias from the base's own name: GNU notifies a plain base twice
+/// through an alias (that phase, then `set_internal`'s) and once by name.
+#[cold]
+#[inline(never)]
+fn set_default_internal_through_alias(
+    ctx: &mut Context,
+    reported_symbol: Value,
+    symbol: SymId,
+    value: Value,
+    bindflag: SetInternalBind,
+) -> EvalResult {
     let resolved = super::builtins::resolve_variable_alias_id(ctx, symbol)?;
+    if ctx.obarray().thread_projection_of(resolved).is_some() {
+        return ctx.with_revealed_projection(resolved, |ctx| {
+            set_default_internal_with(ctx, reported_symbol, symbol, resolved, value, bindflag)
+        });
+    }
     set_default_internal_with(ctx, reported_symbol, symbol, resolved, value, bindflag)
 }
 
@@ -190,6 +205,96 @@ fn set_default_internal_with(
     Ok(value)
 }
 
+/// [`store_default_internal`] of a thread-projected variable: GNU
+/// `set_default_internal`'s redirect switch (`src/data.c:2034-2128`) on the
+/// variable it projects, entered where the projection's per-buffer header
+/// meets that switch, after [`set_default_internal_with`]'s trapped-write
+/// phase.
+///
+/// That phase notified the watchers once, as `set`, for the projected cell's
+/// forwarded redirect. For a localized or per-buffer variable GNU notifies
+/// there and only there, then stores the default. For a builtin-forwarded one
+/// GNU's `set_internal` notifies again, with BINDFLAG's operation, which this
+/// does. For a plain variable set by its own name GNU's one notification is
+/// `set_internal`'s, and the phase already made it: only `set-default`
+/// reaches a plain variable here, so its operation is that `set`. (Through an
+/// alias, GNU notifies a plain variable twice; [`set_default_internal_through_alias`]
+/// reveals before that phase, so an alias never arrives here.)
+///
+/// The default this owner binds, if it binds one, takes the store; canonical
+/// storage otherwise. Watchers run on the projected cell, never on a revealed
+/// one.
+#[cold]
+#[inline(never)]
+fn store_projected_default_internal(
+    ctx: &mut Context,
+    resolved: SymId,
+    value: Value,
+    bindflag: SetInternalBind,
+) -> EvalResult {
+    use super::forward::{CanonicalArm, LispFwdType};
+
+    let Some(projection) = ctx.obarray().thread_projection_of(resolved) else {
+        return store_default_internal(ctx, resolved, value, bindflag);
+    };
+    let arm = projection.arm();
+    let falls_through_set_internal = match arm {
+        CanonicalArm::Plain => true,
+        CanonicalArm::Forwarded(builtin) => !matches!(
+            builtin.descriptor().ty(),
+            LispFwdType::BufferObj | LispFwdType::KboardObj
+        ),
+        CanonicalArm::Localized(_) => false,
+    };
+    if !falls_through_set_internal {
+        if ctx.owner_default_binding(resolved).is_some() {
+            let stored = super::eval::check_forwarded_store_at(
+                ctx.obarray(),
+                &ctx.buffers,
+                &ctx.specpdl,
+                resolved,
+                value,
+                ForwardStoreSite::SetDefault,
+            )?
+            .value();
+            ctx.store_owner_default(resolved, stored);
+            if bindflag == SetInternalBind::Set {
+                ctx.note_macro_expansion_mutation();
+            }
+            if ctx.runtime_binding_has_projection(resolved) {
+                let visible = ctx.visible_variable_value_or_nil_by_id(resolved);
+                ctx.publish_runtime_binding_write_by_resolved_id(resolved, visible);
+            }
+            return Ok(value);
+        }
+        return ctx.with_revealed_projection(resolved, |ctx| {
+            store_default_internal(ctx, resolved, value, bindflag)
+        });
+    }
+    if bindflag != SetInternalBind::ThreadSwitch && arm != CanonicalArm::Plain {
+        let operation = match bindflag {
+            SetInternalBind::Set if value.is_unbound() => "makunbound",
+            SetInternalBind::Set => "set",
+            SetInternalBind::Bind => "let",
+            SetInternalBind::Unbind => "unlet",
+            SetInternalBind::ThreadSwitch => unreachable!("filtered above"),
+        };
+        let reported_value = if value.is_unbound() {
+            Value::NIL
+        } else {
+            value
+        };
+        ctx.run_variable_watchers_by_id(resolved, &reported_value, &Value::NIL, operation)?;
+    }
+    // GNU's `set_internal` (`src/data.c:2067`, `:2123`): the owner's binding
+    // of the channel it meets, or canonical storage.
+    ctx.set_internal_after_watchers(resolved, value, bindflag)?;
+    if bindflag == SetInternalBind::Set {
+        ctx.note_macro_expansion_mutation();
+    }
+    Ok(value)
+}
+
 /// The resolved storage half of GNU `set_default_internal`.
 ///
 /// `eval.c` uses this path for default-valued dynamic bindings as well as for
@@ -212,15 +317,21 @@ fn store_default_internal(
     )?
     .value();
 
-    if let Some(info) = forwarded_buffer_slot_info(ctx, resolved) {
-        // GNU's BUFFER_OBJFWD arm updates the shared default and propagates it
-        // only to live buffers that do not have a local value.
-        ctx.buffers.set_buffer_default_slot(info, stored);
+    if ctx.obarray().forward_type(resolved) == Some(super::forward::LispFwdType::BufferObj) {
+        match crate::buffer::buffer::lookup_buffer_slot_by_sym_id(resolved) {
+            // GNU's BUFFER_OBJFWD arm updates the shared default and
+            // propagates it only to live buffers that do not have a local
+            // value.
+            Some(info) => ctx.buffers.set_buffer_default_slot(info, stored),
+            // Only a thread projection's header has no slot.
+            None => return store_projected_default_internal(ctx, resolved, value, bindflag),
+        }
     } else {
         // For PLAINVAL this is the currently installed dynamic value cell; for
         // LOCALIZED it is the BLV default cell; other forwarders store through
         // their descriptor. This is the same storage split as GNU data.c.
-        ctx.obarray_mut().set_symbol_value_id(resolved, stored);
+        ctx.obarray_mut()
+            .set_canonical_value(CanonicalAccess::STORAGE, resolved, stored);
     }
 
     if bindflag == SetInternalBind::Set {
@@ -250,8 +361,13 @@ pub(crate) fn default_boundp(ctx: &mut Context, args: Vec<Value>) -> EvalResult 
     expect_args("default-boundp", &args, 1)?;
     let symbol = SymId::from_value(ctx, args[0])?;
     let resolved = super::builtins::resolve_variable_alias_id_in_obarray(ctx.obarray(), symbol)?;
+    if let Some(binding) = ctx.owner_default_binding(resolved) {
+        return Ok(Value::bool_val(binding.bound().is_some()));
+    }
     Ok(Value::bool_val(
-        ctx.obarray().boundp_id(resolved) || ctx.obarray().is_constant_id(resolved),
+        ctx.obarray()
+            .canonical_boundp_id(CanonicalAccess::STORAGE, resolved)
+            || ctx.obarray().is_constant_id(resolved),
     ))
 }
 
@@ -290,6 +406,11 @@ pub(crate) fn default_value(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
 /// binding/thread-switch code must use this projection rather than reading the
 /// static descriptor directly.
 pub(crate) fn default_value_by_id(ctx: &Context, resolved: SymId) -> Option<Value> {
+    // The default this owner binds, if it binds one (GNU's `default_value`
+    // reads the running thread's binding).
+    if let Some(binding) = ctx.owner_default_binding(resolved) {
+        return binding.bound();
+    }
     default_value_in_state(ctx.obarray(), Some(&ctx.buffers.buffer_defaults), resolved)
 }
 
@@ -302,9 +423,13 @@ pub(crate) fn default_value_in_state(
 ) -> Option<Value> {
     // GNU `Fdefault_value` dispatches BUFFER_OBJFWD through the live shared
     // buffer default rather than the forwarded symbol cell.
-    if obarray.forward_type(resolved) == Some(super::forward::LispFwdType::BufferObj)
-        && let Some(info) = crate::buffer::buffer::lookup_buffer_slot_by_sym_id(resolved)
-    {
+    if obarray.forward_type(resolved) == Some(super::forward::LispFwdType::BufferObj) {
+        let Some(info) = crate::buffer::buffer::lookup_buffer_slot_by_sym_id(resolved) else {
+            // Only a thread projection's header has no slot.
+            return obarray
+                .thread_projection_of(resolved)
+                .and_then(|projection| obarray.projected_default_value(projection));
+        };
         let offset = info.offset.index();
         if let Some(defaults) = buffer_defaults
             && offset < defaults.len()
@@ -320,7 +445,7 @@ pub(crate) fn default_value_in_state(
         }
     }
 
-    obarray.default_value_id_copied(resolved)
+    obarray.canonical_default_value(CanonicalAccess::STORAGE, resolved)
 }
 
 #[cfg(test)]

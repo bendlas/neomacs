@@ -73,7 +73,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(test)]
 pub use thread_projection::ThreadProjectionTable;
 pub use thread_projection::{
-    BuiltinForwarder, CanonicalBlv, CanonicalPlainCell, CanonicalStorage, THREAD_PROJECTION_OFFSET,
+    BuiltinForwarder, CanonicalArm, CanonicalBlv, THREAD_PROJECTION_OFFSET,
     ThreadProjectionDescriptor, TlsIndex,
 };
 
@@ -419,6 +419,23 @@ impl LispFwd {
     /// Perform the store for the variants whose storage is the descriptor.
     /// Returns the canonical value so callers that also mirror the write into
     /// buffer-local storage do not have to recompute it.
+    /// [`Self::commit`] for an owner-routed write: `false` when the slot is
+    /// per-buffer, whose storage the caller writes -- the arm a thread
+    /// projection's header takes.
+    #[inline(always)]
+    pub(crate) fn commit_unless_per_buffer(&self, store: ForwardStore) -> bool {
+        match self.slot() {
+            ForwardSlot::BufferObj(_) => false,
+            ForwardSlot::Int(_)
+            | ForwardSlot::Bool(_)
+            | ForwardSlot::Obj(_)
+            | ForwardSlot::KboardObj(_) => {
+                self.commit(store);
+                true
+            }
+        }
+    }
+
     pub fn commit(&self, store: ForwardStore) -> Value {
         match (store, self.slot()) {
             (ForwardStore::Int(integer), ForwardSlot::Int(int_fwd)) => int_fwd.set(integer),
@@ -644,6 +661,9 @@ impl LispIntFwd {
 pub struct LispBoolFwd {
     ty: LispFwdType,
     value: AtomicBool,
+    /// Not GNU's: an owner's own `debug-on-next-call` cell
+    /// ([`alloc_owner_debugger_cell`]), which no symbol forwards to.
+    owner: bool,
 }
 
 /// Byte offset of a [`LispBoolFwd`]'s flag, for compiled code's inline read.
@@ -656,6 +676,7 @@ pub(crate) const LISP_BOOL_FWD_VALUE_OFFSET: usize = std::mem::offset_of!(LispBo
 pub(crate) static DEBUG_ON_NEXT_CALL_UNRESOLVED: LispBoolFwd = LispBoolFwd {
     ty: LispFwdType::Bool,
     value: AtomicBool::new(true),
+    owner: false,
 };
 
 /// What the pointer names once the obarray found no `DEFVAR_BOOL` for
@@ -664,6 +685,7 @@ pub(crate) static DEBUG_ON_NEXT_CALL_UNRESOLVED: LispBoolFwd = LispBoolFwd {
 pub(crate) static DEBUG_ON_NEXT_CALL_ABSENT: LispBoolFwd = LispBoolFwd {
     ty: LispFwdType::Bool,
     value: AtomicBool::new(false),
+    owner: false,
 };
 
 static_assertions::assert_impl_all!(LispBoolFwd: std::fmt::Debug, Send, Sync);
@@ -691,6 +713,12 @@ impl LispBoolFwd {
     pub(crate) fn is_debug_on_next_call_stand_in(&self) -> bool {
         std::ptr::eq(self, &DEBUG_ON_NEXT_CALL_UNRESOLVED)
             || std::ptr::eq(self, &DEBUG_ON_NEXT_CALL_ABSENT)
+    }
+
+    /// Whether this is an owner's own `debug-on-next-call` cell.
+    #[inline(always)]
+    pub(crate) fn is_owner_cell(&self) -> bool {
+        self.owner
     }
 }
 
@@ -736,7 +764,6 @@ impl LispObjFwd {
 /// playing the same role as GNU's `Lisp_Buffer_Objfwd::offset` (a byte
 /// offset into `struct buffer`). Phase 8 wires this up.
 #[repr(C)]
-#[derive(Copy, Clone)]
 pub struct LispBufferObjFwd {
     ty: LispFwdType,
     /// Index into `Buffer::slots`. Mirrors GNU `Lisp_Buffer_Objfwd::offset`.
@@ -759,8 +786,11 @@ pub struct LispBufferObjFwd {
     pub default: Value,
 }
 
-static_assertions::assert_impl_all!(LispBufferObjFwd: Copy, Clone, std::fmt::Debug);
-static_assertions::assert_not_impl_any!(LispBufferObjFwd: Send, Sync);
+static_assertions::assert_impl_all!(LispBufferObjFwd: std::fmt::Debug);
+// Neither `Copy` nor `Clone`: a header is never lifted out of the body it
+// heads, so a thread projection's marker offset only ever sits at the start
+// of a `ThreadProjectionDescriptor` ([`LispBufferObjFwd::thread_projection`]).
+static_assertions::assert_not_impl_any!(LispBufferObjFwd: Copy, Clone, Send, Sync);
 
 /// A per-buffer forwarder's slot index, read but not yet checked: the only
 /// way to an index is [`Self::below`], the bounds test every raw slot-array
@@ -894,7 +924,8 @@ const _: () = {
     assert!(offset_of!(LispIntFwd, _mutator) == 16);
     assert!(offset_of!(LispObjFwd, _mutator) == 16);
     assert!(offset_of!(LispKboardObjFwd, _mutator) == 16);
-    assert!(size_of::<LispBoolFwd>() == 2);
+    // The owner flag follows the baked Boolean; nothing generated reads past it.
+    assert!(size_of::<LispBoolFwd>() == 3);
     // Immutable buffer metadata retains its original repr(C) offsets too.
     assert!(offset_of!(LispBufferObjFwd, offset) == 2);
     assert!(offset_of!(LispBufferObjFwd, local_flags_idx) == 4);
@@ -976,7 +1007,9 @@ impl LispKboardObjFwd {
 /// initialization because the per-process forwarders are constructed
 /// from runtime data (slot index assignments).
 ///
-/// `offset` is the index into [`crate::buffer::buffer::Buffer::slots`].
+/// `slot` is the index into [`crate::buffer::buffer::Buffer::slots`]: a
+/// typed slot, so a real forwarder never carries the thread-projection
+/// marker.
 /// `local_flags_idx` mirrors GNU's `local-flags` index: `-1` means
 /// "always-local in every buffer" (e.g. `buffer-file-name`,
 /// `point`); a positive index points at a bit in
@@ -984,22 +1017,14 @@ impl LispKboardObjFwd {
 /// `predicate` is the closed predicate used by `store_symval_forwarding`.
 /// `default` is the value copied into every fresh buffer's slot.
 pub fn alloc_buffer_objfwd(
-    offset: u16,
+    slot: crate::buffer::buffer::BufferSlot,
     local_flags_idx: i16,
     predicate: crate::buffer::buffer::BufferSlotPredicate,
     default: Value,
 ) -> &'static LispBufferObjFwd {
-    // A real slot never carries the thread-projection marker
-    // (`thread_projection::THREAD_PROJECTION_OFFSET`, const-asserted above
-    // every slot index); the marker is what makes a projection's header
-    // fail every per-buffer slot access.
-    debug_assert!(
-        usize::from(offset) < crate::buffer::buffer::BUFFER_SLOT_COUNT,
-        "per-buffer slot offset {offset} out of range"
-    );
     let fwd = Box::new(LispBufferObjFwd {
         ty: LispFwdType::BufferObj,
-        offset,
+        offset: slot.as_u16(),
         local_flags_idx,
         predicate,
         default,
@@ -1017,6 +1042,20 @@ pub fn alloc_boolfwd(initial: bool) -> &'static LispBoolFwd {
     Box::leak(Box::new(LispBoolFwd {
         ty: LispFwdType::Bool,
         value: AtomicBool::new(initial),
+        owner: false,
+    }))
+}
+
+/// Allocate an owner's own `debug-on-next-call` cell: the storage of the
+/// owner's binding of that `DEFVAR_BOOL`, which the owner's admission header
+/// names while the binding lasts, as GNU's `globals.f_debug_on_next_call`
+/// holds the running thread's binding. One per owner slab, leaked like every
+/// Boolean forwarder, because compiled code may hold its address.
+pub(crate) fn alloc_owner_debugger_cell(initial: bool) -> &'static LispBoolFwd {
+    Box::leak(Box::new(LispBoolFwd {
+        ty: LispFwdType::Bool,
+        value: AtomicBool::new(initial),
+        owner: true,
     }))
 }
 

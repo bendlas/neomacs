@@ -118,7 +118,7 @@ fn read_buffer_completing_args_use_live_buffer_names_and_normalized_default() {
     let mut eval = crate::emacs_core::eval::Context::new();
     let buf_id = eval.buffers.create_buffer(" target-buffer ");
     let args = read_buffer_completing_args(
-        &eval.obarray,
+        eval.variables(),
         &eval.buffers,
         &[
             Value::string("Buffer: "),
@@ -143,7 +143,7 @@ fn read_buffer_completing_args_formats_default_prompt_like_gnu() {
         .set_symbol_value("minibuffer-default-prompt-format", Value::string(" [%s]"));
 
     let with_default = read_buffer_completing_args(
-        &eval.obarray,
+        eval.variables(),
         &eval.buffers,
         &[
             Value::string("Switch to buffer: "),
@@ -156,14 +156,14 @@ fn read_buffer_completing_args_formats_default_prompt_like_gnu() {
     );
 
     let without_default = read_buffer_completing_args(
-        &eval.obarray,
+        eval.variables(),
         &eval.buffers,
         &[Value::string("Switch to buffer: "), Value::NIL],
     );
     assert_eq!(without_default[0], Value::string("Switch to buffer: "));
 
     let empty_default = read_buffer_completing_args(
-        &eval.obarray,
+        eval.variables(),
         &eval.buffers,
         &[Value::string("Switch to buffer: "), Value::string("")],
     );
@@ -1744,16 +1744,16 @@ fn completion_state_reads_use_predeclared_symbols() {
         Value::list(vec![Value::string("neo")]),
     );
 
-    assert!(completion_ignore_case(&eval.obarray));
+    assert!(completion_ignore_case(eval.variables(), &eval.buffers));
     assert_eq!(
-        completion_regexp_lisp_list_from_obarray(&eval.obarray),
+        completion_regexp_lisp_list(eval.variables(), &eval.buffers),
         vec![LispString::from_unibyte(b"neo".to_vec())]
     );
 
     crate::emacs_core::intern::reset_intern_calls();
-    assert!(completion_ignore_case(&eval.obarray));
+    assert!(completion_ignore_case(eval.variables(), &eval.buffers));
     assert_eq!(
-        completion_regexp_lisp_list_from_obarray(&eval.obarray),
+        completion_regexp_lisp_list(eval.variables(), &eval.buffers),
         vec![LispString::from_unibyte(b"neo".to_vec())]
     );
     assert_eq!(
@@ -1998,3 +1998,40 @@ fn test_completion_answers_an_obarray_like_gnu() {
 #[cfg(test)]
 #[path = "compare_case_table_test.rs"]
 mod compare_case_table;
+
+#[test]
+fn completion_primitives_observe_a_let_bound_buffer_local_case_policy() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"(with-temp-buffer
+              (setq-local completion-ignore-case nil)
+              (let ((completion-ignore-case t)
+                    (table '("*Messages*")))
+                (list completion-ignore-case
+                      (try-completion "*mes" table)
+                      (all-completions "*mes" table)
+                      (test-completion "*messages*" table)
+                      (let ((completion-regexp-list '("mes")))
+                        (all-completions "" table)))))"#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (t "*Messages*" ("*Messages*") t ("*Messages*"))"#
+    );
+}
+
+#[test]
+fn completion_primitives_observe_buffer_local_regexp_filters() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"(let ((completion-regexp-list '("Beta")))
+              (with-temp-buffer
+                (setq-local completion-regexp-list '("Alpha"))
+                (let ((table '("Alpha" "Beta")))
+                  (list (try-completion "" table)
+                        (all-completions "" table)
+                        (test-completion "Alpha" table)
+                        (test-completion "Beta" table)))))"#,
+    );
+    assert_eq!(result, r#"OK ("Alpha" ("Alpha") t nil)"#);
+}

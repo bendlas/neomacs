@@ -10,7 +10,6 @@
 
 use super::error::{EvalResult, Flow, signal};
 use super::eval::OverlayModificationHook;
-use super::symbol::Obarray;
 use super::value::*;
 use crate::buffer::{
     Buffer, BufferManager, CharLen, EmacsByteLen, EmacsBytePos, EmacsByteRange, LispCharPos1,
@@ -18,6 +17,7 @@ use crate::buffer::{
 };
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
+use crate::emacs_core::eval::VariableView;
 use crate::emacs_core::runtime_identity::{CredentialScope, process_group_id, process_user_id};
 use crate::emacs_core::value::ValueKind;
 use crate::heap_types::LispString;
@@ -97,8 +97,11 @@ const _: () = {
     }
 };
 
+/// GNU `Fbarf_if_buffer_read_only`'s test. Inlined so a writable buffer
+/// (the common one) costs its callers one slot test and no variable view.
+#[inline(always)]
 pub(crate) fn buffer_read_only_active_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buf: &Buffer,
 ) -> bool {
@@ -112,26 +115,28 @@ pub(crate) fn buffer_read_only_active_in_state(
     // (src/buffer.c:2464). The second lookup this used to perform could only
     // ever return the very same word -- see the assertion below -- so it asked
     // the same question twice on a path that runs four times per keystroke.
-    if !buf.get_read_only() {
-        return false;
-    }
+    buf.get_read_only() && !inhibit_read_only_in_state(vars, buf)
+}
 
+/// Whether `inhibit-read-only` lets a read-only BUF be changed.
+#[inline(never)]
+fn inhibit_read_only_in_state(vars: VariableView<'_>, buf: &Buffer) -> bool {
     let iro = inhibit_read_only_symbol();
-    if let Some(value) = buf.get_buffer_local_by_sym_id_gated(iro, obarray.is_localized(iro))
+    if let Some(value) = buf.get_buffer_local_by_sym_id_gated(iro, vars.obarray().is_localized(iro))
         && value.is_truthy()
     {
-        return false;
+        return true;
     }
-    !obarray.symbol_value_id_or_nil(iro).is_truthy()
+    vars.value_or_nil(iro).is_truthy()
 }
 
 pub(crate) fn ensure_current_buffer_writable_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &BufferManager,
 ) -> Result<(), Flow> {
     if let Some(buf) = buffers.current_buffer()
-        && buffer_read_only_active_in_state(obarray, dynamic, buf)
+        && buffer_read_only_active_in_state(vars, dynamic, buf)
     {
         return Err(signal(
             LispCondition::BufferReadOnly,
@@ -254,8 +259,7 @@ pub(crate) fn inhibit_modification_hooks(ctx: &crate::emacs_core::eval::Context)
             }
             SymbolRedirect::Plainval => {
                 return ctx
-                    .obarray
-                    .symbol_value_id_copied(sym)
+                    .variable_value(sym)
                     .is_some_and(|v| !v.is_unbound() && v.is_truthy());
             }
             // The arm a booted session takes: the code-conversion work buffer
@@ -282,8 +286,7 @@ pub(crate) fn inhibit_modification_hooks(ctx: &crate::emacs_core::eval::Context)
                     return !value.is_unbound() && value.is_truthy();
                 }
                 return ctx
-                    .obarray
-                    .symbol_value_id_copied(sym)
+                    .variable_value(sym)
                     .is_some_and(|v| !v.is_unbound() && v.is_truthy());
             }
             SymbolRedirect::Varalias => {}
@@ -348,14 +351,14 @@ fn verify_change_text_read_only(
     if let Some(current_id) = ctx.buffers.current_buffer_id() {
         if byte_range.is_empty() {
             crate::emacs_core::textprop::verify_text_read_only_for_insert_in_state(
-                &ctx.obarray,
+                ctx.variables(),
                 &ctx.buffers,
                 current_id,
                 byte_range.start(),
             )?;
         } else {
             crate::emacs_core::textprop::verify_text_read_only_emacs_byte_range_in_state(
-                &ctx.obarray,
+                ctx.variables(),
                 &ctx.buffers,
                 current_id,
                 byte_range,
@@ -538,7 +541,7 @@ fn prepare_buffer_change(
     // primitive ran this function (and thus `before-change-functions') first
     // and only barfed afterwards, so a rejected insert double-counted the
     // hook.
-    ensure_current_buffer_writable_in_state(&ctx.obarray, &[], &ctx.buffers)?;
+    ensure_current_buffer_writable_in_state(ctx.variables(), &[], &ctx.buffers)?;
     let mut start = range.char_start();
     let mut live = LiveChangeRange::new(range);
 
@@ -803,7 +806,7 @@ fn deactivate_mark_set_is_noop(
         return false;
     }
     match symbol.redirect() {
-        SymbolRedirect::Plainval => ctx.obarray.symbol_value_id_copied(sym) == Some(Value::T),
+        SymbolRedirect::Plainval => ctx.variable_value(sym) == Some(Value::T),
         SymbolRedirect::Localized => {
             ctx.buffers
                 .current_buffer()
@@ -1120,7 +1123,7 @@ fn evaporate_emptied_overlays_at(
         .into_iter()
         .filter(|overlay| {
             crate::emacs_core::textprop::lookup_overlay_property(
-                &ctx.obarray,
+                ctx.variables(),
                 &ctx.buffers,
                 *overlay,
                 Value::from_sym_id(evaporate_symbol()),
@@ -1199,8 +1202,8 @@ fn combine_after_change_calls_active(ctx: &crate::emacs_core::eval::Context) -> 
                 && BeforeChangeSpecialFunction::SyntaxPpssFlushCache.is_lisp_value(second)
             {
                 let default_val = ctx
-                    .obarray
-                    .default_value_id_copied(before_sym)
+                    .variables()
+                    .default_value(before_sym)
                     .unwrap_or(Value::NIL);
                 return default_val.is_nil();
             }
@@ -1355,7 +1358,7 @@ fn collect_overlay_change_hooks(
         // lookup here instead of a plain plist read.
         let overlay_hook = |prop: &str| -> Option<Value> {
             let value = crate::emacs_core::textprop::lookup_overlay_property(
-                &ctx.obarray,
+                ctx.variables(),
                 &ctx.buffers,
                 ov_id,
                 Value::symbol(prop),
@@ -1737,7 +1740,7 @@ pub(crate) fn builtin_delete_char(
         let delete_range =
             buffer_edit_range_for_byte_range_in_manager(&ctx.buffers, current_id, byte_range)?;
         crate::emacs_core::textprop::verify_text_read_only_in_state(
-            &ctx.obarray,
+            ctx.variables(),
             &ctx.buffers,
             current_id,
             start,
@@ -1785,7 +1788,7 @@ pub(crate) fn builtin_delete_region_2(
     let read_only = ctx
         .buffers
         .get(current_id)
-        .is_some_and(|buf| buffer_read_only_active_in_state(&ctx.obarray, &[], buf));
+        .is_some_and(|buf| buffer_read_only_active_in_state(ctx.variables(), &[], buf));
     if read_only {
         return Err(signal(
             LispCondition::BufferReadOnly,
@@ -1793,7 +1796,7 @@ pub(crate) fn builtin_delete_region_2(
         ));
     }
     crate::emacs_core::textprop::verify_text_read_only_in_state(
-        &ctx.obarray,
+        ctx.variables(),
         &ctx.buffers,
         current_id,
         start_byte,
@@ -1831,7 +1834,7 @@ pub(crate) fn builtin_delete_and_extract_region(
         let Some(buf) = ctx.buffers.get(current_id) else {
             return Ok(Value::string(""));
         };
-        if buffer_read_only_active_in_state(&ctx.obarray, &[], buf) {
+        if buffer_read_only_active_in_state(ctx.variables(), &[], buf) {
             return Err(signal(
                 LispCondition::BufferReadOnly,
                 vec![Value::make_buffer(current_id)],
@@ -1839,7 +1842,7 @@ pub(crate) fn builtin_delete_and_extract_region(
         }
     }
     crate::emacs_core::textprop::verify_text_read_only_in_state(
-        &ctx.obarray,
+        ctx.variables(),
         &ctx.buffers,
         current_id,
         start_byte,
@@ -1876,7 +1879,12 @@ pub(crate) fn builtin_erase_buffer(
     if !byte_range.is_empty() {
         signal_before_text_change(ctx, change)?;
     }
-    erase_buffer_impl(&ctx.obarray, &[], &mut ctx.buffers, vec![])?;
+    erase_buffer_impl(
+        VariableView::new(&ctx.obarray, &ctx.owner),
+        &[],
+        &mut ctx.buffers,
+        vec![],
+    )?;
     if !byte_range.is_empty() {
         signal_after_text_change(ctx, change)?;
     }
@@ -1884,7 +1892,7 @@ pub(crate) fn builtin_erase_buffer(
 }
 
 pub(crate) fn erase_buffer_impl(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &mut BufferManager,
     args: Vec<Value>,
@@ -1895,7 +1903,7 @@ pub(crate) fn erase_buffer_impl(
     };
 
     let should_signal_read_only = buffers.get(current_id).is_some_and(|buf| {
-        !buf.is_text_empty() && buffer_read_only_active_in_state(obarray, dynamic, buf)
+        !buf.is_text_empty() && buffer_read_only_active_in_state(vars, dynamic, buf)
     });
     if should_signal_read_only {
         return Err(signal(

@@ -10,6 +10,7 @@ use crate::emacs_core::eval::{
 use crate::emacs_core::fontset;
 use crate::emacs_core::intern::{NIL_SYM_ID, T_SYM_ID, intern, is_canonical_id};
 use crate::emacs_core::minibuffer;
+use crate::emacs_core::symbol::CanonicalAccess;
 use crate::emacs_core::symbol::{FunctionCellSnapshot, Obarray, SymbolPlistSnapshot};
 use crate::tagged::SymbolMode;
 use crate::tagged::header::ByteCodeSlotObject;
@@ -283,8 +284,26 @@ pub(crate) fn boundp_in(eval: &super::eval::Context, symbol: SymId) -> EvalResul
         return Ok(Value::bool_val(binding.as_value().is_some()));
     }
     Ok(Value::bool_val(
-        obarray.boundp_id(resolved) || obarray.is_constant_id(resolved),
+        obarray.boundp_id_with(resolved, |fwd| host_projected_boundp(eval, resolved, fwd))
+            || obarray.is_constant_id(resolved),
     ))
+}
+
+/// `boundp` of a host-projected forwarded cell. A thread projection is
+/// bound as the variable it projects is in the current buffer; any other
+/// forwarded cell always is.
+#[cold]
+#[inline(never)]
+fn host_projected_boundp(
+    eval: &super::eval::Context,
+    resolved: SymId,
+    fwd: &crate::emacs_core::forward::LispFwd,
+) -> bool {
+    fwd.thread_projection().is_none()
+        || matches!(
+            eval.find_symbol_value_by_id(resolved),
+            Ok(crate::emacs_core::eval::SymbolValueLookup::Bound(_))
+        )
 }
 
 pub(crate) fn builtin_obarrayp(args: Vec<Value>) -> EvalResult {
@@ -466,11 +485,11 @@ pub(crate) fn defvaralias_impl(
     // recorded in ledger 183 rather than added: it calls `display-warning`,
     // which is Lisp, and 141 unit tests reach this primitive on a bare
     // `Context` where no Lisp is loaded.
-    if ctx.obarray.find_symbol_value(old_symbol).is_none()
-        && let Some(alias_value) = ctx.obarray.find_symbol_value(new_symbol)
+    if ctx.variable_value(old_symbol).is_none()
+        && let Some(alias_value) = ctx.variable_value(new_symbol)
     {
         let target = resolve_variable_alias_id_in_obarray(&ctx.obarray, old_symbol)?;
-        ctx.obarray.set_symbol_value_id(target, alias_value);
+        ctx.store_variable(target, alias_value);
         ctx.sync_cached_runtime_binding_by_id(target, alias_value);
         ctx.refresh_gc_runtime_settings_after_change_by_id(target);
     }
@@ -943,7 +962,7 @@ pub(crate) fn symbol_property_get(
     // follows defvaralias and reads the slot `specbind` writes, so a let-bound
     // override is honored.
     let obarray = eval.obarray();
-    let overrides = obarray.symbol_value_id_or_nil(overriding_plist_environment_symbol());
+    let overrides = eval.variable_value_or_nil(overriding_plist_environment_symbol());
     if overrides.is_cons()
         && let Some(plist) = assq_cdr_swp(&symbol_value, overrides, symbols_with_pos_enabled)
         && let Some(propval) =
@@ -1132,11 +1151,11 @@ pub(super) fn builtin_ccl_execute(eval: &mut super::eval::Context, args: Vec<Val
     {
         let mut forced = args.clone();
         forced[0] = Value::fixnum(0);
-        return super::ccl::with_ccl_obarray(obarray, || {
+        return super::ccl::with_ccl_obarray(eval.variables(), || {
             super::ccl::builtin_ccl_execute_impl_with_symbols(forced, symbol_mode)
         });
     }
-    super::ccl::with_ccl_obarray(obarray, || {
+    super::ccl::with_ccl_obarray(eval.variables(), || {
         super::ccl::builtin_ccl_execute_impl_with_symbols(args, symbol_mode)
     })
 }
@@ -1152,11 +1171,11 @@ pub(super) fn builtin_ccl_execute_on_string(
     {
         let mut forced = args.clone();
         forced[0] = Value::fixnum(0);
-        return super::ccl::with_ccl_obarray(obarray, || {
+        return super::ccl::with_ccl_obarray(eval.variables(), || {
             super::ccl::builtin_ccl_execute_on_string_impl_with_symbols(forced, symbol_mode)
         });
     }
-    super::ccl::with_ccl_obarray(obarray, || {
+    super::ccl::with_ccl_obarray(eval.variables(), || {
         super::ccl::builtin_ccl_execute_on_string_impl_with_symbols(args, symbol_mode)
     })
 }
@@ -1516,8 +1535,15 @@ pub(super) fn resolve_indirect_symbol(eval: &super::eval::Context, name: &str) -
 
 /// Hash a string for custom obarray bucket index.
 pub(crate) fn obarray_hash_lisp_string(s: &crate::heap_types::LispString, len: usize) -> usize {
-    let normalized = crate::emacs_core::intern::normalize_symbol_name_lisp_string(s);
-    obarray_hash_bytes(normalized.as_bytes(), len)
+    obarray_hash_name_query(crate::emacs_core::intern::SymbolNameQuery::from(s), len)
+}
+
+#[inline]
+fn obarray_hash_name_query(
+    query: crate::emacs_core::intern::SymbolNameQuery<'_>,
+    len: usize,
+) -> usize {
+    obarray_hash_bytes(query.as_bytes(), len)
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -1639,11 +1665,18 @@ pub(crate) fn obarray_bucket_find(
     bucket: Value,
     name: &crate::heap_types::LispString,
 ) -> Option<Value> {
-    // Normalize BOTH sides: a symbol created from an ascii-only multibyte name
-    // keeps that multibyte string as its name object (GNU `intern_driver`), so
-    // the stored name can carry a representation the query does not. GNU's
-    // `oblookup` never compares the multibyte flag, only chars and bytes.
-    let normalized = crate::emacs_core::intern::normalize_symbol_name_lisp_string(name);
+    obarray_bucket_find_name_query(
+        bucket,
+        crate::emacs_core::intern::SymbolNameQuery::from(name),
+    )
+}
+
+fn obarray_bucket_find_name_query(
+    bucket: Value,
+    query: crate::emacs_core::intern::SymbolNameQuery<'_>,
+) -> Option<Value> {
+    // GNU lread.c:4945 compares characters and bytes, never the MB flag.
+    // Supplied shorthand character counts need not equal a payload rescan.
     let mut current = bucket;
     loop {
         match current.kind() {
@@ -1652,9 +1685,7 @@ pub(crate) fn obarray_bucket_find(
                 let car = current.cons_car();
                 let cdr = current.cons_cdr();
                 if let Some(sym_name) = obarray_lookup_name(car)
-                    && crate::emacs_core::intern::normalize_symbol_name_lisp_string(sym_name.text())
-                        .as_ref()
-                        == normalized.as_ref()
+                    && query.matches(sym_name.text())
                 {
                     return Some(car);
                 }
@@ -1757,19 +1788,15 @@ pub(crate) fn is_global_obarray_proxy(eval: &super::eval::Context, value: &Value
             std::sync::OnceLock::new();
         *SYMBOL.get_or_init(|| crate::emacs_core::intern::intern("neovm--obarray-object"))
     }
-    eval.obarray()
-        .symbol_value_id_copied(neovm_obarray_object_sym())
+    eval.variable_value(neovm_obarray_object_sym())
         .is_some_and(|proxy| proxy == *value)
 }
 
 fn current_lisp_obarray_value(eval: &super::eval::Context) -> Value {
-    eval.obarray()
-        .symbol_value_copied("obarray")
-        .unwrap_or_else(|| {
-            eval.obarray()
-                .symbol_value_copied("neovm--obarray-object")
-                .unwrap_or(Value::NIL)
-        })
+    eval.variable_value_by_name("obarray").unwrap_or_else(|| {
+        eval.variable_value_by_name("neovm--obarray-object")
+            .unwrap_or(Value::NIL)
+    })
 }
 
 fn effective_obarray_arg(eval: &super::eval::Context, args: &[Value]) -> Value {
@@ -1811,6 +1838,11 @@ pub(crate) fn builtin_intern_fn(eval: &mut super::eval::Context, args: Vec<Value
         }
     }
     let name = eval.expect_lisp_string(args[0])?;
+    let rewritten = intern_shorthand_name(eval, name).map_err(shorthand_character_count_error)?;
+    let query = rewritten
+        .as_ref()
+        .map(RewrittenSymbolName::as_query)
+        .unwrap_or_else(|| crate::emacs_core::intern::SymbolNameQuery::from(name));
 
     let effective_obarray = effective_obarray_arg(eval, &args);
 
@@ -1824,11 +1856,11 @@ pub(crate) fn builtin_intern_fn(eval: &mut super::eval::Context, args: Vec<Value
                 vec![Value::symbol("obarrayp"), effective_obarray],
             ));
         }
-        let bucket_idx = obarray_hash_lisp_string(name, vec_len);
+        let bucket_idx = obarray_hash_name_query(query, vec_len);
         let bucket = obarray_bucket(obarray_val, bucket_idx).unwrap_or(Value::NIL);
 
         // Check if already interned
-        if let Some(sym) = obarray_bucket_find(bucket, name) {
+        if let Some(sym) = obarray_bucket_find_name_query(bucket, query) {
             return Ok(sym);
         }
 
@@ -1841,8 +1873,11 @@ pub(crate) fn builtin_intern_fn(eval: &mut super::eval::Context, args: Vec<Value
         // spelling to its unibyte bytes (`obarray_hash_lisp_string`,
         // `obarray_bucket_find`), so identity does not depend on the name
         // object's representation.
+        let name_value = rewritten
+            .map(|name| Value::heap_string(name.into_lisp_string()))
+            .unwrap_or(args[0]);
         let sym = Value::from_sym_id(
-            crate::emacs_core::intern::make_uninterned_symbol_with_name_value(args[0]),
+            crate::emacs_core::intern::make_uninterned_symbol_with_name_value(name_value),
         );
         let new_bucket = Value::cons(sym, bucket);
         let _ = set_obarray_bucket(obarray_val, bucket_idx, new_bucket);
@@ -1854,7 +1889,18 @@ pub(crate) fn builtin_intern_fn(eval: &mut super::eval::Context, args: Vec<Value
     // Global obarray path. Pass the string OBJECT, not just its bytes: when
     // this call creates the symbol that object becomes its name, so
     // `symbol-name` returns it with the text properties it was read from.
-    let sym = eval.obarray_mut().intern_lisp_value(args[0]);
+    if rewritten.is_some() {
+        if let Some(id) = eval.obarray().intern_soft_name_query(query) {
+            return Ok(Value::from_sym_id(id));
+        }
+    }
+    // GNU lread.c:4798 constructs only after lookup. Empty construction can
+    // normalize the supplied count; the inherited registry cannot represent
+    // GNU duplicate canonical spellings arising at that boundary.
+    let name_value = rewritten
+        .map(|name| Value::heap_string(name.into_lisp_string()))
+        .unwrap_or(args[0]);
+    let sym = eval.obarray_mut().intern_lisp_value(name_value);
     Ok(Value::from_sym_id(sym))
 }
 
@@ -1869,103 +1915,290 @@ pub(crate) fn builtin_intern_soft_2(
     intern_soft_impl(eval, &args)
 }
 
+/// A string requests spelling lookup and shorthand expansion; a symbol
+/// requests that exact identity and never expands. Views stay local to the
+/// evaluator's mutator and introduce no shared mutable Lisp state.
+#[derive(Debug)]
+enum InternSoftQuery<'a> {
+    Spelling(&'a crate::heap_types::LispString),
+    Rewritten(RewrittenSymbolName),
+    Exact {
+        id: SymId,
+        original: Value,
+        name: crate::emacs_core::intern::LispVisibleSymbolName,
+        _mutator: std::marker::PhantomData<*const ()>,
+    },
+}
+
+impl InternSoftQuery<'_> {
+    #[inline]
+    fn name_query(&self) -> crate::emacs_core::intern::SymbolNameQuery<'_> {
+        match self {
+            Self::Spelling(name) => crate::emacs_core::intern::SymbolNameQuery::from(*name),
+            Self::Rewritten(name) => name.as_query(),
+            Self::Exact { name, .. } => {
+                crate::emacs_core::intern::SymbolNameQuery::from(name.text())
+            }
+        }
+    }
+
+    fn resolve(&self, found: Value) -> Value {
+        match self {
+            Self::Spelling(_) | Self::Rewritten(_) => found,
+            Self::Exact { id, original, .. } => {
+                if symbol_id(&found, SymbolMode::Bare) == Some(*id) {
+                    *original
+                } else {
+                    Value::NIL
+                }
+            }
+        }
+    }
+}
+
+/// A custom obarray whose compatibility conversion has already completed.
+/// This handle remains in the calling mutator; it does not retain a heap borrow.
+#[derive(Debug)]
+struct CheckedInternSoftObarray {
+    value: Value,
+    _mutator: std::marker::PhantomData<*const ()>,
+}
+
+impl TryFrom<Value> for CheckedInternSoftObarray {
+    type Error = Flow;
+
+    #[inline]
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Ok(Self {
+            value: check_obarray_value(value)?,
+            _mutator: std::marker::PhantomData,
+        })
+    }
+}
+
+/// One selected lookup domain. Custom conversion occurs before NAME coercion,
+/// matching GNU Fintern_soft. The selection stays local to the calling mutator.
+#[derive(Debug)]
+enum SelectedInternSoftObarray {
+    Global,
+    Custom(CheckedInternSoftObarray),
+}
+
+/// Raw shorthand result before GNU name construction changes its metadata.
+/// Threading: owns only Rust bytes and numeric metadata, no Lisp references.
+#[derive(Debug)]
+struct RewrittenSymbolName {
+    bytes: smallvec::SmallVec<[u8; 64]>,
+    chars: crate::heap_types::GnuDeclaredCharacterCount,
+}
+
+impl RewrittenSymbolName {
+    fn as_query(&self) -> crate::emacs_core::intern::SymbolNameQuery<'_> {
+        crate::emacs_core::intern::SymbolNameQuery::new(&self.bytes, self.chars)
+    }
+
+    fn into_lisp_string(self) -> crate::heap_types::LispString {
+        let bytes = if self.bytes.spilled() {
+            self.bytes.into_vec()
+        } else {
+            // Inline storage bounds len to 64. Reserve the trailing NUL once,
+            // when a miss requires an owned Lisp name, without growing scratch
+            // or changing the raw query used before name construction.
+            let mut bytes = Vec::with_capacity(self.bytes.len() + 1);
+            bytes.extend_from_slice(&self.bytes);
+            bytes
+        };
+        crate::heap_types::LispString::from_emacs_bytes_with_declared_chars(bytes, self.chars)
+    }
+}
+
+static_assertions::assert_impl_all!(RewrittenSymbolName: Send, Sync);
+
+/// GNU oblookup_considering_shorthand (lread.c:4966-5010) scans valid
+/// pairs in source order. Nil, the overwhelmingly common binding, allocates
+/// nothing. The rewritten builtin name is multibyte (Fintern, 4793-4796).
+#[inline]
+fn intern_shorthand_name(
+    eval: &super::eval::Context,
+    name: &crate::heap_types::LispString,
+) -> Result<Option<RewrittenSymbolName>, crate::heap_types::GnuDeclaredCharacterCountError> {
+    let value = read_symbol_shorthands_value(eval);
+    if value.is_nil() {
+        return Ok(None);
+    }
+    rewrite_intern_shorthand(value, name)
+}
+
+/// The visible value of `read-symbol-shorthands`, which GNU reads as the C
+/// variable `Vread_symbol_shorthands` (lread.c:4970, a `DEFVAR_LISP` at
+/// lread.c:5921). `intern`, `intern-soft` and every `read` consult it, so
+/// read the cells that hold it directly: the forwarded C variable (or a
+/// plain value cell), and the current buffer's binding cell once a file's
+/// local variables made it buffer-local. Aliases and an unbound cell take
+/// the general variable lookup. Mutator-local: reads only the calling
+/// evaluator's obarray and buffers.
+#[inline]
+pub(crate) fn read_symbol_shorthands_value(eval: &super::eval::Context) -> Value {
+    static SHORTHANDS: std::sync::OnceLock<SymId> = std::sync::OnceLock::new();
+    let id = *SHORTHANDS.get_or_init(|| intern("read-symbol-shorthands"));
+    use crate::emacs_core::symbol::ValueCell;
+    // Copy the tag and its payload from one symbol slot. Re-reading the slot
+    // through `symbol_value_id_copied` repeats its publication check; neither
+    // the live binding nor its redirect changes during this mutator read.
+    let direct = match eval
+        .obarray()
+        .get_by_id(id)
+        .map(|symbol| symbol.value_cell())
+    {
+        Some(ValueCell::Plain(value)) => (!value.is_unbound()).then_some(value),
+        // A buffer-slot forward needs the general current-buffer lookup.
+        Some(ValueCell::Forwarded(fwd)) => fwd.load(),
+        Some(ValueCell::Localized(_)) => eval
+            .buffers
+            .current_buffer()
+            .and_then(|buffer| eval.obarray().read_localized_in_buffer(id, buffer))
+            .filter(|value| !value.is_unbound()),
+        Some(ValueCell::Alias(_)) | None => None,
+    };
+    direct
+        .or_else(|| eval.visible_runtime_variable_value_by_id(id).ok().flatten())
+        .unwrap_or(Value::NIL)
+}
+
+/// Match GNU's first valid byte prefix. Active pairs belong to this mutator;
+/// no Lisp callback or source borrow survives this allocation-only path.
+#[cold]
+#[inline(never)]
+fn rewrite_intern_shorthand(
+    value: Value,
+    name: &crate::heap_types::LispString,
+) -> Result<Option<RewrittenSymbolName>, crate::heap_types::GnuDeclaredCharacterCountError> {
+    crate::emacs_core::value::list_iter(value)
+        .find_map(|pair| {
+            if !pair.is_cons() {
+                return None;
+            }
+            let short = pair.cons_car();
+            let long = pair.cons_cdr();
+            let short = short.as_lisp_string()?;
+            let long = long.as_lisp_string()?;
+            let suffix = name.as_bytes().strip_prefix(short.as_bytes())?;
+            let Some(capacity) = long
+                .sbytes()
+                .checked_add(suffix.len())
+                .filter(|&capacity| capacity <= isize::MAX as usize)
+            else {
+                return Some(Err(
+                    crate::heap_types::GnuDeclaredCharacterCountError::TooLarge,
+                ));
+            };
+            let mut rewritten = smallvec::SmallVec::<[u8; 64]>::with_capacity(capacity);
+            rewritten.extend_from_slice(long.as_bytes());
+            rewritten.extend_from_slice(suffix);
+            // GNU lread.c:5004 uses signed character-count arithmetic; native
+            // Fintern then preserves it in make_multibyte_string (4798).
+            let declared = long.schars() as i128 - short.schars() as i128 + name.schars() as i128;
+            Some(
+                crate::heap_types::GnuDeclaredCharacterCount::try_from(declared).map(|chars| {
+                    RewrittenSymbolName {
+                        bytes: rewritten,
+                        chars,
+                    }
+                }),
+            )
+        })
+        .transpose()
+}
+
+/// GNU aborts on negative native creation counts (alloc.c:2330). Represent
+/// that invalid allocation request safely as a Lisp error instead of a Rust
+/// panic. Intern-soft does not allocate and handles negative queries as misses.
+#[cold]
+#[inline(never)]
+fn shorthand_character_count_error(
+    error: crate::heap_types::GnuDeclaredCharacterCountError,
+) -> Flow {
+    signal(LispCondition::Error, vec![Value::string(error.to_string())])
+}
+
 pub(crate) fn intern_soft_impl(eval: &super::eval::Context, args: &[Value]) -> EvalResult {
     expect_min_args("intern-soft", args, 1)?;
     expect_max_args("intern-soft", args, 2)?;
-
-    let mode = eval.symbol_mode();
-    let symbol = args[0].as_symbol_id(mode);
-    let input = mode.unwrap(args[0]);
     let effective_obarray = effective_obarray_arg(eval, args);
-
-    // Custom obarray path
-    if !is_global_obarray_proxy(eval, &effective_obarray) {
-        let obarray_val = check_obarray_value(effective_obarray)?;
-        // GNU searches for `SYMBOL_NAME (name)` -- the name OBJECT, the same
-        // string the bucket chain is compared on. The view has to outlive the
-        // `Cow` that borrows out of it, so it is bound before the match rather
-        // than produced inside one of its arms.
-        let symbol_name_view = match input.kind() {
-            ValueKind::Symbol(id) => Some(
-                crate::emacs_core::intern::resolve_lisp_visible_symbol_name(id),
-            ),
-            ValueKind::Nil => Some(crate::emacs_core::intern::resolve_lisp_visible_symbol_name(
-                NIL_SYM_ID,
-            )),
-            ValueKind::T => Some(crate::emacs_core::intern::resolve_lisp_visible_symbol_name(
-                T_SYM_ID,
-            )),
-            _ => None,
-        };
-        let name = match (&symbol_name_view, input.kind()) {
-            (Some(view), _) => std::borrow::Cow::Borrowed(view.text()),
-            (None, ValueKind::String) => {
-                std::borrow::Cow::Borrowed(args[0].as_lisp_string().unwrap())
-            }
-            (None, _other) => {
-                // Transparently unwrap symbol-with-pos → bare symbol name.
-                if let Some(id) = symbol_id(&args[0], eval.symbol_mode()) {
-                    std::borrow::Cow::Borrowed(crate::emacs_core::intern::resolve_sym_lisp_string(
-                        id,
-                    ))
-                } else {
-                    return Err(signal(
-                        LispCondition::WrongTypeArgument,
-                        vec![Value::symbol("stringp"), args[0]],
-                    ));
+    // GNU validates the obarray before coercing NAME (lread.c:4819-4828).
+    // Retain the returned compatibility object, instead of converting twice.
+    let selected = if is_global_obarray_proxy(eval, &effective_obarray) {
+        SelectedInternSoftObarray::Global
+    } else {
+        SelectedInternSoftObarray::Custom(CheckedInternSoftObarray::try_from(effective_obarray)?)
+    };
+    let query = if let Some(id) = symbol_id(&args[0], eval.symbol_mode()) {
+        InternSoftQuery::Exact {
+            id,
+            original: args[0],
+            name: crate::emacs_core::intern::resolve_lisp_visible_symbol_name(id),
+            _mutator: std::marker::PhantomData,
+        }
+    } else {
+        let name = eval.expect_lisp_string(args[0])?;
+        let name = match intern_shorthand_name(eval, name) {
+            Ok(Some(rewritten)) => InternSoftQuery::Rewritten(rewritten),
+            Ok(None) => match &selected {
+                SelectedInternSoftObarray::Global => {
+                    return Ok(eval
+                        .obarray()
+                        .intern_soft_name_query(crate::emacs_core::intern::SymbolNameQuery::from(
+                            name,
+                        ))
+                        .map(Value::from_sym_id)
+                        .unwrap_or(Value::NIL));
                 }
+                SelectedInternSoftObarray::Custom(_) => InternSoftQuery::Spelling(name),
+            },
+            Err(crate::heap_types::GnuDeclaredCharacterCountError::Negative) => {
+                // GNU only calls oblookup for intern-soft (lread.c:4830):
+                // no allocated name has a negative count, so this misses.
+                // Keep the custom zero-bucket validation before returning.
+                match &selected {
+                    SelectedInternSoftObarray::Global => {}
+                    SelectedInternSoftObarray::Custom(checked) => {
+                        if obarray_len(checked.value).unwrap_or(0) == 0 {
+                            return Err(signal(
+                                LispCondition::WrongTypeArgument,
+                                vec![Value::symbol("obarrayp"), effective_obarray],
+                            ));
+                        }
+                    }
+                }
+                return Ok(Value::NIL);
+            }
+            Err(error @ crate::heap_types::GnuDeclaredCharacterCountError::TooLarge) => {
+                return Err(shorthand_character_count_error(error));
             }
         };
-        let vec_len = obarray_len(obarray_val).unwrap_or(0);
-        if vec_len == 0 {
-            return Err(signal(
-                LispCondition::WrongTypeArgument,
-                vec![Value::symbol("obarrayp"), effective_obarray],
-            ));
-        }
-        let bucket_idx = obarray_hash_lisp_string(name.as_ref(), vec_len);
-        let bucket = obarray_bucket(obarray_val, bucket_idx).unwrap_or(Value::NIL);
-        let found = obarray_bucket_find(bucket, name.as_ref()).unwrap_or(Value::NIL);
-        return Ok(match symbol {
-            Some(id) if found.as_bare_symbol_id() == Some(id) => args[0],
-            Some(_) => Value::NIL,
-            None => found,
-        });
-    }
-
-    // Global obarray path
-    let name = match input.kind() {
-        ValueKind::String => std::borrow::Cow::Borrowed(args[0].as_lisp_string().unwrap()),
-        ValueKind::Nil => std::borrow::Cow::Borrowed(
-            crate::emacs_core::intern::resolve_sym_lisp_string(NIL_SYM_ID),
-        ),
-        ValueKind::T => {
-            std::borrow::Cow::Borrowed(crate::emacs_core::intern::resolve_sym_lisp_string(T_SYM_ID))
-        }
-        ValueKind::Symbol(id) => {
-            std::borrow::Cow::Borrowed(crate::emacs_core::intern::resolve_sym_lisp_string(id))
-        }
-        _other => {
-            // Transparently unwrap symbol-with-pos → bare symbol name.
-            if let Some(id) = symbol_id(&args[0], eval.symbol_mode()) {
-                std::borrow::Cow::Borrowed(crate::emacs_core::intern::resolve_sym_lisp_string(id))
-            } else {
+        name
+    };
+    let found = match selected {
+        SelectedInternSoftObarray::Global => eval
+            .obarray()
+            .intern_soft_name_query(query.name_query())
+            .map(Value::from_sym_id)
+            .unwrap_or(Value::NIL),
+        SelectedInternSoftObarray::Custom(checked) => {
+            let obarray_val = checked.value;
+            let vec_len = obarray_len(obarray_val).unwrap_or(0);
+            if vec_len == 0 {
                 return Err(signal(
                     LispCondition::WrongTypeArgument,
-                    vec![Value::symbol("stringp"), args[0]],
+                    vec![Value::symbol("obarrayp"), effective_obarray],
                 ));
             }
+            let bucket_idx = obarray_hash_name_query(query.name_query(), vec_len);
+            let bucket = obarray_bucket(obarray_val, bucket_idx).unwrap_or(Value::NIL);
+            obarray_bucket_find_name_query(bucket, query.name_query()).unwrap_or(Value::NIL)
         }
     };
-    if let Some(id) = eval.obarray().intern_soft_lisp_string(name.as_ref()) {
-        Ok(match symbol {
-            Some(expected) if expected == id => args[0],
-            Some(_) => Value::NIL,
-            None => Value::from_sym_id(id),
-        })
-    } else {
-        Ok(Value::NIL)
-    }
+    Ok(query.resolve(found))
 }
 
 pub(crate) fn builtin_obarray_make(args: Vec<Value>) -> EvalResult {
@@ -2497,8 +2730,7 @@ pub(crate) fn menu_bar_top_level_items_for_frame(
         crate::emacs_core::keymap::menu_bar_active_keymaps_for_frame_read_only(eval, frame_id)
     } else {
         let obey_overriding_local_maps = eval
-            .obarray
-            .symbol_value_copied("overriding-local-map-menu-flag")
+            .variable_value_by_name("overriding-local-map-menu-flag")
             .is_some_and(|value| value.is_truthy());
         let mut maps = crate::emacs_core::keymap::current_active_maps_for_position_read_only(
             eval,
@@ -2517,7 +2749,7 @@ pub(crate) fn menu_bar_top_level_items_for_frame(
 }
 
 fn move_menu_bar_final_items(eval: &super::eval::Context, items: &mut Vec<(Value, String)>) {
-    let Some(mut final_items) = eval.obarray().symbol_value_copied("menu-bar-final-items") else {
+    let Some(mut final_items) = eval.variable_value_by_name("menu-bar-final-items") else {
         return;
     };
     while final_items.is_cons() {
@@ -2591,8 +2823,7 @@ fn selected_frame_value(eval: &mut super::eval::Context) -> Value {
 
 fn maybe_transform_mouse_position(eval: &mut super::eval::Context, value: Value) -> EvalResult {
     let transform = eval
-        .obarray
-        .symbol_value_copied("mouse-position-function")
+        .variable_value_by_name("mouse-position-function")
         .unwrap_or(Value::NIL);
     if transform.is_truthy() {
         eval.apply(transform, vec![value])
@@ -2671,23 +2902,22 @@ pub(super) fn fontset_list_value() -> Value {
 }
 
 fn dynamic_or_global_symbol_value_in_state(
-    obarray: &Obarray,
+    vars: crate::emacs_core::eval::VariableView<'_>,
     _dynamic: &[OrderedRuntimeBindingMap],
     name: &str,
 ) -> Option<Value> {
-    obarray.symbol_value_copied(name)
+    vars.value_by_name(name)
 }
 
 pub(crate) fn builtin_new_fontset(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_args("new-fontset", &args, 2)?;
-    let obarray = eval.obarray();
     let name = expect_string_lossy(&args[0])?;
     let char_script_table =
-        dynamic_or_global_symbol_value_in_state(obarray, &[], "char-script-table");
+        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "char-script-table");
     let charset_script_alist =
-        dynamic_or_global_symbol_value_in_state(obarray, &[], "charset-script-alist");
+        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "charset-script-alist");
     let font_encoding_alist =
-        dynamic_or_global_symbol_value_in_state(obarray, &[], "font-encoding-alist");
+        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "font-encoding-alist");
     let registered = fontset::new_fontset(
         &name,
         &args[1],
@@ -3210,13 +3440,12 @@ pub(crate) fn builtin_set_fontset_font(
     args: Vec<Value>,
 ) -> EvalResult {
     expect_args_range("set-fontset-font", &args, 3, 5)?;
-    let obarray = eval.obarray();
     let char_script_table =
-        dynamic_or_global_symbol_value_in_state(obarray, &[], "char-script-table");
+        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "char-script-table");
     let charset_script_alist =
-        dynamic_or_global_symbol_value_in_state(obarray, &[], "charset-script-alist");
+        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "charset-script-alist");
     let font_encoding_alist =
-        dynamic_or_global_symbol_value_in_state(obarray, &[], "font-encoding-alist");
+        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "font-encoding-alist");
     fontset::set_fontset_font(
         &args[0],
         &args[1],
@@ -3582,7 +3811,7 @@ pub(crate) fn builtin_transpose_regions(
     let changed_end_byte = changed_byte_span.end().get();
 
     let read_only = eval.buffers.get(current_id).is_some_and(|buf| {
-        crate::emacs_core::editfns::buffer_read_only_active_in_state(&eval.obarray, &[], buf)
+        crate::emacs_core::editfns::buffer_read_only_active_in_state(eval.variables(), &[], buf)
     });
     if read_only {
         return Err(signal(
@@ -3591,7 +3820,7 @@ pub(crate) fn builtin_transpose_regions(
         ));
     }
     crate::emacs_core::textprop::verify_text_read_only_in_state(
-        &eval.obarray,
+        eval.variables(),
         &eval.buffers,
         current_id,
         changed_start_byte,
@@ -4018,6 +4247,19 @@ fn symbol_name_for_value_lt(
     }
 }
 
+/// `variable-binding-locus` of a thread-projected variable, on the variable
+/// it projects: an owner's `let` binding of the default is not a buffer
+/// binding, and a buffer-local one implies the local.
+#[cold]
+#[inline(never)]
+fn projected_variable_binding_locus(
+    ctx: &mut crate::emacs_core::eval::Context,
+    resolved: SymId,
+    args: Vec<Value>,
+) -> EvalResult {
+    ctx.with_revealed_projection(resolved, |ctx| builtin_variable_binding_locus(ctx, args))
+}
+
 pub(crate) fn builtin_variable_binding_locus(
     ctx: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
@@ -4062,7 +4304,9 @@ pub(crate) fn builtin_variable_binding_locus(
                     let is_local = {
                         if let Some(buf_fwd) = fwd.as_buffer_obj_fwd() {
                             let Some(slot) = buf_fwd.buffer_slot() else {
-                                return Ok(Value::NIL);
+                                // Only a thread projection's header has no
+                                // slot: ask the variable it projects.
+                                return projected_variable_binding_locus(ctx, resolved, args);
                             };
                             let flags_idx = buf_fwd.local_flags_idx;
                             flags_idx == -1 || buf.slot_local_flag(slot)
@@ -4113,7 +4357,7 @@ pub(crate) fn builtin_xw_display_color_p_ctx(
     }
     if super::super::display::display_window_system_symbol_in_state(
         &ctx.frames,
-        &ctx.obarray,
+        ctx.variables(),
         &[],
         args.first(),
     )?
@@ -4496,6 +4740,18 @@ pub(crate) fn builtin_interactive_form(
 /// - SYMBOL_FORWARDED with BUFFER_OBJFWD: always return `t` per
 ///   GNU `data.c:2459`, since BUFFER_OBJFWD slots become local
 ///   automatically when set.
+/// `local-variable-if-set-p` of a thread-projected variable, on the variable
+/// it projects.
+#[cold]
+#[inline(never)]
+fn projected_local_variable_if_set_p(
+    ctx: &mut crate::emacs_core::eval::Context,
+    resolved: SymId,
+    args: Vec<Value>,
+) -> EvalResult {
+    ctx.with_revealed_projection(resolved, |ctx| builtin_local_variable_if_set_p(ctx, args))
+}
+
 pub(crate) fn builtin_local_variable_if_set_p(
     ctx: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
@@ -4533,10 +4789,13 @@ pub(crate) fn builtin_local_variable_if_set_p(
             // symbols because setting them auto-localizes the per-buffer slot
             // (`data.c:2458-2460`). Other forwarder kinds are not
             // buffer-local variables.
-            let is_buffer_objfwd = sym
+            let buf_fwd = sym
                 .forwarded_descriptor()
-                .is_some_and(|fwd| fwd.ty() == crate::emacs_core::forward::LispFwdType::BufferObj);
-            Ok(Value::bool_val(is_buffer_objfwd))
+                .and_then(|fwd| fwd.as_buffer_obj_fwd());
+            if buf_fwd.is_some_and(|buf_fwd| buf_fwd.thread_projection().is_some()) {
+                return projected_local_variable_if_set_p(ctx, resolved_id, args);
+            }
+            Ok(Value::bool_val(buf_fwd.is_some()))
         }
         _ => Ok(Value::NIL),
     }
@@ -5479,8 +5738,12 @@ pub(crate) fn builtin_dump_emacs_portable(
 
     let expanded_lisp = crate::emacs_core::fileio::expand_file_name_lisp(
         expect_lisp_string(&args[0])?,
-        crate::emacs_core::fileio::default_directory_lisp_in_state(&ctx.obarray, &[], &ctx.buffers)
-            .as_ref(),
+        crate::emacs_core::fileio::default_directory_lisp_in_state(
+            ctx.variables(),
+            &[],
+            &ctx.buffers,
+        )
+        .as_ref(),
     );
     let dump_path_buf = crate::emacs_core::fileio::lisp_file_name_to_path_buf(&expanded_lisp);
     let dump_path = dump_path_buf.as_path();
@@ -5495,11 +5758,11 @@ pub(crate) fn builtin_dump_emacs_portable(
     }
     let saved_post_gc_hook = ctx
         .obarray()
-        .symbol_value_copied("post-gc-hook")
+        .canonical_value_by_name(CanonicalAccess::DUMP, "post-gc-hook")
         .unwrap_or(Value::NIL);
     let saved_command_line_processed = ctx
         .obarray()
-        .symbol_value_copied("command-line-processed")
+        .canonical_value_by_name(CanonicalAccess::DUMP, "command-line-processed")
         .unwrap_or(Value::NIL);
     // `process-environment` is a `DEFVAR_LISP` (`src/callproc.c:2144`) that
     // `lisp/eshell/esh-var.el` and `lisp/progmodes/compile.el` localise, so it
@@ -5509,7 +5772,7 @@ pub(crate) fn builtin_dump_emacs_portable(
     // GNU's own `Fdump_emacs_portable` saves nothing of the sort. Ledger 196.
     let saved_process_environment = ctx
         .obarray()
-        .value_without_buffer("process-environment")
+        .canonical_value_without_buffer(CanonicalAccess::DUMP, "process-environment")
         .any_arm()
         .unwrap_or(Value::NIL);
     ctx.set_variable("post-gc-hook", Value::NIL);

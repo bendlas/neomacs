@@ -25,10 +25,24 @@
 //! together as a [`ValueCell`] and written together by one seam, so the
 //! obarray cannot pair a tag with another arm's payload (see `cell`).
 
+mod canonical_access;
 mod cell;
 mod fn_stamps;
+mod projection;
 mod property_revision;
-use cell::{ArmMut, CellWrite, MarkGate, read_symbol_children};
+pub use canonical_access::CanonicalAccess;
+
+/// Where an owner-routed canonical write went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum CanonicalWrite {
+    /// Canonical storage took it, or kept its value as the plain write does
+    /// (a per-buffer slot, a constant).
+    Done,
+    /// The cell is a thread projection: the owner-aware caller routes it.
+    Projected,
+}
+use cell::{ArmMut, CellWrite, MarkGate, RevealedCell, read_symbol_children};
 pub(crate) use cell::{
     BlvPtr, DumpedCell, DumpedSymbolFlags, LISP_SYMBOL_FLAGS_OFFSET,
     LISP_SYMBOL_INTERNED_GLOBAL_OFFSET, LISP_SYMBOL_SIZE, LISP_SYMBOL_VAL_OFFSET, ValueCell,
@@ -36,6 +50,7 @@ pub(crate) use cell::{
 pub use cell::{LispSymbol, SymbolFlags};
 #[cfg(test)]
 pub(crate) use fn_stamps::force_fn_stamps_for_test;
+pub(crate) use projection::{ConcealOutcome, RevealedProjection};
 pub use property_revision::SymbolPropertyRevision;
 
 use super::defvar_bool::ByteBooleanVars;
@@ -699,6 +714,23 @@ impl DebuggerDescriptor {
     #[inline(always)]
     pub(crate) fn resolved(self) -> Option<&'static crate::emacs_core::forward::LispBoolFwd> {
         (!self.0.is_debug_on_next_call_stand_in()).then_some(self.0)
+    }
+
+    /// The descriptor of an owner's own cell
+    /// (`forward::alloc_owner_debugger_cell`).
+    #[inline]
+    pub(crate) fn owner(cell: &'static crate::emacs_core::forward::LispBoolFwd) -> Self {
+        debug_assert!(
+            cell.is_owner_cell(),
+            "an owner descriptor names an owner cell"
+        );
+        Self(cell)
+    }
+
+    /// Whether this names an owner's own cell rather than the canonical one.
+    #[inline(always)]
+    pub(crate) fn is_owner(self) -> bool {
+        self.0.is_owner_cell()
     }
 }
 
@@ -1452,6 +1484,22 @@ impl Clone for Obarray {
             &'static crate::emacs_core::forward::LispFwd,
         > = rustc_hash::FxHashMap::default();
         let mut value_fwds = Vec::with_capacity(self.value_fwds.len());
+        let mut clone_stateful = |orig: &'static crate::emacs_core::forward::LispFwd| {
+            let key = std::ptr::from_ref(orig) as usize;
+            if let Some(&existing) = fwd_map.get(&key) {
+                return Some(existing);
+            }
+            let copy = orig.clone_stateful()?;
+            if copy.owned_value().is_some() {
+                value_fwds.push(copy);
+            }
+            fwd_map.insert(key, copy);
+            Some(copy)
+        };
+        // A copy is unprojected: a thread projection's canonical storage
+        // belongs to the source's owners, so each projected cell gets the
+        // copy of its logical arm, and its logical host-projection bit back.
+        let mut normalized = Vec::new();
         for idx in 0..symbols.len() {
             let Some(mut write) = symbols.cell_write(idx, MarkGate::read()) else {
                 continue;
@@ -1464,23 +1512,32 @@ impl Clone for Obarray {
                 }
                 ArmMut::Forwarded(forwarded) => {
                     let orig = forwarded.descriptor();
-                    let key = std::ptr::from_ref(orig) as usize;
-                    let copy = match fwd_map.get(&key) {
-                        Some(&existing) => existing,
-                        None => {
-                            let Some(copy) = orig.clone_stateful() else {
-                                continue;
-                            };
-                            if copy.owned_value().is_some() {
-                                value_fwds.push(copy);
+                    if let Some(projection) = orig.thread_projection() {
+                        use crate::emacs_core::forward::CanonicalArm;
+                        let logical = match projection.arm() {
+                            CanonicalArm::Plain => RevealedCell::Plain(projection.plain_value()),
+                            CanonicalArm::Localized(blv) => RevealedCell::Localized(
+                                blv_map.get(&blv.blv()).copied().unwrap_or(blv.blv()),
+                            ),
+                            CanonicalArm::Forwarded(builtin) => {
+                                let builtin = builtin.descriptor();
+                                RevealedCell::Forwarded(clone_stateful(builtin).unwrap_or(builtin))
                             }
-                            fwd_map.insert(key, copy);
-                            copy
-                        }
-                    };
-                    forwarded.forward_to(copy);
+                        };
+                        forwarded.reveal_projection(logical);
+                        normalized.push((idx, projection.host_projected()));
+                        continue;
+                    }
+                    if let Some(copy) = clone_stateful(orig) {
+                        forwarded.forward_to(copy);
+                    }
                 }
                 ArmMut::Plain(_) | ArmMut::Alias(_) => {}
+            }
+        }
+        for (idx, host_projected) in normalized {
+            if let Some(sym) = symbols.get_mut(idx) {
+                sym.set_runtime_projected(host_projected);
             }
         }
         // A BLV built from a forwarded symbol keeps a pointer to the same
@@ -1971,6 +2028,17 @@ impl Obarray {
         Some(id)
     }
 
+    /// Look up raw GNU name metadata before allocating a Lisp name string.
+    #[inline]
+    pub(crate) fn intern_soft_name_query(
+        &self,
+        query: crate::emacs_core::intern::SymbolNameQuery<'_>,
+    ) -> Option<SymId> {
+        let id = crate::emacs_core::intern::lookup_interned_name_query(query)?;
+        self.slot(id).filter(|sym| sym.interned_global)?;
+        Some(id)
+    }
+
     /// Get symbol data (mutable). Interns the symbol if needed.
     pub fn get_or_intern(&mut self, name: &str) -> &mut LispSymbol {
         let id = intern(name);
@@ -2020,8 +2088,8 @@ impl Obarray {
     ///
     /// The returned word does not borrow the mutable symbol or descriptor slot.
     #[inline]
-    pub fn symbol_value_copied(&self, name: &str) -> Option<Value> {
-        self.symbol_value_id_copied(intern(name))
+    pub fn canonical_value_by_name(&self, access: CanonicalAccess, name: &str) -> Option<Value> {
+        self.canonical_value(access, intern(name))
     }
 
     /// GNU's `Vfoo` / `foo` / `BVAR (current_buffer, foo)` -- the one spelling
@@ -2045,12 +2113,13 @@ impl Obarray {
     /// `indent::dynamic_buffer_or_global_symbol_value` is the older, identical
     /// reader; it lives in a file ledger 195 owns, so collapsing the two is
     /// owed rather than done here (ledger 196).
-    pub fn value_in_buffer(
+    pub fn canonical_value_in_buffer(
         &self,
+        access: CanonicalAccess,
         buf: Option<&crate::buffer::Buffer>,
         name: &str,
     ) -> Option<Value> {
-        self.value_in_buffer_id(buf, intern(name))
+        self.canonical_value_in_buffer_id(access, buf, intern(name))
     }
 
     /// [`Self::value_in_buffer`] by identity.
@@ -2062,25 +2131,74 @@ impl Obarray {
     /// [`Self::symbol_value_copied`] on the overwhelmingly common global path, which
     /// matters where a caller reads a dozen names at once -- the `print-*`
     /// family, for one.
-    pub fn value_in_buffer_id(
+    pub fn canonical_value_in_buffer_id(
         &self,
+        _access: CanonicalAccess,
         buf: Option<&crate::buffer::Buffer>,
         id: SymId,
     ) -> Option<Value> {
-        if let Some(buf) = buf {
-            // A `struct buffer` slot is read UNCONDITIONALLY, including a
-            // conditional slot whose local-flags bit is clear: GNU's
-            // `set-default` propagation leaves the live default in that same
-            // slot, so it is the right answer in both cases, where
-            // `get_buffer_local` would answer `None` and lose it.
-            if let Some(info) = crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id) {
-                return Some(buf.slots[info.offset.index()]);
-            }
-            if let Some(value) = buf.get_buffer_local_by_sym_id_gated(id, self.is_localized(id)) {
-                return Some(value);
-            }
+        match self.buffer_value(buf, id) {
+            Some(value) => Some(value),
+            None => self.canonical_value(CanonicalAccess::STORAGE, id),
         }
-        self.symbol_value_id_copied(id)
+    }
+
+    /// [`Self::canonical_value_in_buffer_id`]'s read, with PROJECTED
+    /// answering the arms [`Self::value_with`] gives it: BUF's slot and
+    /// local binding are canonical storage, which no projection changes.
+    #[inline(always)]
+    pub(crate) fn value_in_buffer_with(
+        &self,
+        buf: Option<&crate::buffer::Buffer>,
+        id: SymId,
+        projected: impl FnOnce(&Self, SymId) -> Option<Value>,
+    ) -> Option<Value> {
+        if let Some(value) = buf.and_then(|buf| Self::buffer_slot_value(buf, id)) {
+            return Some(value);
+        }
+        self.unslotted_value_with(buf, id, projected)
+    }
+
+    /// [`Self::value_in_buffer_with`] once ID is known not to be one of
+    /// BUF's slots: BUF's local binding, else the global read.
+    #[inline(always)]
+    pub(crate) fn unslotted_value_with(
+        &self,
+        buf: Option<&crate::buffer::Buffer>,
+        id: SymId,
+        projected: impl FnOnce(&Self, SymId) -> Option<Value>,
+    ) -> Option<Value> {
+        if let Some(buf) = buf
+            && let Some(value) = buf.get_buffer_local_by_sym_id_gated(id, self.is_localized(id))
+        {
+            return Some(value);
+        }
+        self.value_with(id, projected)
+    }
+
+    /// BUF's slot or local binding of ID, if it has one. A plain match, not
+    /// a closure for the global read: LLVM outlined that closure, storing
+    /// its captures on every call.
+    #[inline(always)]
+    fn buffer_value(&self, buf: Option<&crate::buffer::Buffer>, id: SymId) -> Option<Value> {
+        let buf = buf?;
+        if let Some(value) = Self::buffer_slot_value(buf, id) {
+            return Some(value);
+        }
+        buf.get_buffer_local_by_sym_id_gated(id, self.is_localized(id))
+    }
+
+    /// BUF's `struct buffer` slot of ID, when ID names one.
+    ///
+    /// A slot is read UNCONDITIONALLY, including a conditional slot whose
+    /// local-flags bit is clear: GNU's `set-default` propagation leaves the
+    /// live default in that same slot, so it is the right answer in both
+    /// cases, where `get_buffer_local` would answer `None` and lose it. No
+    /// projection changes it: an owner's binding of a slot stays in the slot.
+    #[inline(always)]
+    pub(crate) fn buffer_slot_value(buf: &crate::buffer::Buffer, id: SymId) -> Option<Value> {
+        crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id)
+            .map(|info| buf.slots[info.offset.index()])
     }
 
     /// A deliberate buffer-less read, with the disagreement with GNU named.
@@ -2088,19 +2206,27 @@ impl Obarray {
     /// Use this where a site genuinely has no buffer and the ledger row that
     /// licensed it can be cited at the `match`; use [`Self::value_in_buffer`]
     /// everywhere else.
-    pub fn value_without_buffer(&self, name: &str) -> BufferlessValue {
-        self.value_without_buffer_id(intern(name))
+    pub fn canonical_value_without_buffer(
+        &self,
+        access: CanonicalAccess,
+        name: &str,
+    ) -> BufferlessValue {
+        self.canonical_value_without_buffer_id(access, intern(name))
     }
 
     /// [`Self::value_without_buffer`] by identity.
-    pub fn value_without_buffer_id(&self, id: SymId) -> BufferlessValue {
+    pub fn canonical_value_without_buffer_id(
+        &self,
+        _access: CanonicalAccess,
+        id: SymId,
+    ) -> BufferlessValue {
         if crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id).is_some() {
             return BufferlessValue::PerBufferSlot;
         }
         let localized = self
             .slot(self.resolve_alias_for_read(id))
             .is_some_and(|sym| sym.redirect() == SymbolRedirect::Localized);
-        match self.symbol_value_id_copied(id) {
+        match self.canonical_value(CanonicalAccess::STORAGE, id) {
             None => BufferlessValue::Void,
             Some(value) if localized => BufferlessValue::DefaultOfLocalized(value),
             Some(value) => BufferlessValue::Global(value),
@@ -2127,7 +2253,7 @@ impl Obarray {
     /// Phase F: reads from the redirect union (`val`) rather than the
     /// legacy `value` enum field.
     #[inline(always)]
-    pub fn symbol_value_id_copied(&self, id: SymId) -> Option<Value> {
+    pub fn canonical_value(&self, _access: CanonicalAccess, id: SymId) -> Option<Value> {
         let sym = match self.symbols.get(Self::slot_index(id)) {
             Some(sym) => sym,
             _ => return None,
@@ -2154,12 +2280,77 @@ impl Obarray {
         }
     }
 
-    #[cold]
-    fn symbol_value_id_copied_slow(
+    /// [`Self::canonical_value`]'s read, with PROJECTED answering a void
+    /// forwarded cell that is a thread projection, or a void alias chain
+    /// (which may end at one): only those arms call it, so a caller that
+    /// routes it to an owner pays nothing on an ordinary cell, void or not.
+    /// PROJECTED is handed this obarray, so it need capture no more than
+    /// two words: a larger closure is passed to the cold alias arm through
+    /// memory, built on every read.
+    #[inline(always)]
+    pub(crate) fn value_with(
         &self,
-        mut current: SymId,
-        mut remaining: usize,
+        id: SymId,
+        projected: impl FnOnce(&Self, SymId) -> Option<Value>,
     ) -> Option<Value> {
+        let sym = match self.symbols.get(Self::slot_index(id)) {
+            Some(sym) => sym,
+            _ => return None,
+        };
+        match sym.value_cell() {
+            ValueCell::Plain(value) => {
+                if value.is_unbound() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+            // One cold call for the whole chain: nothing stays live across
+            // a call in the hot arms, as in `canonical_value`.
+            ValueCell::Alias(current) => self.alias_value_with(id, current, projected),
+            ValueCell::Localized(_) => {
+                let value = self.blv(id)?.defcell.cons_cdr();
+                if value.is_unbound() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+            ValueCell::Forwarded(fwd) => match fwd.load() {
+                Some(value) => Some(value),
+                None if fwd.thread_projection().is_some() => projected(self, id),
+                None => None,
+            },
+        }
+    }
+
+    /// [`Self::value_with`]'s alias arm: the chain from CURRENT, then
+    /// PROJECTED for ID when the chain ends void.
+    #[cold]
+    #[inline(never)]
+    fn alias_value_with(
+        &self,
+        id: SymId,
+        current: SymId,
+        projected: impl FnOnce(&Self, SymId) -> Option<Value>,
+    ) -> Option<Value> {
+        // The walk inline: one frame for the whole arm, as the old
+        // `symbol_value_id_copied_slow` call was.
+        match self.alias_chain_value(current, 49) {
+            Some(value) => Some(value),
+            None => projected(self, id),
+        }
+    }
+
+    #[cold]
+    fn symbol_value_id_copied_slow(&self, current: SymId, remaining: usize) -> Option<Value> {
+        self.alias_chain_value(current, remaining)
+    }
+
+    /// The value at the end of the alias chain from CURRENT, following at
+    /// most REMAINING more links.
+    #[inline(always)]
+    fn alias_chain_value(&self, mut current: SymId, mut remaining: usize) -> Option<Value> {
         while remaining > 0 {
             remaining -= 1;
             let sym = match self.symbols.get(Self::slot_index(current)) {
@@ -2197,15 +2388,80 @@ impl Obarray {
     /// GNU's `find_symbol_value` returns a `Lisp_Object` directly; keeping
     /// hot evaluator reads in this shape avoids an extra Option path.
     #[inline(always)]
-    pub fn symbol_value_id_or_nil(&self, id: SymId) -> Value {
-        match self.symbol_value_id_copied(id) {
+    pub fn canonical_value_or_nil(&self, access: CanonicalAccess, id: SymId) -> Value {
+        match self.canonical_value(access, id) {
             Some(value) => value,
             None => Value::NIL,
         }
     }
 
+    /// Bootstrap's seeding of NAME's canonical value (GNU's `DEFVAR` and
+    /// `syms_of_*` initializers): before any owner exists, canonical storage
+    /// is every owner's view ([`CanonicalAccess::BOOTSTRAP`]).
+    #[inline]
+    pub fn seed_value(&mut self, name: &str, value: Value) {
+        self.set_canonical_value_by_name(CanonicalAccess::BOOTSTRAP, name, value);
+    }
+
+    /// [`Self::seed_value`] by identity.
+    #[inline]
+    pub fn seed_value_id(&mut self, id: SymId, value: Value) {
+        self.set_canonical_value(CanonicalAccess::BOOTSTRAP, id, value);
+    }
+
+    /// [`Self::set_canonical_value`] for the owner-aware API
+    /// (`Context::store_variable`): the same write, except that a thread
+    /// projection answers [`CanonicalWrite::Projected`] from the per-buffer
+    /// arm its header already takes, where the plain write commits nothing.
+    /// Every other cell executes the canonical write.
+    #[inline(always)]
+    pub(crate) fn set_canonical_value_routed(&mut self, id: SymId, value: Value) -> CanonicalWrite {
+        self.ensure_global_member_if_canonical(id);
+        let target = self.resolve_alias_for_write(id);
+        let blv = match self.cell_write_ensure(target).arm() {
+            ArmMut::Localized(local) => local.blv(),
+            ArmMut::Forwarded(forwarded) => {
+                let fwd = forwarded.descriptor();
+                match fwd.store(value) {
+                    Ok(store) => {
+                        if !fwd.commit_unless_per_buffer(store) && fwd.thread_projection().is_some()
+                        {
+                            return CanonicalWrite::Projected;
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "forwarded slot refused an internal write: {error:?}")
+                    }
+                }
+                return CanonicalWrite::Done;
+            }
+            ArmMut::Plain(plain) => {
+                plain.store(value);
+                return CanonicalWrite::Done;
+            }
+            ArmMut::Alias(alias) => {
+                alias.unalias(value);
+                return CanonicalWrite::Done;
+            }
+        };
+        // Safety: a `Localized` cell names a record owned by self.blvs.
+        unsafe {
+            let blv = &mut *blv.as_ptr();
+            blv.defcell.set_cdr(value);
+            if super::value::eq_value(&blv.valcell, &blv.defcell) {
+                blv.valcell.set_cdr(value);
+            }
+        }
+        CanonicalWrite::Done
+    }
+
     /// Set the value cell of a symbol. Interns if needed.
-    pub fn set_symbol_value(&mut self, name: &str, value: Value) {
+    pub fn set_canonical_value_by_name(
+        &mut self,
+        _access: CanonicalAccess,
+        name: &str,
+        value: Value,
+    ) {
         let id = intern(name);
         self.mark_global_member(id);
         self.set_symbol_value_id_inner(id, value);
@@ -2219,7 +2475,7 @@ impl Obarray {
         value: Value,
         locality: LispVariableLocality,
     ) {
-        self.set_symbol_value(name, value);
+        self.set_canonical_value_by_name(CanonicalAccess::STORAGE, name, value);
         self.make_special(name);
         match locality {
             LispVariableLocality::Global => {}
@@ -2228,7 +2484,7 @@ impl Obarray {
     }
 
     /// Set the value cell of a symbol by identity.
-    pub fn set_symbol_value_id(&mut self, id: SymId, value: Value) {
+    pub fn set_canonical_value(&mut self, _access: CanonicalAccess, id: SymId, value: Value) {
         self.ensure_global_member_if_canonical(id);
         self.set_symbol_value_id_inner(id, value);
     }
@@ -2732,6 +2988,24 @@ impl Obarray {
         binding: impl FnOnce() -> Value,
     ) -> Option<Value> {
         let blv_ptr = self.blv_ptr(id)?;
+        // SAFETY: `blv_ptr` names the record `id`'s LOCALIZED cell holds,
+        // which this obarray's pool owns for `&self`'s lifetime.
+        Some(unsafe { Self::read_blv_with_lookup(blv_ptr, target_buf, binding) })
+    }
+
+    /// The read half of [`Self::read_localized_with_lookup`] for a record
+    /// already in hand.
+    ///
+    /// # Safety
+    ///
+    /// `blv_ptr` names a live record of this obarray's BLV pool, and no
+    /// reference to it is held across the call.
+    #[inline(always)]
+    pub(super) unsafe fn read_blv_with_lookup(
+        blv_ptr: *mut LispBufferLocalValue,
+        target_buf: Value,
+        binding: impl FnOnce() -> Value,
+    ) -> Value {
         let epoch = blv_alist_epoch();
         // SAFETY: the BLV record is a separate heap allocation reached only
         // through the symbol's raw pointer; the evaluator thread is its only
@@ -2750,7 +3024,7 @@ impl Obarray {
             if (*blv_ptr).alist_epoch == epoch
                 && crate::emacs_core::value::eq_value(&(*blv_ptr).where_buf, &target_buf)
             {
-                return Some((*blv_ptr).valcell.cons_cdr());
+                return (*blv_ptr).valcell.cons_cdr();
             }
             // Miss: GNU `find_symbol_value` swaps the binding in
             // (`swap_in_symval_forwarding`) so the NEXT read is a cell read.
@@ -2770,7 +3044,7 @@ impl Obarray {
             (*blv_ptr).found = found;
             store_value_atomic(&mut (*blv_ptr).valcell, valcell);
             (*blv_ptr).alist_epoch = epoch;
-            Some(valcell.cons_cdr())
+            valcell.cons_cdr()
         }
     }
 
@@ -2896,48 +3170,6 @@ impl Obarray {
         installed
     }
 
-    /// Project `id`'s variable to owner-local bindings: its cell becomes
-    /// `Forwarded` over a descriptor TABLE issues (a per-buffer header no
-    /// buffer has), whose canonical record keeps the cell's logical storage,
-    /// and its host-projection bit is set so every checked writer refuses
-    /// it, as stopped admission will require. `None`, changing nothing, for
-    /// an alias (it resolves to its base) or a variable already projected.
-    ///
-    /// Test-only: no production path converts a symbol yet.
-    #[cfg(test)]
-    pub(crate) fn project_thread_variable_for_test(
-        &mut self,
-        id: SymId,
-        table: &mut crate::emacs_core::forward::ThreadProjectionTable,
-    ) -> Option<&'static crate::emacs_core::forward::ThreadProjectionDescriptor> {
-        use crate::emacs_core::forward::CanonicalStorage;
-        let projection = {
-            let mut write = self.cell_write_ensure(id);
-            match write.arm() {
-                ArmMut::Plain(plain) => {
-                    let projection = table.project_for_test(CanonicalStorage::plain(plain.value()));
-                    plain.project_thread(projection);
-                    projection
-                }
-                ArmMut::Localized(local) => {
-                    let projection =
-                        table.project_for_test(CanonicalStorage::localized(local.blv()));
-                    local.project_thread(projection);
-                    projection
-                }
-                ArmMut::Forwarded(forwarded) => {
-                    let canonical = CanonicalStorage::forwarded(forwarded.descriptor())?;
-                    let projection = table.project_for_test(canonical);
-                    forwarded.project_thread(projection);
-                    projection
-                }
-                ArmMut::Alias(_) => return None,
-            }
-        };
-        self.mark_runtime_projected_id(id);
-        Some(projection)
-    }
-
     /// Install a GNU `Lisp_Boolfwd`-equivalent descriptor on a symbol.
     /// Every non-nil write becomes native `true`, and reads expose only `t`
     /// or `nil`, matching `do_symval_forwarding` / `store_symval_forwarding`
@@ -2998,7 +3230,11 @@ impl Obarray {
                 id,
                 crate::emacs_core::pdump::types::DumpLocalizedForwarder::Bool,
             );
-            self.set_symbol_value_id(id, if initial { Value::T } else { Value::NIL });
+            self.set_canonical_value(
+                CanonicalAccess::STORAGE,
+                id,
+                if initial { Value::T } else { Value::NIL },
+            );
         } else {
             match self.forwarder(id).and_then(|fwd| fwd.as_bool_fwd()) {
                 Some(existing) => existing.set(initial),
@@ -3013,7 +3249,9 @@ impl Obarray {
             return;
         }
         let list_id = intern("byte-boolean-vars");
-        let current = self.find_symbol_value(list_id).unwrap_or(Value::NIL);
+        let current = self
+            .canonical_find_value(CanonicalAccess::STORAGE, list_id)
+            .unwrap_or(Value::NIL);
         let symbol = Value::from_sym_id(id);
         let mut tail = current;
         while tail.is_cons() {
@@ -3023,7 +3261,7 @@ impl Obarray {
             tail = tail.cons_cdr();
         }
         let updated = Value::cons(symbol, current);
-        self.set_symbol_value_id(list_id, updated);
+        self.set_canonical_value(CanonicalAccess::STORAGE, list_id, updated);
         self.make_special_id(list_id);
     }
 
@@ -3177,7 +3415,7 @@ impl Obarray {
                 id,
                 crate::emacs_core::pdump::types::DumpLocalizedForwarder::Int,
             );
-            self.set_symbol_value_id(id, value.value());
+            self.set_canonical_value(CanonicalAccess::STORAGE, id, value.value());
             return;
         }
         if let Some(existing) = self.forwarder(id).and_then(|fwd| fwd.as_int_fwd()) {
@@ -3198,7 +3436,7 @@ impl Obarray {
     /// variant.
     ///
     /// Returns `None` for unbound (`void-variable` callsite signals).
-    pub fn find_symbol_value(&self, id: SymId) -> Option<Value> {
+    pub fn canonical_find_value(&self, _access: CanonicalAccess, id: SymId) -> Option<Value> {
         let mut current = id;
         for _ in 0..50 {
             let sym = self.slot(current)?;
@@ -3293,7 +3531,7 @@ impl Obarray {
             // walk can stay on a shared reference.
             match self.slot(current)?.value_cell() {
                 ValueCell::Plain(_) => {
-                    return self.find_symbol_value(current);
+                    return self.canonical_find_value(CanonicalAccess::STORAGE, current);
                 }
                 ValueCell::Alias(next) => {
                     current = next;
@@ -3355,7 +3593,7 @@ impl Obarray {
                         | ForwardSlot::Bool(_)
                         | ForwardSlot::Obj(_)
                         | ForwardSlot::KboardObj(_) => {
-                            return self.find_symbol_value(current);
+                            return self.canonical_find_value(CanonicalAccess::STORAGE, current);
                         }
                     }
                 }
@@ -3370,8 +3608,9 @@ impl Obarray {
     /// Phase 2: thin wrapper over `set_symbol_value_id` that exposes
     /// the GNU name. Phase 5+ adds the LOCALIZED-aware logic and the
     /// `where`/`bindflag` parameters via [`Self::set_internal_localized`].
+    #[cfg(test)]
     pub fn set_internal(&mut self, id: SymId, value: Value) {
-        self.set_symbol_value_id(id, value);
+        self.set_canonical_value(CanonicalAccess::TEST, id, value);
     }
 
     /// LOCALIZED arm of `set_internal`. Mirrors GNU
@@ -3841,8 +4080,8 @@ impl Obarray {
     }
 
     /// Remove the value cell (makunbound).
-    pub fn makunbound(&mut self, name: &str) {
-        self.makunbound_id(intern(name));
+    pub fn makunbound_canonical_by_name(&mut self, access: CanonicalAccess, name: &str) {
+        self.makunbound_canonical(access, intern(name));
     }
 
     /// Remove the value cell by identity: the store GNU's `set_internal`
@@ -3859,7 +4098,7 @@ impl Obarray {
     ///   (`src/data.c:1723-1727`, `:1802-1809`), which the evaluator signals
     ///   before it gets here (`check_forwarded_unbind`).
     /// - A constant is left alone.
-    pub fn makunbound_id(&mut self, id: SymId) {
+    pub fn makunbound_canonical(&mut self, _access: CanonicalAccess, id: SymId) {
         self.ensure_global_member_if_canonical(id);
         let target = self.resolve_alias_for_write(id);
         if self
@@ -3894,9 +4133,55 @@ impl Obarray {
         }
     }
 
+    /// [`Self::makunbound_canonical`] for the owner-aware API: a thread
+    /// projection answers [`CanonicalWrite::Projected`] from the forwarded
+    /// arm, which leaves every forwarder as it is.
+    #[inline(always)]
+    pub(crate) fn makunbound_canonical_routed(&mut self, id: SymId) -> CanonicalWrite {
+        self.ensure_global_member_if_canonical(id);
+        let target = self.resolve_alias_for_write(id);
+        if self
+            .slot(target)
+            .is_none_or(|sym| sym.trapped_write() == SymbolTrappedWrite::NoWrite)
+        {
+            return CanonicalWrite::Done;
+        }
+        let blv = match self.cell_write_ensure(target).arm() {
+            ArmMut::Plain(plain) => {
+                plain.store(Value::UNBOUND);
+                return CanonicalWrite::Done;
+            }
+            // `resolve_alias_for_write` stops on an alias only when the chain
+            // does not end; GNU `Fmakunbound` on an alias undoes it
+            // (`src/data.c:781-784`).
+            ArmMut::Alias(alias) => {
+                alias.unalias(Value::UNBOUND);
+                return CanonicalWrite::Done;
+            }
+            ArmMut::Forwarded(forwarded) => {
+                return if forwarded.descriptor().thread_projection().is_some() {
+                    CanonicalWrite::Projected
+                } else {
+                    CanonicalWrite::Done
+                };
+            }
+            ArmMut::Localized(local) => local.blv(),
+        };
+        // Safety: a `Localized` cell names a record self.blvs owns.
+        let blv = unsafe { &mut *blv.as_ptr() };
+        if blv.fwd.is_some() {
+            return CanonicalWrite::Done;
+        }
+        blv.defcell.set_cdr(Value::UNBOUND);
+        if super::value::eq_value(&blv.valcell, &blv.defcell) {
+            blv.valcell.set_cdr(Value::UNBOUND);
+        }
+        CanonicalWrite::Done
+    }
+
     /// Check if a symbol is bound (has a value cell).
-    pub fn boundp(&self, name: &str) -> bool {
-        self.boundp_id(intern(name))
+    pub fn canonical_boundp(&self, access: CanonicalAccess, name: &str) -> bool {
+        self.canonical_boundp_id(access, intern(name))
     }
 
     /// Check if a symbol is bound by identity.
@@ -3904,7 +4189,24 @@ impl Obarray {
     ///
     /// Phase F: reads from the redirect union (`val`) rather than the
     /// legacy `value` enum field. Mirrors GNU `boundp` (`data.c:805-810`).
-    pub fn boundp_id(&self, id: SymId) -> bool {
+    /// A thread projection answers as the variable it projects is by
+    /// default, as for a localized one.
+    #[inline(always)]
+    pub fn canonical_boundp_id(&self, _access: CanonicalAccess, id: SymId) -> bool {
+        self.boundp_id_with(id, |fwd| self.host_projected_forwarded_boundp(fwd))
+    }
+
+    /// [`Self::boundp_id`]'s walk, with PROJECTED answering a forwarded
+    /// cell that carries the host-projection bit -- every thread projection
+    /// does, and only such a cell can be one. A caller with buffer context
+    /// (`boundp`) answers it there; [`Self::boundp_id`] answers by default.
+    /// Inlined into every caller, as the walk always was.
+    #[inline(always)]
+    pub(crate) fn boundp_id_with(
+        &self,
+        id: SymId,
+        projected: impl FnOnce(&'static crate::emacs_core::forward::LispFwd) -> bool,
+    ) -> bool {
         let mut current = id;
         for _ in 0..50 {
             let Some(s) = self.slot(current) else {
@@ -3923,7 +4225,7 @@ impl Obarray {
                         .blv(current)
                         .is_some_and(|blv| blv.defcell.cons_cdr() != Value::UNBOUND);
                 }
-                ValueCell::Forwarded(_) => {
+                ValueCell::Forwarded(fwd) => {
                     // A forwarded slot is never unbound, whatever it forwards
                     // to: GNU's C storage has no "unbound" representation for
                     // any `Lisp_Fwd` variant, which is the same fact that
@@ -3934,11 +4236,29 @@ impl Obarray {
                     // (`src/data.c:733-736`).  Enumerating the variants here
                     // was how `DEFVAR_LISP` and `DEFVAR_KBOARD` came back
                     // unbound the moment they became forwarded (ledger 170).
-                    return true;
+                    // A thread projection always carries the host-projection
+                    // bit, so no other forwarded cell looks at its
+                    // descriptor.
+                    debug_assert!(
+                        s.flags().runtime_projected() || fwd.thread_projection().is_none(),
+                        "a thread projection carries the host-projection bit"
+                    );
+                    return !s.runtime_projected_on_arm() || projected(fwd);
                 }
             }
         }
         false // cycle
+    }
+
+    /// [`Self::boundp_id`] of a host-projected forwarded cell: a thread
+    /// projection is bound as the variable it projects is by default.
+    #[cold]
+    #[inline(never)]
+    fn host_projected_forwarded_boundp(&self, fwd: &crate::emacs_core::forward::LispFwd) -> bool {
+        match fwd.thread_projection() {
+            None => true,
+            Some(projection) => self.projected_default_value(projection).is_some(),
+        }
     }
 
     /// Check if a symbol has a function cell.
@@ -4080,7 +4400,7 @@ impl Obarray {
     /// constructing the invalid half-registered state where a variable is
     /// bound but lexical Lisp does not treat it as dynamically scoped.
     pub fn define_special_variable(&mut self, name: &str, value: Value) {
-        self.set_symbol_value(name, value);
+        self.set_canonical_value_by_name(CanonicalAccess::STORAGE, name, value);
         self.make_special(name);
     }
 
@@ -4211,7 +4531,9 @@ impl Obarray {
     pub fn make_buffer_local(&mut self, name: &str, local_if_set: bool) {
         let id = intern(name);
         self.mark_global_member(id);
-        let default = self.find_symbol_value(id).unwrap_or(Value::NIL);
+        let default = self
+            .canonical_find_value(CanonicalAccess::STORAGE, id)
+            .unwrap_or(Value::NIL);
         self.make_symbol_localized(id, default);
         self.set_blv_local_if_set(id, local_if_set);
     }
@@ -4383,7 +4705,19 @@ impl Obarray {
     ///
     /// Aliases and localized variables retain the same resolution rules as a
     /// global read. No returned value borrows a symbol, BLV or descriptor slot.
-    pub fn default_value_id_copied(&self, id: SymId) -> Option<Value> {
+    pub fn canonical_default_value(&self, _access: CanonicalAccess, id: SymId) -> Option<Value> {
+        self.default_value_with(id, |projection| self.projected_default_value(projection))
+    }
+
+    /// [`Self::canonical_default_value`]'s walk, with PROJECTED answering a
+    /// thread projection: only that arm calls it, so a caller that routes it
+    /// to an owner pays nothing on any other cell.
+    #[inline(always)]
+    pub(crate) fn default_value_with(
+        &self,
+        id: SymId,
+        projected: impl FnOnce(&crate::emacs_core::forward::ThreadProjectionDescriptor) -> Option<Value>,
+    ) -> Option<Value> {
         let mut current = id;
         for _ in 0..50 {
             let sym = self.slot(current)?;
@@ -4395,9 +4729,13 @@ impl Obarray {
                     return (!value.is_unbound()).then_some(value);
                 }
                 ValueCell::Forwarded(fwd) => {
-                    return fwd
-                        .load()
-                        .or_else(|| fwd.as_buffer_obj_fwd().map(|buf_fwd| buf_fwd.default));
+                    return fwd.load().or_else(|| {
+                        let buf_fwd = fwd.as_buffer_obj_fwd()?;
+                        match buf_fwd.thread_projection() {
+                            None => Some(buf_fwd.default),
+                            Some(projection) => projected(projection),
+                        }
+                    });
                 }
             }
         }
@@ -4782,3 +5120,63 @@ mod copied_value_tests;
 #[cfg(test)]
 #[path = "tests/canonical_dispatch_test.rs"]
 mod canonical_dispatch_tests;
+
+/// The pre-`CanonicalAccess` spellings, for tests, which set up and inspect
+/// canonical storage. Production code names its reason
+/// ([`CanonicalAccess`]) or reads through the owner-aware `Context` API.
+#[cfg(test)]
+impl Obarray {
+    pub fn symbol_value_copied(&self, name: &str) -> Option<Value> {
+        self.canonical_value_by_name(CanonicalAccess::TEST, name)
+    }
+    pub fn symbol_value_id_copied(&self, id: SymId) -> Option<Value> {
+        self.canonical_value(CanonicalAccess::TEST, id)
+    }
+    pub fn symbol_value_id_or_nil(&self, id: SymId) -> Value {
+        self.canonical_value_or_nil(CanonicalAccess::TEST, id)
+    }
+    pub fn value_in_buffer(
+        &self,
+        buf: Option<&crate::buffer::Buffer>,
+        name: &str,
+    ) -> Option<Value> {
+        self.canonical_value_in_buffer(CanonicalAccess::TEST, buf, name)
+    }
+    pub fn value_in_buffer_id(
+        &self,
+        buf: Option<&crate::buffer::Buffer>,
+        id: SymId,
+    ) -> Option<Value> {
+        self.canonical_value_in_buffer_id(CanonicalAccess::TEST, buf, id)
+    }
+    pub fn value_without_buffer(&self, name: &str) -> BufferlessValue {
+        self.canonical_value_without_buffer(CanonicalAccess::TEST, name)
+    }
+    pub fn value_without_buffer_id(&self, id: SymId) -> BufferlessValue {
+        self.canonical_value_without_buffer_id(CanonicalAccess::TEST, id)
+    }
+    pub fn find_symbol_value(&self, id: SymId) -> Option<Value> {
+        self.canonical_find_value(CanonicalAccess::TEST, id)
+    }
+    pub fn default_value_id_copied(&self, id: SymId) -> Option<Value> {
+        self.canonical_default_value(CanonicalAccess::TEST, id)
+    }
+    pub fn boundp(&self, name: &str) -> bool {
+        self.canonical_boundp(CanonicalAccess::TEST, name)
+    }
+    pub fn boundp_id(&self, id: SymId) -> bool {
+        self.canonical_boundp_id(CanonicalAccess::TEST, id)
+    }
+    pub fn set_symbol_value(&mut self, name: &str, value: Value) {
+        self.set_canonical_value_by_name(CanonicalAccess::TEST, name, value);
+    }
+    pub fn set_symbol_value_id(&mut self, id: SymId, value: Value) {
+        self.set_canonical_value(CanonicalAccess::TEST, id, value);
+    }
+    pub fn makunbound(&mut self, name: &str) {
+        self.makunbound_canonical_by_name(CanonicalAccess::TEST, name);
+    }
+    pub fn makunbound_id(&mut self, id: SymId) {
+        self.makunbound_canonical(CanonicalAccess::TEST, id);
+    }
+}

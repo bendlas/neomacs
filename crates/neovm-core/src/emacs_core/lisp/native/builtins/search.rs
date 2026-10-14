@@ -3,6 +3,7 @@ use crate::buffer::{
     BufferId, CharLen, CharPos0, CharRange, EmacsBytePos, EmacsByteRange, LispCharPos1,
 };
 use crate::emacs_core::error::{expect_args, expect_args_range, expect_fixnum, expect_min_args};
+use crate::emacs_core::eval::VariableView;
 use crate::emacs_core::regex::{
     BufferRegexpMatchContext, BufferRegexpSyntaxProperties, MatchDataSource, MatchGroup,
     char_pos_to_byte, char_pos_to_byte_lisp_string,
@@ -118,7 +119,7 @@ pub(crate) fn current_word_boundary_lookup(
 /// Snapshot the match-time state, borrowing only the obarray so the caller can
 /// still take `&mut eval.buffers` for the search itself.
 fn current_buffer_regexp_match_context<'a>(
-    obarray: &'a crate::emacs_core::symbol::Obarray,
+    vars: VariableView<'a>,
     buffers: &crate::buffer::BufferManager,
     word_boundary: crate::emacs_core::regex_emacs::WordBoundaryLookup,
     syntax_properties: BufferRegexpSyntaxProperties,
@@ -126,7 +127,7 @@ fn current_buffer_regexp_match_context<'a>(
     BufferRegexpMatchContext::new(
         crate::emacs_core::syntax::SyntaxProperties::for_scan_with_symbols(
             syntax_properties.is_honor(),
-            obarray,
+            vars,
             buffers,
             word_boundary.symbol_mode(),
         ),
@@ -134,18 +135,76 @@ fn current_buffer_regexp_match_context<'a>(
     )
 }
 
+fn validated_string_syntax_source(
+    value: &Value,
+) -> Result<crate::emacs_core::syntax::StringSyntaxPositionSource<'_>, Flow> {
+    crate::emacs_core::syntax::StringSyntaxPositionSource::try_from(value).map_err(
+        |crate::emacs_core::syntax::StringSyntaxPositionSourceError::NotString| {
+            signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("stringp"), *value],
+            )
+        },
+    )
+}
+
+fn string_syntax_position_signal(
+    error: crate::emacs_core::syntax::StringSyntaxPositionError,
+) -> Flow {
+    use crate::emacs_core::syntax::StringSyntaxPositionError;
+    match error {
+        StringSyntaxPositionError::OutOfRange { position } => signal(
+            LispCondition::ArgsOutOfRange,
+            vec![Value::fixnum(position.get()), Value::fixnum(position.get())],
+        ),
+        StringSyntaxPositionError::ToEndIntervals
+        | StringSyntaxPositionError::ForwardIntervals
+        | StringSyntaxPositionError::BackwardIntervals => {
+            signal(LispCondition::Error, vec![Value::string(error.to_string())])
+        }
+    }
+}
+
+/// Internal matching preserves typed syntax failures until its Lisp boundary.
+/// Threading: owned diagnostics only; no searched object or mutator borrow.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FastStringMatchError {
+    #[error("{0}")]
+    Regexp(String),
+    #[error(transparent)]
+    Syntax(crate::emacs_core::syntax::StringSyntaxPositionError),
+    #[error(transparent)]
+    Source(crate::emacs_core::syntax::StringSyntaxPositionSourceError),
+}
+static_assertions::assert_impl_all!(FastStringMatchError: Send, Sync);
+
+impl FastStringMatchError {
+    pub(crate) fn into_signal(self) -> Flow {
+        match self {
+            Self::Regexp(message) => regex_error_signal(message),
+            Self::Syntax(error) => string_syntax_position_signal(error),
+            // Actual Lisp arguments were checked before this internal API.
+            Self::Source(error) => {
+                signal(LispCondition::Error, vec![Value::string(error.to_string())])
+            }
+        }
+    }
+}
+
 /// The syntax lookup a regexp over STRING runs under: GNU's
 /// `RE_SETUP_SYNTAX_TABLE_FOR_OBJECT` for a string object (src/syntax.c:277),
 /// with the current buffer's syntax table as the base and the STRING's own
 /// intervals supplying each character's positional `syntax-table` property.
-fn string_regexp_syntax_lookup<'a>(
+#[inline]
+fn with_string_regexp_syntax_lookup<'a, R>(
     syntax_table: Option<&crate::emacs_core::syntax::SyntaxTable>,
     category_table: Option<Value>,
     word_boundary: crate::emacs_core::regex_emacs::WordBoundaryLookup,
-    string: &'a crate::heap_types::LispString,
+    source: crate::emacs_core::syntax::StringSyntaxPositionSource<'a>,
     syntax_properties: crate::emacs_core::syntax::SyntaxProperties<'a>,
-) -> super::regex::StringSyntaxLookup<'a> {
-    super::regex::StringSyntaxLookup::new(
+    with_lookup: impl for<'scan> FnOnce(&'scan dyn crate::emacs_core::regex_emacs::SyntaxLookup) -> R,
+) -> Result<R, crate::emacs_core::syntax::StringSyntaxPositionError> {
+    super::regex::with_string_syntax_lookup(
         syntax_table.map(
             |syntax_table| crate::emacs_core::regex_emacs::BufferSyntaxLookup {
                 syntax_table: *syntax_table,
@@ -153,8 +212,9 @@ fn string_regexp_syntax_lookup<'a>(
                 word_boundary,
             },
         ),
-        string,
+        source,
         syntax_properties,
+        with_lookup,
     )
 }
 
@@ -219,38 +279,56 @@ impl FastStringMatchSyntax {
     #[allow(clippy::too_many_arguments)] // matching options stay explicit at the GNU-regexp boundary
     pub(crate) fn search(
         &self,
-        obarray: &crate::emacs_core::symbol::Obarray,
+        vars: VariableView<'_>,
         buffers: &crate::buffer::BufferManager,
         pattern: &crate::heap_types::LispString,
         string: &crate::heap_types::LispString,
         searched_string: super::regex::SearchedString,
         start: usize,
         case_fold: bool,
-    ) -> Result<Option<super::regex::StringSearchSuccess>, String> {
-        // Interval test ahead of the resolver snapshot: a string with no
-        // intervals cannot honour anything (see
-        // `current_string_match_syntax_properties`).
-        let honor = self.honor_properties && !string.intervals().is_empty();
+    ) -> Result<Option<super::regex::StringSearchSuccess>, FastStringMatchError> {
+        let heap_identity = match &searched_string {
+            super::regex::SearchedString::Heap(value) => Some(*value),
+            super::regex::SearchedString::Owned(_) => None,
+        };
+        let source = match heap_identity.as_ref() {
+            Some(value) => crate::emacs_core::syntax::StringSyntaxPositionSource::try_from(value)
+                .map_err(FastStringMatchError::Source)?,
+            None => crate::emacs_core::syntax::StringSyntaxPositionSource::owned(string),
+        };
+        let string = source.string();
+        let honor = self.honor_properties
+            && (!string.intervals().is_empty() || supplied_nonidentity_syntax_positions(string));
         let properties = crate::emacs_core::syntax::SyntaxProperties::for_scan_with_symbols(
             honor,
-            obarray,
+            vars,
             buffers,
             self.base.map_or(crate::tagged::SymbolMode::Bare, |base| {
                 base.word_boundary.symbol_mode()
             }),
         );
-        let lookup = super::regex::StringSyntaxLookup::new(self.base, string, properties);
-        super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
-            pattern,
-            string,
-            searched_string,
-            start,
-            case_fold,
-            false,
-            None,
-            lookup.as_lookup(),
-        )
+        let result =
+            super::regex::with_string_syntax_lookup(self.base, source, properties, |syntax| {
+                super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
+                    pattern,
+                    string,
+                    searched_string,
+                    start,
+                    case_fold,
+                    false,
+                    None,
+                    syntax,
+                )
+            })
+            .map_err(FastStringMatchError::Syntax)?;
+        result.map_err(FastStringMatchError::Regexp)
     }
+}
+
+fn supplied_nonidentity_syntax_positions(string: &crate::heap_types::LispString) -> bool {
+    string.character_count_kind() == crate::heap_types::StringCharacterCountKind::Supplied
+        && string.is_multibyte()
+        && string.schars() != string.sbytes()
 }
 
 /// Snapshot the string-match property source, borrowing only the obarray.
@@ -269,16 +347,19 @@ impl FastStringMatchSyntax {
 /// snapshot behind it.
 pub(crate) fn current_string_match_syntax_properties<'a>(
     eval: &super::eval::Context,
-    obarray: &'a crate::emacs_core::symbol::Obarray,
+    vars: VariableView<'a>,
     buffers: &crate::buffer::BufferManager,
     searched: Option<&Value>,
 ) -> crate::emacs_core::syntax::SyntaxProperties<'a> {
     let honor = searched.is_some_and(|value| {
         crate::emacs_core::value::string_has_text_properties_for_value(*value)
+            || value
+                .as_lisp_string()
+                .is_some_and(supplied_nonidentity_syntax_positions)
     }) && crate::emacs_core::syntax::parse_sexp_lookup_properties_enabled(eval);
     crate::emacs_core::syntax::SyntaxProperties::for_scan_with_symbols(
         honor,
-        obarray,
+        vars,
         buffers,
         eval.symbol_mode(),
     )
@@ -289,7 +370,10 @@ fn buffer_byte_to_lisp_char(buf: &crate::buffer::Buffer, byte_pos: EmacsBytePos)
 }
 
 fn match_data_for_explicit_string_arg(md: &super::regex::MatchData) -> super::regex::MatchData {
-    super::regex::MatchData::string(md.groups_snapshot(), None)
+    match md.source() {
+        MatchDataSource::String => md.clone(),
+        MatchDataSource::Buffer(_) => super::regex::MatchData::string(md.groups_snapshot(), None),
+    }
 }
 
 fn buffer_byte_to_char_pos(buf: &crate::buffer::Buffer, byte_pos: EmacsBytePos) -> CharPos0 {
@@ -1098,7 +1182,7 @@ fn propertize_window_for_forward_regexp(
             return Ok(());
         }
         let match_context = current_buffer_regexp_match_context(
-            &eval.obarray,
+            VariableView::new(&eval.obarray, &eval.owner),
             &eval.buffers,
             current_word_boundary_lookup(eval),
             syntax_properties,
@@ -1309,7 +1393,7 @@ pub(crate) fn builtin_re_search_forward_4(
             .with_symbol_mode(eval.symbol_mode())
     };
     let match_context = current_buffer_regexp_match_context(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &eval.buffers,
         word_boundary,
         ready.syntax_properties,
@@ -1597,7 +1681,7 @@ fn buffer_regexp_search_fast(
         BufferRegexpSyntaxProperties::Ignore
     };
     let match_context = current_buffer_regexp_match_context(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &eval.buffers,
         word_boundary,
         syntax_properties,
@@ -1649,7 +1733,7 @@ pub(crate) fn builtin_re_search_backward(
         current_word_boundary_lookup(eval)
     };
     let match_context = current_buffer_regexp_match_context(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &eval.buffers,
         word_boundary,
         ready.syntax_properties,
@@ -1732,7 +1816,7 @@ pub(crate) fn builtin_posix_search_forward(
         current_word_boundary_lookup(eval)
     };
     let match_context = current_buffer_regexp_match_context(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &eval.buffers,
         word_boundary,
         ready.syntax_properties,
@@ -1779,7 +1863,7 @@ pub(crate) fn builtin_posix_search_backward(
         current_word_boundary_lookup(eval)
     };
     let match_context = current_buffer_regexp_match_context(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &eval.buffers,
         word_boundary,
         ready.syntax_properties,
@@ -1850,7 +1934,7 @@ pub(crate) fn builtin_looking_at_2(
                 .with_symbol_mode(eval.symbol_mode())
         };
         let mut match_context = current_buffer_regexp_match_context(
-            &eval.obarray,
+            VariableView::new(&eval.obarray, &eval.owner),
             &eval.buffers,
             word_boundary,
             syntax_properties,
@@ -1919,7 +2003,7 @@ fn looking_at_fast(
             .with_symbol_mode(eval.symbol_mode())
     };
     let match_context = current_buffer_regexp_match_context(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &eval.buffers,
         word_boundary,
         BufferRegexpSyntaxProperties::Ignore,
@@ -2004,7 +2088,7 @@ pub(crate) fn builtin_looking_at_p(
             }
         });
         let mut match_context = current_buffer_regexp_match_context(
-            &eval.obarray,
+            eval.variables(),
             &eval.buffers,
             current_word_boundary_lookup(eval),
             syntax_properties,
@@ -2089,7 +2173,7 @@ pub(crate) fn builtin_posix_looking_at(
             }
         });
         let mut match_context = current_buffer_regexp_match_context(
-            &eval.obarray,
+            VariableView::new(&eval.obarray, &eval.owner),
             &eval.buffers,
             current_word_boundary_lookup(eval),
             syntax_properties,
@@ -2158,11 +2242,14 @@ fn commit_string_search_success(
 ) -> EvalResult {
     match result {
         Ok(Some(success)) => {
-            let (start, published_match_data) = success.into_parts();
-            if let Some(match_data) = match_data {
+            let start = if let Some(match_data) = match_data {
+                let (start, published_match_data) = success.into_parts();
                 *match_data = Some(published_match_data);
-            }
-            Ok(Value::fixnum(start.get() as i64))
+                start
+            } else {
+                success.into_start()
+            };
+            Ok(Value::fixnum(start.get()))
         }
         Ok(None) => {
             if let Some(Some(match_data)) = match_data {
@@ -2199,24 +2286,26 @@ pub(crate) fn builtin_string_match_with_state(
                         args[1],
                         args.get(2),
                     )?;
-                    let string_syntax = string_regexp_syntax_lookup(
+                    let result = with_string_regexp_syntax_lookup(
                         syntax_table,
                         category_table,
                         word_boundary,
-                        string,
+                        validated_string_syntax_source(&args[1])?,
                         syntax_properties,
-                    );
-                    let syntax = string_syntax.as_lookup();
-                    let result = super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
-                        pattern,
-                        string,
-                        super::regex::SearchedString::Heap(args[1]),
-                        start,
-                        case_fold,
-                        false,
-                        case_translation_table,
-                        syntax,
-                    );
+                        |syntax| {
+                            super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
+                                pattern,
+                                string,
+                                super::regex::SearchedString::Heap(args[1]),
+                                start,
+                                case_fold,
+                                false,
+                                case_translation_table,
+                                syntax,
+                            )
+                        },
+                    )
+                    .map_err(string_syntax_position_signal)?;
                     let target = if inhibit_modify { None } else { match_data };
                     commit_string_search_success(result, target)
                 }
@@ -2267,8 +2356,12 @@ pub(crate) fn builtin_string_match_slice(
         Some(crate::emacs_core::category::active_category_table_for_buffer(current_buffer)?);
     let word_boundary = current_word_boundary_lookup(eval);
     let inhibit_changing = read_inhibit_changing_match_data(eval);
-    let syntax_properties =
-        current_string_match_syntax_properties(eval, &eval.obarray, &eval.buffers, args.get(1));
+    let syntax_properties = current_string_match_syntax_properties(
+        eval,
+        VariableView::new(&eval.obarray, &eval.owner),
+        &eval.buffers,
+        args.get(1),
+    );
     let match_data = (!inhibit_changing).then_some(&mut eval.match_data);
     let result = builtin_string_match_with_state(
         case_fold,
@@ -2329,6 +2422,10 @@ fn string_match_fast(
     let inhibit_modify = args.get(3).is_some_and(|v| v.is_truthy());
     let pattern = args[0].as_lisp_string()?;
     let string = args[1].as_lisp_string()?;
+    let source = match validated_string_syntax_source(&args[1]) {
+        Ok(source) => source,
+        Err(flow) => return Some(Err(flow)),
+    };
     let start = match crate::emacs_core::search::normalize_lisp_string_value_start_arg(
         args[1],
         args.get(2),
@@ -2340,30 +2437,38 @@ fn string_match_fast(
         // The cache key and a `[[:word:]]` fastmap depend on the base syntax
         // table alone, so the key lookup needs neither the word-boundary
         // tables nor the property resolver.
-        let key_lookup = string_regexp_syntax_lookup(
+        match with_string_regexp_syntax_lookup(
             syntax_table.as_ref(),
             category_table,
             crate::emacs_core::regex_emacs::WordBoundaryLookup::default()
                 .with_symbol_mode(eval.symbol_mode()),
-            string,
+            source,
             crate::emacs_core::syntax::SyntaxProperties::Ignore,
-        );
-        match super::regex::compile_string_search_pattern(
-            pattern,
-            string,
-            case_fold,
-            false,
-            case_translation_table,
-            key_lookup.as_lookup(),
+            |syntax| {
+                super::regex::compile_string_search_pattern(
+                    pattern,
+                    string,
+                    case_fold,
+                    false,
+                    case_translation_table,
+                    syntax,
+                )
+            },
         ) {
-            Ok(compiled) => compiled,
-            Err(msg) => return Some(Err(regex_error_signal(msg))),
+            Ok(Ok(compiled)) => compiled,
+            Ok(Err(msg)) => return Some(Err(regex_error_signal(msg))),
+            Err(error) => return Some(Err(string_syntax_position_signal(error))),
         }
     };
     let (word_boundary, syntax_properties) = if compiled.uses_syntax {
         (
             current_word_boundary_lookup(eval),
-            current_string_match_syntax_properties(eval, &eval.obarray, &eval.buffers, args.get(1)),
+            current_string_match_syntax_properties(
+                eval,
+                eval.variables(),
+                &eval.buffers,
+                args.get(1),
+            ),
         )
     } else {
         (
@@ -2372,22 +2477,26 @@ fn string_match_fast(
             crate::emacs_core::syntax::SyntaxProperties::Ignore,
         )
     };
-    let lookup = string_regexp_syntax_lookup(
+    // The register carrier stays in place; it must not replace the removed
+    // lookup aggregate with another large by-value return.
+    let mut regs = super::regex::SearchRegisters::default();
+    let found = match with_string_regexp_syntax_lookup(
         syntax_table.as_ref(),
         category_table,
         word_boundary,
-        string,
+        source,
         syntax_properties,
-    );
-    let mut regs = super::regex::SearchRegisters::default();
-    let found = super::regex::string_search_compiled_into(
-        &compiled,
-        string,
-        start,
-        lookup.as_lookup(),
-        &mut regs,
-    );
-    note_frontend_fast_call();
+        |syntax| {
+            let found = super::regex::string_search_compiled_into(
+                &compiled, string, start, syntax, &mut regs,
+            );
+            note_frontend_fast_call();
+            found
+        },
+    ) {
+        Ok(found) => found,
+        Err(error) => return Some(Err(string_syntax_position_signal(error))),
+    };
     Some(match found {
         Ok(true) => {
             let target = (!inhibit_modify && !inhibit_changing).then_some(&mut eval.match_data);
@@ -2439,24 +2548,26 @@ pub(crate) fn builtin_posix_string_match_with_state(
                         args[1],
                         args.get(2),
                     )?;
-                    let string_syntax = string_regexp_syntax_lookup(
+                    let result = with_string_regexp_syntax_lookup(
                         syntax_table,
                         category_table,
                         word_boundary,
-                        string,
+                        validated_string_syntax_source(&args[1])?,
                         syntax_properties,
-                    );
-                    let syntax = string_syntax.as_lookup();
-                    let result = super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
-                        pattern,
-                        string,
-                        super::regex::SearchedString::Heap(args[1]),
-                        start,
-                        case_fold,
-                        true,
-                        case_translation_table,
-                        syntax,
-                    );
+                        |syntax| {
+                            super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
+                                pattern,
+                                string,
+                                super::regex::SearchedString::Heap(args[1]),
+                                start,
+                                case_fold,
+                                true,
+                                case_translation_table,
+                                syntax,
+                            )
+                        },
+                    )
+                    .map_err(string_syntax_position_signal)?;
                     let target = if inhibit_modify { None } else { match_data };
                     commit_string_search_success(result, target)
                 }
@@ -2493,27 +2604,27 @@ pub(crate) fn builtin_string_match_p_with_case_fold(
                 args[1],
                 args.get(2),
             )?;
-            let string_syntax = string_regexp_syntax_lookup(
+            let result = with_string_regexp_syntax_lookup(
                 syntax_table,
                 category_table,
                 word_boundary,
-                string,
+                validated_string_syntax_source(&args[1])?,
                 syntax_properties,
-            );
-            let syntax = string_syntax.as_lookup();
-            commit_string_search_success(
-                super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
-                    pattern,
-                    string,
-                    super::regex::SearchedString::Heap(args[1]),
-                    start,
-                    case_fold,
-                    false,
-                    case_translation_table,
-                    syntax,
-                ),
-                None,
+                |syntax| {
+                    super::regex::string_search_full_with_case_fold_source_lisp_pattern_posix_syntax(
+                        pattern,
+                        string,
+                        super::regex::SearchedString::Heap(args[1]),
+                        start,
+                        case_fold,
+                        false,
+                        case_translation_table,
+                        syntax,
+                    )
+                },
             )
+            .map_err(string_syntax_position_signal)?;
+            commit_string_search_success(result, None)
         }
         _ => {
             let pattern = expect_string_lossy(&args[0])?;
@@ -2558,8 +2669,12 @@ pub(crate) fn builtin_posix_string_match(
         Some(crate::emacs_core::category::active_category_table_for_buffer(current_buffer)?);
     let word_boundary = current_word_boundary_lookup(eval);
     let inhibit_changing = read_inhibit_changing_match_data(eval);
-    let syntax_properties =
-        current_string_match_syntax_properties(eval, &eval.obarray, &eval.buffers, args.get(1));
+    let syntax_properties = current_string_match_syntax_properties(
+        eval,
+        VariableView::new(&eval.obarray, &eval.owner),
+        &eval.buffers,
+        args.get(1),
+    );
     let match_data = (!inhibit_changing).then_some(&mut eval.match_data);
     builtin_posix_string_match_with_state(
         case_fold,
@@ -2593,8 +2708,37 @@ pub(crate) fn builtin_match_string(
         None => return Ok(Value::NIL),
     };
 
-    let Some(group) = md.group(group_index) else {
+    let Some(endpoints) = md.lisp_group(group_index) else {
         return Ok(Value::NIL);
+    };
+    // GNU subr.el:5863-5866 delegates string extraction to substring.
+    // Keep signed END until that boundary normalizes relative indices and
+    // uses the original source object's cached character/byte positions.
+    if let Some(source) = args.get(1).copied().filter(|value| value.is_string()) {
+        return super::strings::builtin_substring_slice(&[
+            source,
+            Value::fixnum(endpoints.start()),
+            Value::fixnum(endpoints.end()),
+        ]);
+    }
+    let Some(group) = md.group(group_index) else {
+        let source = args
+            .get(1)
+            .copied()
+            .filter(|value| value.is_string())
+            .or_else(|| match md.searched_string() {
+                Some(super::regex::SearchedString::Heap(value)) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(Value::NIL);
+        return Err(signal(
+            LispCondition::ArgsOutOfRange,
+            vec![
+                source,
+                Value::fixnum(endpoints.start()),
+                Value::fixnum(endpoints.end()),
+            ],
+        ));
     };
     let start = group.start();
     let end = group.end();
@@ -2702,8 +2846,8 @@ pub(crate) fn builtin_match_beginning_with_state(
                 None => return Ok(Value::NIL),
             };
 
-            match md.group(group) {
-                Some(group) => Ok(Value::fixnum(group.start() as i64)),
+            match md.lisp_group(group) {
+                Some(group) => Ok(Value::fixnum(group.start())),
                 None => Ok(Value::NIL),
             }
         },
@@ -2754,8 +2898,8 @@ pub(crate) fn builtin_match_end_with_state(
                 None => return Ok(Value::NIL),
             };
 
-            match md.group(group) {
-                Some(group) => Ok(Value::fixnum(group.end() as i64)),
+            match md.lisp_group(group) {
+                Some(group) => Ok(Value::fixnum(group.end())),
                 None => Ok(Value::NIL),
             }
         },
@@ -2838,17 +2982,17 @@ pub(crate) fn builtin_match_data_with_state(
 
     // Emacs trims trailing unmatched groups from match-data output.
     let mut trailing = md.group_count();
-    while trailing > 0 && md.group(trailing - 1).is_none() {
+    while trailing > 0 && md.lisp_group(trailing - 1).is_none() {
         trailing -= 1;
     }
 
     let mut flat: Vec<Value> = Vec::with_capacity(trailing * 2);
     for group_index in 0..trailing {
-        let grp = md.group(group_index);
+        let grp = md.lisp_group(group_index);
         match grp {
             Some(group) => {
-                let start = group.start() as i64;
-                let end = group.end() as i64;
+                let start = group.start();
+                let end = group.end();
                 match source {
                     MatchDataMaterializationSource::String
                     | MatchDataMaterializationSource::LiveBuffer(_)
@@ -2993,26 +3137,51 @@ pub(crate) fn builtin_match_data_3(
     builtin_match_data_with_state(&mut eval.buffers, &eval.match_data, &args)
 }
 
-/// A marker-backed snapshot produced by GNU-compatible `(match-data)`.
-///
-/// Keep this private newtype instead of passing a bare `Value` through native
-/// unwind code: only a snapshot captured here may be restored with reseating.
-/// Buffer positions are markers, so the saved ranges continue to track edits
-/// made while the protected operation runs.
-#[derive(Clone, Copy)]
-struct SavedMatchData(Value);
+/// Native unwind snapshots preserve signed string registers directly and
+/// marker-backed buffer positions through the existing Lisp snapshot path.
+/// String snapshots own only numeric metadata; the marker list is rooted.
+/// Threading: the marker-bearing variant stays in its originating mutator.
+#[derive(Clone)]
+enum SavedMatchData {
+    String(super::regex::StringMatchRegisterSnapshot),
+    MarkerList {
+        value: Value,
+        _mutator: std::marker::PhantomData<*const ()>,
+    },
+}
 
 impl SavedMatchData {
     fn capture(eval: &mut super::eval::Context) -> Result<Self, Flow> {
-        builtin_match_data(eval, Vec::new()).map(Self)
+        if let Some(snapshot) = eval
+            .match_data
+            .as_ref()
+            .and_then(super::regex::MatchData::string_register_snapshot)
+        {
+            return Ok(Self::String(snapshot));
+        }
+        builtin_match_data(eval, Vec::new()).map(|value| Self::MarkerList {
+            value,
+            _mutator: std::marker::PhantomData,
+        })
     }
 
-    fn root(self, eval: &mut super::eval::Context) {
-        eval.push_specpdl_root(self.0);
+    fn root(&self, eval: &mut super::eval::Context) {
+        match self {
+            Self::String(_) => {}
+            Self::MarkerList { value, .. } => eval.push_specpdl_root(*value),
+        }
     }
 
     fn restore(self, eval: &mut super::eval::Context) -> EvalResult {
-        builtin_set_match_data(eval, vec![self.0, Value::T])
+        match self {
+            Self::String(snapshot) => {
+                eval.match_data = Some(super::regex::MatchData::from_string_register_snapshot(
+                    snapshot,
+                ));
+                Ok(Value::NIL)
+            }
+            Self::MarkerList { value, .. } => builtin_set_match_data(eval, vec![value, Value::T]),
+        }
     }
 }
 
@@ -3170,10 +3339,16 @@ pub(crate) fn builtin_set_match_data_2(
     builtin_set_match_data_with_state(&mut eval.buffers, &mut eval.match_data, &args)
 }
 
-fn translate_match_data(match_data: &mut Option<super::regex::MatchData>, delta: i64) {
+fn translate_match_data(
+    match_data: &mut Option<super::regex::MatchData>,
+    delta: i64,
+) -> Result<(), Flow> {
     if let Some(md) = match_data {
-        md.translate_positions(delta);
+        md.translate_positions(delta).map_err(|error| {
+            signal(LispCondition::Error, vec![Value::string(error.to_string())])
+        })?;
     }
+    Ok(())
 }
 
 pub(crate) fn builtin_match_data_translate_with_state(
@@ -3183,7 +3358,7 @@ pub(crate) fn builtin_match_data_translate_with_state(
 ) -> EvalResult {
     expect_args("match-data--translate", args, 1)?;
     let delta = expect_fixnum(&args[0])?;
-    translate_match_data(match_data, delta);
+    translate_match_data(match_data, delta)?;
     Ok(Value::NIL)
 }
 
@@ -3244,12 +3419,242 @@ fn update_match_data_after_buffer_replace(
     });
 }
 
+/// GNU's string replacement path needs the original object for its cache.
+/// This cold path serves supplied counts and signed, nonsliceable registers;
+/// ordinary computed strings keep the existing metadata path.
+/// No Lisp callback or collection boundary occurs while payloads are borrowed.
+#[cold]
+#[inline(never)]
+fn replace_match_declared_string(
+    args: &[Value],
+    md: &super::regex::MatchData,
+    subexp: usize,
+    vars: crate::emacs_core::eval::VariableView<'_>,
+    mode: SymbolMode,
+) -> EvalResult {
+    let obarray = vars.obarray();
+    let source = args.get(3).copied().unwrap_or(Value::NIL);
+    let string = source.as_lisp_string().ok_or_else(|| {
+        signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("stringp"), source],
+        )
+    })?;
+    let replacement = args.first().copied().unwrap_or(Value::NIL);
+    let replacement_string = replacement.as_lisp_string().ok_or_else(|| {
+        signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("stringp"), replacement],
+        )
+    })?;
+    let subexp_value = args.get(4).copied().unwrap_or(Value::NIL);
+    let Some(endpoints) = md.lisp_group(subexp) else {
+        return Err(signal(
+            LispCondition::Error,
+            vec![
+                Value::string(super::regex::REPLACE_MATCH_SUBEXP_MISSING),
+                subexp_value,
+            ],
+        ));
+    };
+    let start = endpoints.start();
+    let end = endpoints.end();
+    let bounds_error = || {
+        signal(
+            LispCondition::ArgsOutOfRange,
+            vec![Value::fixnum(start), Value::fixnum(end)],
+        )
+    };
+    // GNU search.c:2417-2427 checks raw registers; relative negative END
+    // applies only to subsequent Fsubstring back-reference extraction.
+    if start > end || end > string.schars() as i64 {
+        return Err(bounds_error());
+    }
+    let fixedcase = args.get(1).is_some_and(|value| value.is_truthy());
+    let literal = args.get(2).is_some_and(|value| value.is_truthy());
+
+    // GNU search.c:2439-2465 consults START's cache before walking the
+    // logical match for case analysis. It does not convert END here.
+    let matched = if fixedcase {
+        None
+    } else {
+        let byte_start = crate::emacs_core::string_pos_cache::string_char_to_byte(
+            source,
+            string,
+            start as usize,
+        );
+        let mut byte = byte_start;
+        let bytes = string.as_bytes();
+        let mut copy = Vec::new();
+        for _ in start..end {
+            if byte == bytes.len() {
+                copy.push(0); // only the initialized terminator
+                byte += 1;
+                continue;
+            }
+            let tail = bytes.get(byte..).ok_or_else(bounds_error)?;
+            let step = if string.is_multibyte() {
+                crate::heap_types::decode_declared_multibyte_char(tail).1
+            } else {
+                1
+            };
+            let unit = tail.get(..step).ok_or_else(bounds_error)?;
+            copy.extend_from_slice(unit);
+            byte += step;
+        }
+        Some(if string.is_multibyte() {
+            crate::heap_types::LispString::from_emacs_bytes(copy)
+        } else {
+            crate::heap_types::LispString::from_unibyte(copy)
+        })
+    };
+
+    // Fsubstring order in GNU search.c:2513-2514 is observable through the
+    // original source's position cache, even for the same logical registers.
+    let before =
+        super::strings::builtin_substring_slice(&[source, Value::fixnum(0), Value::fixnum(start)])?;
+    let after = super::strings::builtin_substring_slice(&[source, Value::fixnum(end), Value::NIL])?;
+
+    let mut middle = replacement;
+    if !literal && replacement_string.as_bytes().contains(&b'\\') {
+        // substring_both copies literal pieces with known character/byte
+        // pairs; only Fsubstring of matched groups touches SOURCE's cache.
+        let literal_piece = |byte_start, byte_end, char_start, char_end| -> EvalResult {
+            let slice = replacement_string
+                .slice_with_char_bounds(byte_start, byte_end, char_start, char_end)
+                .ok_or_else(|| {
+                    signal(
+                        LispCondition::ArgsOutOfRange,
+                        vec![
+                            replacement,
+                            Value::fixnum(char_start as i64),
+                            Value::fixnum(char_end as i64),
+                        ],
+                    )
+                })?;
+            Ok(Value::heap_string(slice))
+        };
+        let group_piece = |index| -> EvalResult {
+            let (start, end) = md
+                .lisp_group(index)
+                .map(|group| (group.start(), group.end()))
+                .unwrap_or((0, 0));
+            super::strings::builtin_substring_slice(&[
+                source,
+                Value::fixnum(start),
+                Value::fixnum(end),
+            ])
+        };
+        let mut pieces = Vec::new();
+        let bytes = replacement_string.as_bytes();
+        let mut byte = 0usize;
+        let mut character = 0usize;
+        let mut last_byte = 0usize;
+        let mut last_character = 0usize;
+        while byte < bytes.len() {
+            let code_step = |offset| {
+                if replacement_string.is_multibyte() {
+                    crate::heap_types::decode_declared_multibyte_char(&bytes[offset..])
+                } else {
+                    (u32::from(bytes[offset]), 1)
+                }
+            };
+            let slash_byte = byte;
+            let slash_character = character;
+            let (code, step) = code_step(byte);
+            if step > bytes.len() - byte {
+                return Err(bounds_error());
+            }
+            byte += step;
+            character += 1;
+            if code != u32::from(b'\\') {
+                continue;
+            }
+            if byte == bytes.len() {
+                let style = crate::emacs_core::coding::effective_text_quoting_style(vars, mode);
+                return Err(signal(
+                    LispCondition::Error,
+                    vec![Value::string(
+                        crate::emacs_core::coding::requote_c_error_message(
+                            "Invalid use of `\\' in replacement text",
+                            style,
+                        ),
+                    )],
+                ));
+            }
+            let escaped_byte = byte;
+            let (escaped, step) = code_step(byte);
+            if step > bytes.len() - byte {
+                return Err(bounds_error());
+            }
+            byte += step;
+            character += 1;
+            match escaped {
+                code if code == u32::from(b'&')
+                    || (u32::from(b'1')..=u32::from(b'9')).contains(&code) =>
+                {
+                    if slash_character != last_character {
+                        pieces.push(literal_piece(
+                            last_byte,
+                            slash_byte,
+                            last_character,
+                            slash_character,
+                        )?);
+                    }
+                    let index = if code == u32::from(b'&') {
+                        subexp
+                    } else {
+                        (code - u32::from(b'0')) as usize
+                    };
+                    pieces.push(group_piece(index)?);
+                    last_byte = byte;
+                    last_character = character;
+                }
+                code if code == u32::from(b'\\') => {
+                    pieces.push(literal_piece(
+                        last_byte,
+                        escaped_byte,
+                        last_character,
+                        character - 1,
+                    )?);
+                    last_byte = byte;
+                    last_character = character;
+                }
+                code if code == u32::from(b'?') => {} // GNU's string-path exception
+                _ => {
+                    let style = crate::emacs_core::coding::effective_text_quoting_style(vars, mode);
+                    return Err(signal(
+                        LispCondition::Error,
+                        vec![Value::string(
+                            crate::emacs_core::coding::requote_c_error_message(
+                                "Invalid use of `\\' in replacement text",
+                                style,
+                            ),
+                        )],
+                    ));
+                }
+            }
+        }
+        if character != last_character {
+            pieces.push(literal_piece(last_byte, byte, last_character, character)?);
+        }
+        middle = super::strings::builtin_concat_slice(&pieces)?;
+    }
+    if let Some(matched) = matched.as_ref() {
+        let middle_string = expect_lisp_string(&middle)?;
+        middle = Value::heap_string(
+            crate::emacs_core::casefiddle::apply_replace_match_case_lisp(middle_string, matched),
+        );
+    }
+    super::strings::builtin_concat_slice(&[before, middle, after])
+}
+
 /// Variant that also carries the current value of
 /// `case-symbols-as-words` into the case-preservation decision for
 /// `replace-match` with FIXEDCASE=nil. Audit findings #14/#20 in
 /// `drafts/regex-search-audit.md`.
 pub(crate) fn builtin_replace_match_with_state_and_flags(
-    obarray: &crate::emacs_core::symbol::Obarray,
+    vars: VariableView<'_>,
     buffers: &mut crate::buffer::BufferManager,
     match_data: &mut Option<super::regex::MatchData>,
     args: &[Value],
@@ -3310,7 +3715,7 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
     };
     // C-level `error()' messages are requoted via `text-quoting-style' by
     // GNU's doprnt (e.g. "Invalid use of `\\' ..." -> curly quotes).
-    let quoting_style = crate::emacs_core::coding::effective_text_quoting_style(obarray, mode);
+    let quoting_style = crate::emacs_core::coding::effective_text_quoting_style(vars, mode);
     let c_error = |msg: String| {
         signal(
             "error",
@@ -3335,6 +3740,18 @@ pub(crate) fn builtin_replace_match_with_state_and_flags(
                     Value::fixnum(md.group_count().saturating_sub(1) as i64),
                 ],
             ));
+        }
+        if let Some(md) = md_snapshot.as_ref() {
+            let declared_source = source.character_count_kind()
+                == crate::heap_types::StringCharacterCountKind::Supplied;
+            let unchecked_subexp = md.lisp_group(subexp).is_some() && md.group(subexp).is_none();
+            let unchecked_backref = !literal
+                && newtext_lisp.as_bytes().contains(&b'\\')
+                && (0..md.group_count())
+                    .any(|index| md.lisp_group(index).is_some() && md.group(index).is_none());
+            if declared_source || unchecked_subexp || unchecked_backref {
+                return replace_match_declared_string(args, md, subexp, vars, mode);
+            }
         }
         let string_md_snapshot = md_snapshot.as_ref().map(match_data_for_explicit_string_arg);
         return match crate::emacs_core::search::replace_match_lisp_string_with_syntax(
@@ -3571,7 +3988,7 @@ pub(crate) fn builtin_replace_match(
                 Ok(n) if n >= 0 => n as usize,
                 _ => {
                     return builtin_replace_match_with_state_and_flags(
-                        &eval.obarray,
+                        VariableView::new(&eval.obarray, &eval.owner),
                         &mut eval.buffers,
                         &mut eval.match_data,
                         &args,
@@ -3595,7 +4012,7 @@ pub(crate) fn builtin_replace_match(
             // C-level `error()' messages are requoted via
             // `text-quoting-style' by GNU's doprnt.
             let quoting_style = crate::emacs_core::coding::effective_text_quoting_style(
-                &eval.obarray,
+                eval.variables(),
                 eval.symbol_mode(),
             );
             let change = {
@@ -3673,7 +4090,7 @@ pub(crate) fn builtin_replace_match(
             };
             let symbol_mode = eval.symbol_mode();
             let result = builtin_replace_match_with_state_and_flags(
-                &eval.obarray,
+                VariableView::new(&eval.obarray, &eval.owner),
                 &mut eval.buffers,
                 &mut eval.match_data,
                 &args,
@@ -3711,7 +4128,7 @@ pub(crate) fn builtin_replace_match(
 
     // Fallback: string replacement or no match data — no buffer hooks needed.
     builtin_replace_match_with_state_and_flags(
-        &eval.obarray,
+        VariableView::new(&eval.obarray, &eval.owner),
         &mut eval.buffers,
         &mut eval.match_data,
         &args,

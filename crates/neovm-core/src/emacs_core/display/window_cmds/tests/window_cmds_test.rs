@@ -343,6 +343,7 @@ struct RecordingDisplayHost {
         Rc<RefCell<Vec<(crate::window::FrameId, crate::window::GuiFrameGeometryHints)>>>,
     primary_size: Option<GuiFrameHostSize>,
     resolved_frame_font: Option<ResolvedFrameFont>,
+    native_x11_ids: Rc<RefCell<Vec<(crate::window::FrameId, (u64, u64))>>>,
 }
 
 impl RecordingDisplayHost {
@@ -439,6 +440,14 @@ impl DisplayHost for RecordingDisplayHost {
     fn resize_gui_frame(&mut self, request: GuiFrameHostRequest) -> Result<(), String> {
         self.resized.borrow_mut().push(request);
         Ok(())
+    }
+
+    fn native_x11_window_ids(&self, frame_id: crate::window::FrameId) -> Option<(u64, u64)> {
+        self.native_x11_ids
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == frame_id)
+            .map(|(_, ids)| *ids)
     }
 
     fn set_gui_frame_fullscreen(
@@ -7041,6 +7050,47 @@ fn x_create_frame_creates_live_frame_and_preserves_char_geometry_params() {
 }
 
 #[test]
+fn frame_parameter_reads_native_x11_window_ids_from_display_host() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    let scratch = ev.buffers.create_buffer("*scratch*");
+    let fid = ev.frames.create_frame("GUI", 800, 600, scratch);
+    ev.frames
+        .get_mut(fid)
+        .expect("frame")
+        .set_window_system(Some(Value::symbol("x")));
+
+    let host = RecordingDisplayHost::new();
+    let ids = host.native_x11_ids.clone();
+    ev.set_display_host(Box::new(host));
+    ids.borrow_mut().push((fid, (20_971_56, 20_971_56)));
+
+    let frame_value = Value::make_frame(fid.0);
+    let window_id = crate::emacs_core::frame::builtin_frame_parameter(
+        &mut ev,
+        vec![frame_value, Value::symbol("window-id")],
+    )
+    .expect("window-id");
+    let outer_id = crate::emacs_core::frame::builtin_frame_parameter(
+        &mut ev,
+        vec![frame_value, Value::symbol("outer-window-id")],
+    )
+    .expect("outer-window-id");
+    assert_eq!(window_id.as_utf8_str(), Some("2097156"));
+    assert_eq!(outer_id.as_utf8_str(), Some("2097156"));
+
+    // A frame the host knows nothing about stays nil, like a non-X11 backend.
+    let other = ev.frames.create_frame("Other", 40, 10, scratch);
+    let other_value = Value::make_frame(other.0);
+    let missing = crate::emacs_core::frame::builtin_frame_parameter(
+        &mut ev,
+        vec![other_value, Value::symbol("window-id")],
+    )
+    .expect("missing window-id");
+    assert!(missing.is_nil());
+}
+
+#[test]
 fn x_create_frame_creates_opening_frame_and_notifies_host() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -12403,3 +12453,57 @@ fn window_lines_pixel_dimensions_returns_nil_without_a_current_matrix() {
 #[cfg(test)]
 #[path = "tsb_boundary_numbers.rs"]
 mod tsb_boundary_numbers;
+
+#[test]
+fn minibuffer_selected_window_returns_nil_after_the_invoking_window_is_deleted() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = runtime_startup_context();
+    ev.eval_str("(setq issue560-origin (split-window)) (select-window issue560-origin)")
+        .expect("create and select the invoking window");
+    let mini = ev.buffer_manager_mut().create_buffer(" *Minibuf-1*");
+    ev.activate_minibuffer_window_for_buffer(mini, LispString::from_utf8("Prompt: "), None)
+        .expect("activate minibuffer");
+    assert_eq!(
+        format_eval_result(&ev.eval_str("(eq (minibuffer-selected-window) issue560-origin)")),
+        "OK t"
+    );
+    let result = ev.eval_str(
+        "(delete-window issue560-origin)
+         (list (minibuffer-selected-window) (window-live-p issue560-origin)
+               (with-selected-window
+                   (or (minibuffer-selected-window) (selected-window)) 'ok))",
+    );
+    assert_eq!(format_eval_result(&result), "OK (nil nil ok)");
+}
+
+#[test]
+fn minibuffer_selected_window_requires_an_active_selected_minibuffer() {
+    crate::test_utils::init_test_tracing();
+    let result = crate::test_utils::runtime_startup_eval_one(
+        r#"(let ((executing-kbd-macro t)
+      (origin (split-window))
+      (observations nil))
+  (select-window origin)
+  (push (minibuffer-selected-window) observations)
+  (catch 'issue560-done
+    (minibuffer-with-setup-hook
+        (lambda ()
+          (let ((mini (selected-window)))
+            (push (list (> (minibuffer-depth) 0)
+                        (window-minibuffer-p)
+                        (eq (minibuffer-selected-window) origin)) observations)
+            (select-window origin)
+            (push (list (> (minibuffer-depth) 0)
+                        (window-minibuffer-p)
+                        (minibuffer-selected-window)) observations)
+            (select-window mini)
+            (push (eq (minibuffer-selected-window) origin) observations))
+          (throw 'issue560-done nil))
+      (read-from-minibuffer "Prompt: ")))
+  (push (list (minibuffer-depth) (minibuffer-selected-window)) observations)
+  (delete-window origin)
+  (nreverse observations))
+"#,
+    );
+    assert_eq!(result, "OK (nil (t t t) (t nil nil) t (0 nil))");
+}

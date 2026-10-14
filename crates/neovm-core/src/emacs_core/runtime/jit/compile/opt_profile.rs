@@ -1,4 +1,4 @@
-//! Single-variable opt configuration, defaulting to qualified list-loop SSA.
+//! Single-variable opt configuration, defaulting to qualified primitive-loop SSA.
 //!
 //! Threading: the process publishes one immutable scalar enum through OnceLock.
 //! Presets only supply compile-time defaults, with no Lisp handles, feedback,
@@ -66,10 +66,11 @@ impl Profile {
                 fold: true,
                 bool_rep: true,
                 reps: true,
+                reads: true,
                 ..OptPasses::default()
             },
             profit: if self == Self::Lists48Osr {
-                OptProfitMode::PrimitiveLists
+                OptProfitMode::PrimitiveLoops
             } else {
                 OptProfitMode::Lists
             },

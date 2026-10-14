@@ -43,11 +43,12 @@
 //! | `NEOVM_REGEX_DFA_FIRST_STEP` | `on` (default), `off` | Reject cached prefixes of at most eight bytes inline; verify also checks the predicate against the matcher ([`first_step_enabled`]). |
 
 use super::{
-    CompiledPattern, LookupClassKey, MatchRegisters, MatchScratch, RegexOp, SyntaxAssertion,
-    SyntaxCacheKey, SyntaxLookup, evaluate_syntax_assertion, extract_number, extract_number_u16,
-    fail_stack_overflow_free_span, match_anychar_at, match_categoryspec_at, match_charset_at,
-    match_exactn_char_at, match_syntaxspec_at, match_syntaxspecset_at, matcher_overflow_pending,
-    opcode_len, posix_class_bits_read_syntax, re_match_candidate_in, re_text_char,
+    CompiledPattern, LookupClassKey, MatchRegisters, MatchScratch, MatchSyntax, RegexOp,
+    SyntaxAssertion, SyntaxCacheKey, SyntaxLookup, evaluate_syntax_assertion, extract_number,
+    extract_number_u16, fail_stack_overflow_free_span, match_anychar_at, match_categoryspec_at,
+    match_charset_at, match_exactn_char_at, match_syntaxspec_at, match_syntaxspecset_at,
+    matcher_overflow_pending, opcode_len, posix_class_bits_read_syntax, re_match_candidate_in,
+    re_text_char,
 };
 use crate::emacs_core::emacs_char;
 use crate::emacs_core::syntax::SyntaxClass;
@@ -543,7 +544,7 @@ pub(crate) struct Place<'a> {
     pub(crate) stop: usize,
     pub(crate) point: usize,
     pub(crate) target_multibyte: bool,
-    pub(crate) syntax: &'a dyn SyntaxLookup,
+    pub(crate) syntax: MatchSyntax<'a>,
 }
 
 impl Place<'_> {
@@ -564,7 +565,7 @@ impl Place<'_> {
                 d,
                 self.stop,
                 self.target_multibyte,
-                self.syntax,
+                &self.syntax,
             ),
         }
     }
@@ -634,6 +635,10 @@ impl Facts {
     pub(crate) const WORD: Self = Self(1 << 2);
     /// Word or symbol syntax (`\_< \_>`).
     pub(crate) const WORD_OR_SYMBOL: Self = Self(1 << 3);
+    /// The current character is word/symbol syntax for GNU symbol assertions.
+    /// Unibyte input uses its raw byte here, unlike the promoted previous fact.
+    /// This bit belongs to a class, never a predecessor state.
+    pub(crate) const CURRENT_WORD_OR_SYMBOL: Self = Self(1 << 5);
     /// A word constituent above U+00FF.  Between two word constituents GNU's
     /// `WORD_BOUNDARY_P` consults scripts and categories unless both are at
     /// or below U+00FF (`WordBoundaryLookup::boundary_between`), so such a
@@ -665,6 +670,7 @@ impl Facts {
     fn of_char(
         code: u32,
         first_byte: u8,
+        target_multibyte: bool,
         syntax: &dyn SyntaxLookup,
         at: usize,
         mask: Self,
@@ -684,6 +690,12 @@ impl Facts {
                 }
             } else if class == SyntaxClass::Symbol {
                 facts |= Self::WORD_OR_SYMBOL.0;
+            }
+            if mask.contains(Self::CURRENT_WORD_OR_SYMBOL)
+                && SymbolMembership::of_current(first_byte, target_multibyte, syntax, at, class)
+                    == SymbolMembership::Inside
+            {
+                facts |= Self::CURRENT_WORD_OR_SYMBOL.0;
             }
         }
         Self(facts).masked(mask)
@@ -711,7 +723,7 @@ impl Nfa {
             mask = mask | Facts::WORD | Facts::WIDE_WORD;
         }
         if self.assertions.intersects(Assertions::SYMBOL) {
-            mask = mask | Facts::WORD_OR_SYMBOL;
+            mask = mask | Facts::WORD_OR_SYMBOL | Facts::CURRENT_WORD_OR_SYMBOL;
         }
         mask
     }
@@ -869,7 +881,7 @@ impl Nfa {
         }
         ClassKey {
             accepts,
-            facts: Facts::of_char(code, text[d], syntax, d, mask),
+            facts: Facts::of_char(code, text[d], pattern.target_multibyte, syntax, d, mask),
         }
     }
 }
@@ -882,8 +894,16 @@ pub(crate) const MAX_CLASSES: usize = UNKNOWN_CLASS as usize;
 const WIDE_SLOTS: usize = 512;
 const WIDE_EMPTY: u32 = u32::MAX;
 const POSITIONAL_SLOTS: usize = 64;
+const POSITIONAL_EMPTY: (u32, PositionalSyntaxFacts, u8) = (
+    WIDE_EMPTY,
+    PositionalSyntaxFacts {
+        promoted: SyntaxClass::Whitespace,
+        current_symbol: SymbolMembership::Outside,
+    },
+    0,
+);
 /// `byte_facts` value of a byte whose facts are not known yet (facts use
-/// the low five bits).
+/// the low six bits).
 const NO_FACTS: u8 = 0xFF;
 
 /// What the character-to-class maps of one pattern are valid for.
@@ -933,6 +953,58 @@ impl ClassContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TooManyClasses;
 
+/// Whether a character supplies the word/symbol fact. This immutable value
+/// carries no Lisp identity and is safe to use in mutator-local memo keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SymbolMembership {
+    Outside,
+    Inside,
+}
+
+impl SymbolMembership {
+    #[inline]
+    fn of_class(class: SyntaxClass) -> Self {
+        if matches!(class, SyntaxClass::Word | SyntaxClass::Symbol) {
+            Self::Inside
+        } else {
+            Self::Outside
+        }
+    }
+
+    /// GNU symbol-current uses RE_STRING_CHAR, while previous and word
+    /// reads use GET_CHAR_* (regex-emacs.c:55-56,67-95,5111,5163).
+    #[inline]
+    fn of_current(
+        first_byte: u8,
+        target_multibyte: bool,
+        syntax: &dyn SyntaxLookup,
+        at: usize,
+        promoted: SyntaxClass,
+    ) -> Self {
+        let class = if !target_multibyte && first_byte >= 0x80 {
+            syntax.emacs_char_syntax_at(
+                emacs_char::EmacsChar::from_code_unchecked(u32::from(first_byte)),
+                at,
+            )
+        } else {
+            promoted
+        };
+        Self::of_class(class)
+    }
+}
+
+/// All syntax facts that can distinguish classes at a property position.
+/// Symbol-current identity is separate from the promoted predicate/previous
+/// identity; both are immutable invocation-local metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PositionalSyntaxFacts {
+    promoted: SyntaxClass,
+    current_symbol: SymbolMembership,
+}
+
+// The extra current-character distinction must not enlarge the property memo.
+static_assertions::assert_eq_size!((u32, PositionalSyntaxFacts, u8), (u32, u8, u8));
+
 /// The classes of one pattern and the character-to-class maps.
 ///
 /// Class ids name [`ClassKey`]s, which do not depend on the search context,
@@ -944,9 +1016,9 @@ pub(crate) struct CharClasses {
     pub(crate) byte_class: [u8; 256],
     /// Direct-mapped `(character code, class)` memo for the other characters.
     wide: Box<[(u32, u8)]>,
-    /// Direct-mapped `(character code, syntax class there, class)` memo for
+    /// Direct-mapped `(character code, syntax facts there, class)` memo for
     /// characters inside `syntax-table` property runs.
-    positional: Box<[(u32, u8, u8)]>,
+    positional: Box<[(u32, PositionalSyntaxFacts, u8)]>,
     /// The facts of each tabled byte's character ([`NO_FACTS`]: not known
     /// yet), for the character before a candidate, which the DFA need not
     /// have classified.
@@ -964,7 +1036,7 @@ impl CharClasses {
         Self {
             byte_class: [UNKNOWN_CLASS; 256],
             wide: vec![(WIDE_EMPTY, 0); WIDE_SLOTS].into_boxed_slice(),
-            positional: vec![(WIDE_EMPTY, 0, 0); POSITIONAL_SLOTS].into_boxed_slice(),
+            positional: vec![POSITIONAL_EMPTY; POSITIONAL_SLOTS].into_boxed_slice(),
             byte_facts: [NO_FACTS; 256],
             keys: Vec::new(),
             ids: FxHashMap::default(),
@@ -984,7 +1056,7 @@ impl CharClasses {
         }
         self.byte_class = [UNKNOWN_CLASS; 256];
         self.wide.fill((WIDE_EMPTY, 0));
-        self.positional.fill((WIDE_EMPTY, 0, 0));
+        self.positional.fill(POSITIONAL_EMPTY);
         self.byte_facts = [NO_FACTS; 256];
         self.context = Some(context);
     }
@@ -1056,11 +1128,10 @@ impl CharClasses {
     /// where a `syntax-table` property may apply: what the matcher's tests
     /// answer there through `syntax` at `d`.
     ///
-    /// Every syntax read a class makes is the syntax of this one character
-    /// at `d` (`match_syntaxspec_at`, `posix_class_matches`, the facts), so
-    /// the class is a function of the character and its syntax class there:
-    /// that pair keys the memo, and the base-table memo serves the pair
-    /// whenever the property leaves the table's answer unchanged.
+    /// Promoted syntax controls predicates and previous-character facts;
+    /// GNU symbol-current additionally reads the raw byte for unibyte input.
+    /// Both facts key the memo, and a base-table class is reusable only when
+    /// both answers agree with the base table.
     pub(crate) fn class_at_position(
         &mut self,
         nfa: &Nfa,
@@ -1073,19 +1144,36 @@ impl CharClasses {
         let (code, len) = re_text_char(text, d, pattern.target_multibyte)
             .expect("a class is asked for a character inside the text");
         let ch = emacs_char::EmacsChar::from_code_unchecked(code);
-        let here = syntax.emacs_char_syntax_at(ch, d);
-        let slot_index = (code as usize ^ ((here as usize) << 4)) % POSITIONAL_SLOTS;
+        let promoted = syntax.emacs_char_syntax_at(ch, d);
+        let current_symbol = if self.mask.contains(Facts::CURRENT_WORD_OR_SYMBOL) {
+            SymbolMembership::of_current(text[d], pattern.target_multibyte, syntax, d, promoted)
+        } else {
+            SymbolMembership::Outside
+        };
+        let here = PositionalSyntaxFacts {
+            promoted,
+            current_symbol,
+        };
+        let slot_index =
+            (code as usize ^ ((promoted as usize) << 4) ^ ((current_symbol as usize) << 3))
+                % POSITIONAL_SLOTS;
         let slot = self.positional[slot_index];
-        if slot.0 == code && slot.1 == here as u8 {
+        if slot.0 == code && slot.1 == here {
             return Ok((slot.2, len));
         }
-        let class = if here == base.emacs_char_syntax(ch) {
+        let base_promoted = base.emacs_char_syntax(ch);
+        let base_current = if self.mask.contains(Facts::CURRENT_WORD_OR_SYMBOL) {
+            SymbolMembership::of_current(text[d], pattern.target_multibyte, base, d, base_promoted)
+        } else {
+            SymbolMembership::Outside
+        };
+        let class = if promoted == base_promoted && current_symbol == base_current {
             self.class_at(nfa, pattern, text, d, base)?.0
         } else {
             let key = nfa.class_key_at(pattern, text, d, code, len, syntax, self.mask);
             self.intern(key)?
         };
-        self.positional[slot_index] = (code, here as u8, class);
+        self.positional[slot_index] = (code, here, class);
         Ok((class, len))
     }
 
@@ -1125,7 +1213,9 @@ impl CharClasses {
     ) -> Facts {
         let (code, _) =
             re_text_char(text, at, target_multibyte).expect("the previous character exists");
-        Facts::of_char(code, text[at], syntax, at, self.mask)
+        // These facts describe only the previous character of a candidate.
+        let mask = Facts(self.mask.bits() & !Facts::CURRENT_WORD_OR_SYMBOL.bits());
+        Facts::of_char(code, text[at], target_multibyte, syntax, at, mask)
     }
 }
 
@@ -1254,7 +1344,12 @@ impl ExistenceDfa {
         let reads_edge = nfa.assertions.intersects(
             Assertions::BEG_LINE | Assertions::BEG_BUF | Assertions::WORD | Assertions::SYMBOL,
         );
-        let prev_mask = if reads_edge { mask | Facts::EDGE } else { mask };
+        let previous = Facts(mask.bits() & !Facts::CURRENT_WORD_OR_SYMBOL.bits());
+        let prev_mask = if reads_edge {
+            previous | Facts::EDGE
+        } else {
+            previous
+        };
         let mut dfa = Self {
             classes: CharClasses::new(mask),
             nfa,
@@ -1496,7 +1591,8 @@ impl ExistenceDfa {
         point: usize,
         syntax: &dyn SyntaxLookup,
     ) -> Exists {
-        self.anchored_exists_inner::<true>(pattern, text, p, stop, point, syntax)
+        let syntax = MatchSyntax::for_pattern(pattern, syntax);
+        self.anchored_exists_inner::<true>(pattern, text, p, stop, point, &syntax)
     }
 
     /// The candidate path after a caller's inline probe omits that probe
@@ -1510,7 +1606,7 @@ impl ExistenceDfa {
         p: usize,
         stop: usize,
         point: usize,
-        syntax: &dyn SyntaxLookup,
+        syntax: &MatchSyntax<'_>,
     ) -> Exists {
         if self.gave_up.is_some() {
             return Exists::Unknown;
@@ -1776,7 +1872,7 @@ impl ExistenceDfa {
         p: usize,
         stop: usize,
         point: usize,
-        syntax: &dyn SyntaxLookup,
+        syntax: &MatchSyntax<'_>,
     ) -> Exists {
         let stop = stop.min(text.len());
         if p > stop {
@@ -1793,7 +1889,7 @@ impl ExistenceDfa {
             self.counters.frontier_unknown += 1;
             return Exists::Unknown;
         }
-        let (mut row, plain_end) = self.start_at(text, p, pattern.target_multibyte, syntax);
+        let (mut row, plain_end) = self.start_at(text, p, pattern.target_multibyte, syntax.lookup);
         // `\=` holds at point only: that position's closure is never cached.
         let special = if self.has_at_dot && point >= p {
             point
@@ -1862,9 +1958,9 @@ impl ExistenceDfa {
         point: usize,
         mut special: usize,
         mut plain_end: usize,
-        syntax: &dyn SyntaxLookup,
+        syntax: &MatchSyntax<'_>,
     ) -> Exists {
-        let base = BaseTableView(syntax);
+        let base = BaseTableView(syntax.lookup);
         let target_multibyte = pattern.target_multibyte;
         let search = self.search;
         // Where `syntax-table` properties may apply, every syntax the DFA
@@ -1876,14 +1972,21 @@ impl ExistenceDfa {
         // function of (state, class): the assertions it evaluated read only
         // the facts both carry, and a class read at a position is interned
         // like any other.
-        let lookup: &dyn SyntaxLookup = if search.positional { syntax } else { &base };
+        // Preserve the existing projection: positional assertions retain the
+        // original invocation plan; the base table uses physical coordinates.
+        let base_syntax = MatchSyntax::physical(&base);
+        let boundary_syntax = if search.positional {
+            *syntax
+        } else {
+            base_syntax
+        };
         let place = |d: usize| Place {
             text,
             d,
             stop,
             point,
             target_multibyte,
-            syntax: lookup,
+            syntax: boundary_syntax,
         };
         let mut polled = d - p;
         loop {
@@ -1940,7 +2043,7 @@ impl ExistenceDfa {
             // inside a property run.
             let mut at_position = false;
             if d >= plain_end {
-                plain_end = self.plain_until(d, syntax);
+                plain_end = self.plain_until(d, syntax.lookup);
                 if plain_end > d {
                     continue;
                 }
@@ -1951,7 +2054,7 @@ impl ExistenceDfa {
             let classified = if at_position {
                 self.counters.positional_chars += 1;
                 self.classes
-                    .class_at_position(&self.nfa, pattern, text, d, &base, syntax)
+                    .class_at_position(&self.nfa, pattern, text, d, &base, syntax.lookup)
             } else {
                 self.classes.class_at(&self.nfa, pattern, text, d, &base)
             };
@@ -2467,7 +2570,7 @@ fn classic_candidate(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
     regs: &mut MatchRegisters,
 ) -> Option<usize> {
@@ -2630,7 +2733,7 @@ impl<'p> DfaLease<'p> {
         text: &[u8],
         pos: usize,
         stop: usize,
-        syntax: &dyn SyntaxLookup,
+        syntax: &MatchSyntax<'_>,
         point: usize,
         regs: &mut MatchRegisters,
     ) -> Option<usize> {
@@ -2661,7 +2764,7 @@ impl<'p> DfaLease<'p> {
             if found.is_none() && !matcher_overflow_pending() {
                 *failed += 1;
                 if *failed >= COLD_THRESHOLD {
-                    self.build(pattern, syntax);
+                    self.build(pattern, syntax.lookup);
                 }
             }
             return found;
@@ -2681,7 +2784,7 @@ impl<'p> DfaLease<'p> {
         text: &[u8],
         pos: usize,
         stop: usize,
-        syntax: &dyn SyntaxLookup,
+        syntax: &MatchSyntax<'_>,
         point: usize,
         regs: &mut MatchRegisters,
     ) -> Option<usize> {
@@ -2713,7 +2816,7 @@ impl<'p> DfaLease<'p> {
         text: &[u8],
         pos: usize,
         stop: usize,
-        syntax: &dyn SyntaxLookup,
+        syntax: &MatchSyntax<'_>,
         point: usize,
         regs: &mut MatchRegisters,
     ) -> Option<usize> {
@@ -2727,7 +2830,7 @@ impl<'p> DfaLease<'p> {
                 if found.is_none() && !matcher_overflow_pending() {
                     *failed += 1;
                     if *failed >= COLD_THRESHOLD {
-                        self.build(pattern, syntax);
+                        self.build(pattern, syntax.lookup);
                     }
                 }
                 return found;
@@ -2736,7 +2839,7 @@ impl<'p> DfaLease<'p> {
         };
         let verdict = live
             .dfa
-            .anchored_exists(pattern, text, pos, stop, point, syntax);
+            .anchored_exists_inner::<true>(pattern, text, pos, stop, point, syntax);
         live.note(verdict);
         if let Some(why) = live.dfa.gave_up() {
             self.retire(why);

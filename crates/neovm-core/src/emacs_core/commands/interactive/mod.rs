@@ -13,6 +13,7 @@
 
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
+use crate::emacs_core::eval::VariableView;
 use crate::tagged::SymbolMode;
 use std::collections::HashMap;
 
@@ -644,8 +645,10 @@ pub(crate) fn builtin_commandp_interactive(eval: &mut Context, args: &[Value]) -
             // its apostrophe follows the effective `text-quoting-style`.
             // Constructing a Rust string directly would permanently bake in
             // the straight-quote spelling and bypass that typed policy.
-            let quoting_style =
-                crate::emacs_core::coding::effective_text_quoting_style(&eval.obarray, symbol_mode);
+            let quoting_style = crate::emacs_core::coding::effective_text_quoting_style(
+                eval.variables(),
+                symbol_mode,
+            );
             let message = crate::emacs_core::coding::requote_c_error_message(
                 "Found an 'interactive-form' property!",
                 quoting_style,
@@ -1434,9 +1437,35 @@ enum ParsedInteractiveSpec {
     Form(InteractiveFormSpec),
 }
 
+/// Operations preceding interactive argument acquisition, in source order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractivePrefixFlag {
+    RequireWritableBuffer,
+    SelectEventWindow,
+    HandleShiftSelection,
+}
+
+impl InteractivePrefixFlag {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            b'*' => Some(Self::RequireWritableBuffer),
+            b'@' => Some(Self::SelectEventWindow),
+            b'^' => Some(Self::HandleShiftSelection),
+            _ => None,
+        }
+    }
+
+    fn requires_runtime(self) -> bool {
+        match self {
+            Self::RequireWritableBuffer => false,
+            Self::SelectEventWindow | Self::HandleShiftSelection => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ParsedInteractiveStringCode {
-    prefix_flags: Vec<char>,
+    prefix_flags: Vec<InteractivePrefixFlag>,
     entries: Vec<(char, crate::heap_types::LispString)>,
 }
 
@@ -1583,11 +1612,11 @@ fn dynamic_or_global_symbol_value(eval: &Context, name: &str) -> Option<Value> {
 }
 
 fn dynamic_or_global_symbol_value_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     _dynamic: &[OrderedRuntimeBindingMap],
     name: &str,
 ) -> Option<Value> {
-    obarray.symbol_value_copied(name)
+    vars.value_by_name(name)
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -1596,20 +1625,21 @@ fn dynamic_buffer_or_global_symbol_value(
     buf: &crate::buffer::Buffer,
     name: &str,
 ) -> Option<Value> {
-    dynamic_buffer_or_global_symbol_value_in_state(&eval.obarray, &[], buf, name)
+    dynamic_buffer_or_global_symbol_value_in_state(eval.variables(), &[], buf, name)
 }
 
 fn dynamic_buffer_or_global_symbol_value_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     _dynamic: &[OrderedRuntimeBindingMap],
     buf: &crate::buffer::Buffer,
     name: &str,
 ) -> Option<Value> {
+    let obarray = vars.obarray();
     let sym = crate::emacs_core::intern::intern(name);
     if let Some(v) = buf.get_buffer_local_by_sym_id_gated(sym, obarray.is_localized(sym)) {
         return Some(v);
     }
-    obarray.symbol_value_copied(name)
+    vars.value_by_name(name)
 }
 
 fn prefix_numeric_value(value: &Value) -> i64 {
@@ -1617,11 +1647,11 @@ fn prefix_numeric_value(value: &Value) -> i64 {
 }
 
 fn interactive_prefix_raw_arg(eval: &Context, kind: CommandInvocationKind) -> Value {
-    interactive_prefix_raw_arg_in_state(&eval.obarray, &[], kind)
+    interactive_prefix_raw_arg_in_state(eval.variables(), &[], kind)
 }
 
 fn interactive_prefix_raw_arg_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     kind: CommandInvocationKind,
 ) -> Value {
@@ -1629,7 +1659,7 @@ fn interactive_prefix_raw_arg_in_state(
         CommandInvocationKind::CallInteractively => "current-prefix-arg",
         CommandInvocationKind::CommandExecute => "prefix-arg",
     };
-    dynamic_or_global_symbol_value_in_state(obarray, dynamic, symbol).unwrap_or(Value::NIL)
+    dynamic_or_global_symbol_value_in_state(vars, dynamic, symbol).unwrap_or(Value::NIL)
 }
 
 fn interactive_prefix_numeric_arg(eval: &Context, kind: CommandInvocationKind) -> Value {
@@ -1638,11 +1668,11 @@ fn interactive_prefix_numeric_arg(eval: &Context, kind: CommandInvocationKind) -
 }
 
 fn interactive_prefix_numeric_arg_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     kind: CommandInvocationKind,
 ) -> Value {
-    let raw = interactive_prefix_raw_arg_in_state(obarray, dynamic, kind);
+    let raw = interactive_prefix_raw_arg_in_state(vars, dynamic, kind);
     Value::fixnum(prefix_numeric_value(&raw))
 }
 
@@ -1717,44 +1747,56 @@ fn interactive_other_buffer_default(buffers: &mut crate::buffer::BufferManager) 
 }
 
 fn interactive_last_input_event_with_parameters_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
 ) -> Option<Value> {
-    let event = dynamic_or_global_symbol_value_in_state(obarray, dynamic, "last-input-event")?;
+    let event = dynamic_or_global_symbol_value_in_state(vars, dynamic, "last-input-event")?;
     interactive_event_with_parameters_p(&event).then_some(event)
 }
 
 fn interactive_next_event_with_parameters_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     context: &mut InteractiveInvocationContext,
 ) -> Option<Value> {
     if context.has_command_keys_context {
         return interactive_next_event_with_parameters_from_keys(context);
     }
-    interactive_last_input_event_with_parameters_in_state(obarray, dynamic)
+    interactive_last_input_event_with_parameters_in_state(vars, dynamic)
 }
 
 #[allow(dead_code, clippy::too_many_arguments)] // explicit split-state compatibility seam
 fn interactive_args_from_string_code_in_state(
-    obarray: &mut Obarray,
+    vars: VariableView<'_>,
     dynamic: &mut Vec<OrderedRuntimeBindingMap>,
     buffers: &mut crate::buffer::BufferManager,
-    custom: &crate::emacs_core::custom::CustomManager,
-    specpdl: &[crate::emacs_core::eval::SpecBinding],
+    _custom: &crate::emacs_core::custom::CustomManager,
+    _specpdl: &[crate::emacs_core::eval::SpecBinding],
     code: &crate::heap_types::LispString,
     kind: CommandInvocationKind,
     context: &mut InteractiveInvocationContext,
 ) -> Result<Option<Vec<Value>>, Flow> {
     let parsed = parse_interactive_code_entries(code);
-    interactive_apply_prefix_flags_in_state(
-        obarray,
-        dynamic.as_mut_slice(),
-        buffers,
-        custom,
-        specpdl,
-        &parsed.prefix_flags,
-    )?;
+    // Defer before any effect: Lisp hooks and shift-selection policy cannot
+    // execute through this split-state seam, and prefix order is observable.
+    if parsed
+        .prefix_flags
+        .iter()
+        .any(|flag| flag.requires_runtime())
+    {
+        return Ok(None);
+    }
+    for flag in &parsed.prefix_flags {
+        match flag {
+            InteractivePrefixFlag::RequireWritableBuffer => {
+                interactive_require_writable_current_buffer_in_state(vars, dynamic, buffers)?;
+            }
+            InteractivePrefixFlag::SelectEventWindow
+            | InteractivePrefixFlag::HandleShiftSelection => {
+                unreachable!("runtime prefixes were deferred above");
+            }
+        }
+    }
     if parsed.entries.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -1770,7 +1812,7 @@ fn interactive_args_from_string_code_in_state(
             }
             InteractiveControlLetter::InvokingEvent => {
                 if let Some(event) =
-                    interactive_next_event_with_parameters_in_state(obarray, dynamic, context)
+                    interactive_next_event_with_parameters_in_state(vars, dynamic, context)
                 {
                     args.push(event);
                 } else {
@@ -1785,17 +1827,17 @@ fn interactive_args_from_string_code_in_state(
             InteractiveControlLetter::Ignore => args.push(Value::NIL),
             InteractiveControlLetter::Mark => args.push(interactive_mark_arg_in_buffers(buffers)?),
             InteractiveControlLetter::NumberOrPrefix => {
-                let raw = interactive_prefix_raw_arg_in_state(obarray, dynamic.as_slice(), kind);
+                let raw = interactive_prefix_raw_arg_in_state(vars, dynamic.as_slice(), kind);
                 if raw.is_nil() {
                     return Ok(None);
                 }
                 args.push(Value::fixnum(prefix_numeric_value(&raw)));
             }
             InteractiveControlLetter::NumericPrefix => args.push(
-                interactive_prefix_numeric_arg_in_state(obarray, dynamic.as_slice(), kind),
+                interactive_prefix_numeric_arg_in_state(vars, dynamic.as_slice(), kind),
             ),
             InteractiveControlLetter::RawPrefix => args.push(interactive_prefix_raw_arg_in_state(
-                obarray,
+                vars,
                 dynamic.as_slice(),
                 kind,
             )),
@@ -1804,7 +1846,7 @@ fn interactive_args_from_string_code_in_state(
             }
             InteractiveControlLetter::UpEvent => args.push(Value::NIL),
             InteractiveControlLetter::CodingSystemWithPrefix => {
-                let raw = interactive_prefix_raw_arg_in_state(obarray, dynamic.as_slice(), kind);
+                let raw = interactive_prefix_raw_arg_in_state(vars, dynamic.as_slice(), kind);
                 if raw.is_nil() {
                     args.push(Value::NIL);
                 } else {
@@ -1897,7 +1939,7 @@ fn interactive_args_from_string_code_in_vm_runtime(
                 ),
                 InteractiveControlLetter::InvokingEvent => {
                     if let Some(event) = interactive_next_event_with_parameters_in_state(
-                        &shared.obarray,
+                        shared.variables(),
                         &[],
                         context,
                     ) {
@@ -1967,7 +2009,7 @@ fn interactive_args_from_string_code_in_vm_runtime(
                     args.push(interactive_mark_arg_in_buffers(&shared.buffers)?)
                 }
                 InteractiveControlLetter::NumberOrPrefix => {
-                    let raw = interactive_prefix_raw_arg_in_state(&shared.obarray, &[], kind);
+                    let raw = interactive_prefix_raw_arg_in_state(shared.variables(), &[], kind);
                     if raw.is_nil() {
                         args.push(read_number_through_the_function_cell(
                             shared,
@@ -1978,10 +2020,10 @@ fn interactive_args_from_string_code_in_vm_runtime(
                     }
                 }
                 InteractiveControlLetter::NumericPrefix => args.push(
-                    interactive_prefix_numeric_arg_in_state(&shared.obarray, &[], kind),
+                    interactive_prefix_numeric_arg_in_state(shared.variables(), &[], kind),
                 ),
                 InteractiveControlLetter::RawPrefix => args.push(
-                    interactive_prefix_raw_arg_in_state(&shared.obarray, &[], kind),
+                    interactive_prefix_raw_arg_in_state(shared.variables(), &[], kind),
                 ),
                 InteractiveControlLetter::Region => args.extend(
                     interactive_region_args_in_buffers(&shared.buffers, "error")?,
@@ -2061,7 +2103,7 @@ fn interactive_args_from_string_code_in_vm_runtime(
                     )?)
                 }
                 InteractiveControlLetter::CodingSystemWithPrefix => {
-                    let raw = interactive_prefix_raw_arg_in_state(&shared.obarray, &[], kind);
+                    let raw = interactive_prefix_raw_arg_in_state(shared.variables(), &[], kind);
                     if raw.is_nil() {
                         args.push(Value::NIL);
                     } else {
@@ -2142,99 +2184,37 @@ fn interactive_use_region_p_in_vm_runtime(shared: &mut super::eval::Context) -> 
 }
 
 fn interactive_buffer_read_only_active_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buf: &crate::buffer::Buffer,
 ) -> bool {
     if buf.get_read_only() {
         return true;
     }
-    dynamic_buffer_or_global_symbol_value_in_state(obarray, dynamic, buf, "buffer-read-only")
+    dynamic_buffer_or_global_symbol_value_in_state(vars, dynamic, buf, "buffer-read-only")
         .is_some_and(|v| v.is_truthy())
 }
 
 fn interactive_require_writable_current_buffer_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &crate::buffer::BufferManager,
 ) -> Result<(), Flow> {
     let Some(buf) = buffers.current_buffer() else {
         return Ok(());
     };
-    if dynamic_buffer_or_global_symbol_value_in_state(obarray, dynamic, buf, "inhibit-read-only")
+    if dynamic_buffer_or_global_symbol_value_in_state(vars, dynamic, buf, "inhibit-read-only")
         .is_some_and(|v| v.is_truthy())
     {
         return Ok(());
     }
-    if interactive_buffer_read_only_active_in_state(obarray, dynamic, buf) {
+    if interactive_buffer_read_only_active_in_state(vars, dynamic, buf) {
         return Err(signal(
             LispCondition::BufferReadOnly,
             vec![buf.name_value()],
         ));
     }
     Ok(())
-}
-
-#[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
-fn interactive_apply_shift_selection_prefix(eval: &mut Context) {
-    let buffers = &mut eval.buffers;
-    let custom = &eval.custom;
-    let specpdl = eval.specpdl.as_slice();
-    // SAFETY: shift-selection updates only runtime values/buffer state;
-    // no Lisp watcher, canonical writer or retained manager reference exists.
-    unsafe {
-        eval.obarray.with_legacy_value_write(|obarray| {
-            interactive_apply_shift_selection_prefix_in_state(
-                obarray,
-                &mut [],
-                buffers,
-                custom,
-                specpdl,
-            );
-        });
-    }
-}
-
-fn interactive_apply_shift_selection_prefix_in_state(
-    obarray: &mut Obarray,
-    dynamic: &mut [OrderedRuntimeBindingMap],
-    buffers: &mut crate::buffer::BufferManager,
-    custom: &crate::emacs_core::custom::CustomManager,
-    specpdl: &[crate::emacs_core::eval::SpecBinding],
-) {
-    let shifted = dynamic_or_global_symbol_value_in_state(
-        obarray,
-        dynamic,
-        "this-command-keys-shift-translated",
-    )
-    .is_some_and(|v| v.is_truthy());
-    let shift_select_mode =
-        dynamic_or_global_symbol_value_in_state(obarray, dynamic, "shift-select-mode")
-            .is_some_and(|v| v.is_truthy());
-    if !shifted || !shift_select_mode {
-        return;
-    }
-
-    let mut mark_activated = false;
-    if let Some(current_id) = buffers.current_buffer_id() {
-        let point = buffers
-            .get(current_id)
-            .map(|buf| buf.point_emacs_byte_pos())
-            .unwrap_or(EmacsBytePos::ZERO);
-        let _ = buffers.set_buffer_mark_emacs_byte_pos(current_id, point);
-        let _ = buffers.set_buffer_local_property(current_id, "mark-active", Value::T);
-        mark_activated = true;
-    }
-    if mark_activated {
-        let _ = super::eval::set_runtime_binding(
-            obarray,
-            buffers,
-            custom,
-            specpdl,
-            intern("mark-active"),
-            Value::T,
-        );
-    }
 }
 
 fn interactive_first_event_with_parameters_from_keys(
@@ -2314,61 +2294,27 @@ fn interactive_select_window_from_prefix_context(
 
 fn interactive_apply_prefix_flags(
     eval: &mut Context,
-    prefix_flags: &[char],
+    prefix_flags: &[InteractivePrefixFlag],
     context: &InteractiveInvocationContext,
 ) -> Result<(), Flow> {
     for prefix_flag in prefix_flags {
         match prefix_flag {
-            '*' => interactive_require_writable_current_buffer_in_state(
-                &eval.obarray,
-                &[],
-                &eval.buffers,
-            )?,
-            '@' => interactive_select_window_from_prefix_context(eval, context)?,
-            '^' => {
-                let buffers = &mut eval.buffers;
-                let custom = &eval.custom;
-                let specpdl = eval.specpdl.as_slice();
-                // SAFETY: the shift-selection storage helper changes only
-                // values/buffer state and does not invoke Lisp or dispatch writers.
-                unsafe {
-                    eval.obarray.with_legacy_value_write(|obarray| {
-                        interactive_apply_shift_selection_prefix_in_state(
-                            obarray,
-                            &mut [],
-                            buffers,
-                            custom,
-                            specpdl,
-                        );
-                    });
-                }
+            InteractivePrefixFlag::RequireWritableBuffer => {
+                interactive_require_writable_current_buffer_in_state(
+                    eval.variables(),
+                    &[],
+                    &eval.buffers,
+                )?
             }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
-fn interactive_apply_prefix_flags_in_state(
-    obarray: &mut Obarray,
-    dynamic: &mut [OrderedRuntimeBindingMap],
-    buffers: &mut crate::buffer::BufferManager,
-    custom: &crate::emacs_core::custom::CustomManager,
-    specpdl: &[crate::emacs_core::eval::SpecBinding],
-    prefix_flags: &[char],
-) -> Result<(), Flow> {
-    for prefix_flag in prefix_flags {
-        match prefix_flag {
-            '*' => interactive_require_writable_current_buffer_in_state(obarray, dynamic, buffers)?,
-            '@' => {
-                // Selecting the window from the first mouse event requires command-loop
-                // event context; current batch paths have no such events yet.
+            InteractivePrefixFlag::SelectEventWindow => {
+                interactive_select_window_from_prefix_context(eval, context)?
             }
-            '^' => interactive_apply_shift_selection_prefix_in_state(
-                obarray, dynamic, buffers, custom, specpdl,
-            ),
-            _ => {}
+            InteractivePrefixFlag::HandleShiftSelection => {
+                // GNU callint.c calls the Lisp policy before acquiring arguments.
+                // It owns temporary activation, anchor preservation, mark hooks,
+                // and restoration of buffer-local transient-mark-mode.
+                eval.apply(Value::symbol("handle-shift-selection"), vec![])?;
+            }
         }
     }
     Ok(())
@@ -2495,12 +2441,12 @@ fn interactive_form_value_to_args(value: Value) -> Result<Vec<Value>, Flow> {
     ))
 }
 
-fn parse_interactive_prefix_flags(line: &[u8]) -> (Vec<char>, usize) {
+fn parse_interactive_prefix_flags(line: &[u8]) -> (Vec<InteractivePrefixFlag>, usize) {
     let mut flags = Vec::new();
     let mut offset = 0usize;
     while let Some(&byte) = line.get(offset) {
-        if matches!(byte, b'*' | b'@' | b'^') {
-            flags.push(byte as char);
+        if let Some(flag) = InteractivePrefixFlag::from_byte(byte) {
+            flags.push(flag);
             offset += 1;
         } else {
             break;
@@ -3191,7 +3137,7 @@ pub(crate) fn resolve_call_interactively_target_and_args_in_eval(
 
 #[allow(dead_code, clippy::too_many_arguments)] // explicit split-state compatibility seam
 pub(crate) fn resolve_call_interactively_target_and_args_in_state(
-    obarray: &mut Obarray,
+    vars: VariableView<'_>,
     dynamic: &mut Vec<OrderedRuntimeBindingMap>,
     buffers: &mut crate::buffer::BufferManager,
     custom: &crate::emacs_core::custom::CustomManager,
@@ -3202,7 +3148,7 @@ pub(crate) fn resolve_call_interactively_target_and_args_in_state(
     match &plan.interactive_spec {
         ParsedInteractiveSpec::NoArgs => Ok(Some((func, Vec::new()))),
         ParsedInteractiveSpec::StringCode(code) => interactive_args_from_string_code_in_state(
-            obarray,
+            vars,
             dynamic,
             buffers,
             custom,
@@ -3965,7 +3911,7 @@ pub(crate) fn builtin_where_is_internal(eval: &mut Context, args: Vec<Value>) ->
     // C-side mask exactly once, before keymap discovery or menu-item filters
     // can run Lisp.  Carry the typed snapshot through candidate selection so
     // its identity and timing cannot drift into the inner sequence loop.
-    let preferred_modifier = WhereIsPreferredModifier::snapshot(eval.obarray(), symbol_mode);
+    let preferred_modifier = WhereIsPreferredModifier::snapshot(eval.variables(), symbol_mode);
     let mut definition = args[0];
     let first_only = args.get(2).is_some_and(|v| !v.is_nil());
     let first_only_non_ascii = args
@@ -4422,11 +4368,11 @@ enum WhereIsPreferredModifier {
 }
 
 impl WhereIsPreferredModifier {
-    fn snapshot(obarray: &Obarray, symbol_mode: SymbolMode) -> Self {
+    fn snapshot(vars: VariableView<'_>, symbol_mode: SymbolMode) -> Self {
         static VARIABLE: std::sync::OnceLock<SymId> = std::sync::OnceLock::new();
         let variable = *VARIABLE.get_or_init(|| intern("where-is-preferred-modifier"));
-        match obarray
-            .symbol_value_id_copied(variable)
+        match vars
+            .value(variable)
             .and_then(|value| value.as_symbol_name(symbol_mode))
         {
             Some("C" | "ctrl" | "control") => Self::Control,

@@ -7,10 +7,11 @@
 use super::*;
 use crate::buffer::buffer::{BufferStorage, OwnedBufferStorageParts};
 use crate::emacs_core::defvar_bool::ByteBooleanVars;
+use crate::emacs_core::symbol::CanonicalAccess;
 use crate::emacs_core::symbol::{
-    CanonicalDispatchCells, DebuggerDescriptor, FunctionEpoch, FunctionEpochBump,
+    CanonicalDispatchCells, ConcealOutcome, DebuggerDescriptor, FunctionEpoch, FunctionEpochBump,
     LispVariableLocality, MakeAliasError, NotPlain, OBARRAY_DISPATCH_CELLS_OFFSET,
-    SetInternalAlist, SetInternalBind,
+    RevealedProjection, SetInternalAlist, SetInternalBind,
 };
 use crate::heap_types::LispString;
 use std::cell::{Cell, UnsafeCell};
@@ -41,6 +42,9 @@ struct World {
     coding_systems: Box<UnsafeCell<CodingSystemManager>>,
     macro_perf_stats: Box<UnsafeCell<MacroPerfStats>>,
     buffers: Box<UnsafeCell<BufferStorage>>,
+    /// Every owner's slab of dynamic bindings (Phase 0 step 2), for
+    /// allocation and the collector's root phase.
+    owner_slabs: std::cell::RefCell<super::owner_bindings::OwnerSlabRegistry>,
     /// Owner-local variable slot assignments (Phase 0 step 2). Test-only
     /// until stopped admission exists; no view or Context field reaches it.
     #[cfg(test)]
@@ -214,10 +218,26 @@ impl AdmissionHeader {
 
     /// The ONE retirement hook. It never resolves, allocates, asserts, calls
     /// Lisp, increments a clock, takes a lock, or waits for marker completion.
+    ///
+    /// An owner's own debugger cell stays: it names the owner's binding of
+    /// `debug-on-next-call`, which no canonical write changes, and only the
+    /// owner's unbind gives the canonical descriptor back
+    /// ([`ObarrayView::point_debugger`]).
     #[inline(always)]
     fn retire_current_admission(&self, canonical: &CanonicalDispatchCells) {
         self.epoch.set(canonical.admission_epoch());
-        self.debugger.set(canonical.admission_debugger());
+        if !self.debugger.get().is_owner() {
+            self.debugger.set(canonical.admission_debugger());
+        }
+    }
+
+    /// The retirement of a function-cell write: only the function clock
+    /// moves. Such a write never changes the canonical debugger descriptor
+    /// (resolution and installation do, in full-dispatch phases), so the
+    /// header's debugger -- canonical, or this owner's own cell -- stays.
+    #[inline(always)]
+    fn retire_function_epoch(&self, canonical: &CanonicalDispatchCells) {
+        self.epoch.set(canonical.admission_epoch());
     }
 
     #[inline(always)]
@@ -303,7 +323,18 @@ impl PreparedDebuggerPublication<'_> {
 struct AdmissionRetirement<'phase> {
     source: NonNull<CanonicalDispatchCells>,
     destination: NonNull<AdmissionHeader>,
+    scope: RetirementScope,
     owner: PhantomData<&'phase mut ObarrayView>,
+}
+
+/// What a canonical-changing phase can have changed, so what its
+/// retirement republishes. Fixed per call site, so it folds away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetirementScope {
+    /// Anything: the function clock and the debugger descriptor.
+    Dispatch,
+    /// A function cell: the function clock alone.
+    FunctionCell,
 }
 static_assertions::assert_not_impl_any!(AdmissionRetirement<'static>: Send, Sync, Clone, Copy);
 impl fmt::Debug for AdmissionRetirement<'_> {
@@ -311,15 +342,17 @@ impl fmt::Debug for AdmissionRetirement<'_> {
         f.debug_struct("AdmissionRetirement")
             .field("source", &self.source)
             .field("destination", &self.destination)
+            .field("scope", &self.scope)
             .finish()
     }
 }
 impl<'phase> AdmissionRetirement<'phase> {
     #[inline(always)]
-    fn new(view: &'phase mut ObarrayView) -> Self {
+    fn new(view: &'phase mut ObarrayView, scope: RetirementScope) -> Self {
         Self {
             source: view.dispatch,
             destination: NonNull::from(&mut view.admission),
+            scope,
             owner: PhantomData,
         }
     }
@@ -333,9 +366,15 @@ impl Drop for AdmissionRetirement<'_> {
         // source derives from the finalized UnsafeCell root, not a temporary
         // manager reference. No callback observes this phase-local guard.
         unsafe {
-            self.destination
-                .as_ref()
-                .retire_current_admission(self.source.as_ref());
+            let destination = self.destination.as_ref();
+            match self.scope {
+                RetirementScope::Dispatch => {
+                    destination.retire_current_admission(self.source.as_ref());
+                }
+                RetirementScope::FunctionCell => {
+                    destination.retire_function_epoch(self.source.as_ref());
+                }
+            }
         }
     }
 }
@@ -414,6 +453,21 @@ impl ObarrayView {
             .retire_current_admission(unsafe { self.dispatch.as_ref() });
     }
 
+    /// Name OWNER_CELL as this owner's `debug-on-next-call` while the owner
+    /// binds it, or the canonical descriptor again (`None`).
+    #[cold]
+    pub(crate) fn point_debugger(
+        &mut self,
+        owner_cell: Option<&'static crate::emacs_core::forward::LispBoolFwd>,
+    ) {
+        let descriptor = match owner_cell {
+            Some(cell) => DebuggerDescriptor::owner(cell),
+            // SAFETY: as in `refresh_admission`.
+            None => unsafe { self.dispatch.as_ref() }.admission_debugger(),
+        };
+        self.admission.debugger.set(descriptor);
+    }
+
     /// Test the actual descriptor identity, not just two equal Boolean values.
     #[cfg(test)]
     pub(crate) fn admission_matches_canonical(&self) -> bool {
@@ -430,8 +484,27 @@ impl ObarrayView {
         &mut self,
         write: impl for<'manager> FnOnce(&'manager mut Obarray) -> R,
     ) -> R {
+        self.with_retiring_write(RetirementScope::Dispatch, write)
+    }
+
+    /// [`Self::with_dispatch_write`] for a function-cell write, which moves
+    /// only the function clock ([`AdmissionHeader::retire_function_epoch`]).
+    #[inline(always)]
+    fn with_function_write<R>(
+        &mut self,
+        write: impl for<'manager> FnOnce(&'manager mut Obarray) -> R,
+    ) -> R {
+        self.with_retiring_write(RetirementScope::FunctionCell, write)
+    }
+
+    #[inline(always)]
+    fn with_retiring_write<R>(
+        &mut self,
+        scope: RetirementScope,
+        write: impl for<'manager> FnOnce(&'manager mut Obarray) -> R,
+    ) -> R {
         let mut manager = self.ptr;
-        let retirement = AdmissionRetirement::new(self);
+        let retirement = AdmissionRetirement::new(self, scope);
         // SAFETY: this sole view is exclusively borrowed; the closure's manager
         // loan cannot escape, call Lisp or overlap an admission reader. Every
         // private caller uses canonical producers, preserving manager storage.
@@ -590,6 +663,9 @@ macro_rules! obarray_write_operation {
     (dispatch, $view:expr, $name:ident, $($arg:ident),*) => {
         $view.with_dispatch_write(|manager| manager.$name($($arg),*))
     };
+    (function, $view:expr, $name:ident, $($arg:ident),*) => {
+        $view.with_function_write(|manager| manager.$name($($arg),*))
+    };
 }
 // Effect and access are independent compile-time domains. Internal-only
 // operations stay on the confined View; only needed methods reach the public
@@ -637,12 +713,23 @@ obarray_method_proxies! {
     pub fn intern_lisp_value(name_value: crate::tagged::value::TaggedValue) -> SymId;
     pub fn ensure_interned_global_id(id: SymId);
     pub(crate) fn materialize_read_symbols(value: Value);
+    #[cfg(test)]
     pub fn set_symbol_value(name: &str, value: Value);
+    pub fn seed_value(name: &str, value: Value);
+    pub fn set_canonical_value_by_name(access: CanonicalAccess,
+            name: &str,
+            value: Value,
+        );
     pub fn define_lisp_variable(name: &str,
             value: Value,
             locality: LispVariableLocality,
         );
+    #[cfg(test)]
     pub fn set_symbol_value_id(id: SymId, value: Value);
+    pub fn set_canonical_value(access: CanonicalAccess,
+            id: SymId,
+            value: Value,
+        );
     pub fn set_blv_local_if_set(id: SymId, local_if_set: bool);
     pub fn reset_blv_cache_to_default(id: SymId);
     pub fn reset_blv_cache_for_buffer(id: SymId, buffer: Value);
@@ -654,10 +741,21 @@ obarray_method_proxies! {
             current_buffer_local_flags: u64,
             buffer_defaults: Option<&[Value]>,
         ) -> Option<Value>;
+    #[cfg(test)]
     pub fn set_internal(id: SymId, value: Value);
     pub fn for_each_value_cell_mut(f: impl FnMut(&mut Value));
+    #[cfg(test)]
     pub fn makunbound(name: &str);
+    #[cfg(test)]
     pub fn makunbound_id(id: SymId);
+    pub fn makunbound_canonical_by_name(access: CanonicalAccess,
+            name: &str,
+        );
+    pub fn makunbound_canonical(access: CanonicalAccess, id: SymId);
+    pub(crate) fn set_canonical_value_routed(id: SymId,
+            value: Value,
+        ) -> crate::emacs_core::symbol::CanonicalWrite;
+    pub(crate) fn makunbound_canonical_routed(id: SymId) -> crate::emacs_core::symbol::CanonicalWrite;
     pub fn put_property(name: &str, prop: &str, value: Value) -> Result<(), Flow>;
     pub fn put_property_id(symbol: SymId,
             prop: SymId,
@@ -688,6 +786,8 @@ obarray_method_proxies! {
         ) -> Option<Value>;
     pub(crate) fn set_plain_untrapped_value_id(id: SymId, value: Value) -> bool;
     pub(crate) fn mark_runtime_projected_id(id: SymId);
+    pub(crate) fn reveal_projection(id: SymId) -> Option<RevealedProjection>;
+    pub(crate) fn conceal_projection(revealed: RevealedProjection) -> ConcealOutcome;
     pub(crate) fn store_plain_value_id(id: SymId, value: Value) -> Result<(), NotPlain>;
     pub(crate) fn set_internal_localized(sym_id: SymId,
             value: Value,
@@ -730,16 +830,6 @@ obarray_method_proxies! {
             fwd: &'static crate::emacs_core::forward::LispKboardObjFwd,
         );
     pub fn define_int_variable(name: &str, initial: i64);
-    pub fn set_symbol_function(name: &str, function: Value);
-    pub fn set_symbol_function_id(id: SymId, function: Value);
-    pub(crate) fn set_symbol_function_id_for(id: SymId,
-            function: Value,
-            why: FunctionEpochBump,
-        );
-    pub fn fmakunbound(name: &str);
-    pub fn fmakunbound_id(id: SymId);
-    pub fn clear_function_silent(name: &str);
-    pub fn clear_function_silent_id(id: SymId);
     pub fn unintern_name(name: &str) -> bool;
     pub fn unintern_lisp_string(name: &LispString) -> bool;
     pub fn unintern_id(id: SymId) -> bool;
@@ -750,6 +840,22 @@ obarray_method_proxies! {
 obarray_method_proxies! {
     dispatch; view_only;
     pub(crate) fn invalidate_all_function_bindings(why: FunctionEpochBump);
+}
+
+// Function-cell writes: they move the function clock and never the
+// canonical debugger descriptor.
+obarray_method_proxies! {
+    function; public_access;
+    pub fn set_symbol_function(name: &str, function: Value);
+    pub fn set_symbol_function_id(id: SymId, function: Value);
+    pub(crate) fn set_symbol_function_id_for(id: SymId,
+            function: Value,
+            why: FunctionEpochBump,
+        );
+    pub fn fmakunbound(name: &str);
+    pub fn fmakunbound_id(id: SymId);
+    pub fn clear_function_silent(name: &str);
+    pub fn clear_function_silent_id(id: SymId);
 }
 
 /// Pure Context-bound owner-header read; no manager reference spans Lisp.
@@ -953,6 +1059,7 @@ impl WorldStorageBuilder {
             coding_systems: Box::new(UnsafeCell::new(self.coding_systems)),
             macro_perf_stats: Box::new(UnsafeCell::new(self.macro_perf_stats)),
             buffers,
+            owner_slabs: Default::default(),
             #[cfg(test)]
             thread_projections: Default::default(),
         }));
@@ -1038,27 +1145,55 @@ impl WorldStorageBuilder {
     }
 }
 
+/// Owner slabs (Phase 0 step 2): the World allocates and traces them.
+impl Context {
+    /// Allocate this Context's owner slab in its World's registry.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn register_owner_slab(
+        &mut self,
+    ) -> std::ptr::NonNull<super::owner_bindings::OwnerSlab> {
+        let heap = self.tagged_heap.identity();
+        self.obarray.lease.0.owner_slabs.borrow_mut().register(heap)
+    }
+
+    /// Visit every owner slab's values: each owner's bindings are roots,
+    /// whether or not that owner is running.
+    pub(super) fn trace_owner_slabs(&self, visit: &mut dyn FnMut(Value)) {
+        let heap = self.tagged_heap.identity();
+        self.obarray
+            .lease
+            .0
+            .owner_slabs
+            .borrow()
+            .trace_roots(heap, visit);
+    }
+}
+
 /// Thread-projection hooks for tests (Phase 0 step 2): no production path
 /// projects a variable yet.
 #[cfg(test)]
 impl Context {
     /// Project `id`'s variable through this World's table
     /// (`Obarray::project_thread_variable_for_test`, a redirect change and
-    /// so a canonical-changing phase), rooting a canonical plain word with an
-    /// owned-roots lease the table keeps.
+    /// so a canonical-changing phase).
     pub(crate) fn project_thread_variable_for_test(
         &mut self,
         id: SymId,
     ) -> Option<&'static crate::emacs_core::forward::ThreadProjectionDescriptor> {
+        // `buffer-undo-list` keeps its storage in the buffer's shared undo
+        // state, not a cell; its bindings swap with their owner instead
+        // (`owner_mirrors`).
+        if id == super::buffer_undo_list_symbol() {
+            return None;
+        }
+        // A Context that can see a projected cell holds an owner slab: the
+        // owner-aware variable API's dormant answer relies on it.
+        self.ensure_owner_slab();
         let world = Arc::clone(&self.obarray.lease.0);
         let mut table = world.thread_projections.borrow_mut();
-        let projection = self.obarray.with_dispatch_write(|obarray| {
-            obarray.project_thread_variable_for_test(id, &mut table)
-        })?;
-        if let Some(value) = projection.canonical().owned_value() {
-            table.retain_roots(self.retain_gc_roots([value]));
-        }
-        Some(projection)
+        self.obarray
+            .with_dispatch_write(|obarray| obarray.project_thread_variable_for_test(id, &mut table))
     }
 
     /// The projection CELL's header heads, resolved by the World's table.

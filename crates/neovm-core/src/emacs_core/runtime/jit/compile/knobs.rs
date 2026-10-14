@@ -1769,6 +1769,8 @@ pub(crate) struct OptPasses {
     pub bool_rep: bool,
     pub reps: bool,
     pub gvn: bool,
+    /// Car/cdr read reuse (`opt::passes::reads`); GVN subsumes it.
+    pub reads: bool,
     pub range: bool,
     pub licm: bool,
     pub sink: bool,
@@ -1780,6 +1782,7 @@ impl OptPasses {
         bool_rep: true,
         reps: true,
         gvn: true,
+        reads: true,
         range: true,
         licm: true,
         sink: true,
@@ -1798,6 +1801,7 @@ impl OptPasses {
                 "bool" => passes.bool_rep = on,
                 "reps" => passes.reps = on,
                 "gvn" => passes.gvn = on,
+                "reads" => passes.reads = on,
                 "range" => passes.range = on,
                 "licm" => passes.licm = on,
                 "sink" => passes.sink = on,
@@ -1936,6 +1940,10 @@ pub(crate) enum OptProfitMode {
     Loops,
     Lists,
     PrimitiveLists,
+    /// `PrimitiveLists` without the list-operation requirement: a loop of
+    /// primitive opcodes (no explicit bytecode call) qualifies whatever it
+    /// computes, numeric loops included.
+    PrimitiveLoops,
     Kernels,
 }
 impl OptProfitMode {
@@ -1944,6 +1952,7 @@ impl OptProfitMode {
             Some("loops") => Self::Loops,
             Some("lists") => Self::Lists,
             Some("primitive-lists") => Self::PrimitiveLists,
+            Some("primitive-loops") => Self::PrimitiveLoops,
             Some("kernels") => Self::Kernels,
             _ => Self::Off,
         }
@@ -2151,4 +2160,33 @@ pub(crate) fn jit_exit_path() -> Option<&'static std::path::Path> {
             .map(std::path::PathBuf::from)
     })
     .as_deref()
+}
+
+/// `NEOVM_JIT_OPT_OSR_ENTRY` (default on; `off` disables): guard an opt OSR
+/// leaf's fixnum loop state once at its entry (`opt::passes::osr_entry`).
+/// Read once per process; tests override it per thread.
+pub(crate) fn jit_opt_osr_entry() -> bool {
+    #[cfg(test)]
+    if let Some(on) = OPT_OSR_ENTRY_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("NEOVM_JIT_OPT_OSR_ENTRY").as_deref(),
+            Ok("off")
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Scalar compiler configuration only; never Lisp or mutator state.
+    static OPT_OSR_ENTRY_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_opt_osr_entry_for_test(on: Option<bool>) {
+    OPT_OSR_ENTRY_TEST_OVERRIDE.with(|value| value.set(on));
 }

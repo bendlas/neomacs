@@ -4189,10 +4189,229 @@ impl WordBoundaryLookup {
     }
 }
 
+/// One zero-width opcode's bounded physical characters. Threading: immutable
+/// decoded characters and numeric byte positions; no Lisp identity or borrow.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoundarySyntaxCharacter {
+    character: emacs_char::EmacsChar,
+    byte_position: crate::buffer::EmacsBytePos,
+}
+
+impl BoundarySyntaxCharacter {
+    pub(crate) const fn character(self) -> emacs_char::EmacsChar {
+        self.character
+    }
+    #[inline]
+    fn physical_syntax<T: SyntaxLookup + ?Sized>(
+        self,
+        lookup: &T,
+    ) -> (emacs_char::EmacsChar, SyntaxClass) {
+        (
+            self.character,
+            lookup.emacs_char_syntax_at(self.character, self.byte_position.get()),
+        )
+    }
+}
+
+/// A bounded query plan preserves opcode order and short-circuiting. A
+/// supplied-count implementation converts current_byte once, even for an
+/// end assertion whose current physical character is absent. Threading:
+/// immutable physical input metadata, valid for one opcode evaluation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoundarySyntaxRequest {
+    kind: SyntaxAssertion,
+    current_byte: crate::buffer::EmacsBytePos,
+    previous: Option<BoundarySyntaxCharacter>,
+    current: Option<BoundarySyntaxCharacter>,
+}
+
+impl BoundarySyntaxRequest {
+    pub(crate) const fn kind(self) -> SyntaxAssertion {
+        self.kind
+    }
+    pub(crate) const fn current_byte(self) -> crate::buffer::EmacsBytePos {
+        self.current_byte
+    }
+    pub(crate) const fn previous(self) -> Option<BoundarySyntaxCharacter> {
+        self.previous
+    }
+    pub(crate) const fn current(self) -> Option<BoundarySyntaxCharacter> {
+        self.current
+    }
+    pub(crate) fn with_classes(
+        self,
+        previous: Option<SyntaxClass>,
+        current: Option<SyntaxClass>,
+    ) -> BoundarySyntaxClasses {
+        BoundarySyntaxClasses {
+            previous: self
+                .previous
+                .zip(previous)
+                .map(|(ch, class)| (ch.character, class)),
+            current: self
+                .current
+                .zip(current)
+                .map(|(ch, class)| (ch.character, class)),
+        }
+    }
+
+    /// GNU opcode lookup order and short-circuiting, with no source conversion
+    /// or capability query added to ordinary boundaries.
+    #[inline]
+    pub(crate) fn physical_lookup<T: SyntaxLookup + ?Sized>(
+        self,
+        lookup: &T,
+    ) -> BoundarySyntaxClasses {
+        let classify = |character: Option<BoundarySyntaxCharacter>| {
+            character.map(|ch| ch.physical_syntax(lookup))
+        };
+        match self.kind {
+            SyntaxAssertion::WordBoundary | SyntaxAssertion::NotWordBoundary => {
+                let previous = classify(self.previous);
+                let current = classify(self.current);
+                BoundarySyntaxClasses { previous, current }
+            }
+            SyntaxAssertion::SymbolBeginning => {
+                // GNU regex-emacs.c:5111-5130: classify current first, and
+                // inspect previous only after current is a constituent.
+                let current = classify(self.current);
+                let previous = if current.is_some_and(|(_, class)| {
+                    matches!(class, SyntaxClass::Word | SyntaxClass::Symbol)
+                }) {
+                    classify(self.previous)
+                } else {
+                    None
+                };
+                BoundarySyntaxClasses { previous, current }
+            }
+            SyntaxAssertion::SymbolEnd => {
+                // GNU regex-emacs.c:5147-5170: classify previous first, and
+                // inspect current only after previous is a constituent.
+                let previous = classify(self.previous);
+                let current = if previous.is_some_and(|(_, class)| {
+                    matches!(class, SyntaxClass::Word | SyntaxClass::Symbol)
+                }) {
+                    classify(self.current)
+                } else {
+                    None
+                };
+                BoundarySyntaxClasses { previous, current }
+            }
+            SyntaxAssertion::WordBeginning => {
+                let current = classify(self.current);
+                let previous = if current.is_some_and(|(_, class)| class == SyntaxClass::Word) {
+                    classify(self.previous)
+                } else {
+                    None
+                };
+                BoundarySyntaxClasses { previous, current }
+            }
+            SyntaxAssertion::WordEnd => {
+                let previous = classify(self.previous);
+                let current = if previous.is_some_and(|(_, class)| class == SyntaxClass::Word) {
+                    classify(self.current)
+                } else {
+                    None
+                };
+                BoundarySyntaxClasses { previous, current }
+            }
+        }
+    }
+}
+
+/// Classes retain their request's decoded characters; independent character
+/// identities cannot be attached to a returned class. Threading: plain data.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoundarySyntaxClasses {
+    previous: Option<(emacs_char::EmacsChar, SyntaxClass)>,
+    current: Option<(emacs_char::EmacsChar, SyntaxClass)>,
+}
+
+impl BoundarySyntaxClasses {
+    pub(crate) const fn previous(self) -> Option<(emacs_char::EmacsChar, SyntaxClass)> {
+        self.previous
+    }
+    pub(crate) const fn current(self) -> Option<(emacs_char::EmacsChar, SyntaxClass)> {
+        self.current
+    }
+}
+static_assertions::assert_impl_all!(BoundarySyntaxCharacter: Send, Sync, Copy);
+static_assertions::assert_impl_all!(BoundarySyntaxRequest: Send, Sync, Copy);
+static_assertions::assert_impl_all!(BoundarySyntaxClasses: Send, Sync, Copy);
+
+/// Boundary coordinates selected once for one match/search invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundarySyntaxMode {
+    Physical,
+    Supplied,
+}
+
+/// Bind the lookup to its coordinate plan for one synchronous invocation.
+/// This borrowed pair never enters a persistent compiled-pattern cache.
+/// Threading: a mutator-local borrow of the original, thread-confined lookup.
+#[derive(Clone, Copy)]
+pub(crate) struct MatchSyntax<'a> {
+    lookup: &'a dyn SyntaxLookup,
+    boundary_mode: BoundarySyntaxMode,
+}
+
+impl std::fmt::Debug for MatchSyntax<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MatchSyntax")
+            .field("boundary_mode", &self.boundary_mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> MatchSyntax<'a> {
+    /// Sealed compilation's `uses_syntax` covers every boundary opcode.
+    /// Syntax-free compiled patterns need no capability query. Hand-built
+    /// unsealed buffers retain the callback even if their metadata is absent.
+    #[inline]
+    fn for_pattern(pattern: &CompiledPattern, lookup: &'a dyn SyntaxLookup) -> Self {
+        if pattern.uses_syntax || !pattern.buffer_sealed {
+            Self::new(lookup)
+        } else {
+            Self::physical(lookup)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn new(lookup: &'a dyn SyntaxLookup) -> Self {
+        Self {
+            lookup,
+            boundary_mode: lookup.boundary_syntax_mode(),
+        }
+    }
+
+    #[inline]
+    fn physical(lookup: &'a dyn SyntaxLookup) -> Self {
+        Self {
+            lookup,
+            boundary_mode: BoundarySyntaxMode::Physical,
+        }
+    }
+}
+
 pub(crate) trait SyntaxLookup {
     fn symbol_mode(&self) -> SymbolMode {
         SymbolMode::Bare
     }
+
+    /// Invocation-local selection, never queried by an assertion opcode.
+    fn boundary_syntax_mode(&self) -> BoundarySyntaxMode {
+        BoundarySyntaxMode::Physical
+    }
+
+    /// One opcode's previous/current syntax reads, allowing supplied string
+    /// counts to preserve GNU's single current-offset conversion. Default
+    /// lookup keeps its existing physical position/order and never queries an
+    /// optional capability on the ordinary path.
+    fn boundary_syntax_at(&self, request: BoundarySyntaxRequest) -> BoundarySyntaxClasses {
+        request.physical_lookup(self)
+    }
+
     /// Return the syntax class of character `c` in the current syntax table.
     fn char_syntax(&self, c: char) -> SyntaxClass;
 
@@ -5144,35 +5363,125 @@ fn match_categoryspec_at(
     if has != negate { Some(len) } else { None }
 }
 
-/// Character and syntax class at `pos`.  Keeping the character lets GNU word
-/// boundaries distinguish adjacent word constituents from different scripts.
-#[inline]
-fn re_char_and_syntax(
+/// Decode physical neighbours only when GNU's opcode reads them.
+/// Symbol-current is raw for unibyte input; previous/word keys are promoted.
+#[inline(always)]
+fn re_physical_boundary_syntax(
+    kind: SyntaxAssertion,
     text: &[u8],
-    pos: usize,
+    d: usize,
     target_multibyte: bool,
     syntax: &dyn SyntaxLookup,
-) -> Option<(emacs_char::EmacsChar, SyntaxClass)> {
-    re_text_char(text, pos, target_multibyte).map(|(c, _)| {
-        let c = emacs_char::EmacsChar::from_code_unchecked(c);
-        (c, syntax.emacs_char_syntax_at(c, pos))
-    })
+) -> BoundarySyntaxClasses {
+    #[derive(Debug)]
+    enum CharacterDomain {
+        Promoted,
+        SymbolCurrent,
+    }
+    let classify = |pos, domain| {
+        let code = match (domain, target_multibyte) {
+            (CharacterDomain::SymbolCurrent, false) => text.get(pos).map(|byte| u32::from(*byte)),
+            (CharacterDomain::Promoted, _) | (CharacterDomain::SymbolCurrent, true) => {
+                re_text_char(text, pos, target_multibyte).map(|(code, _)| code)
+            }
+        }?;
+        let character = emacs_char::EmacsChar::from_code_unchecked(code);
+        Some((character, syntax.emacs_char_syntax_at(character, pos)))
+    };
+    let previous = || {
+        re_prev_char_start(text, d, target_multibyte)
+            .and_then(|pos| classify(pos, CharacterDomain::Promoted))
+    };
+    let current = |domain| classify(d, domain);
+    match kind {
+        SyntaxAssertion::WordBoundary | SyntaxAssertion::NotWordBoundary => {
+            let previous = previous();
+            let current = current(CharacterDomain::Promoted);
+            BoundarySyntaxClasses { previous, current }
+        }
+        SyntaxAssertion::WordBeginning | SyntaxAssertion::SymbolBeginning => {
+            let symbol = kind == SyntaxAssertion::SymbolBeginning;
+            let current = current(if symbol {
+                CharacterDomain::SymbolCurrent
+            } else {
+                CharacterDomain::Promoted
+            });
+            let previous = if current.is_some_and(|(_, class)| {
+                class == SyntaxClass::Word || (symbol && class == SyntaxClass::Symbol)
+            }) {
+                previous()
+            } else {
+                None
+            };
+            BoundarySyntaxClasses { previous, current }
+        }
+        SyntaxAssertion::WordEnd | SyntaxAssertion::SymbolEnd => {
+            let symbol = kind == SyntaxAssertion::SymbolEnd;
+            let previous = previous();
+            let current = if previous.is_some_and(|(_, class)| {
+                class == SyntaxClass::Word || (symbol && class == SyntaxClass::Symbol)
+            }) {
+                current(if symbol {
+                    CharacterDomain::SymbolCurrent
+                } else {
+                    CharacterDomain::Promoted
+                })
+            } else {
+                None
+            };
+            BoundarySyntaxClasses { previous, current }
+        }
+    }
 }
 
-/// Is the char at `pos` a word OR symbol constituent?  (`false` past the ends.)
-#[inline]
-fn re_char_is_symbol(
+/// Supplied coordinates retain the initialized request and one current-offset
+/// conversion. Physical inputs call their opcode helper directly.
+#[inline(always)]
+fn re_boundary_syntax(
+    kind: SyntaxAssertion,
     text: &[u8],
-    pos: usize,
+    d: usize,
     target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
-) -> bool {
-    re_text_char(text, pos, target_multibyte)
-        .map(|(c, _)| {
-            let s = syntax.emacs_char_syntax_at(emacs_char::EmacsChar::from_code_unchecked(c), pos);
-            s == SyntaxClass::Word || s == SyntaxClass::Symbol
+    syntax: &MatchSyntax<'_>,
+) -> BoundarySyntaxClasses {
+    match syntax.boundary_mode {
+        BoundarySyntaxMode::Physical => {
+            return re_physical_boundary_syntax(kind, text, d, target_multibyte, syntax.lookup);
+        }
+        BoundarySyntaxMode::Supplied => {}
+    }
+
+    let character = |pos| {
+        re_text_char(text, pos, target_multibyte).map(|(ch, _)| BoundarySyntaxCharacter {
+            character: emacs_char::EmacsChar::from_code_unchecked(ch),
+            byte_position: crate::buffer::EmacsBytePos::new(pos),
         })
-        .unwrap_or(false)
+    };
+    // GNU symbeg/symend use RE_STRING_CHAR for the current character
+    // (regex-emacs.c:55-56,5111,5163): unibyte input indexes its raw byte.
+    // Their previous character and every word opcode use GET_CHAR_* instead,
+    // which promotes high unibyte bytes to byte8 (regex-emacs.c:67-95).
+    let current = match kind {
+        SyntaxAssertion::SymbolBeginning | SyntaxAssertion::SymbolEnd if !target_multibyte => {
+            text.get(d).map(|byte| BoundarySyntaxCharacter {
+                character: emacs_char::EmacsChar::from_code_unchecked(u32::from(*byte)),
+                byte_position: crate::buffer::EmacsBytePos::new(d),
+            })
+        }
+        SyntaxAssertion::WordBoundary
+        | SyntaxAssertion::NotWordBoundary
+        | SyntaxAssertion::WordBeginning
+        | SyntaxAssertion::WordEnd
+        | SyntaxAssertion::SymbolBeginning
+        | SyntaxAssertion::SymbolEnd => character(d),
+    };
+    let request = BoundarySyntaxRequest {
+        kind,
+        current_byte: crate::buffer::EmacsBytePos::new(d),
+        previous: re_prev_char_start(text, d, target_multibyte).and_then(character),
+        current,
+    };
+    syntax.lookup.boundary_syntax_at(request)
 }
 
 /// `\b` word boundary (mirrors GNU `regex-emacs.c` `case wordbound`).
@@ -5181,7 +5490,7 @@ fn assert_word_boundary(
     text: &[u8],
     d: usize,
     target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
 ) -> bool {
     // GNU Case 1 (regex-emacs.c:4972-4974): a position at the beginning or end
     // of the searched region is *unconditionally* a word boundary — `\b`
@@ -5195,12 +5504,18 @@ fn assert_word_boundary(
     if d == 0 || d == text.len() {
         return true;
     }
-    let previous = re_prev_char_start(text, d, target_multibyte)
-        .and_then(|p| re_char_and_syntax(text, p, target_multibyte, syntax));
-    let current = re_char_and_syntax(text, d, target_multibyte, syntax);
+    let classes = re_boundary_syntax(
+        SyntaxAssertion::WordBoundary,
+        text,
+        d,
+        target_multibyte,
+        syntax,
+    );
+    let previous = classes.previous();
+    let current = classes.current();
     match (previous, current) {
         (Some((c1, SyntaxClass::Word)), Some((c2, SyntaxClass::Word))) => {
-            syntax.emacs_word_boundary_between(c1, c2)
+            syntax.lookup.emacs_word_boundary_between(c1, c2)
         }
         (Some((_, previous)), Some((_, current))) => {
             (previous == SyntaxClass::Word) != (current == SyntaxClass::Word)
@@ -5215,20 +5530,24 @@ fn assert_word_beg(
     text: &[u8],
     d: usize,
     target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
 ) -> bool {
-    let Some((c2, SyntaxClass::Word)) = re_char_and_syntax(text, d, target_multibyte, syntax)
-    else {
+    let classes = re_boundary_syntax(
+        SyntaxAssertion::WordBeginning,
+        text,
+        d,
+        target_multibyte,
+        syntax,
+    );
+    let Some((c2, SyntaxClass::Word)) = classes.current() else {
         return false;
     };
-    let Some(previous) = re_prev_char_start(text, d, target_multibyte)
-        .and_then(|p| re_char_and_syntax(text, p, target_multibyte, syntax))
-    else {
+    let Some(previous) = classes.previous() else {
         return true;
     };
     match previous {
         (_, class) if class != SyntaxClass::Word => true,
-        (c1, SyntaxClass::Word) => syntax.emacs_word_boundary_between(c1, c2),
+        (c1, SyntaxClass::Word) => syntax.lookup.emacs_word_boundary_between(c1, c2),
         _ => false,
     }
 }
@@ -5239,53 +5558,58 @@ fn assert_word_end(
     text: &[u8],
     d: usize,
     target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
 ) -> bool {
-    let Some(previous) = re_prev_char_start(text, d, target_multibyte)
-        .and_then(|p| re_char_and_syntax(text, p, target_multibyte, syntax))
-    else {
+    let classes = re_boundary_syntax(SyntaxAssertion::WordEnd, text, d, target_multibyte, syntax);
+    let Some(previous) = classes.previous() else {
         return false;
     };
     let (c1, SyntaxClass::Word) = previous else {
         return false;
     };
-    let Some(current) = re_char_and_syntax(text, d, target_multibyte, syntax) else {
+    let Some(current) = classes.current() else {
         return true;
     };
     match current {
         (_, class) if class != SyntaxClass::Word => true,
-        (c2, SyntaxClass::Word) => syntax.emacs_word_boundary_between(c1, c2),
+        (c2, SyntaxClass::Word) => syntax.lookup.emacs_word_boundary_between(c1, c2),
         _ => false,
     }
 }
 
 /// `\_<` symbol beginning.
 #[inline]
-fn assert_sym_beg(
-    text: &[u8],
-    d: usize,
-    target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
-) -> bool {
-    let prev_sym = re_prev_char_start(text, d, target_multibyte)
-        .map(|p| re_char_is_symbol(text, p, target_multibyte, syntax))
-        .unwrap_or(false);
-    let curr_sym = re_char_is_symbol(text, d, target_multibyte, syntax);
+fn assert_sym_beg(text: &[u8], d: usize, target_multibyte: bool, syntax: &MatchSyntax<'_>) -> bool {
+    let classes = re_boundary_syntax(
+        SyntaxAssertion::SymbolBeginning,
+        text,
+        d,
+        target_multibyte,
+        syntax,
+    );
+    let symbol = |entry: Option<(emacs_char::EmacsChar, SyntaxClass)>| {
+        entry.is_some_and(|(_, class)| matches!(class, SyntaxClass::Word | SyntaxClass::Symbol))
+    };
+    let prev_sym = symbol(classes.previous());
+    let curr_sym = symbol(classes.current());
     !prev_sym && curr_sym
 }
 
 /// `\_>` symbol end.
 #[inline]
-fn assert_sym_end(
-    text: &[u8],
-    d: usize,
-    target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
-) -> bool {
-    let prev_sym = re_prev_char_start(text, d, target_multibyte)
-        .map(|p| re_char_is_symbol(text, p, target_multibyte, syntax))
-        .unwrap_or(false);
-    let curr_sym = re_char_is_symbol(text, d, target_multibyte, syntax);
+fn assert_sym_end(text: &[u8], d: usize, target_multibyte: bool, syntax: &MatchSyntax<'_>) -> bool {
+    let classes = re_boundary_syntax(
+        SyntaxAssertion::SymbolEnd,
+        text,
+        d,
+        target_multibyte,
+        syntax,
+    );
+    let symbol = |entry: Option<(emacs_char::EmacsChar, SyntaxClass)>| {
+        entry.is_some_and(|(_, class)| matches!(class, SyntaxClass::Word | SyntaxClass::Symbol))
+    };
+    let prev_sym = symbol(classes.previous());
+    let curr_sym = symbol(classes.current());
     prev_sym && !curr_sym
 }
 
@@ -5297,7 +5621,7 @@ fn assert_sym_end(
 /// character).  Keeping that distinction in one exhaustive enum evaluator
 /// prevents the backtracking and Pike engines from choosing independently.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SyntaxAssertion {
+pub(crate) enum SyntaxAssertion {
     WordBoundary,
     NotWordBoundary,
     WordBeginning,
@@ -5327,7 +5651,7 @@ fn evaluate_syntax_assertion(
     d: usize,
     stop: usize,
     target_multibyte: bool,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
 ) -> bool {
     match assertion {
         SyntaxAssertion::WordBoundary => assert_word_boundary(text, d, target_multibyte, syntax),
@@ -5477,6 +5801,8 @@ fn re_match_candidate(
     syntax: &dyn SyntaxLookup,
     point: usize,
 ) -> Option<(usize, MatchRegisters)> {
+    let match_syntax = MatchSyntax::for_pattern(pattern, syntax);
+    let syntax = &match_syntax;
     let mut regs = MatchRegisters::default();
     let end = MATCH_SCRATCH.with(|cell| match cell.try_borrow_mut() {
         Ok(mut scratch) => re_match_candidate_in(
@@ -5518,7 +5844,7 @@ fn re_match_candidate_in(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
     regs: &mut MatchRegisters,
 ) -> Option<usize> {
@@ -5553,7 +5879,7 @@ fn pike_fallback_into(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
     regs: &mut MatchRegisters,
 ) -> Option<usize> {
@@ -5646,11 +5972,11 @@ fn pike_match_into(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
     regs: &mut MatchRegisters,
 ) -> Option<usize> {
-    let (end, found) = pike_match(pattern, text, pos, stop, syntax, point)?;
+    let (end, found) = pike_match_outcome(pattern, text, pos, stop, syntax, point).found?;
     *regs = found;
     Some(end)
 }
@@ -5662,7 +5988,7 @@ fn re_match_internal(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
     enable_pike_fallback: bool,
     regs: &mut MatchRegisters,
@@ -5704,7 +6030,7 @@ fn re_match_loop<const SEALED: bool>(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
     // When true, abort with `set_pike_fallback()` if backtracking exceeds a
     // linear budget — the caller then re-runs on the Pike VM.  Only set for
@@ -6396,7 +6722,7 @@ fn re_match_loop<const SEALED: bool>(
                     stop,
                     target_multibyte,
                     translate,
-                    syntax,
+                    syntax.lookup,
                 );
                 pc += bitmap_len;
                 match result {
@@ -6431,7 +6757,7 @@ fn re_match_loop<const SEALED: bool>(
                                     stop,
                                     target_multibyte,
                                     translate,
-                                    syntax,
+                                    syntax.lookup,
                                 ) {
                                     Some(ch_len) => d += ch_len,
                                     None => break,
@@ -6459,7 +6785,7 @@ fn re_match_loop<const SEALED: bool>(
                                     stop,
                                     target_multibyte,
                                     translate,
-                                    syntax,
+                                    syntax.lookup,
                                 ) {
                                     Some(ch_len) => d += ch_len,
                                     None => break,
@@ -6494,7 +6820,7 @@ fn re_match_loop<const SEALED: bool>(
                                     stop,
                                     target_multibyte,
                                     translate,
-                                    syntax,
+                                    syntax.lookup,
                                 ) {
                                     Some(ch_len) => d += ch_len,
                                     None => break,
@@ -6637,7 +6963,7 @@ fn re_match_loop<const SEALED: bool>(
                     d,
                     stop,
                     target_multibyte,
-                    syntax,
+                    syntax.lookup,
                 ) {
                     Some(len) => d += len,
                     None => {
@@ -6649,8 +6975,15 @@ fn re_match_loop<const SEALED: bool>(
             RegexOp::NotSyntaxSpec => {
                 let class_byte = bytecode[pc];
                 pc += 1;
-                match match_syntaxspec_at(class_byte, true, text, d, stop, target_multibyte, syntax)
-                {
+                match match_syntaxspec_at(
+                    class_byte,
+                    true,
+                    text,
+                    d,
+                    stop,
+                    target_multibyte,
+                    syntax.lookup,
+                ) {
                     Some(len) => d += len,
                     None => {
                         try_fail!('main_loop);
@@ -6666,7 +6999,7 @@ fn re_match_loop<const SEALED: bool>(
                 // `\sA\|\sB\|...` alternation.
                 let mask = extract_number_u16(bytecode, pc);
                 pc += 2;
-                match match_syntaxspecset_at(mask, text, d, stop, target_multibyte, syntax) {
+                match match_syntaxspecset_at(mask, text, d, stop, target_multibyte, syntax.lookup) {
                     Some(len) => d += len,
                     None => {
                         try_fail!('main_loop);
@@ -6677,7 +7010,15 @@ fn re_match_loop<const SEALED: bool>(
             RegexOp::CategorySpec => {
                 let cat = bytecode[pc];
                 pc += 1;
-                match match_categoryspec_at(cat, false, text, d, stop, target_multibyte, syntax) {
+                match match_categoryspec_at(
+                    cat,
+                    false,
+                    text,
+                    d,
+                    stop,
+                    target_multibyte,
+                    syntax.lookup,
+                ) {
                     Some(len) => d += len,
                     None => {
                         try_fail!('main_loop);
@@ -6688,7 +7029,15 @@ fn re_match_loop<const SEALED: bool>(
             RegexOp::NotCategorySpec => {
                 let cat = bytecode[pc];
                 pc += 1;
-                match match_categoryspec_at(cat, true, text, d, stop, target_multibyte, syntax) {
+                match match_categoryspec_at(
+                    cat,
+                    true,
+                    text,
+                    d,
+                    stop,
+                    target_multibyte,
+                    syntax.lookup,
+                ) {
                     Some(len) => d += len,
                     None => {
                         try_fail!('main_loop);
@@ -6954,7 +7303,7 @@ fn pike_add_thread(
     point: usize,
     target_multibyte: bool,
     num_regs: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
 ) {
     // Explicit DFS stack (avoids unbounded recursion on deeply nested
     // patterns).  Children are pushed in REVERSE priority so the highest
@@ -7146,6 +7495,8 @@ pub(crate) fn pike_match(
     syntax: &dyn SyntaxLookup,
     point: usize,
 ) -> Option<(usize, MatchRegisters)> {
+    let match_syntax = MatchSyntax::for_pattern(pattern, syntax);
+    let syntax = &match_syntax;
     pike_match_outcome(pattern, text, pos, stop, syntax, point).found
 }
 
@@ -7154,7 +7505,7 @@ fn pike_match_outcome(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
 ) -> PikeOutcome {
     PIKE_SCRATCH.with(|cell| match cell.try_borrow_mut() {
@@ -7179,7 +7530,7 @@ fn pike_match_inner(
     text: &[u8],
     pos: usize,
     stop: usize,
-    syntax: &dyn SyntaxLookup,
+    syntax: &MatchSyntax<'_>,
     point: usize,
 ) -> PikeOutcome {
     debug_assert!(pattern.pike_eligible);
@@ -7341,7 +7692,7 @@ fn pike_match_inner(
                         stop,
                         target_multibyte,
                         translate,
-                        syntax,
+                        syntax.lookup,
                     ) {
                         let next_pc = pc + 2 + (bytecode[pc + 1] as usize & 0x7F);
                         next_d_close(&mut nlist, &mut seen, next_pc, d + len, caps);
@@ -7355,7 +7706,7 @@ fn pike_match_inner(
                         d,
                         stop,
                         target_multibyte,
-                        syntax,
+                        syntax.lookup,
                     ) {
                         next_d_close(&mut nlist, &mut seen, pc + 2, d + len, caps);
                     }
@@ -7368,7 +7719,7 @@ fn pike_match_inner(
                         d,
                         stop,
                         target_multibyte,
-                        syntax,
+                        syntax.lookup,
                     ) {
                         next_d_close(&mut nlist, &mut seen, pc + 2, d + len, caps);
                     }
@@ -7376,7 +7727,7 @@ fn pike_match_inner(
                 Some(RegexOp::SyntaxSpecSet) => {
                     let mask = extract_number_u16(bytecode, pc + 1);
                     if let Some(len) =
-                        match_syntaxspecset_at(mask, text, d, stop, target_multibyte, syntax)
+                        match_syntaxspecset_at(mask, text, d, stop, target_multibyte, syntax.lookup)
                     {
                         next_d_close(&mut nlist, &mut seen, pc + 3, d + len, caps);
                     }
@@ -7389,7 +7740,7 @@ fn pike_match_inner(
                         d,
                         stop,
                         target_multibyte,
-                        syntax,
+                        syntax.lookup,
                     ) {
                         next_d_close(&mut nlist, &mut seen, pc + 2, d + len, caps);
                     }
@@ -7402,7 +7753,7 @@ fn pike_match_inner(
                         d,
                         stop,
                         target_multibyte,
-                        syntax,
+                        syntax.lookup,
                     ) {
                         next_d_close(&mut nlist, &mut seen, pc + 2, d + len, caps);
                     }
@@ -9501,6 +9852,11 @@ pub(crate) fn re_search(
         .as_ref()
         .is_some_and(|lease| lease.inline_first_step_enabled());
     let mut dfa_cold_heat = dfa::ColdSearchHeat::default();
+    // Literal searches above never consume boundary coordinates. Keep the
+    // invocation's typed plan out of their path and out of DFA setup, then
+    // select it once for all candidates that enter either matcher.
+    let match_syntax = MatchSyntax::for_pattern(pattern, syntax);
+    let syntax = &match_syntax;
     macro_rules! try_candidate {
         ($pos:expr, $stop:expr) => {{
             let found = match dfa_lease.as_mut() {
@@ -9548,7 +9904,7 @@ pub(crate) fn re_search(
                         if credit != 0 {
                             dfa_lease = dfa::DfaLease::after_cold_failure(
                                 pattern,
-                                syntax,
+                                syntax.lookup,
                                 dfa_max_stop,
                                 credit,
                             );
@@ -10032,7 +10388,7 @@ pub(crate) fn re_search(
     {
         drop(dfa::DfaLease::after_cold_failure(
             pattern,
-            syntax,
+            syntax.lookup,
             dfa_max_stop,
             1,
         ));
@@ -10126,3 +10482,7 @@ mod suffix_literal_tests;
 #[cfg(test)]
 #[path = "tests/raw_byte_syntax_test.rs"]
 mod raw_byte_syntax_tests;
+
+#[cfg(test)]
+#[path = "tests/declared_boundary_positions.rs"]
+mod declared_boundary_positions_tests;

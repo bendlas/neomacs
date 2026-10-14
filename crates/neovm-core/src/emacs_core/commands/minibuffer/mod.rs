@@ -8,6 +8,7 @@
 
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_args_range, expect_max_args, expect_min_args};
+use crate::emacs_core::eval::VariableView;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use strum::IntoStaticStr;
@@ -159,7 +160,7 @@ fn format_default_prompt(format: &LispString, default: &LispString) -> LispStrin
     result
 }
 
-fn read_buffer_prompt(obarray: &Obarray, raw_prompt: Value, default: Value) -> Value {
+fn read_buffer_prompt(vars: VariableView<'_>, raw_prompt: Value, default: Value) -> Value {
     if default.is_nil() {
         return raw_prompt;
     }
@@ -171,8 +172,8 @@ fn read_buffer_prompt(obarray: &Obarray, raw_prompt: Value, default: Value) -> V
     if let Some(default_text) = default.as_lisp_string()
         && !default_text.as_bytes().is_empty()
     {
-        let default_prompt_format = obarray
-            .symbol_value_copied("minibuffer-default-prompt-format")
+        let default_prompt_format = vars
+            .value_by_name("minibuffer-default-prompt-format")
             .and_then(|value| value.as_lisp_string().cloned())
             .unwrap_or_else(|| LispString::from_unibyte(b" (default %s)".to_vec()));
         formatted = formatted.concat(&format_default_prompt(&default_prompt_format, default_text));
@@ -850,8 +851,8 @@ impl MinibufferManager {
     }
 
     /// Read the effective `history-length` from the obarray, defaulting to 100.
-    pub fn history_length_from_obarray(obarray: &Obarray) -> usize {
-        match obarray.symbol_value_copied("history-length") {
+    pub fn history_length_from_obarray(vars: VariableView<'_>) -> usize {
+        match vars.value_by_name("history-length") {
             Some(v) if v.is_fixnum() && v.xfixnum() > 0 => v.xfixnum() as usize,
             _ => 100,
         }
@@ -1078,7 +1079,7 @@ fn plan_read_buffer(eval: &mut super::eval::Context, args: &[Value]) -> ReadBuff
         }
     } else {
         ReadBufferPlan::Complete {
-            arguments: read_buffer_completing_args(eval.obarray(), eval.buffer_manager(), args),
+            arguments: read_buffer_completing_args(eval.variables(), eval.buffer_manager(), args),
         }
     }
 }
@@ -1132,13 +1133,13 @@ pub(crate) fn builtin_read_buffer_in_runtime(
 }
 
 pub(crate) fn read_buffer_completing_args(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     buffers: &BufferManager,
     args: &[Value],
 ) -> [Value; 7] {
     let default =
         normalize_buffer_reader_default(buffers, args.get(1).copied().unwrap_or(Value::NIL));
-    let prompt = read_buffer_prompt(obarray, args[0], default);
+    let prompt = read_buffer_prompt(vars, args[0], default);
     let require_match = args.get(2).copied().unwrap_or(Value::NIL);
     let predicate = args.get(3).copied().unwrap_or(Value::NIL);
 
@@ -1301,12 +1302,13 @@ pub(crate) fn builtin_minibuffer_prompt_end_ctx(
     expect_args("minibuffer-prompt-end", &args, 0)?;
 
     Ok(Value::fixnum(
-        minibuffer_prompt_end_in_state(&eval.obarray, &eval.buffers, &eval.minibuffers)?.as_i64(),
+        minibuffer_prompt_end_in_state(eval.variables(), &eval.buffers, &eval.minibuffers)?
+            .as_i64(),
     ))
 }
 
 fn minibuffer_prompt_end_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     buffers: &BufferManager,
     minibuffers: &MinibufferManager,
 ) -> Result<LispCharPos1, Flow> {
@@ -1328,7 +1330,7 @@ fn minibuffer_prompt_end_in_state(
     }
 
     let (_, prompt_end_pos) = super::buffer::find_field_bounds_in_state(
-        obarray,
+        vars,
         &[],
         buffers,
         Some(&Value::fixnum(point_min)),
@@ -1663,7 +1665,7 @@ pub(crate) fn builtin_abort_minibuffers_ctx(
 }
 
 pub(crate) fn minibuffer_contents_lisp_string_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     buffers: &BufferManager,
     minibuffers: &MinibufferManager,
     preserve_properties: bool,
@@ -1674,7 +1676,7 @@ pub(crate) fn minibuffer_contents_lisp_string_in_state(
     else {
         return Ok(LispString::from_utf8(""));
     };
-    let prompt_end = minibuffer_prompt_end_in_state(obarray, buffers, minibuffers)?;
+    let prompt_end = minibuffer_prompt_end_in_state(vars, buffers, minibuffers)?;
     let buffer = buffers
         .get(current_id)
         .expect("current buffer must remain available");
@@ -1692,7 +1694,7 @@ fn minibuffer_contents_lisp_string(
     preserve_properties: bool,
 ) -> Result<LispString, Flow> {
     minibuffer_contents_lisp_string_in_state(
-        &eval.obarray,
+        eval.variables(),
         &eval.buffers,
         &eval.minibuffers,
         preserve_properties,
@@ -1980,23 +1982,16 @@ fn lisp_string_chars(
     let bytes = string.as_bytes();
     let multibyte = string.is_multibyte();
     let mut pos = 0usize;
-    std::iter::from_fn(move || {
-        if pos >= bytes.len() {
-            return None;
-        }
+    // GNU minibuf.c:1719-1723 compares a declared character prefix. A
+    // shorthand name can have SCHARS independent of payload decoding.
+    (0..string.schars()).map(move |index| {
         if !multibyte {
-            let code = bytes[pos] as u32;
-            pos += 1;
-            return Some(code);
+            return u32::from(bytes[index]);
         }
-        let byte = bytes[pos];
-        if byte < 0x80 {
-            pos += 1;
-            return Some(byte as u32);
-        }
-        let (cp, len) = crate::emacs_core::emacs_char::string_char_unchecked(&bytes[pos..]);
-        pos += len;
-        Some(cp)
+        let tail = bytes.get(pos..).unwrap_or_default();
+        let (code, width) = crate::heap_types::decode_declared_multibyte_char(tail);
+        pos += width;
+        code
     })
 }
 
@@ -2168,9 +2163,8 @@ fn gnu_compare_strings(a: &[u32], b: &[u32], len: usize, ignore_case: bool) -> S
     }
 }
 
-fn is_global_obarray_proxy_in_state(obarray: &Obarray, value: &Value) -> bool {
-    obarray
-        .symbol_value_id_copied(CompletionStateVariable::Obarray.symbol_id())
+fn is_global_obarray_proxy_in_state(vars: VariableView<'_>, value: &Value) -> bool {
+    vars.value(CompletionStateVariable::Obarray.symbol_id())
         .is_some_and(|proxy| proxy == *value)
 }
 
@@ -2192,13 +2186,14 @@ pub(crate) fn completion_candidates_from_collection_in_state(
     collection: &Value,
 ) -> Result<Option<Vec<CompletionCandidate>>, Flow> {
     let obarray = &ctx.obarray;
+    let vars = ctx.variables();
     Ok(match collection.kind() {
         ValueKind::Nil | ValueKind::Cons => Some(completion_candidates_from_list_value(collection)),
         ValueKind::Veclike(VecLikeType::HashTable) => {
             Some(completion_candidates_from_hash_table(*collection))
         }
         ValueKind::Veclike(VecLikeType::Vector)
-            if is_global_obarray_proxy_in_state(obarray, collection) =>
+            if is_global_obarray_proxy_in_state(vars, collection) =>
         {
             Some(completion_candidates_from_global_obarray_in_state(
                 obarray,
@@ -2333,7 +2328,7 @@ pub(crate) fn builtin_try_completion_with_candidates(
         if !regexps.is_empty()
             && !matches_completion_regexps(
                 syntax,
-                &eval.obarray,
+                eval.variables(),
                 &eval.buffers,
                 &candidate.completion,
                 regexps,
@@ -2487,7 +2482,7 @@ pub(crate) fn builtin_all_completions_with_candidates(
         if !regexps.is_empty()
             && !matches_completion_regexps(
                 syntax,
-                &eval.obarray,
+                eval.variables(),
                 &eval.buffers,
                 &candidate.completion,
                 regexps,
@@ -2545,7 +2540,7 @@ pub(crate) fn builtin_test_completion_with_candidates(
         if !regexps.is_empty()
             && !matches_completion_regexps(
                 syntax,
-                &eval.obarray,
+                eval.variables(),
                 &eval.buffers,
                 &candidate.completion,
                 regexps,
@@ -2627,15 +2622,16 @@ enum ObarrayProbe {
 /// -- so the shortcut cannot answer with a differently spelled completion than
 /// the slow path would have.
 fn probe_obarray_completion(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     collection: Value,
     string: &crate::heap_types::LispString,
     ignore_case: bool,
 ) -> ObarrayProbe {
+    let obarray = vars.obarray();
     use super::builtins::symbols as sym;
     let found = match collection.kind() {
         ValueKind::Veclike(VecLikeType::Vector)
-            if is_global_obarray_proxy_in_state(obarray, &collection) =>
+            if is_global_obarray_proxy_in_state(vars, &collection) =>
         {
             obarray
                 .intern_soft_lisp_string(string)
@@ -2736,19 +2732,24 @@ fn completion_candidates_from_hash_table(collection: Value) -> Vec<CompletionCan
     candidates
 }
 
-/// Read the `completion-ignore-case` symbol from the obarray.
-fn completion_ignore_case(obarray: &Obarray) -> bool {
-    obarray
-        .symbol_value_id_copied(CompletionStateVariable::CompletionIgnoreCase.symbol_id())
-        .is_some_and(|v| v.is_truthy())
+/// GNU's forwarded completion state follows the current buffer binding
+/// (`src/data.c:swap_in_symval_forwarding`), including a local `let` binding.
+pub(crate) fn completion_ignore_case(vars: VariableView<'_>, buffers: &BufferManager) -> bool {
+    vars.value_in_buffer(
+        buffers.current_buffer(),
+        CompletionStateVariable::CompletionIgnoreCase.symbol_id(),
+    )
+    .is_some_and(|v| v.is_truthy())
 }
 
-pub(crate) fn completion_regexp_lisp_list_from_obarray(
-    obarray: &Obarray,
+pub(crate) fn completion_regexp_lisp_list(
+    vars: VariableView<'_>,
+    buffers: &BufferManager,
 ) -> Vec<crate::heap_types::LispString> {
-    let Some(val) =
-        obarray.symbol_value_id_copied(CompletionStateVariable::CompletionRegexpList.symbol_id())
-    else {
+    let Some(val) = vars.value_in_buffer(
+        buffers.current_buffer(),
+        CompletionStateVariable::CompletionRegexpList.symbol_id(),
+    ) else {
         return Vec::new();
     };
     let Some(items) = super::value::list_to_vec(&val) else {
@@ -2767,7 +2768,7 @@ pub(crate) fn completion_regexp_lisp_list_from_obarray(
 /// match carries the current buffer's syntax state via `syntax`.
 fn matches_completion_regexps(
     syntax: super::builtins::search::FastStringMatchSyntax,
-    obarray: &super::symbol::Obarray,
+    vars: VariableView<'_>,
     buffers: &crate::buffer::BufferManager,
     candidate: &CompletionText,
     regexps: &[crate::heap_types::LispString],
@@ -2775,7 +2776,7 @@ fn matches_completion_regexps(
 ) -> Result<bool, Flow> {
     completion_string_matches_regexps(
         syntax,
-        obarray,
+        vars,
         buffers,
         candidate.lisp_string(),
         candidate.searched_string(),
@@ -2786,7 +2787,7 @@ fn matches_completion_regexps(
 
 pub(crate) fn lisp_string_matches_completion_regexps(
     syntax: super::builtins::search::FastStringMatchSyntax,
-    obarray: &super::symbol::Obarray,
+    vars: VariableView<'_>,
     buffers: &crate::buffer::BufferManager,
     candidate: &crate::heap_types::LispString,
     regexps: &[crate::heap_types::LispString],
@@ -2794,7 +2795,7 @@ pub(crate) fn lisp_string_matches_completion_regexps(
 ) -> Result<bool, Flow> {
     completion_string_matches_regexps(
         syntax,
-        obarray,
+        vars,
         buffers,
         candidate,
         super::regex::SearchedString::Owned(candidate.clone()),
@@ -2806,7 +2807,7 @@ pub(crate) fn lisp_string_matches_completion_regexps(
 #[allow(clippy::too_many_arguments)] // match-time state stays explicit at the GNU-regexp boundary
 fn completion_string_matches_regexps(
     syntax: super::builtins::search::FastStringMatchSyntax,
-    obarray: &super::symbol::Obarray,
+    vars: VariableView<'_>,
     buffers: &crate::buffer::BufferManager,
     candidate: &crate::heap_types::LispString,
     searched_string: super::regex::SearchedString,
@@ -2815,7 +2816,7 @@ fn completion_string_matches_regexps(
 ) -> Result<bool, Flow> {
     for re in regexps {
         match syntax.search(
-            obarray,
+            vars,
             buffers,
             re,
             candidate,
@@ -2825,12 +2826,13 @@ fn completion_string_matches_regexps(
         ) {
             Ok(Some(_)) => {} // matched — continue checking remaining regexps
             Ok(None) => return Ok(false),
-            Err(message) => {
+            Err(super::builtins::search::FastStringMatchError::Regexp(message)) => {
                 return Err(signal(
                     LispCondition::InvalidRegexp,
                     vec![Value::string(message)],
                 ));
             }
+            Err(error) => return Err(error.into_signal()),
         }
     }
     Ok(true)
@@ -2863,8 +2865,8 @@ pub(crate) fn builtin_try_completion(
     args: Vec<Value>,
 ) -> EvalResult {
     let candidates = completion_candidates_from_collection(eval, &args[1])?;
-    let ignore_case = completion_ignore_case(&eval.obarray);
-    let regexps = completion_regexp_lisp_list_from_obarray(&eval.obarray);
+    let ignore_case = completion_ignore_case(eval.variables(), &eval.buffers);
+    let regexps = completion_regexp_lisp_list(eval.variables(), &eval.buffers);
     let syntax = super::builtins::search::FastStringMatchSyntax::for_current_buffer(eval);
     // Root the candidate set across the predicate calls (see the holder doc).
     let root_scope = eval.save_specpdl_roots();
@@ -2888,8 +2890,8 @@ pub(crate) fn builtin_all_completions(
     args: Vec<Value>,
 ) -> EvalResult {
     let candidates = completion_candidates_from_collection(eval, &args[1])?;
-    let ignore_case = completion_ignore_case(&eval.obarray);
-    let regexps = completion_regexp_lisp_list_from_obarray(&eval.obarray);
+    let ignore_case = completion_ignore_case(eval.variables(), &eval.buffers);
+    let regexps = completion_regexp_lisp_list(eval.variables(), &eval.buffers);
     let syntax = super::builtins::search::FastStringMatchSyntax::for_current_buffer(eval);
     // Root the candidate set across the predicate calls (see the holder doc).
     let root_scope = eval.save_specpdl_roots();
@@ -2922,16 +2924,16 @@ pub(crate) fn builtin_test_completion(
     if args.len() >= 2
         && let Ok(string) = expect_lisp_string(&args[0])
     {
-        let ignore_case = completion_ignore_case(&eval.obarray);
+        let ignore_case = completion_ignore_case(eval.variables(), &eval.buffers);
         let probe =
             match direct_hash_completion_candidate(args[1], &string, eval.symbols_with_pos_enabled)
             {
                 Some(candidate) => ObarrayProbe::Found(candidate),
-                None => probe_obarray_completion(&eval.obarray, args[1], &string, ignore_case),
+                None => probe_obarray_completion(eval.variables(), args[1], &string, ignore_case),
             };
         match probe {
             ObarrayProbe::Found(candidate) => {
-                let regexps = completion_regexp_lisp_list_from_obarray(&eval.obarray);
+                let regexps = completion_regexp_lisp_list(eval.variables(), &eval.buffers);
                 let syntax =
                     super::builtins::search::FastStringMatchSyntax::for_current_buffer(eval);
                 return builtin_test_completion_with_candidates(
@@ -2950,8 +2952,8 @@ pub(crate) fn builtin_test_completion(
         }
     }
     let candidates = completion_candidates_from_collection(eval, &args[1])?;
-    let ignore_case = completion_ignore_case(&eval.obarray);
-    let regexps = completion_regexp_lisp_list_from_obarray(&eval.obarray);
+    let ignore_case = completion_ignore_case(eval.variables(), &eval.buffers);
+    let regexps = completion_regexp_lisp_list(eval.variables(), &eval.buffers);
     let syntax = super::builtins::search::FastStringMatchSyntax::for_current_buffer(eval);
     // Root the candidate set across the predicate calls (see the holder doc).
     let root_scope = eval.save_specpdl_roots();
@@ -3022,7 +3024,7 @@ pub(crate) fn builtin_flex_cost_gotoh(
         return Ok(Value::NIL);
     }
 
-    let ignore_case = completion_ignore_case(&eval.obarray);
+    let ignore_case = completion_ignore_case(eval.variables(), &eval.buffers);
 
     // Cheap subsequence pre-filter for the common case-sensitive case: if PAT
     // is not a subsequence of STR there can be no match, so bail before the
@@ -3138,3 +3140,7 @@ pub(crate) fn builtin_flex_cost_gotoh(
 #[cfg(test)]
 #[path = "tests/minibuffer_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/declared_string_completion.rs"]
+mod declared_string_completion_tests;

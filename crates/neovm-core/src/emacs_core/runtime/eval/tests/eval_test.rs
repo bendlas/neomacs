@@ -1,4 +1,6 @@
 use super::*;
+use crate::emacs_core::eval::VariableView;
+use crate::emacs_core::symbol::CanonicalAccess;
 
 #[cfg(test)]
 #[path = "input_wait.rs"]
@@ -190,7 +192,11 @@ fn sort_signals_circular_list_like_gnu() {
 
 fn eval_all(src: &str) -> Vec<String> {
     let mut ev = Context::new();
-    let forms = crate::emacs_core::value_reader::read_all(src, &test_ob()).expect("parse");
+    let forms = crate::emacs_core::value_reader::read_all(
+        src,
+        VariableView::canonical(CanonicalAccess::TEST, &test_ob()),
+    )
+    .expect("parse");
     // Root all parsed forms across the eval loop. Without rooting,
     // any intervening GC reclaims the cons cells in the unrooted
     // `forms` Vec<Value> (malloc heap, invisible to conservative
@@ -1006,7 +1012,7 @@ fn recursive_edit_without_input_receiver_still_runs_noninteractive_top_level() {
     ev.set_variable("noninteractive", Value::T);
     let top_level = crate::emacs_core::value_reader::read_all(
         "(progn (setq neomacs--batch-no-input-probe 42) nil)",
-        &test_ob(),
+        VariableView::canonical(CanonicalAccess::TEST, &test_ob()),
     )
     .expect("parse top-level form")
     .into_iter()
@@ -1056,7 +1062,7 @@ fn outer_command_loop_leaves_exit_unmatched_inside_keyboard_macro() {
                (execute-kbd-macro "a")
                (setq neo-continued-after-macro t))
              nil)"#,
-        &test_ob(),
+        VariableView::canonical(CanonicalAccess::TEST, &test_ob()),
     )
     .expect("parse top-level form")
     .into_iter()
@@ -4242,28 +4248,28 @@ fn special_event_map_bootstraps_delete_frame_and_focus_handlers() {
         .expect("special-event-map should be bound");
 
     let delete_frame = crate::emacs_core::keymap::lookup_key_in_keymaps_in_obarray(
-        ev.obarray(),
+        VariableView::canonical(CanonicalAccess::TEST, ev.obarray()),
         &[special_event_map],
         &[Value::symbol("delete-frame")],
         true,
         crate::tagged::SymbolMode::Bare,
     );
     let focus_in = crate::emacs_core::keymap::lookup_key_in_keymaps_in_obarray(
-        ev.obarray(),
+        VariableView::canonical(CanonicalAccess::TEST, ev.obarray()),
         &[special_event_map],
         &[Value::symbol("focus-in")],
         true,
         crate::tagged::SymbolMode::Bare,
     );
     let focus_out = crate::emacs_core::keymap::lookup_key_in_keymaps_in_obarray(
-        ev.obarray(),
+        VariableView::canonical(CanonicalAccess::TEST, ev.obarray()),
         &[special_event_map],
         &[Value::symbol("focus-out")],
         true,
         crate::tagged::SymbolMode::Bare,
     );
     let file_notify = crate::emacs_core::keymap::lookup_key_in_keymaps_in_obarray(
-        ev.obarray(),
+        VariableView::canonical(CanonicalAccess::TEST, ev.obarray()),
         &[special_event_map],
         &[Value::symbol("file-notify")],
         true,
@@ -7186,8 +7192,11 @@ fn eval_keyword_checks_explicit_lexenv_before_self_value() {
 }
 
 #[test]
-fn intern_canonicalizes_ascii_multibyte_names_to_existing_symbol() {
+fn intern_reuses_ascii_name_without_changing_its_source_encoding() {
     crate::test_utils::init_test_tracing();
+    // GNU 31.1 reads the quoted ASCII name as multibyte, then reuses it:
+    // lread.c:4246-4253 preserves source encoding on creation, 4773-4836
+    // returns an existing name unchanged. Observed result: (t t t).
     assert_eq!(
         eval_one(
             r#"(let ((m (string-to-multibyte "foo")))
@@ -7195,7 +7204,7 @@ fn intern_canonicalizes_ascii_multibyte_names_to_existing_symbol() {
                        (eq (intern m) 'foo)
                        (multibyte-string-p (symbol-name (intern m)))))"#
         ),
-        "OK (t t nil)"
+        "OK (t t t)"
     );
 }
 
@@ -8493,11 +8502,14 @@ fn watched_variables_carry_gnu_trapped_write_on_their_symbol() {
             .unwrap_or(SymbolTrappedWrite::Untrapped)
     };
     let run = |ev: &mut Context, src: &str| {
-        let form = crate::emacs_core::value_reader::read_all(src, &test_ob())
-            .expect("parse")
-            .into_iter()
-            .next()
-            .expect("one form");
+        let form = crate::emacs_core::value_reader::read_all(
+            src,
+            VariableView::canonical(CanonicalAccess::TEST, &test_ob()),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one form");
         ev.eval_form(form).expect("eval");
     };
     run(&mut ev, "(defvar tw-target 1)");
@@ -16295,6 +16307,10 @@ fn jit_save_window_excursion_through_funcall_seam() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_direct_call_speculation_tracks_redefinition() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     // Compiles a deliberately call-only forwarder to exercise direct-call
     // speculation; production would decline it as unprofitable, so disable the
@@ -16580,6 +16596,10 @@ fn jit_subr_spec_counters() -> (u64, u64, u64) {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_pred_recordp_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -16639,6 +16659,10 @@ fn jit_subr_spec_pred_recordp_engages_and_matches() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_vectorp_stays_general() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -16737,6 +16761,10 @@ fn jit_subr_spec_symbol_with_pos_p_both_flag_states() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_eq_incl_props_hit_and_miss() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -16796,6 +16824,10 @@ fn jit_subr_spec_eq_incl_props_hit_and_miss() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_put_general_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -16834,6 +16866,10 @@ fn jit_subr_spec_put_general_engages_and_matches() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_tracks_redefinition_and_rearms() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -17191,6 +17227,10 @@ fn jit_subr_spec_position_queries_match_interpreter() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_inplace_rewrite_calls_fresh_entry() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     fn f1(_: &mut Context, _: Value) -> crate::emacs_core::error::EvalResult {
@@ -17243,6 +17283,10 @@ fn jit_subr_spec_inplace_rewrite_calls_fresh_entry() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_fixed_return_preserves_unwind_protocol() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     fn callee(ctx: &mut Context, mode: Value) -> EvalResult {
         let mode = mode.as_int().unwrap();
@@ -17332,6 +17376,10 @@ fn jit_subr_spec_fixed_return_preserves_unwind_protocol() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_many_re_search_forward_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -17389,6 +17437,10 @@ fn jit_subr_spec_many_re_search_forward_engages_and_matches() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_subr_spec_many_get_text_property_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -17842,6 +17894,10 @@ fn jit_cbsym_fastpath_suppressed_by_harness() -> bool {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_cbsym_spec_tierb_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -17892,6 +17948,10 @@ fn jit_cbsym_spec_tierb_engages_and_matches() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_cbsym_spec_tierb_end_of_line_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -17934,6 +17994,10 @@ fn jit_cbsym_spec_tierb_end_of_line_engages_and_matches() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_cbsym_buffer_loop_tiers_with_profit_gate_on() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -18008,6 +18072,10 @@ fn jit_cbsym_buffer_loop_tiers_with_profit_gate_on() {
 #[cfg(all(feature = "jit", debug_assertions))]
 #[test]
 fn jit_cbsym_spec_inplace_rewrite_to_nonbuiltin_bounces_like_interp() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     use crate::emacs_core::eval::{
@@ -18184,6 +18252,10 @@ fn jit_cbsym_spec_adds_no_eval_depth_level() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_cbsym_read_tiera_engages_and_matches() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
     let mut ev = Context::new();
@@ -18365,6 +18437,10 @@ fn jit_cbsym_read_bolp_at_begv_in_narrowed_buffer() {
 #[cfg(all(feature = "jit", debug_assertions))]
 #[test]
 fn jit_cbsym_read_current_buffer_bounces_when_unmaterialized() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     // This test's premise is that the current buffer's tagged value has NOT
     // been materialized before the first compiled call. Under NEOVM_GC_STRESS
@@ -18698,6 +18774,10 @@ fn jit_native_to_native_optional_callee_pure_and_marshaled() {
 #[cfg(debug_assertions)]
 #[test]
 fn jit_v3_fast_path_engages_and_tracks_redefinition() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     // Compiles a deliberately call-only forwarder to exercise the V3 fast-path
     // speculation; production would decline it as unprofitable, so disable the
@@ -22352,7 +22432,11 @@ fn gc_safe_point_runs_post_gc_hook_when_incremental_collection_finishes() {
 
 fn eval_stress(src: &str) -> Vec<String> {
     let mut ev = Context::new();
-    let forms = crate::emacs_core::value_reader::read_all(src, &test_ob()).expect("parse");
+    let forms = crate::emacs_core::value_reader::read_all(
+        src,
+        VariableView::canonical(CanonicalAccess::TEST, &test_ob()),
+    )
+    .expect("parse");
     ev.gc_stress = true;
     // Force very low threshold so gc_safe_point triggers on every call
     ev.tagged_heap.set_gc_threshold(1);
@@ -25897,11 +25981,14 @@ fn plain_let_takes_one_obarray_visit_per_bind_and_pop() {
     // The counter is the claim: one obarray slot visit for the bind, one for
     // the pop, on a plain unwatched variable.
     let mut ev = Context::new();
-    let form = crate::emacs_core::value_reader::read_all("(defvar neo-visit-var 1)", &test_ob())
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("one form");
+    let form = crate::emacs_core::value_reader::read_all(
+        "(defvar neo-visit-var 1)",
+        VariableView::canonical(CanonicalAccess::TEST, &test_ob()),
+    )
+    .expect("parse")
+    .into_iter()
+    .next()
+    .expect("one form");
     ev.eval_form(form).expect("defvar");
     let sym = intern("neo-visit-var");
     let base = ev.specpdl.len();
@@ -26575,6 +26662,10 @@ fn jit_compiled_id(v: Value) -> Option<u64> {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_make_closure_instances_share_one_leaf_and_read_their_own_captures() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     use crate::emacs_core::bytecode::opcode::Op;
     let mut ev = Context::new();
@@ -26640,6 +26731,10 @@ fn jit_make_closure_instances_share_one_leaf_and_read_their_own_captures() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_make_closure_widening_evicts_leaf_compiled_under_narrower_prefix() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     use crate::emacs_core::bytecode::opcode::Op;
     let mut ev = Context::new();
@@ -26696,6 +26791,10 @@ fn jit_make_closure_widening_evicts_leaf_compiled_under_narrower_prefix() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_make_closure_captured_callee_is_not_speculated_across_instances() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     use crate::emacs_core::bytecode::opcode::Op;
     let mut ev = Context::new();
@@ -27453,6 +27552,10 @@ fn native_calls_marshal_optional_and_rest_arguments() {
 #[cfg(feature = "jit")]
 #[test]
 fn jit_apply_enters_a_compiled_callee_natively() {
+    // Asserts what a tier-up installs by the call that triggered it: the
+    // deterministic split, whatever `NEOVM_JIT_BG` the suite runs under.
+    let _bg_mode =
+        crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;

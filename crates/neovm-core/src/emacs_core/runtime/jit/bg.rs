@@ -6,15 +6,15 @@
 //! reads the heap, the obarray and the eval thread's knobs, and it is
 //! unchanged. The backend is Cranelift alone.
 //!
-//! `NEOVM_JIT_BG` ([`mode`], read once per process; tests override it per
-//! thread) picks where the backend runs:
+//! `NEOVM_JIT_BG` ([`mode`], read once per process; unit tests read it unset
+//! as `sync` and override it per thread) picks where the backend runs:
 //!
 //! | value | [`BgMode`] | what runs where |
 //! |---|---|---|
-//! | `legacy` (default) | `Legacy` | the persistent per-thread module defines each leaf in place (the B4 path, unchanged) |
+//! | `legacy` | `Legacy` | the persistent per-thread module defines each leaf in place (the B4 path) |
 //! | `sync` | `Sync` | the split, run in line: the eval thread's backend compiles each packaged function at once. Deterministic |
-//! | `on` | `Threaded` | entry tier-ups, first-sight and OSR compiles hand their package to a worker thread (`bg::worker`); the function stays interpreted until its leaf is installed. Under `NEOVM_JIT_TIER2=on`, upgrades use a worker too, and the old native leaf keeps serving calls until install. Other re-tiers and the AOT drain run as under `sync`. x86-64 Linux; elsewhere `on` is `sync` |
-//! | `auto` | `Threaded` or `Sync` | `on` when the process's affinity has at least two CPUs, else `sync` (a worker on the eval thread's only CPU just competes with it) |
+//! | `on` | `Threaded` | entry tier-ups, first-sight and OSR compiles of a function larger than `NEOVM_JIT_BG_INLINE_INSTS` CLIF instructions hand their package to a worker thread (`bg::worker`); the function stays interpreted until its leaf is installed. Smaller ones run their backend in line, as under `sync`. Under `NEOVM_JIT_TIER2=on`, upgrades use a worker too, and the old native leaf keeps serving calls until install. Other re-tiers and the AOT drain run as under `sync`. x86-64 Linux; elsewhere `on` is `sync` |
+//! | `auto` (default) | `Threaded` or `Sync` | `on` when the process's affinity has at least two CPUs, else `sync` (a worker on the eval thread's only CPU just competes with it) |
 //!
 //! The companions -- worker count, queue caps, the classes that defer, worker
 //! placement and the stress soak -- are in the knob table of `jit/mod.rs`.
@@ -41,10 +41,12 @@
 //!   pending entry as it would a compiled leaf; every other removal (a
 //!   `make-closure` prefix widening, a deopt invalidation, a heap change)
 //!   drops the pending entry, which cancels its job.
-//! - Dispatch: a probe that finds the job unfinished holds the function in
-//!   the interpreter for the next 32, 64, ... 1024 calls
-//!   (`RuntimeState::defer_tier_up`), so the dispatcher does not probe per
-//!   call.
+//! - Dispatch: the function is parked in the interpreter
+//!   (`RuntimeState::park_tier_up`), a deferral no heat reaches, so the
+//!   dispatcher neither probes nor pays anything per call. The backend's
+//!   publication releases the park ([`JobCell::publish`]), and the next
+//!   call installs the leaf: no call is interpreted after the code is
+//!   ready, and none probes before.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -84,18 +86,18 @@ pub(crate) const fn workers_supported() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
-/// The mode a `NEOVM_JIT_BG` value selects; anything unrecognised (or
-/// unset) is [`BgMode::Legacy`]. `auto` is `on` when this process may run
-/// on at least two CPUs (its affinity), else `sync`: on one CPU a worker
-/// only competes with the eval thread.
+/// The mode a `NEOVM_JIT_BG` value selects; unset (or unrecognised) is
+/// `auto`: `on` when this process may run on at least two CPUs (its
+/// affinity), else `sync`, since on one CPU a worker only competes with the
+/// eval thread. `legacy` keeps the persistent per-thread module.
 pub(crate) fn parse_mode(value: Option<&str>) -> BgMode {
     match value.map(str::trim) {
+        Some("legacy") => BgMode::Legacy,
         Some("sync") => BgMode::Sync,
         Some("on") if workers_supported() => BgMode::Threaded,
         Some("on") => BgMode::Sync,
-        Some("auto") if workers_supported() && available_cpus() >= 2 => BgMode::Threaded,
-        Some("auto") => BgMode::Sync,
-        _ => BgMode::Legacy,
+        _ if workers_supported() && available_cpus() >= 2 => BgMode::Threaded,
+        _ => BgMode::Sync,
     }
 }
 
@@ -120,10 +122,16 @@ pub(crate) fn mode() -> BgMode {
     }
     static MODE: OnceLock<BgMode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        let mode = parse_mode(std::env::var("NEOVM_JIT_BG").ok().as_deref());
+        let value = std::env::var("NEOVM_JIT_BG").ok();
+        // Unit tests assert what a tier-up installed by the call that
+        // triggered it, so unset they take the deterministic split
+        // (`sync`); `NEOVM_JIT_BG=on` runs them against the worker.
+        #[cfg(test)]
+        let value = value.or_else(|| Some("sync".to_owned()));
+        let mode = parse_mode(value.as_deref());
         if mode != BgMode::Legacy {
             let name: &'static str = mode.into();
-            tracing::info!(target: "neovm::jit::knobs", "NEOVM_JIT_BG={name} is on in this process");
+            tracing::info!(target: "neovm::jit::knobs", "NEOVM_JIT_BG resolves to {name} in this process");
         }
         mode
     })
@@ -309,11 +317,16 @@ pub(crate) struct BackendOut {
 
 /// The rendezvous of one backend job: the backend publishes its
 /// [`BackendOut`] and then marks it done (release); the eval thread reads
-/// the mark (acquire) before it takes the result.
+/// the mark (acquire) before it takes the result. A function parked on the
+/// job is released right after the mark.
 pub(crate) struct JobCell {
     state: AtomicU8,
     cancelled: AtomicBool,
     out: Mutex<Option<BackendOut>>,
+    /// The function parked on this job ([`JobCell::park`]). Its owner, the
+    /// eval thread's pending entry, takes it back before it drops the cell,
+    /// so a worker never holds the last reference.
+    parked: Mutex<Option<Arc<RuntimeState>>>,
 }
 
 impl JobCell {
@@ -322,7 +335,57 @@ impl JobCell {
             state: AtomicU8::new(JobState::Queued as u8),
             cancelled: AtomicBool::new(false),
             out: Mutex::new(None),
+            parked: Mutex::new(None),
         })
+    }
+
+    /// Park `rt` in the interpreter until this job publishes (at once if
+    /// it already has). Eval thread only.
+    fn park(&self, rt: Arc<RuntimeState>) {
+        rt.park_tier_up();
+        *self.parked.lock().unwrap_or_else(|p| p.into_inner()) = Some(rt);
+        self.release_if_done();
+    }
+
+    /// Park the function this job already holds again (a probe found it
+    /// unfinished). Eval thread only.
+    fn repark(&self) {
+        if let Some(rt) = self
+            .parked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            rt.park_tier_up();
+        }
+        self.release_if_done();
+    }
+
+    /// The parker's recheck: a publication that came before the park found
+    /// nothing to release, so release it here. `SeqCst` with the park and
+    /// the publication (see `RuntimeState::park_tier_up`).
+    fn release_if_done(&self) {
+        if self.state.load(Ordering::SeqCst) == JobState::Done as u8 {
+            self.release_parked();
+        }
+    }
+
+    /// End the park of the function waiting on this job, if any.
+    fn release_parked(&self) {
+        if let Some(rt) = self
+            .parked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            rt.release_parked_tier_up();
+        }
+    }
+
+    /// Take the parked function back (its pending entry is settling), so
+    /// its last reference drops on the eval thread.
+    fn unpark(&self) -> Option<Arc<RuntimeState>> {
+        self.parked.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
     /// Tell the backend the result is no longer wanted (advisory: a job not
@@ -335,10 +398,12 @@ impl JobCell {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    /// Publish the backend's result.
+    /// Publish the backend's result, and release the function parked on
+    /// it: its next call installs the leaf.
     pub(crate) fn publish(&self, out: BackendOut) {
         *self.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(out);
-        self.state.store(JobState::Done as u8, Ordering::Release);
+        self.state.store(JobState::Done as u8, Ordering::SeqCst);
+        self.release_parked();
     }
 
     /// Publish that the full queue dropped the job unrun.
@@ -390,12 +455,6 @@ pub(crate) struct DeferredCode {
 /// line (the front then sees the live epoch).
 pub(crate) const MAX_EPOCH_DISCARDS: u8 = 2;
 
-/// Probes that find a job unfinished hold its function in the interpreter
-/// for this many calls at first, doubling up to [`MAX_BACKOFF`].
-pub(crate) const FIRST_BACKOFF: u32 = 32;
-/// The longest hold between two probes of one pending job.
-pub(crate) const MAX_BACKOFF: u32 = 1024;
-
 /// A compile whose backend runs elsewhere, as its cache entry holds it
 /// (see the module docs). Lives on the eval thread; only its
 /// [`JobCell`] is shared. Each mutator owns its own cache and pending jobs;
@@ -412,10 +471,12 @@ pub(crate) struct PendingJob {
     class: JobClass,
     /// The tagged heap the front compiled against.
     heap: Option<usize>,
-    /// The function's tier-up deferral before this job's hold replaced it.
+    /// The function's tier-up deferral before this job's park replaced it.
     saved_hold: u32,
-    backoff: Cell<u32>,
     requested_heat: u32,
+    /// The function parked on this job (entry and first-sight compiles),
+    /// so an install without a caller's runtime still restores its hold.
+    parked: Option<Arc<RuntimeState>>,
     /// The upgrade's source runtime, so an idle drain can restore its hold
     /// and disarm its leaf slot. Owned by this mutator's job; never sent
     /// to the worker, which only sees JobCell and plain backend payloads.
@@ -436,17 +497,19 @@ pub(crate) struct PendingJob {
 }
 
 impl PendingJob {
-    /// The pending entry for `leaf`, whose code `code` is compiling; holds
-    /// the function (`rt`) in the interpreter for the first backoff.
+    /// The pending entry for `leaf`, whose code `code` is compiling; parks
+    /// the function (`rt`) in the interpreter until the backend publishes.
     pub(crate) fn new(
         id: u64,
         leaf: CompiledLeaf,
         code: DeferredCode,
-        rt: &RuntimeState,
+        rt: &super::Runtime,
     ) -> Box<PendingJob> {
-        let saved_hold = rt.deferred_heat();
+        // A park is this job's own state, never a hold to restore.
+        let saved_hold = Some(rt.deferred_heat()).filter(|_| !rt.tier_up_parked());
         let heat = rt.heat();
-        rt.defer_tier_up(heat.saturating_add(FIRST_BACKOFF));
+        let parked = rt.share_state();
+        code.cell.park(Arc::clone(&parked));
         PENDING_COUNT.with(|c| c.set(c.get() + 1));
         PENDING_IDS.with(|ids| ids.borrow_mut().push(id));
         Box::new(PendingJob {
@@ -456,9 +519,9 @@ impl PendingJob {
             cell: code.cell,
             class: code.class,
             heap: crate::tagged::gc::current_tagged_heap_identity(),
-            saved_hold,
-            backoff: Cell::new(FIRST_BACKOFF.saturating_mul(2)),
+            saved_hold: saved_hold.unwrap_or(0),
             requested_heat: heat,
+            parked: Some(parked),
             upgrade_runtime: None,
             cancel_estimate_us: 0,
             backend_charged_in_front: code.backend_charged_in_front,
@@ -481,8 +544,8 @@ impl PendingJob {
             class: code.class,
             heap: crate::tagged::gc::current_tagged_heap_identity(),
             saved_hold: 0,
-            backoff: Cell::new(0),
             requested_heat: 0,
+            parked: None,
             upgrade_runtime: None,
             cancel_estimate_us: 0,
             backend_charged_in_front: code.backend_charged_in_front,
@@ -527,6 +590,12 @@ impl PendingJob {
         self.leaf.as_ref().expect("a pending job holds its leaf")
     }
 
+    /// Whether the backend has published, ignoring the stress soak's
+    /// skips (a read without the side effect of [`Self::is_ready`]).
+    pub(crate) fn cell_done(&self) -> bool {
+        self.cell.is_done()
+    }
+
     /// Whether the backend has published (install it now).
     pub(crate) fn is_ready(&self) -> bool {
         if !self.cell.is_done() {
@@ -547,12 +616,18 @@ impl PendingJob {
         self.saved_hold
     }
 
-    /// A probe found the backend still running: interpret the next
-    /// `backoff` calls of the function without probing.
-    pub(crate) fn wait(&self, rt: &RuntimeState) {
-        let backoff = self.backoff.get();
-        self.backoff.set(backoff.saturating_mul(2).min(MAX_BACKOFF));
-        rt.defer_tier_up(rt.heat().saturating_add(backoff));
+    /// Park `waiter`, an entry compile that depends on this (OSR) job's
+    /// outcome (`cache::osr_wait`), until the backend publishes or the job
+    /// is dropped, however it settles.
+    pub(crate) fn park_waiter(&self, waiter: Arc<RuntimeState>) {
+        self.cell.park(waiter);
+    }
+
+    /// A probe found the backend still running (another owner's hold ran
+    /// out first, or the stress soak reads a finished job as running): park
+    /// the function again until the backend publishes.
+    pub(crate) fn repark(&self) {
+        self.cell.repark();
         bump_stats(|s| s.pending_probes += 1);
     }
 
@@ -579,6 +654,11 @@ enum Settled {
 impl Drop for PendingJob {
     fn drop(&mut self) {
         let _ = PENDING_COUNT.try_with(|c| c.set(c.get().saturating_sub(1)));
+        // Superseded (or settled without restoring it): the function's next
+        // call compiles again rather than waiting on a dropped job.
+        if let Some(rt) = self.cell.unpark() {
+            rt.release_parked_tier_up();
+        }
         if !self.settled.get() {
             if self.class == JobClass::Upgrade && !self.backend_charged_in_front {
                 let cost = self
@@ -619,6 +699,10 @@ pub(crate) fn install(
     ctx: Option<&Context>,
 ) -> Result<CompiledLeaf, Discard> {
     let out = job.cell.take_out().expect("install only a ready job");
+    // An entry's own parked runtime stands in when the caller has none (an
+    // idle drain): its hold is restored either way.
+    let parked = job.parked.take();
+    let rt = rt.or(parked.as_deref());
     if job.class == JobClass::Upgrade && !job.backend_charged_in_front {
         super::tier2::charge_compile(std::time::Duration::from_micros(out.backend_cpu_us));
     }
@@ -634,7 +718,7 @@ pub(crate) fn install(
         job.settle(Settled::Discarded(DiscardReason::Dropped));
         return Err(Discard::Stale(DiscardReason::Dropped));
     }
-    if let Some(rt) = rt {
+    let calls = rt.map(|rt| {
         rt.defer_tier_up(job.saved_hold);
         let calls = u64::from(rt.heat().saturating_sub(job.requested_heat));
         bump_stats(|s| {
@@ -644,12 +728,24 @@ pub(crate) fn install(
                 s.interp_calls_while_pending += calls;
             }
         });
-    }
+        calls
+    });
     bump_stats(|s| {
         s.backend_us += out.backend_us;
         s.backend_max_us = s.backend_max_us.max(out.backend_us);
         s.queue_wait_us += out.queue_wait_us;
     });
+    tracing::debug!(
+        target: "neovm_jit::bg",
+        id = job.id,
+        class = <&'static str>::from(job.class),
+        clif_insts = job.leaf().clif_insts,
+        calls_while_pending = calls,
+        latency_us = job.enqueued_at.elapsed().as_micros() as u64,
+        queue_wait_us = out.queue_wait_us,
+        backend_us = out.backend_us,
+        "pending backend installs"
+    );
     let entry = match out.result {
         Ok(entry) => entry,
         Err(err) => {
@@ -757,6 +853,10 @@ pub(crate) struct BgStats {
     /// Hot back-edge wraps that found their OSR leaf still compiling (and
     /// interpreted on without latching).
     pub(crate) osr_waits: u64,
+    /// Hot back-edge wraps that found their function's entry compile still
+    /// pending and waited on it rather than compile an OSR leaf of the
+    /// same body.
+    pub(crate) osr_adopted: u64,
     /// Heat a function gained between its request and its install (the
     /// calls it interpreted meanwhile), over the installs that know it.
     pub(crate) interp_calls_while_pending: u64,
@@ -848,7 +948,7 @@ impl BgReport {
         format!(
             "mode={} workers={} enqueued={} installed={} discarded={discarded} backend_us={} \
              backend_max_us={} queue_wait_us={} latency_hist_us[<100,<250,<500,<1ms,<2.5ms,<5ms,<10ms,>=10ms]={latency} \
-             pending_probes={} osr_waits={} refused={} interp_calls_while_pending={} native_calls_while_pending={} spec_restamps={} in_flight_at_exit={} worker_jobs={} \
+             pending_probes={} osr_waits={} osr_adopted={} refused={} interp_calls_while_pending={} native_calls_while_pending={} spec_restamps={} in_flight_at_exit={} worker_jobs={} \
              worker_skipped={} worker_panics={} worker_code_bytes={} worker_backend_max_us={} \
              worker_batches={} worker_failed_batches={} worker_published_modules_finalized={} worker_published_arena_seals={}",
             self.mode,
@@ -860,6 +960,7 @@ impl BgReport {
             self.stats.queue_wait_us,
             self.stats.pending_probes,
             self.stats.osr_waits,
+            self.stats.osr_adopted,
             self.stats.refused,
             self.stats.interp_calls_while_pending,
             self.stats.native_calls_while_pending,
@@ -938,6 +1039,11 @@ pub(crate) fn note_osr_wait() {
     bump_stats(|s| s.osr_waits += 1);
 }
 
+/// A hot back-edge waited on its function's pending entry compile.
+pub(crate) fn note_osr_adopted() {
+    bump_stats(|s| s.osr_adopted += 1);
+}
+
 /// This thread's counters.
 pub(crate) fn stats_snapshot() -> BgStats {
     STATS.with(Cell::get)
@@ -995,36 +1101,60 @@ pub(crate) fn defer_route(insts: u64) -> Option<(JobClass, DeferRoute)> {
     }
     match mode() {
         BgMode::Legacy | BgMode::Sync => None,
-        BgMode::Threaded if osr_backend_in_line(class, insts) => None,
+        BgMode::Threaded if backend_in_line(class, insts) => None,
         BgMode::Threaded => Some((class, DeferRoute::Worker)),
     }
 }
 
-/// Whether an OSR leaf's backend runs in line although a worker could take
-/// it: its function is at most [`osr_in_line_insts`] CLIF instructions.
-/// The loop that asked for it is running now and interprets until the leaf
-/// installs, so a small backend costs less in line than the wait it saves.
-/// A size, never a clock: the same function always takes the same route.
-fn osr_backend_in_line(class: JobClass, insts: u64) -> bool {
-    class == JobClass::Osr && insts <= osr_in_line_insts()
+/// Whether a leaf's backend runs in line although a worker could take it:
+/// its function interprets until the leaf installs (an OSR loop, an entry
+/// or first-sight tier-up) and is at most [`in_line_insts`] CLIF
+/// instructions. A small backend costs less in line than the interpreted
+/// calls it would otherwise wait through (behind any larger job queued
+/// first). An upgrade always defers: its old native leaf serves the calls
+/// meanwhile. A size, never a clock: the same function always takes the
+/// same route.
+fn backend_in_line(class: JobClass, insts: u64) -> bool {
+    let interprets_while_pending = match class {
+        JobClass::Osr | JobClass::FirstSight | JobClass::Entry => true,
+        JobClass::Upgrade => false,
+    };
+    interprets_while_pending && insts <= in_line_insts()
 }
 
-/// `NEOVM_JIT_BG_OSR_INLINE_INSTS`: the largest OSR function (CLIF
-/// instructions) whose backend runs in line under `NEOVM_JIT_BG=on`
-/// (default [`OSR_INLINE_INSTS`]; `0` defers every OSR backend).
-fn osr_in_line_insts() -> u64 {
+/// `NEOVM_JIT_BG_INLINE_INSTS`: the largest function (CLIF instructions)
+/// whose OSR, first-sight or entry backend runs in line under
+/// `NEOVM_JIT_BG=on` (default [`INLINE_INSTS`]; `0` defers every backend).
+/// Unit tests read it as `0` unless they pin it: a test that forces the
+/// worker exercises the deferred route whatever its function's size.
+fn in_line_insts() -> u64 {
     #[cfg(test)]
-    if let Some(limit) = OSR_INLINE_INSTS_TEST.with(Cell::get) {
-        return limit;
+    {
+        INLINE_INSTS_TEST.with(Cell::get).unwrap_or(0)
     }
-    static LIMIT: OnceLock<u64> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        knob_count("NEOVM_JIT_BG_OSR_INLINE_INSTS", OSR_INLINE_INSTS as usize) as u64
-    })
+    #[cfg(not(test))]
+    {
+        in_line_insts_knob()
+    }
 }
 
-/// See [`osr_in_line_insts`].
-pub(crate) const OSR_INLINE_INSTS: u64 = 1024;
+/// The knob behind [`in_line_insts`], read once per process.
+fn in_line_insts_knob() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| knob_count("NEOVM_JIT_BG_INLINE_INSTS", INLINE_INSTS as usize) as u64)
+}
+
+/// See [`in_line_insts`]. A backend this large takes about 5 ms; below it
+/// what a deferral costs -- the calls interpreted until the leaf installs,
+/// however soon the install follows the backend -- outweighs the stall it
+/// saves. Re-measured with the shortest-first queue, the parked install and
+/// OSR requests waiting on the entry job (2026-10-13, two CPUs): 1024..4096
+/// cut the first call of a body between 4,096 and 8,192 instructions from
+/// 3.2 to 0.8 ms and pass the benchmark rows (geomean +0.02..+0.05%), but
+/// cost the editing board +0.47% (org) and +31% (sustained editing, whose
+/// window then counts the worker's backend of `syntax-ppss`, 5,489
+/// instructions).
+pub(crate) const INLINE_INSTS: u64 = 8192;
 
 /// Start worker `index` for `pool` (x86-64 Linux only; see
 /// [`workers_supported`]).
@@ -1041,7 +1171,8 @@ fn spawn_worker(index: usize, pool: &'static queue::Pool) -> std::io::Result<()>
     }
 }
 
-/// Process-unique job sequence numbers (FIFO order within a class).
+/// Process-unique job sequence numbers (the queue's last tie-break: equal
+/// class and virtual finish go oldest first).
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Hand `payload` to a worker under `class` and record the job for the
@@ -1319,7 +1450,7 @@ thread_local! {
     static DEFERRED_INSTALL_TEST: Cell<bool> = const { Cell::new(false) };
     static FAIL_BACKEND_TEST: Cell<bool> = const { Cell::new(false) };
     static QUEUE_CAP_TEST: Cell<Option<usize>> = const { Cell::new(None) };
-    static OSR_INLINE_INSTS_TEST: Cell<Option<u64>> = const { Cell::new(None) };
+    static INLINE_INSTS_TEST: Cell<Option<u64>> = const { Cell::new(None) };
     static HOLD_PUBLISH_TEST: Cell<bool> = const { Cell::new(false) };
     static HELD_TEST: RefCell<Vec<(Arc<JobCell>, BackendOut)>> = const { RefCell::new(Vec::new()) };
 }
@@ -1342,11 +1473,11 @@ pub(crate) fn take_served_for_test() -> Vec<(JobClass, u64, bool)> {
     std::mem::take(&mut *SERVED_TEST.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
-/// Pin [`osr_in_line_insts`] for this thread (tests only); `None` returns to
-/// the knob.
+/// Pin [`in_line_insts`] for this thread (tests only); `None` returns to
+/// the tests' `0`.
 #[cfg(test)]
-pub(crate) fn force_osr_inline_insts_for_test(limit: Option<u64>) {
-    OSR_INLINE_INSTS_TEST.with(|c| c.set(limit));
+pub(crate) fn force_inline_insts_for_test(limit: Option<u64>) {
+    INLINE_INSTS_TEST.with(|c| c.set(limit));
 }
 
 /// Cap the queue at `cap` jobs for pushes and admissions from this thread
@@ -1441,6 +1572,10 @@ mod osr_pending_tests;
 mod osr_best_tests;
 
 #[cfg(test)]
+#[path = "bg/tests/osr_adopt_test.rs"]
+mod osr_adopt_tests;
+
+#[cfg(test)]
 #[path = "bg/tests/upgrade_test.rs"]
 mod upgrade_tests;
 
@@ -1457,8 +1592,8 @@ mod soak_tests;
 mod mutator_tests;
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-#[path = "bg/tests/osr_size_test.rs"]
-mod osr_size_tests;
+#[path = "bg/tests/inline_size_test.rs"]
+mod inline_size_tests;
 
 /// Scoped ownership for tests of a particular backend's thread-local module.
 /// Native execution fixtures should await the real worker instead.

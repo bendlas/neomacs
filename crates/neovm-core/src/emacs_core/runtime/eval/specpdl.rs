@@ -4,6 +4,7 @@
 //! the same view of `Context` and the parent's private items (`use super::*`).
 
 use super::*;
+use crate::emacs_core::symbol::CanonicalAccess;
 
 /// Push the entry MAKE builds onto SPECPDL, constructed in its final slot.
 ///
@@ -398,12 +399,16 @@ impl Context {
                 }
                 SpecBinding::LoadsInProgress { len } => self.loads_in_progress.truncate(len),
                 SpecBinding::RequireStack { len } => self.require_stack.truncate(len),
+                SpecBinding::NativeUnwind { action } => {
+                    if let NativeUnwindAction::OwnerBinding(binding) = action {
+                        self.discard_owner_binding(binding);
+                    }
+                }
                 SpecBinding::GcRoot { .. }
                 | SpecBinding::Backtrace1 { .. }
                 | SpecBinding::Backtrace2 { .. }
                 | SpecBinding::BacktraceNative { .. }
                 | SpecBinding::UnwindProtect { .. }
-                | SpecBinding::NativeUnwind { .. }
                 | SpecBinding::Nop => {}
             }
         }
@@ -412,7 +417,10 @@ impl Context {
     }
 
     /// Storage-only restoration below watcher and constant-check policy.
-    fn discard_restore_default_binding(&mut self, sym_id: SymId, saved: Option<Value>) {
+    /// Inlined into both of its callers (the panic-recovery drain and its
+    /// thread-projection reveal), as into the drain when it was the only one.
+    #[inline(always)]
+    pub(super) fn discard_restore_default_binding(&mut self, sym_id: SymId, saved: Option<Value>) {
         use crate::emacs_core::forward::ForwardSlot;
 
         // Follow the storage writer's bounded alias walk without constructing
@@ -431,6 +439,9 @@ impl Context {
         }
         let value = saved.unwrap_or(Value::UNBOUND);
         let forwarder = self.obarray.forwarder(resolved);
+        if forwarder.is_some_and(|fwd| fwd.thread_projection().is_some()) {
+            return self.discard_restore_projected(resolved, saved);
+        }
         // GNU set_internal refuses Qunbound for both built-in arms before
         // storing (data.c:1725-1728,1805-1808). Descriptor type checking alone
         // is insufficient: a Bool would accept UNBOUND as true, and an Obj
@@ -467,7 +478,8 @@ impl Context {
             } else {
                 // This preserves LOCALIZED defcell/valcell identity. These
                 // storage setters do not evaluate watchers or Lisp forms.
-                self.obarray.set_symbol_value_id(sym_id, value);
+                self.obarray
+                    .set_canonical_value(CanonicalAccess::STORAGE, sym_id, value);
             }
         }
         if self.runtime_binding_has_projection(resolved) {
@@ -570,7 +582,7 @@ impl Context {
                         store_runtime_binding(
                             obarray,
                             &mut self.buffers,
-                            &self.custom,
+                            self.owner.slab_mut(),
                             &self.specpdl,
                             resolved,
                             checked,
@@ -604,7 +616,10 @@ impl Context {
                             buf.replace_local_var_alist(new_alist);
                         }
                     }
-                    None => self.obarray.set_symbol_value_id(resolved, stored),
+                    None => {
+                        self.obarray
+                            .set_canonical_value(CanonicalAccess::STORAGE, resolved, stored)
+                    }
                 }
                 stored
             }
@@ -616,8 +631,11 @@ impl Context {
                         Ok(store) => store.canonical_value(),
                         Err(error) => return Err(forward_store_signal(error, value)),
                     };
-                    if let Some(slot) = buf_fwd.buffer_slot()
-                        && let Some(buf_id) = self.buffers.current_buffer_id()
+                    let Some(slot) = buf_fwd.buffer_slot() else {
+                        // Only a thread projection's header has no slot.
+                        return self.set_projected_internal(sym_id, resolved, value, bindflag);
+                    };
+                    if let Some(buf_id) = self.buffers.current_buffer_id()
                         && let Some(buf) = self.buffers.get_mut(buf_id)
                     {
                         buf.slots[slot.index()] = stored;
@@ -637,13 +655,15 @@ impl Context {
                         ForwardStoreSite::Bind,
                     )?
                     .value();
-                    self.obarray.set_symbol_value_id(resolved, stored);
+                    self.obarray
+                        .set_canonical_value(CanonicalAccess::STORAGE, resolved, stored);
                     stored
                 }
             },
             // The alias walk above ends on a non-alias cell.
             None | Some(ValueCell::Plain(_) | ValueCell::Alias(_)) => {
-                self.obarray.set_symbol_value_id(resolved, value);
+                self.obarray
+                    .set_canonical_value(CanonicalAccess::STORAGE, resolved, value);
                 value
             }
         };
@@ -786,7 +806,8 @@ impl Context {
             if let Some(fwd) = forwarded {
                 if let Some(buf_fwd) = fwd.as_buffer_obj_fwd() {
                     let Some(slot) = buf_fwd.buffer_slot() else {
-                        return Ok(());
+                        // Only a thread projection's header has no slot.
+                        return self.specbind_projected(resolved, value);
                     };
                     let off = slot.index();
                     let flags_idx = buf_fwd.local_flags_idx;
@@ -948,7 +969,9 @@ impl Context {
         // the typed-store probe is pure overhead for it; non-buffer forwarded
         // symbols (Int/Bool/Obj/Kboard) still take it so `(let
         // ((gc-cons-threshold "x")) ...)` keeps signaling before the body.
-        let old_value = self.obarray.symbol_value_id_copied(resolved);
+        let old_value = self
+            .obarray
+            .canonical_value(CanonicalAccess::STORAGE, resolved);
         self.push_specpdl_with(|| SpecBinding::Let {
             sym_id: resolved,
             old_value: SavedBindingValue::from_option(old_value),
@@ -967,7 +990,8 @@ impl Context {
             )?
             .value()
         };
-        self.obarray.set_symbol_value_id(resolved, stored);
+        self.obarray
+            .set_canonical_value(CanonicalAccess::STORAGE, resolved, stored);
         self.sync_cached_runtime_binding_by_id(resolved, stored);
         self.sync_user_test_gc_binding_by_id(resolved);
         Ok(())
@@ -1105,7 +1129,8 @@ impl Context {
         let current_value = if use_default_storage {
             super::super::data::default_value_by_id(self, sym_id)
         } else {
-            self.obarray.symbol_value_id_copied(sym_id)
+            self.obarray
+                .canonical_value(CanonicalAccess::STORAGE, sym_id)
         };
         if use_default_storage {
             self.restore_default_binding_by_id(
@@ -1116,12 +1141,14 @@ impl Context {
         } else {
             match old_value {
                 Some(value) => {
-                    self.obarray.set_symbol_value_id(sym_id, value);
+                    self.obarray
+                        .set_canonical_value(CanonicalAccess::STORAGE, sym_id, value);
                     self.sync_cached_runtime_binding_by_id(sym_id, value);
                     self.sync_user_test_gc_binding_by_id(sym_id);
                 }
                 None => {
-                    self.obarray.makunbound_id(sym_id);
+                    self.obarray
+                        .makunbound_canonical(CanonicalAccess::STORAGE, sym_id);
                     self.sync_cached_runtime_binding_by_id(sym_id, Value::NIL);
                     self.sync_user_test_gc_binding_by_id(sym_id);
                 }
@@ -1271,6 +1298,7 @@ impl Context {
             LexicalEnv,
             Let,
             LetLocal,
+            Owner(super::owner_bindings::OwnerBindingRef),
         }
         let swap = match self.specpdl.get(index) {
             Some(SpecBinding::SaveExcursion {
@@ -1282,6 +1310,9 @@ impl Context {
             Some(SpecBinding::LexicalEnv { .. }) => Swap::LexicalEnv,
             Some(SpecBinding::Let { .. } | SpecBinding::LetDefault { .. }) => Swap::Let,
             Some(SpecBinding::LetLocal { .. }) => Swap::LetLocal,
+            Some(SpecBinding::NativeUnwind {
+                action: NativeUnwindAction::OwnerBinding(binding),
+            }) => Swap::Owner(*binding),
             _ => return Ok(()),
         };
         match swap {
@@ -1341,6 +1372,7 @@ impl Context {
                 self.swap_let_binding_for_thread_switch(index)?;
                 self.swap_local_let_binding_for_thread_switch(index);
             }
+            Swap::Owner(binding) => self.swap_owner_binding(binding),
         }
         Ok(())
     }
@@ -1451,7 +1483,16 @@ impl Context {
                 LispExecution::Live => PoppedBindingPolicy::LispCleanup,
                 LispExecution::ExitedAlready => PoppedBindingPolicy::PureStorage,
             },
-            Some(SpecBinding::NativeUnwind { .. }) => PoppedBindingPolicy::LispCleanup,
+            // An owner binding is a `let`: storage only, unless watched.
+            Some(SpecBinding::NativeUnwind { action }) => {
+                if let NativeUnwindAction::OwnerBinding(binding) = action
+                    && !self.watchers.has_watchers(binding.symbol())
+                {
+                    PoppedBindingPolicy::PureStorage
+                } else {
+                    PoppedBindingPolicy::LispCleanup
+                }
+            }
             Some(
                 SpecBinding::LexicalEnv { .. }
                 | SpecBinding::GcRoot { .. }
@@ -1525,12 +1566,14 @@ impl Context {
                 } else if still_plain {
                     match old_value {
                         Some(val) => {
-                            self.obarray.set_symbol_value_id(sym_id, val);
+                            self.obarray
+                                .set_canonical_value(CanonicalAccess::STORAGE, sym_id, val);
                             self.sync_cached_runtime_binding_by_id(sym_id, val);
                             self.sync_user_test_gc_binding_by_id(sym_id);
                         }
                         None => {
-                            self.obarray.makunbound_id(sym_id);
+                            self.obarray
+                                .makunbound_canonical(CanonicalAccess::STORAGE, sym_id);
                             self.sync_cached_runtime_binding_by_id(sym_id, Value::NIL);
                             self.sync_user_test_gc_binding_by_id(sym_id);
                         }

@@ -1225,6 +1225,8 @@ struct PrimaryWindowDisplayHost {
     primary_frame_id: Option<neovm_core::window::FrameId>,
     /// X11 window ids published by the render thread, keyed by Emacs frame id.
     native_window_ids: neomacs_display_runtime::thread_comm::SharedNativeWindowIds,
+    /// Whether the native backend is X11 (only then are window ids published).
+    x11_backend: bool,
     last_window_titles: Mutex<HashMap<neovm_core::window::FrameId, LispString>>,
     font_metrics: Option<FontMetricsService>,
     font_entities: FontEntityCatalog,
@@ -1510,6 +1512,36 @@ impl PrimaryWindowDisplayHost {
         Ok(())
     }
 
+    /// Block until the render thread publishes FRAME_ID's X11 window ids.
+    ///
+    /// Additional top-level windows are realized asynchronously on the render
+    /// thread.  `x-create-frame` must not return before the frame carries its
+    /// `window-id`/`outer-window-id`, otherwise `frame-parameter` readers (and
+    /// X clients built on them) observe nil.  The wait is bounded so a failed
+    /// realization degrades to nil instead of hanging the evaluator.
+    fn await_native_window_ids(&self, frame_id: FrameId) {
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let ready = self
+                .native_window_ids
+                .lock()
+                .map(|ids| ids.contains_key(&frame_id.0))
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    frame_id = frame_id.0,
+                    "timed out waiting for GUI frame X11 window ids"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn await_clipboard_reply<T>(
         &self,
         command: ClipboardCommand,
@@ -1629,6 +1661,9 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                 }),
                 "failed to create additional GUI window",
             )?;
+            if self.x11_backend {
+                self.await_native_window_ids(request.frame_id);
+            }
             if let Some(fullscreen) = request.fullscreen {
                 self.send_render_command(
                     RenderCommand::Window(WindowCommand::SetWindowFullscreen {
@@ -3047,8 +3082,7 @@ fn frame_host_title(eval: &mut Context, frame_id: FrameId) -> LispString {
     };
 
     let format = eval
-        .obarray()
-        .symbol_value_copied("frame-title-format")
+        .variable_value_by_name("frame-title-format")
         .unwrap_or(Value::NIL);
     if format.is_nil() {
         return fallback_title;
@@ -3102,8 +3136,7 @@ fn adopt_existing_primary_gui_frame(eval: &mut Context) -> Result<(), String> {
         .map(|frame| frame.frame_alpha)
         .unwrap_or([-1.0; 2]);
     let limit = neovm_core::window::frame_alpha::lower_limit(
-        eval.obarray()
-            .symbol_value_copied("frame-alpha-lower-limit")
+        eval.variable_value_by_name("frame-alpha-lower-limit")
             .unwrap_or(Value::fixnum(20)),
     );
     let Some(host) = eval.display_host.as_mut() else {
@@ -3147,9 +3180,7 @@ fn seed_gnu_default_gui_chrome_modes(eval: &mut Context) {
 
 fn run_reused_gui_startup_frame_lisp(eval: &mut Context, frame_id: FrameId, body: &str) {
     let frame_value = Value::make_frame(frame_id.0);
-    let previous = eval
-        .obarray()
-        .symbol_value_copied("neomacs--reused-gui-startup-frame");
+    let previous = eval.variable_value_by_name("neomacs--reused-gui-startup-frame");
     eval.set_variable("neomacs--reused-gui-startup-frame", frame_value);
     let result = eval.eval_str(body);
     match previous {
@@ -3216,12 +3247,11 @@ fn initialize_reused_gui_startup_frame(eval: &mut Context, frame_id: FrameId) {
 fn ensure_gnu_tool_bar_setup(eval: &mut Context) {
     let needs_setup = eval.obarray().fboundp("tool-bar-setup")
         && eval
-            .obarray()
-            .symbol_value_copied("tool-bar-mode")
+            .variable_value_by_name("tool-bar-mode")
             .is_some_and(|value| value.is_truthy())
         && eval
-            .obarray()
-            .default_value_id_copied(intern("tool-bar-map"))
+            .variables()
+            .default_value(intern("tool-bar-map"))
             .is_some_and(|map| list_length(&map) == Some(1));
     if !needs_setup {
         return;
@@ -3232,8 +3262,7 @@ fn ensure_gnu_tool_bar_setup(eval: &mut Context) {
 }
 
 fn throw_on_input_active(eval: &Context) -> bool {
-    eval.obarray()
-        .symbol_value_copied("throw-on-input")
+    eval.variable_value_by_name("throw-on-input")
         .is_some_and(|value| value.is_truthy())
 }
 
@@ -3519,7 +3548,7 @@ fn load_neomacs_gui_term_layer(evaluator: &mut Context) {
         .eval_str("(provide 'neomacs)")
         .expect("GUI terminal layer should advertise the Neomacs backend");
 
-    let load_path = get_load_path(evaluator.obarray(), evaluator.buffers.current_buffer());
+    let load_path = get_load_path(evaluator.variables(), evaluator.buffers.current_buffer());
     for library in ["term/common-win", "term/neo-win"] {
         let Some(path) = find_file_in_load_path(library, &load_path) else {
             panic!("required GUI terminal library should be found: {library}");
@@ -3895,6 +3924,8 @@ fn run_gui_evaluator_worker(
         primary_window_adopted: false,
         primary_frame_id: None,
         native_window_ids: Arc::clone(&emacs_comms.native_window_ids),
+        x11_backend: identity.backend()
+            == neomacs_display_protocol::GraphicalBackend::X11,
         last_window_titles: Mutex::new(HashMap::new()),
         font_metrics: None,
         font_entities: FontEntityCatalog::default(),
@@ -5678,7 +5709,7 @@ fn ensure_gnu_startup_terminal_frame(eval: &mut Context, opening_frame_id: Frame
 fn opening_frame_initial_alist(eval: &Context, window_system: Value) -> Value {
     let mut params = vec![Value::cons(Value::symbol("window-system"), window_system)];
     for symbol_name in ["initial-frame-alist", "default-frame-alist"] {
-        if let Some(value) = eval.obarray().symbol_value_copied(symbol_name)
+        if let Some(value) = eval.variable_value_by_name(symbol_name)
             && let Some(items) = neovm_core::emacs_core::value::list_to_vec(&value)
         {
             params.extend(items);
@@ -5709,7 +5740,7 @@ fn run_gnu_startup_inner(eval: &mut Context) {
         "#,
     )
     .expect("startup exit helper should install");
-    let top_level = eval.obarray().symbol_value_copied("top-level");
+    let top_level = eval.variable_value_by_name("top-level");
     tracing::info!("top-level variable before startup: {:?}", top_level);
 
     let (_tx, rx) = crossbeam_channel::unbounded();
@@ -5720,12 +5751,10 @@ fn run_gnu_startup_inner(eval: &mut Context) {
 
     if let Err(other) = result {
         let last_phase = eval
-            .obarray()
-            .symbol_value_copied("neomacs--startup-last-phase")
+            .variable_value_by_name("neomacs--startup-last-phase")
             .map(|value| print_value_with_eval(eval, &value));
         let last_call = eval
-            .obarray()
-            .symbol_value_copied("neomacs--startup-last-call")
+            .variable_value_by_name("neomacs--startup-last-call")
             .map(|value| print_value_with_eval(eval, &value));
         panic!(
             "GNU startup via recursive_edit failed: {other} last-phase={last_phase:?} last-call={last_call:?}"

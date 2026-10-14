@@ -42,7 +42,7 @@ use super::process::ProcessManager;
 use super::rect::RectangleState;
 use super::regex::MatchData;
 use super::register::RegisterManager;
-use super::symbol::{ConstantWrite, Obarray};
+use super::symbol::{CanonicalAccess, ConstantWrite, Obarray};
 use super::terminal::pure::TtyFrameHostFactory;
 use super::threads::ThreadManager;
 use super::value::*;
@@ -939,12 +939,12 @@ fn internal_make_interpreted_closure_function_symbol() -> SymId {
 }
 
 pub(crate) fn compiler_function_override_in_obarray(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     sym_id: SymId,
     mode: crate::tagged::SymbolMode,
 ) -> Option<Value> {
     let overrides_sym = internal_compiler_function_overrides_sym();
-    let mut cursor = obarray.symbol_value_id_or_nil(overrides_sym);
+    let mut cursor = vars.value_or_nil(overrides_sym);
     while cursor.is_cons() {
         let entry = cursor.cons_car();
         cursor = cursor.cons_cdr();
@@ -1280,6 +1280,11 @@ pub(crate) enum NativeUnwindAction {
     /// (eval.c:4255): re-swap the specpdl suffix a `backtrace-eval` unbound,
     /// restoring the frames' own bindings before their normal unwind.
     BacktraceEvalRewind { distance: usize },
+    /// An owner-local dynamic binding of a projected variable (Phase 0 step
+    /// 2): GNU's `SPECPDL_LET` family for a variable whose bindings live in
+    /// its owner's slab. Unbinding restores the owner's slot; the values are
+    /// the slab's, so the entry holds none.
+    OwnerBinding(owner_bindings::OwnerBindingRef),
 }
 
 impl NativeUnwindAction {
@@ -1292,6 +1297,7 @@ impl NativeUnwindAction {
             Self::MinibufferSession { state } => state.trace_roots(visit),
             Self::MinibufferBuffer { .. } => {}
             Self::BacktraceEvalRewind { .. } => {}
+            Self::OwnerBinding(_) => {}
         }
     }
 
@@ -1318,6 +1324,9 @@ impl NativeUnwindAction {
             Self::BacktraceEvalRewind { distance } => context
                 .specpdl_swap_suffix_for_backtrace_eval(distance, false)
                 .map(|()| Value::NIL),
+            Self::OwnerBinding(binding) => {
+                context.unbind_owner_binding(binding).map(|()| Value::NIL)
+            }
         };
         context.restore_vm_roots(root_scope);
         result
@@ -2002,7 +2011,7 @@ struct CoreEvalSymbols {
 fn install_core_eval_symbols(obarray: &mut Obarray, reset_runtime_values: bool) -> CoreEvalSymbols {
     obarray.intern("internal-interpreter-environment");
     let internal_interpreter_environment_symbol = hidden_internal_interpreter_environment_symbol();
-    obarray.set_symbol_value_id(internal_interpreter_environment_symbol, Value::NIL);
+    obarray.seed_value_id(internal_interpreter_environment_symbol, Value::NIL);
     obarray.make_special_id(internal_interpreter_environment_symbol);
     let load_read_stream_token = hidden_load_read_stream_token();
 
@@ -2010,19 +2019,19 @@ fn install_core_eval_symbols(obarray: &mut Obarray, reset_runtime_values: bool) 
 
     let quit_flag_symbol = intern("quit-flag");
     if reset_runtime_values {
-        obarray.set_symbol_value_id(quit_flag_symbol, Value::NIL);
+        obarray.seed_value_id(quit_flag_symbol, Value::NIL);
     }
     obarray.make_special_id(quit_flag_symbol);
 
     let inhibit_quit_symbol = intern("inhibit-quit");
     if reset_runtime_values {
-        obarray.set_symbol_value_id(inhibit_quit_symbol, Value::NIL);
+        obarray.seed_value_id(inhibit_quit_symbol, Value::NIL);
     }
     obarray.make_special_id(inhibit_quit_symbol);
 
     let throw_on_input_symbol = intern("throw-on-input");
     if reset_runtime_values {
-        obarray.set_symbol_value_id(throw_on_input_symbol, Value::NIL);
+        obarray.seed_value_id(throw_on_input_symbol, Value::NIL);
     }
     obarray.make_special_id(throw_on_input_symbol);
 
@@ -2095,19 +2104,17 @@ fn let_constant_error_name(obarray: &Obarray, sym_id: SymId, value: Value) -> Op
     }
 }
 
-pub(crate) fn sync_features_variable_in_state(obarray: &mut Obarray, features: &[SymId]) {
+pub(crate) fn sync_features_variable_in_state(vars: &mut VariableStore<'_>, features: &[SymId]) {
     let values: Vec<Value> = features.iter().map(|id| Value::from_sym_id(*id)).collect();
-    obarray.set_symbol_value("features", Value::list(values));
+    vars.store_by_name("features", Value::list(values));
 }
 
 pub(crate) fn refresh_features_from_variable_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     features: &mut Vec<SymId>,
     mode: crate::tagged::SymbolMode,
 ) {
-    let current = obarray
-        .symbol_value_copied("features")
-        .unwrap_or(Value::NIL);
+    let current = vars.value_by_name("features").unwrap_or(Value::NIL);
     let mut parsed = Vec::new();
     if let Some(items) = list_to_vec(&current) {
         for item in items {
@@ -2120,60 +2127,58 @@ pub(crate) fn refresh_features_from_variable_in_state(
 }
 
 pub(crate) fn feature_present_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     features: &mut Vec<SymId>,
     name: &str,
     mode: crate::tagged::SymbolMode,
 ) -> bool {
-    refresh_features_from_variable_in_state(obarray, features, mode);
+    refresh_features_from_variable_in_state(vars, features, mode);
     let id = intern(name);
     features.contains(&id)
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 pub(crate) fn add_feature_in_state(
-    obarray: &mut Obarray,
+    vars: &mut VariableStore<'_>,
     features: &mut Vec<SymId>,
     name: &str,
     mode: crate::tagged::SymbolMode,
 ) {
-    refresh_features_from_variable_in_state(obarray, features, mode);
+    refresh_features_from_variable_in_state(vars.view(), features, mode);
     let id = intern(name);
-    add_feature_id_in_state(obarray, features, id, mode);
+    add_feature_id_in_state(vars, features, id, mode);
 }
 
 pub(crate) fn add_feature_id_in_state(
-    obarray: &mut Obarray,
+    vars: &mut VariableStore<'_>,
     features: &mut Vec<SymId>,
     id: SymId,
     mode: crate::tagged::SymbolMode,
 ) {
-    refresh_features_from_variable_in_state(obarray, features, mode);
+    refresh_features_from_variable_in_state(vars.view(), features, mode);
     if features.contains(&id) {
         return;
     }
-    let current = obarray
-        .symbol_value_copied("features")
-        .unwrap_or(Value::NIL);
+    let current = vars.view().value_by_name("features").unwrap_or(Value::NIL);
     // Emacs pushes newly-provided features at the front.
     features.insert(0, id);
-    obarray.set_symbol_value("features", Value::cons(Value::from_sym_id(id), current));
+    vars.store_by_name("features", Value::cons(Value::from_sym_id(id), current));
 }
 
 pub(crate) fn remove_feature_in_state(
-    obarray: &mut Obarray,
+    vars: &mut VariableStore<'_>,
     features: &mut Vec<SymId>,
     name: &str,
     mode: crate::tagged::SymbolMode,
 ) {
-    refresh_features_from_variable_in_state(obarray, features, mode);
+    refresh_features_from_variable_in_state(vars.view(), features, mode);
     let id = intern(name);
     features.retain(|feature| *feature != id);
-    sync_features_variable_in_state(obarray, features);
+    sync_features_variable_in_state(vars, features);
 }
 
 pub(crate) fn provide_value_in_state(
-    obarray: &mut Obarray,
+    vars: &mut VariableStore<'_>,
     features: &mut Vec<SymId>,
     feature: Value,
     subfeatures: Option<Value>,
@@ -2194,30 +2199,29 @@ pub(crate) fn provide_value_in_state(
             ));
         }
         if value.is_nil() {
-            add_feature_value_in_state(obarray, features, sym_id, feature, mode);
+            add_feature_value_in_state(vars, features, sym_id, feature, mode);
             return Ok(feature);
         }
-        obarray.put_property_id(sym_id, intern("subfeatures"), value)?;
+        vars.obarray()
+            .put_property_id(sym_id, intern("subfeatures"), value)?;
     }
-    add_feature_value_in_state(obarray, features, sym_id, feature, mode);
+    add_feature_value_in_state(vars, features, sym_id, feature, mode);
     Ok(feature)
 }
 
 // GNU Fprovide stores the original symbol object after EQ membership checking.
 fn add_feature_value_in_state(
-    obarray: &mut Obarray,
+    vars: &mut VariableStore<'_>,
     features: &mut Vec<SymId>,
     id: SymId,
     original: Value,
     mode: crate::tagged::SymbolMode,
 ) {
-    refresh_features_from_variable_in_state(obarray, features, mode);
+    refresh_features_from_variable_in_state(vars.view(), features, mode);
     if !features.contains(&id) {
         features.insert(0, id);
-        let current = obarray
-            .symbol_value_copied("features")
-            .unwrap_or(Value::NIL);
-        obarray.set_symbol_value("features", Value::cons(original, current));
+        let current = vars.view().value_by_name("features").unwrap_or(Value::NIL);
+        vars.store_by_name("features", Value::cons(original, current));
     }
 }
 
@@ -3588,11 +3592,11 @@ pub struct Context {
     /// thread-local's lookup plus RefCell borrow ran on every bind, unbind
     /// and native entry.
     pub(crate) jit_bind_stack: Vec<usize>,
-    /// Reserved former opcode epoch word. Primitive opcodes never consult it;
-    /// keeping its storage preserves Context offsets used by protected call
-    /// paths while the obsolete Aset guards are removed. Threading: this word
-    /// is never read or published and contains no Lisp or mutator state.
-    _reserved_opcode_epoch: std::cell::Cell<u64>,
+    /// This owner's slab of dynamic bindings of projected variables (Phase 0
+    /// step 2), or none. It occupies the former reserved opcode-epoch word,
+    /// with the same size, alignment and niche, so no Context offset moves.
+    /// Thread-confined like the Context: only this owner mutates the slab.
+    pub(crate) owner: owner_bindings::OwnerSlot,
     /// The function epoch at which `apply` was last found to be the builtin
     /// with compiler overrides inactive (`Vm::call_apply_native`). Genuine
     /// calls must recheck after advice, redefinition or an overrides toggle.
@@ -3888,7 +3892,7 @@ pub(crate) enum RequirePlan {
 }
 
 pub(crate) fn plan_require_in_state(
-    obarray: &Obarray,
+    vars: VariableView<'_>,
     buf: Option<&crate::buffer::Buffer>,
     features: &mut Vec<SymId>,
     require_stack: &[SymId],
@@ -3897,7 +3901,7 @@ pub(crate) fn plan_require_in_state(
     noerror: Option<Value>,
     mode: crate::tagged::SymbolMode,
 ) -> Result<RequirePlan, Flow> {
-    refresh_features_from_variable_in_state(obarray, features, mode);
+    refresh_features_from_variable_in_state(vars, features, mode);
     // Use symbol_id to transparently handle symbol-with-pos wrappers.
     let sym_id = super::builtins::symbols::symbol_id(&feature, mode).ok_or_else(|| {
         signal(
@@ -3953,7 +3957,7 @@ pub(crate) fn plan_require_in_state(
     // which otherwise shadowed org's `org-capture.el` and was read as Lisp.
     let requirement = super::load::LoadSuffixRequirement::for_require(filename_given);
     let filename = crate::heap_types::LispString::from_utf8(&filename);
-    match super::load::resolve_load_path_file_in_state(obarray, buf, &filename, requirement)? {
+    match super::load::resolve_load_path_file_in_state(vars, buf, &filename, requirement)? {
         Some(path) => Ok(RequirePlan::Load {
             sym_id,
             name,
@@ -4030,9 +4034,8 @@ pub(crate) fn parse_eval_lexical_arg(arg: Option<Value>) -> Result<(bool, Option
     Ok((true, Some(arg)))
 }
 
-fn lexical_binding_in_obarray(obarray: &Obarray) -> bool {
-    obarray
-        .symbol_value_id_copied(lexical_binding_symbol())
+fn lexical_binding_in_obarray(vars: VariableView<'_>) -> bool {
+    vars.value(lexical_binding_symbol())
         .is_some_and(|v| v.is_truthy())
 }
 
@@ -4744,12 +4747,10 @@ impl Context {
 
     pub(crate) fn sync_keyboard_runtime_from_obarray(&mut self) {
         let input_decode_map = self
-            .obarray
-            .symbol_value_copied("input-decode-map")
+            .variable_value_by_name("input-decode-map")
             .unwrap_or(Value::NIL);
         let local_function_key_map = self
-            .obarray
-            .symbol_value_copied("local-function-key-map")
+            .variable_value_by_name("local-function-key-map")
             .unwrap_or(Value::NIL);
         self.command_loop
             .keyboard
@@ -4895,7 +4896,7 @@ impl Context {
     /// evaluator is reused.
     pub(crate) fn clear_top_level_eval_state(&mut self) {
         self.unbind_to(0);
-        self.lexenv = if lexical_binding_in_obarray(&self.obarray) {
+        self.lexenv = if lexical_binding_in_obarray(self.variables()) {
             top_level_lexenv_sentinel()
         } else {
             Value::NIL
@@ -5005,13 +5006,22 @@ impl Context {
 
     pub(crate) fn refresh_features_from_variable(&mut self) {
         let mode = self.symbol_mode();
-        refresh_features_from_variable_in_state(&self.obarray, &mut self.features, mode);
+        refresh_features_from_variable_in_state(
+            VariableView::new(&self.obarray, &self.owner),
+            &mut self.features,
+            mode,
+        );
     }
 
     fn has_feature(&mut self, name: &str) -> bool {
         {
             let mode = self.symbol_mode();
-            feature_present_in_state(&self.obarray, &mut self.features, name, mode)
+            feature_present_in_state(
+                VariableView::new(&self.obarray, &self.owner),
+                &mut self.features,
+                name,
+                mode,
+            )
         }
     }
 
@@ -5022,7 +5032,8 @@ impl Context {
         // it preserves function cells, canonical descriptors and manager identity.
         unsafe {
             self.obarray.with_legacy_value_write(|obarray| {
-                add_feature_in_state(obarray, &mut self.features, name, mode);
+                let mut vars = VariableStore::new(obarray, Some(&mut self.owner));
+                add_feature_in_state(&mut vars, &mut self.features, name, mode);
             });
         }
     }
@@ -5038,7 +5049,8 @@ impl Context {
         // no dispatch metadata or manager authority leaves the phase.
         unsafe {
             self.obarray.with_legacy_value_write(|obarray| {
-                remove_feature_in_state(obarray, &mut self.features, name, mode);
+                let mut vars = VariableStore::new(obarray, Some(&mut self.owner));
+                remove_feature_in_state(&mut vars, &mut self.features, name, mode);
             });
         }
     }
@@ -5091,7 +5103,7 @@ impl Context {
         if let Some(info) = crate::buffer::buffer::lookup_buffer_slot(name) {
             return Some(self.buffers.buffer_defaults[info.offset.index()]);
         }
-        self.obarray.symbol_value_copied(name)
+        self.variable_value_by_name(name)
     }
 
     /// Seed the 24 GNU standard built-in fringe bitmaps into the registry and
@@ -5289,8 +5301,20 @@ impl Context {
     /// GNU keeps this window's mode/header line active while the minibuffer
     /// owns input selection (`minibuffer-selected-window`).
     pub fn minibuffer_selected_window_id(&self) -> Option<WindowId> {
-        self.active_minibuffer_window_id()?;
-        self.minibuffer_selected_window
+        // GNU window.c returns the saved caller only while a minibuffer is
+        // selected, at positive minibuffer depth, and the caller is live.
+        // Keep the saved identity for nested reads/window-configuration
+        // restoration; deletion invalidates the query, not the session.
+        if !self.minibuffer_is_active() {
+            return None;
+        }
+        let selected_frame = self.frames.selected_frame()?;
+        if selected_frame.minibuffer_window != Some(selected_frame.selected_window) {
+            return None;
+        }
+        let caller = self.minibuffer_selected_window?;
+        super::window_cmds::WindowDomain::Live.frame_of(&self.frames, caller)?;
+        Some(caller)
     }
 
     pub fn activate_minibuffer_window_for_buffer(
@@ -5767,8 +5791,7 @@ impl Context {
             .set_internal_last_event_frame(frame_id);
 
         let frame_value = Value::make_frame(frame_id.0);
-        self.obarray
-            .set_symbol_value("last-event-frame", frame_value);
+        self.store_variable_by_name("last-event-frame", frame_value);
         if switching || self.command_loop.keyboard.has_unread_selection_event() {
             self.command_loop
                 .keyboard
@@ -5828,7 +5851,7 @@ impl Context {
     /// Reads via the Value-native reader and evaluates via eval_sub.
     pub fn eval_str(&mut self, source: &str) -> Result<Value, EvalError> {
         self.setup_thread_locals();
-        let forms = super::value_reader::read_all(source, &self.obarray).map_err(|e| {
+        let forms = super::value_reader::read_all(source, self.variables()).map_err(|e| {
             EvalError::signal(
                 crate::emacs_core::intern::intern("error"),
                 vec![Value::string(format!("Read error: {}", e.message))],
@@ -5895,7 +5918,7 @@ impl Context {
     /// Uses the Value-native reader.
     pub fn eval_str_each(&mut self, source: &str) -> Vec<Result<Value, EvalError>> {
         self.setup_thread_locals();
-        let forms = match super::value_reader::read_all(source, &self.obarray) {
+        let forms = match super::value_reader::read_all(source, self.variables()) {
             Ok(f) => f,
             Err(e) => {
                 return vec![Err(EvalError::signal(
@@ -5954,7 +5977,7 @@ impl Context {
                 return;
             }
         }
-        self.obarray.set_symbol_value(name, value);
+        self.store_variable_by_name(name, value);
         self.sync_cached_runtime_binding_by_id(sym_id, value);
         self.refresh_gc_runtime_settings_after_change_by_id(sym_id);
         self.mark_redisplay_dirty_if_display_var(sym_id);
@@ -6018,25 +6041,46 @@ impl Context {
         }
     }
 
+    /// A per-buffer forwarder's value in the current buffer, or `None` for
+    /// any other cell. A thread projection's header has no slot: its
+    /// variable's own value answers instead (`thread_projection`).
     #[inline]
     fn forwarded_buffer_obj_value(
         &self,
+        sym_id: SymId,
         sym: &crate::emacs_core::symbol::LispSymbol,
-    ) -> Option<Value> {
+    ) -> Option<SymbolValueLookup> {
         let buf_fwd = sym.forwarded_descriptor()?.as_buffer_obj_fwd()?;
-        let slot = buf_fwd.buffer_slot()?;
+        let Some(slot) = buf_fwd.buffer_slot() else {
+            return buf_fwd
+                .thread_projection()
+                .map(|projection| self.projected_value(sym_id, projection));
+        };
+        Some(SymbolValueLookup::Bound(
+            self.per_buffer_value(buf_fwd, slot),
+        ))
+    }
+
+    /// A real per-buffer forwarder's value in the current buffer, falling
+    /// back to the buffer defaults and then the forwarder's own default.
+    #[inline(always)]
+    fn per_buffer_value(
+        &self,
+        buf_fwd: &crate::emacs_core::forward::LispBufferObjFwd,
+        slot: crate::buffer::buffer::BufferSlot,
+    ) -> Value {
         let off = slot.index();
         if let Some(buf) = self.buffers.current_buffer() {
             let local = buf_fwd.local_flags_idx < 0 || buf.slot_local_flag(slot);
             if local && off < buf.slots.len() {
-                return Some(buf.slots[off]);
+                return buf.slots[off];
             }
         }
 
         if off < self.buffers.buffer_defaults.len() {
-            Some(self.buffers.buffer_defaults[off])
+            self.buffers.buffer_defaults[off]
         } else {
-            Some(buf_fwd.default)
+            buf_fwd.default
         }
     }
 
@@ -6063,7 +6107,7 @@ impl Context {
         }) {
             let default = self
                 .obarray
-                .find_symbol_value(resolved)
+                .canonical_find_value(CanonicalAccess::STORAGE, resolved)
                 .unwrap_or(Value::UNBOUND);
             self.obarray.make_symbol_localized(resolved, default);
         }
@@ -6166,8 +6210,8 @@ impl Context {
                     }
                 }
                 crate::emacs_core::symbol::ValueCell::Forwarded(_) => {
-                    if let Some(value) = self.forwarded_buffer_obj_value(sym) {
-                        return Ok(SymbolValueLookup::Bound(value));
+                    if let Some(lookup) = self.forwarded_buffer_obj_value(sym_id, sym) {
+                        return Ok(lookup);
                     }
                     // The remaining descriptor variants are GNU's one-load
                     // `do_symval_forwarding` cases.  Without them every read
@@ -6216,8 +6260,8 @@ impl Context {
                     }
                 }
                 SymbolRedirect::Forwarded => {
-                    if let Some(value) = self.forwarded_buffer_obj_value(sym) {
-                        return Ok(SymbolValueLookup::Bound(value));
+                    if let Some(lookup) = self.forwarded_buffer_obj_value(resolved, sym) {
+                        return Ok(lookup);
                     }
                 }
                 SymbolRedirect::Plainval | SymbolRedirect::Varalias => {}
@@ -6243,7 +6287,10 @@ impl Context {
         // legacy `symbol_value_id`) so FORWARDED reads land on the
         // forwarder descriptor's default rather than returning None
         // and signalling void-variable.
-        if let Some(value) = self.obarray.find_symbol_value(resolved) {
+        if let Some(value) = self
+            .obarray
+            .canonical_find_value(CanonicalAccess::STORAGE, resolved)
+        {
             return Ok(SymbolValueLookup::Bound(value));
         }
 
@@ -6615,6 +6662,11 @@ pub(crate) fn default_toplevel_value(ctx: &mut Context, args: Vec<Value>) -> Eva
         return value.ok_or_else(|| signal(LispCondition::VoidVariable, vec![args[0]]));
     }
 
+    // An owner binding of a projected variable is GNU's entry too.
+    if let Some(value) = ctx.owner_default_toplevel_value(symbol) {
+        return value.ok_or_else(|| signal(LispCondition::VoidVariable, vec![args[0]]));
+    }
+
     // GNU scans the specpdl by exact symbol identity before Fdefault_value
     // resolves aliases. A let through an alias records the resolved target,
     // so querying the alias itself intentionally falls back to its currently
@@ -6632,7 +6684,9 @@ pub(crate) fn set_default_toplevel_value(ctx: &mut Context, args: Vec<Value>) ->
     let symbol = SymId::from_value(ctx, args[0])?;
     let value = args[1];
 
-    if set_default_toplevel_value_in_state(ctx.specpdl.as_mut_slice(), symbol, value) {
+    if set_default_toplevel_value_in_state(ctx.specpdl.as_mut_slice(), symbol, value)
+        || ctx.set_owner_default_toplevel_value(symbol, value)
+    {
         // The visible binding has not changed yet, so GNU neither notifies
         // watchers nor publishes a runtime-variable update at this point.
         ctx.note_macro_expansion_mutation();
@@ -6701,7 +6755,7 @@ pub(crate) fn set_runtime_binding_in_state(
             set_runtime_binding(
                 obarray,
                 &mut ctx.buffers,
-                &ctx.custom,
+                ctx.owner.slab_mut(),
                 ctx.specpdl.as_slice(),
                 sym_id,
                 value,
@@ -6752,10 +6806,10 @@ pub(crate) fn let_shadows_buffer_binding_p_in_state(
 ///
 /// Takes a [`ForwardChecked`] rather than a `Value` so that the forward type's
 /// rule cannot be skipped by adding another assignment path here.
-fn store_runtime_binding(
+pub(super) fn store_runtime_binding(
     obarray: &mut Obarray,
     buffers: &mut BufferManager,
-    _custom: &CustomManager,
+    owner: Option<&mut owner_bindings::OwnerSlab>,
     specpdl: &[SpecBinding],
     sym_id: SymId,
     checked: ForwardChecked,
@@ -6805,28 +6859,49 @@ fn store_runtime_binding(
     //     binding, unless a surrounding `let` is shadowing the buffer
     //     binding, in which case the write targets the default path
     //     (`set_default_internal`)
-    if symbol_is_interned_global
-        && matches!(redirect, Some(SymbolRedirect::Forwarded))
-        && let Some(current_id) = buffers.current_buffer_id()
-        && let Some(info) = crate::buffer::buffer::lookup_buffer_slot_by_sym_id(sym_id)
+    //
+    // The descriptor decides the arm, as GNU's `BUFFER_OBJFWDP` does: a
+    // per-buffer slot's own descriptor names its slot, so no other cell
+    // reads the slot table here.
+    if matches!(redirect, Some(SymbolRedirect::Forwarded))
+        && let Some(buf_fwd) = symbol
+            .and_then(|s| s.forwarded_descriptor())
+            .and_then(|fwd| fwd.as_buffer_obj_fwd())
     {
-        let has_local = buffers
-            .get(current_id)
-            .map(|buf| info.local_flags_idx < 0 || buf.slot_local_flag(info.offset))
-            .unwrap_or(false);
-        if has_local {
+        // A thread projection's header names no slot: this owner's binding
+        // takes the store, or the variable it projects.
+        let Some(slot) = buf_fwd.buffer_slot() else {
+            return thread_projection::store_projected_runtime_binding(
+                obarray, buffers, owner, specpdl, sym_id, checked,
+            );
+        };
+        debug_assert!(
+            crate::buffer::buffer::lookup_buffer_slot_by_sym_id(sym_id).is_some_and(|info| {
+                info.offset == slot && info.local_flags_idx == buf_fwd.local_flags_idx
+            }),
+            "a per-buffer descriptor is its slot's own"
+        );
+        if symbol_is_interned_global && let Some(current_id) = buffers.current_buffer_id() {
+            let has_local = buffers
+                .get(current_id)
+                .map(|buf| buf_fwd.local_flags_idx < 0 || buf.slot_local_flag(slot))
+                .unwrap_or(false);
+            if has_local {
+                let _ = buffers.set_buffer_local_property_by_sym_id(current_id, sym_id, value);
+                return Some(current_id);
+            }
+
+            let let_shadows = let_shadows_buffer_binding_p_in_state(specpdl, buffers, sym_id);
+            if let_shadows {
+                if let Some(info) = crate::buffer::buffer::lookup_buffer_slot_by_sym_id(sym_id) {
+                    buffers.set_buffer_default_slot(info, value);
+                }
+                return None;
+            }
+
             let _ = buffers.set_buffer_local_property_by_sym_id(current_id, sym_id, value);
             return Some(current_id);
         }
-
-        let let_shadows = let_shadows_buffer_binding_p_in_state(specpdl, buffers, sym_id);
-        if let_shadows {
-            buffers.set_buffer_default_slot(info, value);
-            return None;
-        }
-
-        let _ = buffers.set_buffer_local_property_by_sym_id(current_id, sym_id, value);
-        return Some(current_id);
     }
 
     // Non-forwarded per-buffer variables like `buffer-undo-list`
@@ -6847,7 +6922,7 @@ fn store_runtime_binding(
         return Some(current_id);
     }
 
-    obarray.set_symbol_value_id(sym_id, value);
+    obarray.set_canonical_value(CanonicalAccess::STORAGE, sym_id, value);
     None
 }
 
@@ -6973,6 +7048,26 @@ pub(crate) fn check_forwarded_store_at(
     let Some(fwd) = assignment_forwarder(obarray, sym_id) else {
         return Ok(ForwardChecked(value));
     };
+    if fwd.ty() == LispFwdType::BufferObj
+        && let Some(projection) = fwd.thread_projection()
+    {
+        return check_projected_store(projection, buffers, specpdl, sym_id, value, site);
+    }
+    check_store_through(fwd, buffers, specpdl, sym_id, value, site)
+}
+
+/// [`check_forwarded_store_at`] once the governing forwarder FWD is known.
+#[inline(always)]
+fn check_store_through(
+    fwd: &crate::emacs_core::forward::LispFwd,
+    buffers: &BufferManager,
+    specpdl: &[SpecBinding],
+    sym_id: SymId,
+    value: Value,
+    site: ForwardStoreSite,
+) -> Result<ForwardChecked, Flow> {
+    use crate::emacs_core::forward::LispFwdType;
+
     if fwd.ty() == LispFwdType::BufferObj {
         if site == ForwardStoreSite::SetDefault {
             return Ok(ForwardChecked(value));
@@ -7003,6 +7098,25 @@ pub(crate) fn check_forwarded_store_at(
     }
 }
 
+/// [`check_forwarded_store_at`] for a thread-projected variable: the rule of
+/// the forwarder its logical arm has (none for a plain cell, the BLV's for a
+/// localized one, the builtin's own for a forwarded one).
+#[cold]
+#[inline(never)]
+fn check_projected_store(
+    projection: &crate::emacs_core::forward::ThreadProjectionDescriptor,
+    buffers: &BufferManager,
+    specpdl: &[SpecBinding],
+    sym_id: SymId,
+    value: Value,
+    site: ForwardStoreSite,
+) -> Result<ForwardChecked, Flow> {
+    match projection.logical_forwarder() {
+        None => Ok(ForwardChecked(value)),
+        Some(fwd) => check_store_through(fwd, buffers, specpdl, sym_id, value, site),
+    }
+}
+
 /// [`check_forwarded_store_at`] for an ordinary assignment.
 pub(crate) fn check_forwarded_store(
     obarray: &Obarray,
@@ -7026,14 +7140,14 @@ pub(crate) fn check_forwarded_store(
 pub(crate) fn set_runtime_binding(
     obarray: &mut Obarray,
     buffers: &mut BufferManager,
-    custom: &CustomManager,
+    owner: Option<&mut owner_bindings::OwnerSlab>,
     specpdl: &[SpecBinding],
     sym_id: SymId,
     value: Value,
 ) -> Result<Option<crate::buffer::BufferId>, Flow> {
     let checked = check_forwarded_store(obarray, buffers, specpdl, sym_id, value)?;
     Ok(store_runtime_binding(
-        obarray, buffers, custom, specpdl, sym_id, checked,
+        obarray, buffers, owner, specpdl, sym_id, checked,
     ))
 }
 
@@ -7048,7 +7162,14 @@ pub(crate) fn check_forwarded_unbind(
     sym_id: SymId,
     reported: Value,
 ) -> Result<(), Flow> {
-    if assignment_forwarder(obarray, sym_id).is_none() {
+    let Some(fwd) = assignment_forwarder(obarray, sym_id) else {
+        return Ok(());
+    };
+    if let Some(projection) = fwd.thread_projection()
+        && projection.logical_forwarder().is_none()
+    {
+        // A projected plain or forwarder-less localized variable can be
+        // unbound, as it could unprojected.
         return Ok(());
     }
     Err(signal(
@@ -7278,7 +7399,7 @@ impl Context {
                 store_runtime_binding(
                     obarray,
                     &mut self.buffers,
-                    &self.custom,
+                    self.owner.slab_mut(),
                     &self.specpdl,
                     sym_id,
                     checked,
@@ -7299,8 +7420,9 @@ impl Context {
         // Obarray's P6.1 CellWrite seam and its seqlock/SATB protocol. It cannot
         // change dispatch metadata or leak a manager or symbol reference.
         unsafe {
-            self.obarray
-                .with_legacy_value_write(|obarray| obarray.makunbound_id(sym_id));
+            self.obarray.with_legacy_value_write(|obarray| {
+                obarray.makunbound_canonical(CanonicalAccess::STORAGE, sym_id)
+            });
         }
         self.sync_cached_runtime_binding_by_id(sym_id, Value::NIL);
         self.sync_keyboard_runtime_binding_by_id(sym_id, Value::NIL);
@@ -7402,8 +7524,11 @@ impl Context {
                     }
                 }
                 SymbolRedirect::Forwarded => {
-                    if let Some(value) = self.forwarded_buffer_obj_value(sym) {
-                        return Some(value);
+                    if let Some(lookup) = self.forwarded_buffer_obj_value(resolved, sym) {
+                        return match lookup {
+                            SymbolValueLookup::Bound(value) => Some(value),
+                            SymbolValueLookup::Unbound => None,
+                        };
                     }
                 }
                 SymbolRedirect::Plainval | SymbolRedirect::Varalias => {}
@@ -7418,7 +7543,10 @@ impl Context {
             return binding.as_value();
         }
 
-        if let Some(value) = self.obarray.symbol_value_id_copied(resolved) {
+        if let Some(value) = self
+            .obarray
+            .canonical_value(CanonicalAccess::STORAGE, resolved)
+        {
             return Some(value);
         }
 
@@ -7559,10 +7687,12 @@ impl Context {
                 }
             }
             SymbolRedirect::Forwarded => {
-                if sym
-                    .forwarded_descriptor()
-                    .is_some_and(|fwd| fwd.ty() == LispFwdType::BufferObj)
+                if let Some(fwd) = sym.forwarded_descriptor()
+                    && fwd.ty() == LispFwdType::BufferObj
                 {
+                    if let Some(projection) = fwd.thread_projection() {
+                        return self.projected_watcher_where(sym_id, projection, current_id);
+                    }
                     return Value::make_buffer(current_id);
                 }
                 Value::NIL
@@ -7605,7 +7735,13 @@ mod pdump_reconstruct;
 
 mod macroexpand;
 
+mod owner_bindings;
+mod owner_mirrors;
+mod variable_access;
+pub(crate) use variable_access::RawVariableView;
+pub use variable_access::{VariableStore, VariableView};
 mod specpdl;
+mod thread_projection;
 pub(crate) use specpdl::{CurrentBufferScope, ExcursionScope, RestrictionScope};
 
 mod builtin_vars;
@@ -7727,8 +7863,14 @@ mod varset_plain_fast_path_tests;
 #[path = "tests/cconv_memo_test.rs"]
 mod cconv_memo_tests;
 #[cfg(test)]
+#[path = "tests/owner_bindings_test.rs"]
+mod owner_bindings_tests;
+#[cfg(test)]
 #[path = "tests/thread_projection_readers_test.rs"]
 mod thread_projection_reader_tests;
+#[cfg(test)]
+#[path = "tests/thread_projection_transparency_test.rs"]
+mod thread_projection_transparency_tests;
 #[cfg(test)]
 #[path = "tests/var_fast_test.rs"]
 mod var_fast_tests;

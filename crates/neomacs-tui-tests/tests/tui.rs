@@ -8,6 +8,7 @@
 
 mod support;
 
+mod buffer_local_completion;
 mod coding_detection;
 mod coding_save;
 mod dual_width_fixed_pitch;
@@ -167,3 +168,6 @@ mod gnu_redisplay_mutation_oracle;
 mod redisplay_mini_source_start_oracle;
 
 mod font_coverage;
+
+#[path = "minibuffer_selected_window.rs"]
+mod minibuffer_selected_window;

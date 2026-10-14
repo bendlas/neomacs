@@ -14,6 +14,7 @@ use super::intern::{SymId, intern};
 use super::value::*;
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
+use crate::emacs_core::eval::VariableView;
 use crate::tagged::SymbolMode;
 
 // ---------------------------------------------------------------------------
@@ -374,11 +375,7 @@ fn expect_character_code(value: &Value) -> Result<i64, Flow> {
 /// requoting here from the active obarray's `text-quoting-style` rather than
 /// emitting the raw ASCII quotes, so the captured error data matches GNU
 /// byte-for-byte.
-fn invalid_range_error(
-    name: &str,
-    obarray: Option<&super::symbol::Obarray>,
-    mode: SymbolMode,
-) -> Flow {
+fn invalid_range_error(name: &str, obarray: Option<VariableView<'_>>, mode: SymbolMode) -> Flow {
     // GNU resolves `text-quoting-style` from the global environment in `doprnt`.
     // When no obarray is threaded in (internal callers that pass valid ranges
     // and never reach this path, plus tests), fall back to the batch/UTF-8
@@ -401,32 +398,64 @@ fn prepare_uniprop_ascii_cache(table: &Value, mode: SymbolMode) {
     }
 }
 
+/// GNU's sub-char-table literal diagnostics (src/lread.c:3322-3333).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum SubCharTableReadError {
+    #[error("Invalid size of sub-char-table")]
+    MissingHeader,
+    #[error("Invalid depth in sub-char-table")]
+    Depth,
+    #[error("Invalid size in sub-char-table")]
+    SlotCount,
+    #[error("Invalid minimum character in sub-char-table")]
+    MinimumCharacter,
+}
+
+/// Validated external GNU depth code; no mutator state is stored here.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, num_enum::TryFromPrimitive, num_enum::IntoPrimitive,
+)]
+#[repr(u8)]
+enum SubCharTableReadDepth {
+    First = 1,
+    Second = 2,
+    Third = 3,
+}
+
+impl SubCharTableReadDepth {
+    /// External GNU slot counts, src/chartab.c:30-35; not enum ordinals.
+    const fn slots(self) -> usize {
+        match self {
+            Self::First => 16,
+            Self::Second => 32,
+            Self::Third => 128,
+        }
+    }
+}
+
 /// Build a sub-char-table from GNU's readable `#^^[DEPTH MIN-CHAR ...]`
 /// literal, as `lread.c` does.
-pub(crate) fn make_sub_char_table_from_external_slots(items: &[Value]) -> Result<Value, String> {
+pub(crate) fn make_sub_char_table_from_external_slots(
+    items: &[Value],
+) -> Result<Value, SubCharTableReadError> {
     if items.len() < 2 {
-        return Err("Invalid size of sub-char-table".to_string());
+        return Err(SubCharTableReadError::MissingHeader);
     }
     let depth = items[0]
         .as_fixnum()
-        .ok_or_else(|| "Invalid depth in sub-char-table".to_string())?;
-    if !(1..=3).contains(&depth) {
-        return Err("Invalid depth in sub-char-table".to_string());
+        .and_then(|code| u8::try_from(code).ok())
+        .and_then(|code| SubCharTableReadDepth::try_from(code).ok())
+        .ok_or(SubCharTableReadError::Depth)?;
+    if items.len() != 2 + depth.slots() {
+        return Err(SubCharTableReadError::SlotCount);
     }
     let min_char = items[1]
         .as_fixnum()
-        .ok_or_else(|| "Invalid minimum character in sub-char-table".to_string())?;
-    if !(0..=MAX_CHAR).contains(&min_char) {
-        return Err("Invalid minimum character in sub-char-table".to_string());
-    }
-
-    let expected = 2 + GNU_CHARTAB_SIZE[depth as usize];
-    if items.len() != expected {
-        return Err("Invalid size in sub-char-table".to_string());
-    }
-
+        .filter(|code| (0..=MAX_CHAR).contains(code))
+        .ok_or(SubCharTableReadError::MinimumCharacter)?;
+    let depth_code: u8 = depth.into();
     Ok(Value::make_sub_char_table(
-        depth as i32,
+        i32::from(depth_code),
         min_char as i32,
         items[2..].to_vec(),
     ))
@@ -762,7 +791,7 @@ pub(crate) fn builtin_char_table_p(args: Vec<Value>) -> EvalResult {
 /// - `t` -- set all character entries while leaving the default slot alone
 pub(crate) fn builtin_set_char_table_range(
     args: Vec<Value>,
-    obarray: Option<&super::symbol::Obarray>,
+    obarray: Option<VariableView<'_>>,
 ) -> EvalResult {
     builtin_set_char_table_range_with_symbols(args, obarray, SymbolMode::Bare)
 }
@@ -771,12 +800,12 @@ pub(crate) fn builtin_set_char_table_range_in_state(
     eval: &mut Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    builtin_set_char_table_range_with_symbols(args, Some(&eval.obarray), eval.symbol_mode())
+    builtin_set_char_table_range_with_symbols(args, Some(eval.variables()), eval.symbol_mode())
 }
 
 pub(crate) fn builtin_set_char_table_range_with_symbols(
     args: Vec<Value>,
-    obarray: Option<&super::symbol::Obarray>,
+    obarray: Option<VariableView<'_>>,
     mode: SymbolMode,
 ) -> EvalResult {
     expect_args("set-char-table-range", &args, 3)?;
@@ -862,7 +891,7 @@ fn ct_lookup_ascii_cached(mut obj: &crate::tagged::header::CharTableObj, ch: i64
 /// - `nil` -- return the default value
 pub(crate) fn builtin_char_table_range(
     args: Vec<Value>,
-    obarray: Option<&super::symbol::Obarray>,
+    obarray: Option<VariableView<'_>>,
 ) -> EvalResult {
     builtin_char_table_range_with_symbols(args, obarray, SymbolMode::Bare)
 }
@@ -871,12 +900,12 @@ pub(crate) fn builtin_char_table_range_in_state(
     eval: &mut Context,
     args: Vec<Value>,
 ) -> EvalResult {
-    builtin_char_table_range_with_symbols(args, Some(&eval.obarray), eval.symbol_mode())
+    builtin_char_table_range_with_symbols(args, Some(eval.variables()), eval.symbol_mode())
 }
 
 pub(crate) fn builtin_char_table_range_with_symbols(
     args: Vec<Value>,
-    obarray: Option<&super::symbol::Obarray>,
+    obarray: Option<VariableView<'_>>,
     mode: SymbolMode,
 ) -> EvalResult {
     expect_args("char-table-range", &args, 2)?;
@@ -2073,8 +2102,7 @@ fn assq_cell_eq(key: Value, list: Value, mode: SymbolMode) -> Result<Value, Flow
 
 fn char_code_property_cell(eval: &Context, prop: Value) -> Result<Value, Flow> {
     let alist = eval
-        .obarray
-        .symbol_value_copied("char-code-property-alist")
+        .variable_value_by_name("char-code-property-alist")
         .unwrap_or(Value::NIL);
     assq_cell_eq(prop, alist, eval.symbol_mode())
 }

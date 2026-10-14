@@ -351,10 +351,107 @@ impl NameAtomStorage {
     }
 }
 
+/// Character-count metadata used for GNU symbol-name identity.
+/// Threading: immutable numeric metadata, containing no Lisp state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SymbolNameCharacterCount(usize);
+
+impl From<&LispString> for SymbolNameCharacterCount {
+    fn from(name: &LispString) -> Self {
+        Self(name.schars())
+    }
+}
+
+impl From<&str> for SymbolNameCharacterCount {
+    fn from(name: &str) -> Self {
+        Self(if name.is_ascii() {
+            name.len()
+        } else {
+            name.chars().count()
+        })
+    }
+}
+
+/// Borrowed GNU symbol-name lookup metadata, before any string construction.
+///
+/// The declared character count and raw bytes remain distinct: constructing
+/// an empty multibyte name can coalesce its count to zero. Threading: queries
+/// stay confined to the borrowing mutator; no callback/GC point may outlive
+/// their source borrow. They own no Lisp references and add no TLS state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SymbolNameQuery<'a> {
+    bytes: &'a [u8],
+    chars: SymbolNameCharacterCount,
+    _mutator: std::marker::PhantomData<*const ()>,
+}
+
+impl<'a> SymbolNameQuery<'a> {
+    pub(crate) fn new(
+        bytes: &'a [u8],
+        chars: crate::heap_types::GnuDeclaredCharacterCount,
+    ) -> Self {
+        Self {
+            bytes,
+            chars: SymbolNameCharacterCount(usize::from(chars)),
+            _mutator: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub(crate) fn matches(self, name: &LispString) -> bool {
+        name.schars() == self.chars.0 && name.as_bytes() == self.bytes
+    }
+}
+
+impl<'a> From<&'a LispString> for SymbolNameQuery<'a> {
+    fn from(name: &'a LispString) -> Self {
+        Self {
+            bytes: name.as_bytes(),
+            chars: SymbolNameCharacterCount::from(name),
+            _mutator: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A key referring only to append-only, immutable NameAtomStorage.
+/// GNU `oblookup` compares character count and bytes, ignoring the MB flag
+/// (`lread.c:4945`). This is deliberately separate from LispString Eq/Hash.
+/// Threading: the referenced atom never moves or mutates; registry locking
+/// serializes publication and map changes. It carries no mutator-owned Value.
+#[derive(Clone, Copy, Debug)]
+struct SymbolNameKey(NameAtomRef);
+
+impl SymbolNameKey {
+    fn name(self) -> &'static LispString {
+        self.0.0
+    }
+}
+
+impl PartialEq for SymbolNameKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.name().schars() == other.name().schars()
+            && self.name().as_bytes() == other.name().as_bytes()
+    }
+}
+
+impl Eq for SymbolNameKey {}
+
+impl Hash for SymbolNameKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name().as_bytes().hash(state);
+        SymbolNameCharacterCount::from(self.name()).hash(state);
+    }
+}
+
+static_assertions::assert_impl_all!(SymbolNameCharacterCount: Send, Sync);
+
 /// Append-only string interner used only for symbol names.
 pub struct StringInterner {
     strings: NameAtomStorage,
-    map: HashMap<NameAtomRef, NameId, FxBuildHasher>,
+    map: HashMap<SymbolNameKey, NameId, FxBuildHasher>,
 }
 
 static_assertions::assert_impl_all!(StringInterner: Send, Sync);
@@ -365,18 +462,14 @@ impl Default for StringInterner {
     }
 }
 
-/// Fold a symbol name to the representation symbol IDENTITY is decided on.
+/// Preserve the existing canonical atom storage for ordinary ASCII names.
 ///
-/// GNU's `oblookup` compares a name's char count, byte count and bytes, never
-/// its multibyte FLAG (lread.c), so an ascii-only multibyte spelling and its
-/// unibyte spelling name the same symbol. Folding ascii-only multibyte names to
-/// unibyte reproduces that on our flag-sensitive `LispString` comparison.
-///
-/// This is about identity ONLY. Which string object `symbol-name` returns is a
-/// separate question, answered by the name object a symbol was created from --
-/// GNU keeps that unfolded, multibyte flag and all.
+/// SymbolNameKey decides identity by SCHARS and bytes independently of this
+/// storage choice. Fold only when the declared count equals the byte count:
+/// supplied shorthand counts may differ even for ASCII payloads. The actual
+/// Lisp-visible symbol-name object retains its original MB flag/properties.
 pub(crate) fn normalize_symbol_name_lisp_string(s: &LispString) -> Cow<'_, LispString> {
-    if s.is_ascii() && s.is_multibyte() {
+    if s.schars() == s.sbytes() && s.is_ascii() && s.is_multibyte() {
         Cow::Owned(LispString::from_unibyte_slice(s.as_bytes()))
     } else {
         Cow::Borrowed(s)
@@ -401,22 +494,21 @@ impl StringInterner {
     }
 
     #[inline]
-    fn hash_name_parts(&self, bytes: &[u8], multibyte: bool) -> u64 {
-        // Keep this exactly aligned with `LispString::hash` so a borrowed
-        // byte/representation query lands in the canonical map's bucket.
+    fn hash_name_parts(&self, bytes: &[u8], chars: SymbolNameCharacterCount) -> u64 {
+        // Match SymbolNameKey::hash exactly for allocation-free raw queries.
         let mut hasher = self.map.hasher().build_hasher();
         bytes.hash(&mut hasher);
-        multibyte.hash(&mut hasher);
+        chars.hash(&mut hasher);
         hasher.finish()
     }
 
     #[inline]
-    fn lookup_name_parts(&self, bytes: &[u8], multibyte: bool) -> Option<NameId> {
-        let hash = self.hash_name_parts(bytes, multibyte);
+    fn lookup_name_parts(&self, bytes: &[u8], chars: SymbolNameCharacterCount) -> Option<NameId> {
+        let hash = self.hash_name_parts(bytes, chars);
         self.map
             .raw_entry()
             .from_hash(hash, |candidate| {
-                candidate.0.is_multibyte() == multibyte && candidate.0.as_bytes() == bytes
+                candidate.name().schars() == chars.0 && candidate.name().as_bytes() == bytes
             })
             .map(|(_, id)| *id)
     }
@@ -431,8 +523,8 @@ impl StringInterner {
 
     /// Intern a symbol-name atom, returning its unique id.
     pub fn intern(&mut self, s: &str) -> NameId {
-        let multibyte = !s.is_ascii();
-        if let Some(idx) = self.lookup_name_parts(s.as_bytes(), multibyte) {
+        let chars = SymbolNameCharacterCount::from(s);
+        if let Some(idx) = self.lookup_name_parts(s.as_bytes(), chars) {
             return idx;
         }
         let atom = Self::name_atom_from_str(s);
@@ -441,11 +533,10 @@ impl StringInterner {
 
     /// Intern a symbol-name atom from an exact Lisp string representation.
     pub fn intern_lisp_string(&mut self, s: &LispString) -> NameId {
-        let normalized = Self::normalize_symbol_name_lisp_string(s);
-        if let Some(idx) = self.lookup_name_parts(normalized.as_bytes(), normalized.is_multibyte())
-        {
+        if let Some(idx) = self.lookup_name_parts(s.as_bytes(), SymbolNameCharacterCount::from(s)) {
             return idx;
         }
+        let normalized = Self::normalize_symbol_name_lisp_string(s);
         let idx = NameId(self.strings.len() as u32);
         // `NameId(u32::MAX)` is reserved as the obarray empty-slot presence
         // sentinel (`symbol::SYMBOL_NAME_SENTINEL`): a `LispSymbol` slot is
@@ -459,7 +550,7 @@ impl StringInterner {
              obarray empty-slot presence sentinel (u32::MAX)",
         );
         let interned = self.strings.push(normalized.into_owned());
-        self.map.insert(interned, idx);
+        self.map.insert(SymbolNameKey(interned), idx);
         idx
     }
 
@@ -481,13 +572,13 @@ impl StringInterner {
             return self.intern_lisp_string(name);
         };
         let bytes = name.as_bytes();
-        let multibyte = name.is_multibyte();
+        let chars = SymbolNameCharacterCount::from(name);
         // One hash per name: the probe and the insert share it. The lookup
         // followed by `map.insert` hashed every new dump name twice -- 18K
         // names per load.
-        let hash = self.hash_name_parts(bytes, multibyte);
+        let hash = self.hash_name_parts(bytes, chars);
         match self.map.raw_entry_mut().from_hash(hash, |candidate| {
-            candidate.0.is_multibyte() == multibyte && candidate.0.as_bytes() == bytes
+            candidate.name().schars() == chars.0 && candidate.name().as_bytes() == bytes
         }) {
             hashbrown::hash_map::RawEntryMut::Occupied(entry) => *entry.get(),
             hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
@@ -499,7 +590,7 @@ impl StringInterner {
                      obarray empty-slot presence sentinel (u32::MAX)",
                 );
                 let interned = self.strings.push(alias);
-                entry.insert_hashed_nocheck(hash, interned, idx);
+                entry.insert_hashed_nocheck(hash, SymbolNameKey(interned), idx);
                 idx
             }
         }
@@ -507,13 +598,17 @@ impl StringInterner {
 
     /// Look up a symbol-name atom without interning it.
     pub fn lookup(&self, s: &str) -> Option<NameId> {
-        self.lookup_name_parts(s.as_bytes(), !s.is_ascii())
+        self.lookup_name_parts(s.as_bytes(), SymbolNameCharacterCount::from(s))
     }
 
     /// Look up a symbol-name atom without interning it.
     pub fn lookup_lisp_string(&self, s: &LispString) -> Option<NameId> {
-        let normalized = Self::normalize_symbol_name_lisp_string(s);
-        self.lookup_name_parts(normalized.as_bytes(), normalized.is_multibyte())
+        self.lookup_name_parts(s.as_bytes(), SymbolNameCharacterCount::from(s))
+    }
+
+    /// Look up raw supplied metadata without first constructing a Lisp string.
+    pub(crate) fn lookup_name_query(&self, query: SymbolNameQuery<'_>) -> Option<NameId> {
+        self.lookup_name_parts(query.bytes, query.chars)
     }
 
     /// Resolve a name id back to its string. Panics if id is invalid.
@@ -640,18 +735,22 @@ impl SymbolNameRootIndex {
 /// The name a freshly allocated symbol carries, stated at every construction
 /// site so "no Lisp name object" is a claim rather than a forgotten argument.
 ///
-/// GNU has only the second case: `intern_driver` and `Fmake_symbol` both store
+/// GNU always retains a Lisp string object: `intern_driver` and `Fmake_symbol` both store
 /// THE STRING OBJECT they were handed (lread.c:4705-4708), so `symbol-name`
 /// returns it with its text properties, its multibyteness and any later
 /// mutation intact. We additionally construct symbols from Rust text -- the
 /// reader, the dumper, bootstrap -- where no Lisp object exists to store; those
-/// sites say `AtomOnly`; the first Lisp-visible `symbol-name` read materializes
+/// sites use `AtomOnly` or an exact frozen `ReaderAtom`; the first Lisp-visible
+/// `symbol-name` read materializes
 /// one heap-local string from the atom and subsequent reads reuse it.
 #[derive(Clone, Copy, Debug)]
 enum NewSymbolName {
     /// No Lisp string object was involved; the interned name atom is the whole
     /// of the symbol's name.
     AtomOnly,
+    /// A reader-created, frozen spelling with a different representation from
+    /// the identity atom. No Lisp caller can already hold this name object.
+    ReaderAtom(NameAtomRef),
     /// GNU's case: this string object IS the symbol's name.
     LispObject(SymbolNameValue),
 }
@@ -665,6 +764,7 @@ enum NewSymbolName {
 #[repr(u8)]
 enum SymbolNameOrigin {
     AtomOnly,
+    ReaderAtom,
     LispObject,
 }
 
@@ -711,6 +811,7 @@ impl NewSymbolName {
     fn origin(self) -> SymbolNameOrigin {
         match self {
             Self::AtomOnly => SymbolNameOrigin::AtomOnly,
+            Self::ReaderAtom(_) => SymbolNameOrigin::ReaderAtom,
             Self::LispObject(_) => SymbolNameOrigin::LispObject,
         }
     }
@@ -757,6 +858,10 @@ struct SymbolRegistry {
     /// Keeping this rare case out of `SymbolSlot` makes every ordinary symbol
     /// substantially smaller.
     name_values: FxHashMap<SymId, SymbolNameValue>,
+    /// Reader spellings are immutable, property-free and not observable until
+    /// first materialization. Keep encoding separate from normalized identity.
+    reader_name_atoms: FxHashMap<SymId, NameAtomRef>,
+    reader_name_storage: NameAtomStorage,
     /// Per-heap Lisp objects lazily created for symbols whose name originated
     /// as a Rust/process-lifetime atom.  GNU always stores one Lisp string in
     /// every symbol; this cache supplies the equivalent object without making
@@ -774,6 +879,12 @@ impl Default for SymbolRegistry {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ReaderSymbolKind {
+    Canonical,
+    Uninterned,
+}
+
 impl SymbolRegistry {
     fn new() -> Self {
         let mut registry = Self {
@@ -781,6 +892,8 @@ impl SymbolRegistry {
             symbols: Vec::new(),
             canonical_by_name: FxHashMap::default(),
             name_values: FxHashMap::default(),
+            reader_name_atoms: FxHashMap::default(),
+            reader_name_storage: NameAtomStorage::new(),
             materialized_name_values: FxHashMap::default(),
             name_value_roots: SymbolNameRootIndex::default(),
         };
@@ -810,6 +923,9 @@ impl SymbolRegistry {
             let old = self.name_values.insert(id, name_value);
             debug_assert!(old.is_none(), "new symbol id already had a name value");
             self.name_value_roots.insert(name_value);
+        }
+        if let NewSymbolName::ReaderAtom(atom) = name_value {
+            self.reader_name_atoms.insert(id, atom);
         }
         if canonical {
             self.canonical_by_name.insert(name, id);
@@ -872,6 +988,73 @@ impl SymbolRegistry {
             .names
             .intern_lisp_string(name_value.as_lisp_string().expect("string name"));
         self.alloc_symbol(name, false, NewSymbolName::from_lisp_object(name_value))
+    }
+
+    /// A reader token has no pre-existing Lisp string identity to retain.
+    /// Freeze only a representation that the identity atom would normalize;
+    /// the existing per-heap materializer supplies its first observable object.
+    fn reader_name_origin(&mut self, name: LispString, identity: NameId) -> NewSymbolName {
+        assert!(
+            !name.has_intervals(),
+            "reader symbol names carry no properties"
+        );
+        let atom = self.names.resolve_lisp_string(identity);
+        if name.is_multibyte() == atom.is_multibyte()
+            && name.character_count_kind() == atom.character_count_kind()
+        {
+            NewSymbolName::AtomOnly
+        } else {
+            NewSymbolName::ReaderAtom(self.reader_name_storage.push(name))
+        }
+    }
+
+    fn restored_reader_name_origin(
+        &mut self,
+        exact: &LispString,
+        identity: NameId,
+    ) -> NewSymbolName {
+        let atom = self.names.resolve_lisp_string(identity);
+        if exact.is_multibyte() == atom.is_multibyte()
+            && exact.character_count_kind() == atom.character_count_kind()
+        {
+            NewSymbolName::AtomOnly
+        } else {
+            // The comparison above already proves the exact representation
+            // differs from its identity atom; freeze it without repeating the
+            // atom lookup or count-kind/encoding checks.
+            assert!(
+                !exact.has_intervals(),
+                "reader symbol names carry no properties"
+            );
+            NewSymbolName::ReaderAtom(
+                self.reader_name_storage
+                    .push(exact.borrowed_alias().unwrap_or_else(|| exact.clone())),
+            )
+        }
+    }
+
+    fn intern_reader_name(&mut self, name: LispString, kind: ReaderSymbolKind) -> SymId {
+        let identity = self.names.intern_lisp_string(&name);
+        let canonical = match kind {
+            ReaderSymbolKind::Canonical => true,
+            ReaderSymbolKind::Uninterned => false,
+        };
+        if canonical && let Some(existing) = self.canonical_by_name.get(&identity) {
+            return *existing;
+        }
+        let origin = self.reader_name_origin(name, identity);
+        self.alloc_symbol(identity, canonical, origin)
+    }
+
+    fn resolve_name_template(&self, id: SymId) -> &'static LispString {
+        if self.slot(id).expect("valid symbol id").name_origin == SymbolNameOrigin::ReaderAtom {
+            self.reader_name_atoms
+                .get(&id)
+                .expect("reader name atom exists")
+                .0
+        } else {
+            self.resolve_lisp_string(id)
+        }
     }
 
     fn lookup(&self, s: &str) -> Option<SymId> {
@@ -959,7 +1142,7 @@ impl SymbolRegistry {
         } else {
             LispVisibleSymbolName::Atom {
                 symbol: id,
-                string: self.resolve_lisp_string(id),
+                string: self.resolve_name_template(id),
             }
         }
     }
@@ -983,11 +1166,19 @@ impl SymbolRegistry {
     }
 
     fn dump_symbol_table(&self) -> DumpedSymbolTable {
-        let names = self.names.strings.iter().map(LispString::clone).collect();
+        let mut names: Vec<_> = self.names.strings.iter().map(LispString::clone).collect();
         let mut symbol_names = Vec::with_capacity(self.symbols.len());
         let mut canonical = Vec::with_capacity(self.symbols.len());
-        for slot in &self.symbols {
-            symbol_names.push(slot.name.0);
+        for (index, slot) in self.symbols.iter().enumerate() {
+            let name_index = if slot.name_origin == SymbolNameOrigin::ReaderAtom {
+                let exact = self.reader_name_atoms[&SymId(index as u32)].0;
+                let index = u32::try_from(names.len()).expect("dump name index fits u32");
+                names.push(exact.clone());
+                index
+            } else {
+                slot.name.0
+            };
+            symbol_names.push(name_index);
             canonical.push(slot.canonical);
         }
         DumpedSymbolTable {
@@ -1007,7 +1198,13 @@ impl SymbolRegistry {
         self.symbols.reserve(symbol_names.len());
         let mut name_remap = Vec::with_capacity(names.len());
         for name in names {
-            name_remap.push(self.names.intern_dump_lisp_string(name));
+            name_remap.push(
+                if name.is_multibyte() && name.is_ascii() && name.schars() == name.sbytes() {
+                    self.names.intern_lisp_string(name)
+                } else {
+                    self.names.intern_dump_lisp_string(name)
+                },
+            );
         }
 
         let derived_flags;
@@ -1128,15 +1325,15 @@ impl SymbolRegistry {
                             .get(&runtime_name)
                             .copied()
                             .unwrap_or_else(|| {
-                                self.alloc_symbol(runtime_name, true, NewSymbolName::AtomOnly)
+                                let exact = &names[dump_name_id as usize];
+                                let origin = self.restored_reader_name_origin(exact, runtime_name);
+                                self.alloc_symbol(runtime_name, true, origin)
                             }),
                     )
                 } else {
-                    Ok::<SymId, String>(self.alloc_symbol(
-                        runtime_name,
-                        false,
-                        NewSymbolName::AtomOnly,
-                    ))
+                    let exact = &names[dump_name_id as usize];
+                    let origin = self.restored_reader_name_origin(exact, runtime_name);
+                    Ok::<SymId, String>(self.alloc_symbol(runtime_name, false, origin))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1228,11 +1425,12 @@ fn global_symbol_registry() -> &'static RwLock<SymbolRegistry> {
     GLOBAL_SYMBOL_REGISTRY.get_or_init(|| RwLock::new(SymbolRegistry::new()))
 }
 
-/// The epoch every thread-local symbol cache validates against: bumped
-/// whenever the canonical name -> symbol mapping can have changed (a new
-/// canonical symbol, an unintern, a symbol-table load). Exposed so caches
-/// outside this module — `TaggedValue::subr_from_sym_id`'s memo — can hang off
-/// the same invalidation.
+/// The epoch positive canonical-name caches validate against. Removing a
+/// canonical mapping publishes invalidation under the registry write guard;
+/// readers load it with Acquire. Fresh intern/dump insertions preserve existing
+/// mappings, and these caches never retain misses, so insertions need no bump.
+/// Caches outside this module, including `TaggedValue::subr_from_sym_id`'s memo,
+/// can use the same invalidation.
 pub(crate) fn symbol_registry_epoch_value() -> u64 {
     symbol_registry_epoch().load(Ordering::Acquire)
 }
@@ -1276,11 +1474,99 @@ pub fn intern(s: &str) -> SymId {
     sym_id
 }
 
+/// A validated computed ASCII spelling for the ordinary reader hit path.
+///
+/// Threading: this borrows immutable token bytes and owns no Lisp state. It
+/// cannot represent a raw-byte or supplied-count symbol-name query.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedAsciiName<'a>(&'a str);
+
+/// The ordinary ASCII reader path does not accept non-ASCII spellings.
+#[derive(Debug, thiserror::Error)]
+#[error("reader symbol spelling is not ASCII")]
+pub(crate) struct NonAsciiReaderName;
+
+impl<'a> TryFrom<&'a str> for ValidatedAsciiName<'a> {
+    type Error = NonAsciiReaderName;
+
+    #[inline]
+    fn try_from(name: &'a str) -> Result<Self, Self::Error> {
+        if name.is_ascii() {
+            Ok(Self(name))
+        } else {
+            Err(NonAsciiReaderName)
+        }
+    }
+}
+
+/// Intern an ordinary reader spelling, deferring its exact representation to
+/// canonical creation. GNU lread.c:4213-4253 returns a hit without retaining a
+/// name; only a new symbol retains the source's encoding and character count.
+///
+/// `make_name` must reconstruct this same property-free computed ASCII token.
+/// It runs under the registry write lock and must not execute Lisp, GC or
+/// reenter the symbol registry. The reader supplies only its leaf token-copy
+/// operation. The closure borrows its token; it does not construct a name on
+/// either a positive-cache hit or an uncached canonical hit.
+#[inline]
+pub(crate) fn intern_ascii_reader_name<F>(name: ValidatedAsciiName<'_>, make_name: F) -> SymId
+where
+    F: FnOnce() -> LispString,
+{
+    #[cfg(test)]
+    {
+        // Account for this interner entry just like intern, including reader
+        // hits that previously used the lookup-only entry point.
+        INTERN_CALLS.set(INTERN_CALLS.get() + 1);
+        INTERN_CALL_NAMES.with(|names| names.borrow_mut().push(name.0.to_owned()));
+    }
+    // Use exactly intern's existing epoch validation and positive cache. The
+    // source-encoding decision belongs only to the cold creation closure.
+    ensure_thread_local_cache_epoch_current();
+    if let Some(id) = thread_local_interned_str(name.0) {
+        return id;
+    }
+    intern_ascii_reader_name_uncached(name, make_name)
+}
+
+#[cold]
+fn intern_ascii_reader_name_uncached<F>(name: ValidatedAsciiName<'_>, make_name: F) -> SymId
+where
+    F: FnOnce() -> LispString,
+{
+    let mut registry = global_symbol_registry().write();
+    // Recheck canonical membership under the write lock. No negative result
+    // from a dropped read lock is reused across a concurrent unintern/create.
+    let id = if let Some(id) = registry.lookup(name.0) {
+        id
+    } else {
+        let exact = make_name();
+        debug_assert_eq!(exact.as_bytes(), name.0.as_bytes());
+        debug_assert_eq!(exact.schars(), name.0.len());
+        debug_assert!(!exact.has_intervals());
+        registry.intern_reader_name(exact, ReaderSymbolKind::Canonical)
+    };
+    let canonical_name = registry.resolve(id);
+    drop(registry);
+    // As in intern, admission retains the epoch validated before lookup. A
+    // concurrent invalidation between drop and admission is checked next use.
+    thread_local_record_interned_str(canonical_name, id);
+    id
+}
+
 /// Intern an exact Lisp-string name using the global runtime symbol registry.
 #[inline]
 pub fn intern_lisp_string(s: &LispString) -> SymId {
     let mut registry = global_symbol_registry().write();
     registry.intern_lisp_string(s)
+}
+
+/// Look up supplied name metadata without changing its character count.
+#[inline]
+pub(crate) fn lookup_interned_name_query(query: SymbolNameQuery<'_>) -> Option<SymId> {
+    let registry = global_symbol_registry().read();
+    let name = registry.names.lookup_name_query(query)?;
+    registry.canonical_by_name.get(&name).copied()
 }
 
 /// Create an uninterned symbol using the global runtime symbol registry.
@@ -1311,6 +1597,22 @@ pub fn intern_lisp_value(name_value: TaggedValue) -> SymId {
     registry.intern_lisp_value(name_value)
 }
 
+/// Intern a private, property-free reader spelling without eagerly allocating
+/// a tagged-heap name. GNU's first spelling/encoding remains observable through
+/// symbol-name; strings passed to Lisp intern/make-symbol use the object APIs.
+pub(crate) fn intern_reader_name(name: LispString) -> SymId {
+    global_symbol_registry()
+        .write()
+        .intern_reader_name(name, ReaderSymbolKind::Canonical)
+}
+
+/// The reader's #: token likewise has no caller-owned string to adopt.
+pub(crate) fn make_uninterned_reader_symbol(name: LispString) -> SymId {
+    global_symbol_registry()
+        .write()
+        .intern_reader_name(name, ReaderSymbolKind::Uninterned)
+}
+
 /// Create an uninterned symbol that stores NAME_VALUE as its exact name
 /// object, matching GNU `make-symbol`.
 #[inline]
@@ -1320,10 +1622,24 @@ pub fn make_uninterned_symbol_with_name_value(name_value: TaggedValue) -> SymId 
 }
 
 /// Look up the canonical interned symbol id for a string without interning it.
-#[inline]
+///
+/// Successful UTF-8 queries share `intern`'s positive cache: the registry
+/// lookup proves both bytes and computed character count match the immutable
+/// name atom. Supplied-count Lisp-string queries use their separate APIs.
+/// Threading: cached ids and process-lifetime spellings contain no Lisp heap
+/// state. Each thread validates the existing shared registry epoch before use.
+#[inline(always)]
 pub fn lookup_interned(s: &str) -> Option<SymId> {
+    ensure_thread_local_cache_epoch_current();
+    if let Some(sym_id) = thread_local_interned_str(s) {
+        return Some(sym_id);
+    }
     let registry = global_symbol_registry().read();
-    registry.lookup(s)
+    let sym_id = registry.lookup(s)?;
+    let canonical_name = registry.resolve(sym_id);
+    drop(registry);
+    thread_local_record_interned_str(canonical_name, sym_id);
+    Some(sym_id)
 }
 
 #[inline]
@@ -1480,10 +1796,15 @@ pub fn resolve_sym_lisp_string(id: SymId) -> &'static LispString {
 pub(crate) fn unintern_canonical_id(id: SymId) -> bool {
     let changed = {
         let mut registry = global_symbol_registry().write();
-        registry.unintern_canonical_symbol(id)
+        let changed = registry.unintern_canonical_symbol(id);
+        if changed {
+            // Publish invalidation before an uncached reader can observe the
+            // removed mapping; cache hits validate this epoch with Acquire.
+            symbol_registry_epoch().fetch_add(1, Ordering::AcqRel);
+        }
+        changed
     };
     if changed {
-        symbol_registry_epoch().fetch_add(1, Ordering::AcqRel);
         ensure_thread_local_cache_epoch_current();
     }
     changed
@@ -1605,7 +1926,7 @@ pub(crate) fn materialize_symbol_name_value(id: SymId) -> TaggedValue {
         if let Some(value) = registry.resolve_name_value_in_heap(id, heap_id) {
             return value;
         }
-        registry.resolve_lisp_string(id)
+        registry.resolve_name_template(id)
     };
 
     let materialized = TaggedValue::heap_string(atom.clone());
@@ -1710,7 +2031,8 @@ thread_local! {
     // Cell, not RefCell: read on EVERY cached symbol query (epoch check),
     // and a u64 needs no borrow flag.
     static THREAD_CACHE_EPOCH: Cell<u64> = const { Cell::new(0) };
-    static INTERN_STR_CACHE: RefCell<FxHashMap<&'static str, SymId>> = RefCell::new(FxHashMap::default());
+    static INTERN_STR_CACHE: RefCell<HashMap<&'static str, SymId, FxBuildHasher>> =
+        RefCell::new(HashMap::with_hasher(FxBuildHasher));
     static SYMBOL_CACHE: RefCell<Vec<SymbolCacheEntry>> = const { RefCell::new(Vec::new()) };
     static NAME_CANONICAL_SYMBOL_CACHE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
@@ -1798,9 +2120,53 @@ fn ensure_thread_local_cache_epoch_current() {
     });
 }
 
-#[inline]
+/// A paired spelling/hash query for the private native positive cache.
+///
+/// `&str` supplies only the ordinary UTF-8 domain. Supplied-count Lisp names
+/// keep their separate registry APIs; cache admission already proves the
+/// canonical atom's bytes and computed character count. Hash exactly as a
+/// stored `&'static str`, not as its byte slice.
+#[derive(Debug)]
+struct NativeCacheQuery<'a> {
+    name: &'a str,
+    hash: u64,
+}
+
+impl<'a> From<&'a str> for NativeCacheQuery<'a> {
+    #[inline(always)]
+    fn from(name: &'a str) -> Self {
+        Self {
+            name,
+            hash: FxBuildHasher.hash_one(name),
+        }
+    }
+}
+
+// Preserve the cache hit inside both ordinary intern and reader lookup;
+// outlining this small helper adds a call for every name probe.
+#[inline(always)]
 fn thread_local_interned_str(s: &str) -> Option<SymId> {
-    INTERN_STR_CACHE.with(|cache| cache.borrow().get(s).copied())
+    let query = NativeCacheQuery::from(s);
+    match INTERN_STR_CACHE.try_with(|cache| {
+        cache
+            .borrow()
+            .raw_entry()
+            .from_hash(query.hash, |candidate| *candidate == query.name)
+            .map(|(_, id)| *id)
+    }) {
+        Ok(sym_id) => sym_id,
+        Err(error) => panic_intern_str_cache_access(error),
+    }
+}
+
+// Match LocalKey::with's destruction failure while keeping its cold panic
+// separate from the positive-cache lookup. The installed try_with API carries
+// an inline hint; this wrapper is inlined at each existing lookup call site.
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn panic_intern_str_cache_access(error: std::thread::AccessError) -> ! {
+    panic!("cannot access a Thread Local Storage value during or after destruction: {error:?}")
 }
 
 #[inline]
@@ -1964,3 +2330,15 @@ mod seed_prefix_tests;
 #[cfg(test)]
 #[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;
+
+#[cfg(test)]
+#[path = "tests/declared_name_identity.rs"]
+mod declared_name_identity_tests;
+
+#[cfg(test)]
+#[path = "tests/native_lookup_cache.rs"]
+mod native_lookup_cache_tests;
+
+#[cfg(test)]
+#[path = "tests/ascii_reader_name.rs"]
+mod ascii_reader_name_tests;
