@@ -125,14 +125,32 @@ cargo xtask fresh-build --release
 docs/exwm/harness/run-gui-init.sh --server xvfb   # or xephyr with a DISPLAY
 ```
 
+### Interactive test-drive
+
+`docs/exwm/harness/manual-exwm.sh` starts the nested-X fixture (Xephyr when the
+desktop exposes a display, else Xvfb) and runs `exwm-session.el`, which starts
+EXWM after startup and leaves the session running:
+
+```sh
+nix develop
+docs/exwm/harness/manual-exwm.sh          # add --server xvfb for a headless run
+```
+
+Inside the nested window, `s-r` returns to line mode, `s-&` launches a program,
+and `C-x C-c` quits. Neomacs stays responsive and EXWM owns the root as the
+probe reports; hosting launched clients is Milestone 2.
+
 ## 5. Known gaps and next steps (Milestone 2 candidates)
 
 - `x-send-client-message`, `x-window-property`, `x-window-property-attributes`,
-  `x-change-window-property`, `x-delete-window-property`, `x-focus-frame` (it is
-  still a successful no-op), `x-synchronize`, `x-translate-coordinates`,
-  `x-display-list`, and `x-server-max-request-size` remain stubs. EXWM uses
-  XELB (not these subrs) for its own protocol traffic, so they were not on the
-  initialization path.
+  `x-change-window-property`, `x-delete-window-property`, `x-synchronize`,
+  `x-translate-coordinates`, `x-display-list`, and `x-server-max-request-size`
+  remain stubs. EXWM uses XELB (not these subrs) for its own protocol traffic,
+  so they were not on the initialization path.
+- `x-focus-frame` now issues `SetInputFocus` on the frame's X window, so EXWM's
+  focus switch (`exwm-input--set-focus`) reaches the winit window and keyboard
+  input is delivered. `x-display-pixel-width`/`-height` fall back to the X
+  server's root geometry when the winit monitor snapshot is empty.
 - Only the default single-workspace topology is exercised. Additional
   `exwm-workspace-number` frames are covered by the id plumbing but not yet
   tested end-to-end.

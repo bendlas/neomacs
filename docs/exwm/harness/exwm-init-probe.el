@@ -118,6 +118,23 @@
     (exwm-init-probe--log "exwm--root: %S" (and (boundp 'exwm--root) exwm--root))
     (exwm-init-probe--log "warning while init: %S" exwm-init-probe--warning)
     (when (and (boundp 'exwm--connection) exwm--connection)
+      ;; Acceptance: EXWM's focus switch must have reached the winit window.
+      ;; `x-focus-frame' now issues SetInputFocus on the frame's X window.
+      (let ((conn (xcb:connect (frame-parameter nil 'display))))
+        (unwind-protect
+            (progn
+              (x-focus-frame (selected-frame))
+              (sleep-for 0.2)
+              (let ((focus (slot-value
+                            (xcb:+request-unchecked+reply
+                             conn (make-instance 'xcb:GetInputFocus))
+                            'focus))
+                    (frame-window (string-to-number
+                                   (or (frame-parameter nil 'window-id) "0"))))
+                (exwm-init-probe--log
+                 "input focus=#x%x frame-window=#x%x match=%S"
+                 focus frame-window (= focus frame-window))))
+          (xcb:disconnect conn)))
       (exwm-init-probe--log "xprop -root:\n%s"
                             (string-trim
                              (shell-command-to-string

@@ -120,6 +120,23 @@ mod imp {
             i64::from(screen.height_in_pixels),
         ))
     }
+
+    /// Move the X input focus to WINDOW, reverting to Parent on release.
+    pub(crate) fn focus_window(display: &str, window: u32) -> Result<(), X11Error> {
+        let conn = connection(display)?;
+        // Fire-and-forget like GNU: focusing an unmapped (BadMatch) window must
+        // not turn into a Lisp error, but a broken connection still surfaces on
+        // flush.
+        conn.set_input_focus(
+            x11rb::protocol::xproto::InputFocus::PARENT,
+            window,
+            // X's CurrentTime (`XCB_CURRENT_TIME`).
+            0u32,
+        )
+        .map_err(protocol_error)?;
+        conn.flush().map_err(protocol_error)?;
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -141,6 +158,10 @@ mod imp {
     pub(crate) fn screen_size(_display: &str) -> Result<(i64, i64), X11Error> {
         Err(unsupported())
     }
+
+    pub(crate) fn focus_window(_display: &str, _window: u32) -> Result<(), X11Error> {
+        Err(unsupported())
+    }
 }
 
-pub(crate) use imp::{atom_name, screen_size, server_info};
+pub(crate) use imp::{atom_name, focus_window, screen_size, server_info};

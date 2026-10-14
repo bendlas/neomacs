@@ -2559,16 +2559,33 @@ pub(crate) fn builtin_x_focus_frame(eval: &mut Context, args: Vec<Value>) -> Eva
         args.first(),
         crate::emacs_core::window_cmds::FrameDomain::Live,
     )?;
-    if eval
+    if !eval
         .frames
         .get(fid)
         .and_then(|frame| frame.effective_window_system())
         .is_some_and(gui_window_system_active_value)
     {
-        Ok(Value::NIL)
-    } else {
-        Err(x_window_system_frame_error())
+        return Err(x_window_system_frame_error());
     }
+    // GNU `x-focus-frame' moves the X input focus to the frame's X window.  A
+    // window manager (EXWM) reparents that window and then relies on this call
+    // to route keyboard input to the frame, so a no-op here leaves the frame
+    // without key events.
+    let x_display = eval
+        .frames
+        .get(fid)
+        .and_then(|frame| frame.display_identity().x_display())
+        .map(str::to_owned);
+    if let Some(display) = x_display
+        && let Some((window, _)) = eval
+            .display_host
+            .as_ref()
+            .and_then(|host| host.native_x11_window_ids(fid))
+        && let Err(error) = x11_compat::focus_window(&display, window as u32)
+    {
+        return Err(x11_signal(error));
+    }
+    Ok(Value::NIL)
 }
 
 /// (x-get-clipboard) -> nil in batch/no-X context.
