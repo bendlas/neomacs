@@ -68,11 +68,17 @@ pub(crate) trait SwitchLandings {
     fn fill_pending(&mut self, fb: &mut FunctionBuilder);
 }
 
-/// A switch site answered inline: the table's epoch at compile time and
-/// each key's program with the index, in the site's `targets`, of the
-/// target it lands on.
+/// A switch site answered inline: the table's epoch at compile time, the
+/// address of that epoch word, and each key's program with the index, in
+/// the site's `targets`, of the target it lands on.
+#[derive(Debug)]
 pub(crate) struct InlineSwitch {
     epoch: u64,
+    /// The jump table's `switch_epoch` field. The table is a static
+    /// constant of the leaf, which keeps it alive while the code can run,
+    /// and heap objects never move, so the guard reads the word directly
+    /// instead of reloading the table from its constant slot.
+    epoch_addr: usize,
     keys: Vec<(Vec<InlineKeyNode>, usize)>,
 }
 
@@ -103,10 +109,11 @@ pub(crate) fn inline_switch_for_site(
     if index < dynamic_prefix {
         return None;
     }
-    let plan = constants
-        .get(index)?
+    let table = *constants.get(index)?;
+    let plan = table
         .as_hash_table()?
         .switch_inline_plan(INLINE_MAX_NODES)?;
+    let epoch_addr = (table.bits() & !(TAG_MASK as usize)) + SWITCH_EPOCH_OFFSET;
     let nodes: usize = plan.keys.iter().map(|key| key.program.len()).sum();
     let keys = plan
         .keys
@@ -126,8 +133,32 @@ pub(crate) fn inline_switch_for_site(
     );
     Some(InlineSwitch {
         epoch: plan.epoch,
+        epoch_addr,
         keys,
     })
+}
+
+/// Where the inline answer's epoch witness is checked. `LoopEntry` is supplied
+/// only with the IR schedule's entry and serviced-poll guards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpochCheck {
+    AtDispatch,
+    LoopEntry,
+}
+
+impl InlineSwitch {
+    pub(crate) fn emit_epoch_matches(&self, fb: &mut FunctionBuilder) -> ClifValue {
+        let addr = fb.ins().iconst(types::I64, self.epoch_addr as i64);
+        let epoch = fb.ins().load(types::I64, MemFlagsData::trusted(), addr, 0);
+        lowering::icmp_imm_p(fb, IntCC::Equal, epoch, self.epoch as i64)
+    }
+}
+
+/// The shim's table operand. Opt can defer a rooted static word until the
+/// slow block; baseline/AOT keep their already materialized operand.
+pub(crate) enum DispatchTable {
+    Materialized(ClifValue),
+    StaticConstant(usize),
 }
 
 /// Lower `switch` on the tagged `dispatch` value through the jump table
@@ -160,9 +191,37 @@ pub(crate) fn emit_switch_dispatch(
     landings: &mut dyn SwitchLandings,
     inline: Option<&InlineSwitch>,
 ) {
+    emit_switch_dispatch_with_epoch(
+        fb,
+        rt,
+        dispatch,
+        DispatchTable::Materialized(table),
+        targets,
+        miss,
+        stale,
+        landings,
+        inline,
+        EpochCheck::AtDispatch,
+    );
+}
+
+/// Opt adapter: reuse only a witness covered by an IR guard schedule.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_switch_dispatch_with_epoch(
+    fb: &mut FunctionBuilder,
+    rt: &RtCtx,
+    dispatch: ClifValue,
+    table: DispatchTable,
+    targets: &[(i64, usize)],
+    miss: Block,
+    stale: Block,
+    landings: &mut dyn SwitchLandings,
+    inline: Option<&InlineSwitch>,
+    epoch_check: EpochCheck,
+) {
     if let Some(site) = inline {
         let slow = fb.create_block();
-        emit_inline_dispatch(fb, rt, dispatch, table, site, miss, slow, landings);
+        emit_inline_dispatch(fb, rt, dispatch, site, miss, slow, landings, epoch_check);
         fb.switch_to_block(slow);
         fb.seal_block(slow);
     }
@@ -170,6 +229,10 @@ pub(crate) fn emit_switch_dispatch(
     // compare, and is filled right after it: the lowering before inline
     // dispatch existed, block for block. With one, a landing an inline hit
     // made may have a compare still to come, so they are filled at the end.
+    let table = match table {
+        DispatchTable::Materialized(word) => word,
+        DispatchTable::StaticConstant(word) => fb.ins().iconst(types::I64, word as i64),
+    };
     let fill_each = inline.is_none();
     let vmctx = fb.use_var(rt.vmctx_var);
     let switch_lookup = rt.refs.get(fb.func, Shim::SwitchLookup);
@@ -217,29 +280,26 @@ fn emit_inline_dispatch(
     fb: &mut FunctionBuilder,
     rt: &RtCtx,
     dispatch: ClifValue,
-    table: ClifValue,
     site: &InlineSwitch,
     miss: Block,
     slow: Block,
     landings: &mut dyn SwitchLandings,
+    epoch_check: EpochCheck,
 ) {
     #[cfg(test)]
     INLINE_SITES.with(|sites| sites.set(sites.get() + 1));
-    // The table is the compile-time constant (the leaf's reloc load of it),
-    // so its object is the one the plan was read from: its epoch is the
-    // plan's until something mutates it.
-    let object = lowering::band_imm_p(fb, table, !(TAG_MASK as i64));
-    let epoch = fb.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        object,
-        SWITCH_EPOCH_OFFSET as i32,
-    );
-    let current = lowering::icmp_imm_p(fb, IntCC::Equal, epoch, site.epoch as i64);
-    let tree = fb.create_block();
-    fb.ins().brif(current, tree, &[], slow, &[]);
-    fb.switch_to_block(tree);
-    fb.seal_block(tree);
+    // The table is the compile-time constant the plan was read from: its
+    // epoch is the plan's until something mutates it.
+    match epoch_check {
+        EpochCheck::AtDispatch => {
+            let current = site.emit_epoch_matches(fb);
+            let tree = fb.create_block();
+            fb.ins().brif(current, tree, &[], slow, &[]);
+            fb.switch_to_block(tree);
+            fb.seal_block(tree);
+        }
+        EpochCheck::LoopEntry => {}
+    }
 
     let mut trie = KeyTrie::default();
     for (program, k) in &site.keys {

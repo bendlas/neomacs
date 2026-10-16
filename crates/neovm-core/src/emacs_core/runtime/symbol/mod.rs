@@ -31,6 +31,10 @@ mod fn_stamps;
 mod projection;
 mod property_revision;
 pub use canonical_access::CanonicalAccess;
+pub(crate) use property_revision::{
+    swap_world_state as swap_property_revision_world_state,
+    world_state_placeholder as property_revision_world_state_placeholder,
+};
 
 /// Where an owner-routed canonical write went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +54,10 @@ pub(crate) use cell::{
 pub use cell::{LispSymbol, SymbolFlags};
 #[cfg(test)]
 pub(crate) use fn_stamps::force_fn_stamps_for_test;
-pub(crate) use projection::{ConcealOutcome, RevealedProjection};
+pub(crate) use projection::{
+    AdmissionPlanCell, ConcealOutcome, RevealedProjection, enter_projection_scope,
+    leave_projection_scope, reserve_projection_scope,
+};
 pub use property_revision::SymbolPropertyRevision;
 
 use super::defvar_bool::ByteBooleanVars;
@@ -658,6 +665,9 @@ pub(crate) enum FunctionEpochBump {
     /// The `compiler_function_overrides` toggle
     /// (`sync_cached_runtime_binding_by_id`), no cell write.
     CompilerOverrides,
+    /// Thread admission projected the World's variable cells
+    /// (`Context::admit_threads`), no function-cell write.
+    ThreadAdmission,
 }
 
 /// A function-cell write that stored the value already there: no epoch
@@ -1632,7 +1642,7 @@ impl Obarray {
         let idx = Self::slot_index(id);
         let slot = self.symbols.ensure(idx);
         if !slot.is_present() {
-            Self::publish_fresh_slot(slot, id);
+            Self::publish_fresh_slot(slot, id, self.generation);
         }
         slot
     }
@@ -1645,10 +1655,28 @@ impl Obarray {
     /// a half-written slot's arms (see [`LispSymbol::publish_fill`]). Matches
     /// the old `get_or_insert_with(|| LispSymbol::new(id))` semantics — only
     /// an empty slot is written.
+    ///
+    /// In a World thread admission has run, a fresh cell is born projected
+    /// onto the VOID descriptor (`projection::born_projected`), as admission
+    /// left every void cell; a dormant World pays one load and branch here.
     #[cold]
     #[inline(never)]
-    fn publish_fresh_slot(slot: &mut LispSymbol, id: SymId) {
+    fn publish_fresh_slot(slot: &mut LispSymbol, id: SymId, generation: u64) {
+        if projection::scopes_live() {
+            return Self::publish_fresh_slot_admitted(slot, id, generation);
+        }
         slot.publish_fill(LispSymbol::new(id));
+    }
+
+    /// [`Self::publish_fresh_slot`] once some World admitted threads.
+    #[cold]
+    #[inline(never)]
+    fn publish_fresh_slot_admitted(slot: &mut LispSymbol, id: SymId, generation: u64) {
+        let fresh = match projection::born_projected(generation) {
+            None => LispSymbol::new(id),
+            Some(header) => LispSymbol::new_projected(id, header),
+        };
+        slot.publish_fill(fresh);
     }
 
     /// Begin a write of `id`'s value cell, interning the slot if it is
@@ -3747,6 +3775,11 @@ impl Obarray {
             ArmMut::Localized(local) => local.blv(),
             ArmMut::Forwarded(forwarded) => {
                 let fwd = forwarded.descriptor();
+                // A projected variable's canonical storage takes the write.
+                if let Some(projection) = fwd.thread_projection() {
+                    projection::store_projected_canonical(forwarded, projection, value);
+                    return;
+                }
                 // This is the storage-level entry point, below the evaluator,
                 // so a refusal has no way to become a Lisp signal here; the
                 // Lisp-visible check runs in `set_runtime_binding_in_state`.
@@ -4548,6 +4581,9 @@ impl Obarray {
     /// buffer-local cell is refused with GNU `Fdefvaralias`'s reason
     /// (`src/eval.c:665-679`) and left as it is.
     pub fn make_alias(&mut self, id: SymId, target: SymId) -> Result<(), MakeAliasError> {
+        if self.thread_projection_of(id).is_some() {
+            return self.make_projected_alias(id, target);
+        }
         match self.cell_write_ensure(id).arm() {
             ArmMut::Plain(plain) => plain.alias_to(target),
             ArmMut::Alias(alias) => alias.alias_to(target),
@@ -4693,6 +4729,18 @@ impl Obarray {
 
         if let Some(sym) = self.slot(new_alias) {
             match sym.value_cell() {
+                // A projected variable answers by the variable it projects.
+                ValueCell::Forwarded(fwd) if let Some(projection) = fwd.thread_projection() => {
+                    match projection.arm() {
+                        crate::emacs_core::forward::CanonicalArm::Plain => {}
+                        crate::emacs_core::forward::CanonicalArm::Localized(_) => {
+                            return Err(MakeAliasError::Localized);
+                        }
+                        crate::emacs_core::forward::CanonicalArm::Forwarded(_) => {
+                            return Err(MakeAliasError::Forwarded);
+                        }
+                    }
+                }
                 ValueCell::Forwarded(_) => return Err(MakeAliasError::Forwarded),
                 ValueCell::Localized(_) => return Err(MakeAliasError::Localized),
                 ValueCell::Plain(_) | ValueCell::Alias(_) => {}

@@ -54,6 +54,28 @@ mod enabled {
         static RESULT_SETS: RefCell<HashMap<i64, ResultSet>> = RefCell::new(HashMap::new());
     }
 
+    /// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+    /// thread-local while its World's Baton holder runs, and in the World while
+    /// it is parked. The Green runtime takes it at a park and restores it at the
+    /// next resume, so every Lisp thread sees one value, as in GNU. (N-mutator
+    /// mode needs shared storage instead: a recorded obligation.)
+    #[cold]
+    pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+        Box::new((
+            HashMap::<i64, Rc<Connection>>::new(),
+            HashMap::<i64, ResultSet>::new(),
+        ))
+    }
+
+    #[cold]
+    pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+        let slot = slot
+            .downcast_mut::<(HashMap<i64, Rc<Connection>>, HashMap<i64, ResultSet>)>()
+            .expect("carried World state");
+        DB_HANDLES.with(|handles| std::mem::swap(&mut *handles.borrow_mut(), &mut slot.0));
+        RESULT_SETS.with(|sets| std::mem::swap(&mut *sets.borrow_mut(), &mut slot.1));
+    }
+
     /// A live SQLite result set for incremental iteration.
     struct ResultSet {
         connection: Rc<Connection>,
@@ -984,6 +1006,18 @@ pub(crate) use enabled::{
     available_p, close, columns, commit, execute, execute_batch, finalize, is_sqlite_object,
     load_extension, more_p, next, open, pragma, rollback, select, transaction, version,
 };
+#[cfg(feature = "sqlite")]
+pub(crate) use enabled::{swap_world_state, world_state_placeholder};
+
+#[cfg(not(feature = "sqlite"))]
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new(())
+}
+
+#[cfg(not(feature = "sqlite"))]
+#[cold]
+pub(crate) fn swap_world_state(_slot: &mut dyn std::any::Any) {}
 
 #[cfg(not(feature = "sqlite"))]
 pub(crate) fn is_sqlite_object(

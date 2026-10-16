@@ -416,6 +416,60 @@ fn bump_leaf_slot_epoch() {
     LEAF_SLOT_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Green admission reuses the existing generated/Rust epoch probes. Each
+/// acquiring owner invalidates source slots before dispatch, so a World-shared
+/// RuntimeState never admits a foreign owner's TLS leaf.
+#[cold]
+pub(crate) fn invalidate_green_leaf_slots() {
+    bump_leaf_slot_epoch();
+}
+
+/// A parked owner cannot observe another owner's TLS reverse-dependency map.
+/// On return after a function epoch move, retire its dependents before the next
+/// dispatch. Retired entry leaves remain allocated for suspended native frames.
+#[cold]
+pub(crate) fn retire_green_inline_dependents() {
+    let symbols: Vec<_> = INLINE_DEPS.with(|deps| deps.borrow().keys().copied().collect());
+    for symbol in symbols {
+        evict_inline_dependents(symbol);
+    }
+    // Legacy OSR does not register baseline arithmetic dependencies. A running
+    // transfer owns an Rc, but that alone does not root the leaf's relocations
+    // after its parked publication retires. Keep evicted OSR leaves in the same
+    // traced retirement store as entry leaves until this heap is replaced.
+    OSR_PENDING.with(|pending| pending.borrow_mut().clear());
+    let retired_osr: Vec<_> = OSR_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .drain()
+            .filter_map(|(_, entry)| entry.map(|entry| entry.leaf))
+            .collect()
+    });
+    COMPILED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for leaf in retired_osr {
+            cache.retire(leaf);
+        }
+    });
+}
+
+/// Conservative cold check for a possible cached native activation. Production
+/// dispatch retains every executable leaf in this owner's live/retired or OSR
+/// stores. A cache containing only rejected/deferred entries has no activation;
+/// pending jobs are included conservatively. No hot native-depth counter is
+/// needed, and cached relocation tracing is never skipped on this basis.
+#[cold]
+pub(crate) fn green_has_native_state() -> bool {
+    COMPILED.with(|cache| {
+        let cache = cache.borrow();
+        !cache.retired.is_empty()
+            || cache
+                .iter()
+                .any(|(_, entry)| entry.live_leaf().is_some() || entry.pending_job().is_some())
+    }) || OSR_CACHE.with(|cache| cache.borrow().values().any(Option::is_some))
+        || OSR_PENDING.with(|pending| !pending.borrow().is_empty())
+}
+
 #[derive(Clone)]
 struct OsrEntry {
     leaf: Rc<CompiledLeaf>,
@@ -510,36 +564,36 @@ enum OsrLookup {
     Pending,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
-    /// Nesting depth of native leaf executions on this thread (debug builds
-    /// only). `clear()` asserts it is 0: the soundness of every spec-slot leaf
+    /// Nesting depth of native leaf executions on this thread (debug and test
+    /// builds). `clear()` asserts it is 0: the soundness of every spec-slot leaf
     /// pointer and every baked box address rests on "no clear() fires while a
     /// native frame is live" (`resolve_compiled_leaf_ptr`), so a violation must
     /// be loud in debug/test builds instead of a silent use-after-free.
     static NATIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Current native nesting depth (0 outside any leaf). Always 0 in release
-/// builds, where the counter does not exist.
+/// Current native nesting depth (0 outside any leaf). Always 0 in production
+/// release builds, where the counter does not exist.
 #[inline]
 pub(crate) fn native_depth() -> u32 {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     {
         NATIVE_DEPTH.with(|d| d.get())
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(test, debug_assertions)))]
     {
         0
     }
 }
 
 /// RAII marker for one native leaf execution (see `NATIVE_DEPTH`). Zero-sized
-/// and a no-op in release builds; unwind-safe (the decrement is in `Drop`).
+/// and a no-op in production release builds; unwind-safe (the decrement is in `Drop`).
 #[must_use = "the thread-local extent ends when this guard drops"]
 #[derive(Debug)]
 pub(crate) struct NativeDepthGuard {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     _scope: crate::tls_scope::TlsScope<u32, std::cell::Cell<u32>>,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -549,7 +603,7 @@ impl NativeDepthGuard {
     #[inline]
     pub(crate) fn enter() -> Self {
         Self {
-            #[cfg(debug_assertions)]
+            #[cfg(any(test, debug_assertions))]
             _scope: crate::tls_scope::TlsScope::restore(
                 &NATIVE_DEPTH,
                 NATIVE_DEPTH.with(|depth| depth.replace(depth.get().saturating_add(1))),
@@ -1478,8 +1532,8 @@ fn compile_cache_entry(
 /// briefly. Idempotent: an absent/already-evicted id is a no-op. Compiled-id never
 /// reuses, so a stale id in a dep set just removes nothing.
 /// Evict `id`'s compiled state (its leaf is RETIRED, not dropped — see
-/// `DenseCache::remove` — and its OSR entries are dropped, which is sound: an OSR
-/// leaf is only ever entered from the interpreter, never cached in a spec slot).
+/// `DenseCache::remove` — and its OSR leaves join the same traced retirement
+/// store, preserving their relocations while an active transfer can still run).
 /// Used when a `make-closure` widened the source's patched prefix after a leaf
 /// was compiled under the narrower one (`RuntimeState::note_patched_prefix`).
 /// The symbol naming the function whose leaf `id` is about to be compiled,
@@ -1517,14 +1571,25 @@ fn callee_name_hint(ctx: *const Context, id: u64) -> Option<SymId> {
 pub(crate) fn evict_compiled(id: u64) {
     COMPILED.with(|c| c.borrow_mut().remove(id));
     drop_osr_pending(id);
-    OSR_CACHE.with(|c| {
+    let retired_osr = OSR_CACHE.with(|c| {
+        let mut retired = Vec::new();
         c.borrow_mut().retain(|(fid, _), entry| {
             let keep = *fid != id;
-            if !keep && let Some(entry) = entry {
-                fold_dropped_leaf(&entry.leaf);
+            if !keep && let Some(entry) = entry.take() {
+                retired.push(entry.leaf);
             }
             keep
-        })
+        });
+        retired
+    });
+    COMPILED.with(|c| {
+        let mut cache = c.borrow_mut();
+        for leaf in retired_osr {
+            // An active OSR transfer owns its Rc, but only the cache's traced
+            // retirement store keeps its relocation roots visible across a GC
+            // or a subsequent Green park. Fold statistics only at final drop.
+            cache.retire(leaf);
+        }
     });
     if super::compile::jit_inline2_mode().enabled() {
         forget_inline_deps(id);
@@ -1796,8 +1861,9 @@ pub(crate) fn invalidate_for_reopt(
             Err(_) => false,
         });
         if !retired {
-            // Dropped instead, as `evict_compiled` drops OSR leaves (only
-            // the interpreter enters them; a running one holds its own Rc).
+            // Defensive cache-borrow failure: native dispatch normally releases
+            // the cache before running Lisp. This deopting transfer still owns
+            // its Rc through resume; no cache entry is published here.
             for leaf in &osr {
                 fold_dropped_leaf(leaf);
             }
@@ -3560,6 +3626,30 @@ mod osr_inline_tests;
 #[cfg(test)]
 #[path = "cache/tests/hof_regalloc_test.rs"]
 mod hof_regalloc_tests;
+
+/// Install a directly compiled leaf for an exact-tier runtime observation.
+/// Threading: the fixture owns this dormant Context and this mutator's cache;
+/// the function cell roots the source, and the cache roots the leaf constants.
+#[cfg(test)]
+pub(crate) fn install_leaf_for_test(
+    ctx: &Context,
+    func: &ByteCodeFunction,
+    leaf: CompiledLeaf,
+) -> Rc<CompiledLeaf> {
+    sync_cache_to_current_heap();
+    sync_cache_to_obarray(ctx.obarray.generation());
+    let id = func.jit_runtime().compiled_id_or_assign();
+    let leaf = Rc::new(leaf);
+    func.jit_runtime().disarm_leaf_slot();
+    COMPILED.with(|cache| {
+        cache
+            .borrow_mut()
+            .retire_and_replace(id, Some(CacheEntry::Compiled(Rc::clone(&leaf))));
+    });
+    func.jit_runtime().set_hot_for_test();
+    func.jit_runtime().defer_tier_up(0);
+    leaf
+}
 
 /// Prepare an entry through its real front/backend protocol without executing
 /// the body. Native-observation tests call this at explicit fixture boundaries;

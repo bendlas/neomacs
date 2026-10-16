@@ -100,6 +100,35 @@ pub(crate) fn install_terminal_registry_handle(handle: &TerminalRegistryHandle) 
     });
 }
 
+/// Admitted-owner activation needs the same native record reconciliation,
+/// with no allocation for a snapshot of the registry's creation order.
+/// Native record construction does not run Lisp. Current terminal host
+/// destructors release only native resources; they must not reborrow this
+/// registry while record reconciliation holds its shared borrow.
+#[inline(always)]
+pub(crate) fn install_owner_terminal_registry_handle(handle: &TerminalRegistryHandle) {
+    TERMINAL_LISP_STATE.with(|slot| slot.install(handle));
+    let registry = handle.borrow();
+    let ids = &registry.creation_order;
+    TERMINAL_MANAGER.with(|state| {
+        let slot = state.get_or_init(|| RefCell::new(TerminalManager::new()));
+        let mut manager = slot.borrow_mut();
+        for terminal in &mut manager.terminals {
+            if !ids.contains(&terminal.id) {
+                terminal.mark_deleted();
+            }
+        }
+        for id in ids {
+            manager.ensure_lisp_terminal_record(*id);
+        }
+        manager.terminals.sort_by_key(|terminal| {
+            ids.iter()
+                .position(|id| *id == terminal.id)
+                .unwrap_or(ids.len())
+        });
+    });
+}
+
 pub(crate) fn collect_terminal_registry_gc_roots(
     handle: &TerminalRegistryHandle,
     roots: &mut Vec<Value>,
@@ -1687,6 +1716,36 @@ pub(crate) fn builtin_delete_terminal(
 #[cfg(test)]
 #[path = "tests/gc_context_migration_test.rs"]
 mod gc_context_migration_tests;
+
+/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+/// thread-local while its World's Baton holder runs, and in the World while
+/// it is parked; the Green runtime moves it at each park and resume, so
+/// every Lisp thread sees one value, as in GNU. (N-mutator mode needs shared
+/// storage instead: a recorded obligation.)
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new(None::<TerminalManager>)
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    let slot = slot
+        .downcast_mut::<Option<TerminalManager>>()
+        .expect("carried World state");
+    TERMINAL_MANAGER.with(|manager| match manager.get() {
+        Some(manager) => {
+            let incoming = slot.take().unwrap_or(TerminalManager {
+                terminals: Vec::new(),
+            });
+            *slot = Some(std::mem::replace(&mut *manager.borrow_mut(), incoming));
+        }
+        None => {
+            if let Some(state) = slot.take() {
+                let _ = manager.set(RefCell::new(state));
+            }
+        }
+    });
+}
 
 #[cfg(test)]
 #[path = "tests/registry_reinstall_test.rs"]

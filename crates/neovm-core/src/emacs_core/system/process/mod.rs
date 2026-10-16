@@ -76,6 +76,9 @@ pub enum NetworkSocket {
 pub(crate) mod sys;
 use sys::ChildStatusSource;
 
+mod green_select;
+pub(crate) use green_select::GreenSelectHandle;
+
 mod executable;
 pub(super) use executable::{ExecutableLookupMode, ExecutableSearch};
 
@@ -529,6 +532,7 @@ pub(crate) use helpers::*;
 
 mod types;
 pub use types::*;
+pub(crate) use types::{swap_world_state, world_state_placeholder};
 #[cfg(test)]
 #[path = "tests/process_test.rs"]
 mod tests;

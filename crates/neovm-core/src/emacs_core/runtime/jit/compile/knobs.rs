@@ -165,6 +165,32 @@ pub(crate) fn force_inline2_for_test(mode: Option<Inline2Mode>) {
     INLINE2_TEST_OVERRIDE.with(|current| current.set(mode));
 }
 
+/// `NEOVM_JIT_HOF_INLINE` (default on; `off` disables): with the default
+/// profile's Legacy front, a body whose `mapc`/`mapcar` site has an admitted
+/// literal callback compiles through the HOF-only v2 front, inlining the
+/// callback loop; every other body compiles exactly as without it. Read
+/// once per process; tests override it per thread.
+pub(crate) fn jit_hof_inline() -> bool {
+    #[cfg(test)]
+    if let Some(on) = HOF_INLINE_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("NEOVM_JIT_HOF_INLINE").as_deref(), Ok("off")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Scalar compiler configuration only; never Lisp or mutator state.
+    static HOF_INLINE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_hof_inline_for_test(on: Option<bool>) {
+    HOF_INLINE_TEST_OVERRIDE.with(|value| value.set(on));
+}
+
 /// Named planning on the existing re-tier path. Only a compile
 /// with re-tier origin or heat pays for named planning. The
 /// oracle diagnostic admits the first compile at THRESHOLD=1. Threading:
@@ -197,6 +223,31 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn force_profit_gate_for_test(on: bool) {
     PROFIT_GATE_TEST_OVERRIDE.with(|c| c.set(Some(on)));
+}
+
+/// Exact owner-local test policy, including restoration of an unset override.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfitGateTestPolicy {
+    Runtime,
+    Enforce,
+    Bypass,
+}
+#[cfg(test)]
+static_assertions::assert_impl_all!(ProfitGateTestPolicy: Send, Sync);
+
+#[cfg(test)]
+pub(crate) fn replace_profit_gate_for_test(policy: ProfitGateTestPolicy) -> ProfitGateTestPolicy {
+    let override_value = match policy {
+        ProfitGateTestPolicy::Runtime => None,
+        ProfitGateTestPolicy::Enforce => Some(true),
+        ProfitGateTestPolicy::Bypass => Some(false),
+    };
+    match PROFIT_GATE_TEST_OVERRIDE.with(|value| value.replace(override_value)) {
+        None => ProfitGateTestPolicy::Runtime,
+        Some(true) => ProfitGateTestPolicy::Enforce,
+        Some(false) => ProfitGateTestPolicy::Bypass,
+    }
 }
 
 /// Is the JIT profitability gate enabled? Default yes; `NEOVM_JIT_PROFIT=off`
@@ -2189,4 +2240,26 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn force_opt_osr_entry_for_test(on: Option<bool>) {
     OPT_OSR_ENTRY_TEST_OVERRIDE.with(|value| value.set(on));
+}
+
+/// Opt switch constant rematerialization and IR epoch-guard scheduling.
+/// Default off. Immutable process configuration, with no Lisp runtime state.
+pub(crate) fn jit_switch_hoist_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = SWITCH_HOIST_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NEOVM_JIT_SWITCH_HOIST").as_deref() == Ok("on"))
+}
+
+#[cfg(test)]
+thread_local! {
+    // Scalar compiler configuration only; never Lisp state.
+    static SWITCH_HOIST_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_switch_hoist_for_test(on: Option<bool>) {
+    SWITCH_HOIST_TEST_OVERRIDE.with(|v| v.set(on));
 }

@@ -7,8 +7,6 @@
 //! types carry that work across the thread boundary and turn back into values
 //! only inside the collector.
 
-use std::sync::{Arc, Mutex};
-
 use crate::tagged::value::TaggedValue;
 
 /// One value word queued for the collector.
@@ -38,10 +36,6 @@ impl std::fmt::Debug for MarkWord {
         write!(f, "MarkWord({:#x})", self.0)
     }
 }
-
-/// A queue shared between the mutator's SATB barrier or start handshake and
-/// the marker thread.
-pub(super) type SharedMarkQueue = Arc<Mutex<Vec<MarkWord>>>;
 
 /// The marker thread's own gray stack.
 #[derive(Default)]

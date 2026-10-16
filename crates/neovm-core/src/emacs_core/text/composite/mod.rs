@@ -1738,6 +1738,28 @@ pub fn register_bootstrap_vars(obarray: &mut crate::emacs_core::symbol::Obarray)
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+/// thread-local while its World's Baton holder runs, and in the World while
+/// it is parked. The Green runtime takes it at a park and restores it at the
+/// next resume, so every Lisp thread sees one value, as in GNU. (N-mutator
+/// mode needs shared storage instead: a recorded obligation.)
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new(CompositionRegistry {
+        next_id: 0,
+        dedup: std::collections::HashMap::new(),
+        relative_by_id: Vec::new(),
+    })
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    let slot = slot
+        .downcast_mut::<CompositionRegistry>()
+        .expect("carried World state");
+    COMPOSITION_REGISTRY.with(|registry| std::mem::swap(&mut *registry.borrow_mut(), slot));
+}
+
 #[cfg(test)]
 #[path = "tests/composite_test.rs"]
 mod tests;

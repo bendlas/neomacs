@@ -714,7 +714,7 @@ pub(crate) fn builtin_external_debugging_output(
         Some(name) => crate::encoding::encode_lisp_string(&internal, name, eol_conversion),
         None => internal.as_bytes().to_vec(),
     };
-    if let Some(file) = eval.debugging_output_file.as_mut() {
+    if let Some(file) = eval.debugging_output_file_mut().as_mut() {
         use std::io::Write;
         file.write_all(&bytes)
             .and_then(|_| file.flush())
@@ -1558,3 +1558,27 @@ pub(crate) fn builtin_remember_mouse_glyph(
 // `emacs-repository-get-branch' (:231) used to be stubbed here "for
 // loadup.el".  They are not needed: loadup.el loads version.el at :128 and
 // first calls them at :429 (DIVERGENCES.md 152).
+
+/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+/// thread-local while its World's Baton holder runs, and in the World while
+/// it is parked; the Green runtime moves it at each park and resume, so
+/// every Lisp thread sees one value, as in GNU. (N-mutator mode needs shared
+/// storage instead: a recorded obligation.)
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new((
+        None::<String>,
+        None::<String>,
+        Vec::<NeomacsMonitorInfo>::new(),
+    ))
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    let slot = slot
+        .downcast_mut::<(Option<String>, Option<String>, Vec<NeomacsMonitorInfo>)>()
+        .expect("carried World state");
+    NEOMACS_CLIPBOARD_TEXT.with(|t| std::mem::swap(&mut *t.borrow_mut(), &mut slot.0));
+    NEOMACS_PRIMARY_SELECTION_TEXT.with(|t| std::mem::swap(&mut *t.borrow_mut(), &mut slot.1));
+    NEOMACS_MONITORS.with(|m| std::mem::swap(&mut *m.borrow_mut(), &mut slot.2));
+}

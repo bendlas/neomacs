@@ -554,6 +554,19 @@ impl Context {
 
         // `case SYMBOL_VARALIAS: sym = SYMBOL_ALIAS (sym); goto start;`
         let resolved = builtins::resolve_variable_alias_id_in_obarray(&self.obarray, sym_id)?;
+        // A parked binding can acquire an alias to a constant in another
+        // thread. Its eventual restore re-enters GNU's constant check with
+        // the original specpdl symbol (data.c:set_internal).
+        if resolved != sym_id
+            && let Some(result) = builtins::constant_set_outcome_in_obarray(
+                &self.obarray,
+                resolved,
+                Value::from_sym_id(sym_id),
+                value,
+            )
+        {
+            return result.map(|_| ());
+        }
         let unbinding = value.is_unbound();
         if unbinding {
             // "Built-in variable may not be unbound", named by the symbol the
@@ -796,6 +809,11 @@ impl Context {
         use crate::emacs_core::symbol::SymbolRedirect;
         let (redirect, forwarded) = match self.obarray.get_by_id(resolved) {
             Some(sym) => (sym.redirect(), sym.forwarded_descriptor()),
+            // After admission a fresh cell is born projected: make it first,
+            // so the binding is the owner's.
+            None if self.obarray.births_projected() => {
+                return self.specbind_fresh_projected(resolved, value);
+            }
             None => (SymbolRedirect::Plainval, None),
         };
 
@@ -995,6 +1013,15 @@ impl Context {
         self.sync_cached_runtime_binding_by_id(resolved, stored);
         self.sync_user_test_gc_binding_by_id(resolved);
         Ok(())
+    }
+
+    /// `specbind` of RESOLVED, which has no cell yet, in an admitted World:
+    /// the cell is born on VOID, and the binding is this owner's.
+    #[cold]
+    #[inline(never)]
+    fn specbind_fresh_projected(&mut self, resolved: SymId, value: Value) -> Result<(), Flow> {
+        self.obarray.ensure_symbol_id(resolved);
+        self.specbind_projected(resolved, value)
     }
 
     /// GNU-compatible checked entry point for dynamic binding.
@@ -1375,6 +1402,66 @@ impl Context {
             Swap::Owner(binding) => self.swap_owner_binding(binding),
         }
         Ok(())
+    }
+
+    /// Sim executes a new worker eagerly, although GNU's `make-thread`
+    /// does not switch. Preserve absent local entries across that artificial
+    /// switch: their later rewind must still see a local remade by the caller.
+    /// Real exchanges keep their normal missing-local retirement semantics.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn with_sim_creation_local_bindings(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> EvalResult,
+    ) -> EvalResult {
+        // Copy the local fields: another whole-enum Clone caller would change
+        // LTO's inlining of the existing unwind path.
+        let preserved: Vec<_> = self
+            .specpdl
+            .iter()
+            .enumerate()
+            .filter_map(|(position, binding)| match binding {
+                SpecBinding::LetLocal {
+                    sym_id,
+                    old_value,
+                    buffer_id,
+                } if self
+                    .local_binding_value_for_thread_switch(*sym_id, *buffer_id)
+                    .is_none() =>
+                {
+                    Some((position, *sym_id, *old_value, *buffer_id))
+                }
+                _ => None,
+            })
+            .collect();
+        if preserved.is_empty() {
+            return run(self);
+        }
+
+        let mut roots = UnwindVmRootsScope::enter(self);
+        for &(_, sym_id, old_value, _) in &preserved {
+            roots
+                .context()
+                .push_vm_frame_root(Value::from_sym_id(sym_id));
+            roots.context().push_vm_frame_root(old_value);
+        }
+        let result = run(roots.context());
+        // Entry can fail after earlier local entries were zapped. Restore
+        // those copies on the error path too, without replacing any live
+        // entry the simulated worker's own execution may have left behind.
+        for (position, sym_id, old_value, buffer_id) in preserved {
+            if let Some(binding) = roots.context().specpdl.get_mut(position)
+                && matches!(binding, SpecBinding::Nop)
+            {
+                *binding = SpecBinding::LetLocal {
+                    sym_id,
+                    old_value,
+                    buffer_id,
+                };
+            }
+        }
+        roots.finish();
+        result
     }
 
     pub(crate) fn suspend_dynamic_bindings_for_thread_switch(

@@ -54,3 +54,76 @@ pub(super) fn early_fused(
         .or_else(|| inline::fuse_calls_v2(ops, constants, offset_map, native_arity, &feedback))
         .map(Rc::new)
 }
+
+/// The default profile's HOF-only front for a body the opt front leaves on
+/// Legacy: `Some` only when a `mapc`/`mapcar` site with an admitted literal
+/// callback was selected, so every other body keeps the Legacy compile.
+/// Threading: compiler-local, as [`early_fused`].
+pub(super) fn hof_only_fused(
+    source: &ByteCodeFunction,
+    constants: &[Value],
+    native_arity: usize,
+) -> Option<Rc<FusedBody>> {
+    if !super::knobs::jit_hof_inline() || jit_inline2_mode().enabled() || !inline::jit_inline_on() {
+        return None;
+    }
+    let ops = source.executable_ops();
+    let _phase = crate::emacs_core::jit::stats::enter_phase(
+        crate::emacs_core::jit::stats::CompilePhase::Fuse,
+    );
+    let feedback: Vec<_> = (0..ops.len()).map(active_numeric_feedback).collect();
+    inline::fuse_hof_calls_v2(
+        ops,
+        constants,
+        source.executable_gnu_byte_offset_map(),
+        native_arity,
+        &feedback,
+    )
+    .map(Rc::new)
+}
+
+/// Whether `source` has a `mapc`/`mapcar` site the default front's HOF-only
+/// path would select, judged with fixnum feedback assumed (callers decide
+/// once and cache it). Threading: compiler-local, as [`hof_only_fused`].
+pub(crate) fn hof_caller_selectable(source: &ByteCodeFunction) -> bool {
+    if !super::knobs::jit_hof_inline()
+        || jit_inline2_mode().enabled()
+        || !inline::jit_inline_on()
+        || !inline::mentions_hof(&source.constants)
+        || !source.constants.iter().any(|constant| {
+            constant
+                .get_bytecode_data()
+                .is_some_and(is_hof_callback_candidate)
+        })
+    {
+        return false;
+    }
+    let Ok(params) = super::param_shape::JitParamShape::try_from(source) else {
+        return false;
+    };
+    let ops = source.executable_ops();
+    let feedback = vec![crate::emacs_core::jit::NumericFeedback::FixnumOnly; ops.len()];
+    inline::fuse_hof_calls_v2(
+        ops,
+        &source.constants,
+        source.executable_gnu_byte_offset_map(),
+        params.entry_depth(),
+        &feedback,
+    )
+    .is_some()
+}
+
+/// A constant that could be an admitted HOF callback (a literal lambda or a
+/// `make-closure` template): the structural census verdict for one argument,
+/// and no call. A necessary condition only, so callers whose lambdas call
+/// something skip the front's CFG analysis.
+fn is_hof_callback_candidate(callee: &ByteCodeFunction) -> bool {
+    inline::census_callee_verdict(callee, 1).is_ok()
+        && !callee.executable_ops().iter().any(|op| {
+            matches!(
+                op,
+                crate::emacs_core::bytecode::Op::Call(_)
+                    | crate::emacs_core::bytecode::Op::Apply(_)
+            )
+        })
+}

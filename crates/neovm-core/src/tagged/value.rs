@@ -300,6 +300,27 @@ fn canonical_subr_object(sym_id: SymId) -> TaggedValue {
     })
 }
 
+/// Mint the canonical subr object of every symbol in IDS on this thread now,
+/// so a snapshot of the table is complete (a Green Lisp thread installs it;
+/// minting lazily on two threads would give one primitive two objects).
+/// Through `subr_from_sym_id`, so `canonical_subr_object` keeps its one
+/// caller and stays inlined there.
+pub(crate) fn mint_static_subr_objects(ids: impl IntoIterator<Item = SymId>) {
+    for id in ids {
+        let _ = TaggedValue::subr_from_sym_id(id);
+    }
+}
+
+/// This thread's canonical subr objects (leaked, never collected).
+pub(crate) fn snapshot_static_subr_objects() -> Vec<Option<TaggedValue>> {
+    STATIC_SUBR_OBJECTS.with(|objects| objects.borrow().clone())
+}
+
+/// Install OBJECTS as this thread's canonical subr objects.
+pub(crate) fn install_static_subr_objects(objects: Vec<Option<TaggedValue>>) {
+    STATIC_SUBR_OBJECTS.with(|table| *table.borrow_mut() = objects);
+}
+
 fn allocate_static_subr_object(sym_id: SymId) -> TaggedValue {
     let name_id = symbol_name_id(sym_id);
     let entry = crate::emacs_core::eval::lookup_global_subr_entry(sym_id);
@@ -352,9 +373,9 @@ impl TaggedValue {
     /// object, not as an immediate tag. Neomacs mirrors that shape with
     /// a noncanonical process-global symbol named `unbound`.
     ///
-    /// This must never leak into ordinary Lisp code — callers that
-    /// observe it should either signal `void-variable` or treat it
-    /// as "absent" depending on context.
+    /// Variable reads signal `void-variable` or treat this as "absent".
+    /// GNU's `backtrace--locals` deliberately exposes the actual symbol
+    /// when reporting a currently void binding; retain its symbol identity.
     pub const UNBOUND: Self = Self(
         (UNBOUND_SYM_ID.0 as usize) << TAG_BITS | TAG_SYMBOL,
         PhantomData,

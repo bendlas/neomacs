@@ -18,6 +18,7 @@ use crate::emacs_core::value::Value;
 
 #[path = "inline_v2_tags.rs"]
 mod tags;
+pub(crate) use tags::mentions_hof;
 
 /// How a flat static region obtains its executing callee and constants.
 /// Immutable compile-local metadata, never shared mutable Lisp state.
@@ -133,6 +134,24 @@ pub(crate) fn fuse_calls_v2(
 ) -> Option<FusedBody> {
     let front = tags::fuse_static(ops, constants, offset_map, arity, feedback)?;
     annotate(front)
+}
+
+/// Only `mapc`/`mapcar` sites with an admitted literal callback, for the
+/// default profile's Legacy front: `None` when the body has no such site,
+/// so the caller compiles exactly as without it.
+pub(crate) fn fuse_hof_calls_v2(
+    ops: &[Op],
+    constants: &[Value],
+    offset_map: Option<&[GnuByteOffsetMapEntry]>,
+    arity: usize,
+    feedback: &[NumericFeedback],
+) -> Option<FusedBody> {
+    if !tags::mentions_hof(constants) {
+        return None;
+    }
+    annotate(tags::fuse_hof_only(
+        ops, constants, offset_map, arity, feedback,
+    )?)
 }
 
 /// Named callees are selected only by a T2/re-tier compile. All borrowed

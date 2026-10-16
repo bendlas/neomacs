@@ -33,6 +33,39 @@ std::cfg_select! {
     _ => {}
 }
 
+/// D-Bus's carried World state (connections and registered fds; see
+/// `connection::swap_world_state`).
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    std::cfg_select! {
+        neomacs_have_dbus => {
+            Box::new((connection::world_state_placeholder(), fd::world_state_placeholder()))
+        }
+        _ => {
+            Box::new(((), fd::world_state_placeholder()))
+        }
+    }
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    std::cfg_select! {
+        neomacs_have_dbus => {
+            let (buses, fds) = slot
+                .downcast_mut::<(Box<dyn std::any::Any>, Box<dyn std::any::Any>)>()
+                .expect("D-Bus's carried state");
+            connection::swap_world_state(&mut **buses);
+            fd::swap_world_state(&mut **fds);
+        }
+        _ => {
+            let ((), fds) = slot
+                .downcast_mut::<((), Box<dyn std::any::Any>)>()
+                .expect("D-Bus's carried state");
+            fd::swap_world_state(&mut **fds);
+        }
+    }
+}
+
 pub(crate) fn register_subrs(ctx: &mut Context) {
     subrs::register_subrs(ctx);
 }

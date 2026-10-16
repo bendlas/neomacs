@@ -26,7 +26,7 @@ impl ConsBlockCacheEntry {
 }
 
 /// A GNU-shaped cons block with cells at the front of a fixed-size aligned
-/// storage area, followed by the mark, old and unlogged bitmaps.
+/// storage area, followed by the mark bitmap and the cells' age bytes.
 pub(super) struct ConsBlock {
     /// Aligned raw storage for cons cells plus `ConsBlockTrailer`.
     pub(super) storage: *mut u8,
@@ -203,10 +203,6 @@ impl ConsBlock {
             if self.trailer().is_live_generational(i) {
                 live += 1;
             } else {
-                debug_assert!(
-                    !self.trailer().is_unlogged(i),
-                    "a free cell cannot be unlogged"
-                );
                 unsafe { (*cell).set_free_next(*free_list) };
                 *free_list = cell;
             }
@@ -223,6 +219,41 @@ impl ConsBlock {
     #[inline]
     pub(super) fn count_old(&self) -> usize {
         self.trailer().count_old(self.next_index as usize)
+    }
+
+    /// Card-mark S2: the old cells that start in the card at byte OFFSET
+    /// from the block base, as the index of the card's first cell and a mask
+    /// of up to 32 cells from it. Cells are 16 bytes from the block base, so
+    /// a 512-byte card is half of one old-bitmap word.
+    #[inline]
+    pub(super) fn old_cells_in_card(&self, offset: usize) -> (usize, u64) {
+        use super::card_table::CARD_BYTES;
+        const CELLS_PER_CARD: usize = CARD_BYTES / size_of::<ConsCell>();
+        const BITS_PER_WORD: usize = u64::BITS as usize;
+        const _: () = assert!(BITS_PER_WORD % CELLS_PER_CARD == 0);
+        let first = offset / size_of::<ConsCell>();
+        let used = self.next_index as usize;
+        if first >= used {
+            return (first, 0);
+        }
+        let cells = (used - first).min(CELLS_PER_CARD);
+        let old = (self.trailer().old_word(first / BITS_PER_WORD) >> (first % BITS_PER_WORD))
+            & (u64::MAX >> (BITS_PER_WORD - cells));
+        (first, old)
+    }
+
+    /// Whether VALUE is an old cell of this block. A dirty card's cells are
+    /// mostly list spines whose cdr is the next old cell of the same block,
+    /// which a minor would only push and pop again to skip.
+    #[inline]
+    pub(super) fn holds_old_cell(&self, value: TaggedValue) -> bool {
+        if !value.is_cons() {
+            return false;
+        }
+        let ptr = value.xcons_ptr();
+        Self::block_base_for_ptr(ptr) == self.base_addr()
+            && Self::ptr_is_cell_aligned(ptr)
+            && self.trailer().is_old(Self::index_of_ptr(ptr))
     }
 
     /// Sweep: thread reclaimed cells into the global intrusive free list and

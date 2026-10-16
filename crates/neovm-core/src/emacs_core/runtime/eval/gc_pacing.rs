@@ -18,30 +18,31 @@ impl Context {
     /// (`jit::cache::pin_redefined_function`): rooted while a backtrace frame
     /// -- this thread's or a suspended one's -- records the symbol.
     #[cfg(feature = "jit")]
-    fn trace_jit_redefined_functions(&self, visit: &mut dyn FnMut(Value)) {
+    fn trace_jit_redefined_functions(&self, visit: &mut dyn FnMut(Value), called: &mut Vec<SymId>) {
         let symbol_mode = self.symbol_mode();
         use crate::emacs_core::jit::cache;
+        called.clear();
         if !cache::has_redefined_pins() {
             return;
         }
-        let mut called: Vec<SymId> = self
-            .specpdl
-            .iter()
-            .chain(
-                self.suspended_thread_bindings
-                    .iter()
-                    .flat_map(|state| state.specpdl.iter()),
-            )
-            .filter_map(|entry| match entry {
-                SpecBinding::Backtrace { function, .. }
-                | SpecBinding::Backtrace1 { function, .. }
-                | SpecBinding::Backtrace2 { function, .. }
-                | SpecBinding::BacktraceNative { function, .. } => {
-                    function.as_symbol_id(symbol_mode)
-                }
-                _ => None,
-            })
-            .collect();
+        called.extend(
+            self.specpdl
+                .iter()
+                .chain(
+                    self.suspended_thread_bindings
+                        .iter()
+                        .flat_map(|state| state.specpdl.iter()),
+                )
+                .filter_map(|entry| match entry {
+                    SpecBinding::Backtrace { function, .. }
+                    | SpecBinding::Backtrace1 { function, .. }
+                    | SpecBinding::Backtrace2 { function, .. }
+                    | SpecBinding::BacktraceNative { function, .. } => {
+                        function.as_symbol_id(symbol_mode)
+                    }
+                    _ => None,
+                }),
+        );
         called.sort_unstable_by_key(|sym| sym.0);
         called.dedup();
         cache::trace_redefined_pins(
@@ -49,9 +50,66 @@ impl Context {
             &|sym| called.binary_search_by_key(&sym.0, |s| s.0).is_ok(),
             visit,
         );
+        called.clear();
     }
 
+    /// Every root this Context holds, in named groups.
+    #[inline(always)]
     pub(super) fn trace_roots(
+        &self,
+        group: &mut dyn FnMut(&'static str),
+        visit: &mut dyn FnMut(Value),
+    ) {
+        self.trace_root_groups::<true>(group, visit);
+    }
+
+    /// Only this owner's execution roots. World cells are traced by the
+    /// collecting owner; parking must not walk them merely to discard them.
+    #[inline(always)]
+    pub(super) fn trace_private_roots(&self, roots: &mut Vec<Value>) {
+        self.trace_private_roots_reusing(roots, &mut Vec::new());
+    }
+
+    /// Green's private census reuses the called-symbol buffer after JIT source
+    /// capture has cleared it. Both paths use the same pin and Flow collectors.
+    #[inline(always)]
+    pub(super) fn trace_private_roots_reusing(
+        &self,
+        roots: &mut Vec<Value>,
+        called: &mut Vec<SymId>,
+    ) {
+        self.trace_root_groups::<false>(&mut |_| {}, &mut |value| roots.push(value));
+        #[cfg(feature = "jit")]
+        self.trace_jit_redefined_functions(&mut |value| roots.push(value), called);
+        #[cfg(not(feature = "jit"))]
+        let _ = called;
+        self.collect_in_flight_roots(roots);
+    }
+
+    /// Flow payloads belong to the owner. The full walk supplies its registry
+    /// scratch, while parking appends directly to its reusable census buffer.
+    #[inline(always)]
+    fn collect_in_flight_roots(&self, roots: &mut Vec<Value>) {
+        super::super::error::collect_in_flight_registry_gc_roots(
+            roots,
+            &self.in_flight_registry,
+            self.tagged_heap.identity(),
+        );
+    }
+
+    /// Derive private group membership from the same const-generic guards
+    /// that select the actual park walk, without maintaining another list.
+    #[cfg(test)]
+    pub(super) fn private_root_group_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        self.trace_root_groups::<false>(&mut |name| names.push(name), &mut |_| {});
+        names
+    }
+
+    /// Compile separate walks: the collection walk has no runtime mode
+    /// test, and the parking walk never enters a World root group.
+    #[inline(always)]
+    fn trace_root_groups<const WORLD: bool>(
         &self,
         group: &mut dyn FnMut(&'static str),
         visit: &mut dyn FnMut(Value),
@@ -62,10 +120,12 @@ impl Context {
                 visit(root);
             }
         }
-        group("owned_native");
-        self.owned_roots.trace_roots(visit);
-        group("owner_bindings");
-        self.trace_owner_slabs(visit);
+        if WORLD {
+            group("owned_native");
+            self.owned_roots.trace_roots(visit);
+            group("owner_bindings");
+            self.trace_owner_slabs(visit);
+        }
         group("eval_temp");
         for root in self.eval_temp_roots.iter().copied() {
             visit(root);
@@ -76,9 +136,11 @@ impl Context {
         for root in self.eval_call_roots.iter().copied() {
             visit(root);
         }
-        group("treesit");
-        for root in self.treesit.roots() {
-            visit(root);
+        if WORLD {
+            group("treesit");
+            for root in self.treesit.roots() {
+                visit(root);
+            }
         }
         group("bc");
         for root in self.bc_buf.iter().copied() {
@@ -213,7 +275,9 @@ impl Context {
         #[cfg(feature = "jit")]
         {
             group("jit_redefined");
-            self.trace_jit_redefined_functions(visit);
+            if WORLD {
+                self.trace_jit_redefined_functions(visit, &mut Vec::new());
+            }
         }
         group("profiler");
         self.trace_profiler_roots(visit);
@@ -239,7 +303,7 @@ impl Context {
         visit(self.inhibit_quit);
         visit(self.throw_on_input);
         if self.cached_system_name.is_heap_object() {
-            visit(self.cached_system_name);
+            visit(*self.cached_system_name);
         }
         if let Some(filter_fn) = self.interpreted_closure_filter_fn {
             visit(filter_fn);
@@ -286,116 +350,123 @@ impl Context {
         if let Some(table) = self.cached_standard_case_table {
             visit(table);
         }
-        let mut registry_roots = Vec::new();
-        // Rust-held signals, throws and yields stay rooted when this Context moves.
+        // The Flow registry is private even though the full walk uses the
+        // same temporary buffer for it and the following World registries.
         group("in_flight_registry");
-        super::super::error::collect_in_flight_registry_gc_roots(
-            &mut registry_roots,
-            &self.in_flight_registry,
-            self.tagged_heap.identity(),
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
+        if WORLD {
+            let mut registry_roots = Vec::new();
+            // Rust-held signals, throws and yields stay rooted when this Context moves.
+            self.collect_in_flight_roots(&mut registry_roots);
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            // Values that any thread holds through this heap's `SharedRoot`s.
+            group("shared_roots");
+            crate::tagged::transport::collect_shared_root_gc_roots(
+                &self.tagged_heap,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("ccl_registry");
+            super::super::ccl::collect_ccl_registry_gc_roots(
+                &self.ccl_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("charset_registry");
+            super::super::charset::collect_charset_registry_gc_roots(
+                &self.charset_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("terminal_registry");
+            super::super::terminal::pure::collect_terminal_registry_gc_roots(
+                &self.terminal_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("font_registry");
+            super::super::xfaces::collect_font_registry_gc_roots(
+                &self.font_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("hash_table_test_registry");
+            super::super::builtins::collect_hash_table_test_registry_gc_roots(
+                &self.hash_table_test_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("file_notify_registry");
+            super::super::builtins::collect_file_notify_registry_gc_roots(
+                &self.file_notify_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            group("dynamic_module_registry");
+            super::super::dynamic_module::collect_dynamic_module_registry_gc_roots(
+                &self.dynamic_module_registry,
+                &mut registry_roots,
+            );
+            for root in registry_roots.drain(..) {
+                visit(root);
+            }
+            // Registry values are already seeded. Release their scratch storage
+            // before the larger root walks so it does not stay live across them.
+            drop(registry_roots);
         }
-        // Values that any thread holds through this heap's `SharedRoot`s.
-        group("shared_roots");
-        crate::tagged::transport::collect_shared_root_gc_roots(
-            &self.tagged_heap,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
+        if WORLD {
+            // Full ~all-interned-symbols walk on STW collections; only the
+            // BLV-pool residual under `ObarraySymbolCellSkipGuard` (both
+            // concurrent handshakes).
+            group("obarray");
+            self.obarray.trace_roots_with(visit);
+            group("proc_timer");
+            self.processes.trace_roots_with(visit);
+            self.watchers.trace_roots_with(visit);
+            group("registers");
+            self.registers.trace_roots_with(visit);
         }
-        group("ccl_registry");
-        super::super::ccl::collect_ccl_registry_gc_roots(&self.ccl_registry, &mut registry_roots);
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        group("charset_registry");
-        super::super::charset::collect_charset_registry_gc_roots(
-            &self.charset_registry,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        group("terminal_registry");
-        super::super::terminal::pure::collect_terminal_registry_gc_roots(
-            &self.terminal_registry,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        group("font_registry");
-        super::super::xfaces::collect_font_registry_gc_roots(
-            &self.font_registry,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        group("hash_table_test_registry");
-        super::super::builtins::collect_hash_table_test_registry_gc_roots(
-            &self.hash_table_test_registry,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        group("file_notify_registry");
-        super::super::builtins::collect_file_notify_registry_gc_roots(
-            &self.file_notify_registry,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        group("dynamic_module_registry");
-        super::super::dynamic_module::collect_dynamic_module_registry_gc_roots(
-            &self.dynamic_module_registry,
-            &mut registry_roots,
-        );
-        for root in registry_roots.drain(..) {
-            visit(root);
-        }
-        // Registry values are already seeded. Release their scratch storage
-        // before the larger root walks so it does not stay live across them.
-        drop(registry_roots);
-        // Full ~all-interned-symbols walk on STW collections; only the
-        // BLV-pool residual under `ObarraySymbolCellSkipGuard` (both
-        // concurrent handshakes).
-        group("obarray");
-        self.obarray.trace_roots_with(visit);
-        group("proc_timer");
-        self.processes.trace_roots_with(visit);
-        self.watchers.trace_roots_with(visit);
-        group("registers");
-        self.registers.trace_roots_with(visit);
         group("custom");
         self.custom.trace_roots_with(visit);
-        group("autoloads");
-        self.autoloads.trace_roots_with(visit);
-        group("interactive");
-        self.interactive.trace_roots_with(visit);
-        group("buffers");
-        self.buffers.trace_roots_with(visit);
-        group("xwidgets");
-        self.xwidgets.trace_roots_with(visit);
-        group("face_table");
-        self.face_table.trace_roots_with(visit);
-        group("threads");
-        self.threads.trace_roots_with(visit);
-        group("kmacro");
-        self.kmacro.trace_roots_with(visit);
-        group("command_loop");
-        crate::gc_trace::GcTrace::trace_roots_with(&self.command_loop, visit);
-        group("modes");
-        self.modes.trace_roots_with(visit);
-        group("frames");
-        self.frames.trace_roots_with(visit);
-        group("coding_systems");
-        self.coding_systems.trace_roots_with(visit);
+        if WORLD {
+            group("autoloads");
+            self.autoloads.trace_roots_with(visit);
+            group("interactive");
+            self.interactive.trace_roots_with(visit);
+            group("buffers");
+            self.buffers.trace_roots_with(visit);
+            group("xwidgets");
+            self.xwidgets.trace_roots_with(visit);
+            group("face_table");
+            self.face_table.trace_roots_with(visit);
+            group("threads");
+            self.threads.trace_roots_with(visit);
+            group("kmacro");
+            self.kmacro.trace_roots_with(visit);
+            group("command_loop");
+            crate::gc_trace::GcTrace::trace_roots_with(&*self.command_loop, visit);
+            group("modes");
+            self.modes.trace_roots_with(visit);
+            group("frames");
+            self.frames.trace_roots_with(visit);
+            group("coding_systems");
+            self.coding_systems.trace_roots_with(visit);
+        }
         group("match_data");
         if let Some(ref md) = self.match_data
             && let Some(crate::emacs_core::regex::SearchedString::Heap(val)) = md.searched_string()
@@ -653,11 +724,25 @@ impl Context {
     /// Context is thread-confined; worker threads construct their own Context.
     #[inline(never)]
     pub fn setup_thread_locals(&mut self) {
+        self.setup_thread_locals_inner::<true>();
+    }
+
+    /// Separate the ordinary activation from admitted-owner activation at
+    /// compile time. The ordinary specialization keeps its terminal snapshot;
+    /// no runtime owner predicate enters its callers.
+    #[inline(always)]
+    pub(super) fn setup_thread_locals_inner<const SNAPSHOT_TERMINAL_IDS: bool>(&mut self) {
         crate::tagged::gc::set_tagged_heap(&mut self.tagged_heap);
         super::super::ccl::install_ccl_registry_handle(&self.ccl_registry);
         super::super::charset::install_charset_registry_handle(&self.charset_registry);
         super::super::xfaces::install_font_registry_handle(&self.font_registry);
-        super::super::terminal::pure::install_terminal_registry_handle(&self.terminal_registry);
+        if SNAPSHOT_TERMINAL_IDS {
+            super::super::terminal::pure::install_terminal_registry_handle(&self.terminal_registry);
+        } else {
+            super::super::terminal::pure::install_owner_terminal_registry_handle(
+                &self.terminal_registry,
+            );
+        }
         super::super::builtins::install_hash_table_test_registry_handle(
             &self.hash_table_test_registry,
         );

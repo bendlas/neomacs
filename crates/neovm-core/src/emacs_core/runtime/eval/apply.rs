@@ -690,6 +690,35 @@ impl Context {
             })
     }
 
+    /// The function of the innermost backtrace frame within `max_scan`
+    /// specpdl entries of the top for which `keep` holds: the caller a
+    /// mapping builtin credits, skipping the builtin's own frame. `None` when
+    /// that frame is still evaluating its arguments (GNU's UNEVALLED frame of
+    /// an interpreted call): the mapping then ran in an argument of the call,
+    /// not in the function's body. Read-only and cold.
+    #[cfg(feature = "jit")]
+    pub(crate) fn innermost_backtrace_function_where(
+        &self,
+        max_scan: usize,
+        keep: impl Fn(Value) -> bool,
+    ) -> Option<Value> {
+        self.specpdl
+            .iter()
+            .rev()
+            .take(max_scan)
+            .filter_map(|entry| match entry {
+                SpecBinding::Backtrace { function, args, .. } => {
+                    Some((*function, args.is_unevalled()))
+                }
+                SpecBinding::Backtrace1 { function, .. }
+                | SpecBinding::Backtrace2 { function, .. }
+                | SpecBinding::BacktraceNative { function, .. } => Some((*function, false)),
+                _ => None,
+            })
+            .find(|&(function, _)| keep(function))
+            .and_then(|(function, unevalled)| (!unevalled).then_some(function))
+    }
+
     /// Copy the logical GNU backtrace fields from any compact physical frame.
     /// Backtrace inspection is cold; centralizing the representation split
     /// keeps callers exhaustive without putting a larger enum in the hot

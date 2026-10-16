@@ -64,6 +64,7 @@
 //! | `NEOVM_JIT_OPT_BUILD_CENSUS` | off; `PATH` | Append per-build verdict, ops, blocks, insts, phis, frames, full-stack baseline params, split edges, refinements, frame uses and dead leaders. Captures all attempted bodies without selecting opt code. |
 //! | `NEOVM_JIT_DUMP_OPT` | off; `PATH` | Append verified IR text for opt builds (or the build census), with explicit SSA, effects, frames and source positions. |
 //! | `NEOVM_JIT_INLINE2` | off; `=named`, `=closure`, `=hof`, `=all` | P2.3's front runs before the backend choice. `named`/`all` admit direct named cells on the existing re-tier path (or self-recursive Full compile), with virtual frames, per-cell identity, attention and depth guards. Named bodies remain observation-free under F-I1 rule 2. `closure`/`all` add in-unit make-closure calls; `hof`/`all` add list-only mapc/mapcar intrinsics, including OSR chains. Legacy MIR refuses fused-v2 bodies. Read at compile time; off preserves the original CLIF. |
+//! | `NEOVM_JIT_HOF_INLINE` | on; `off` | With INLINE2 off (the default), a body the opt front leaves on Legacy whose constant pool names `mapc` or `mapcar` gets a HOF-only v2 front: if one of those sites has an admitted literal callback (constant or `make-closure` template, the existing T3.2 admission), the callback loop is inlined (`inline_hof::emit`) and the body compiles on that front; otherwise nothing changes and the body compiles exactly as before. No static, named or closure regions are produced, and OSR compiles are unchanged. Explicit INLINE2 values keep their own front. |
 //! | `NEOVM_JIT_INLINE2_AT_FIRST_COMPILE` | off; `=1` | Oracle diagnostic: admit named selection at the first compile to exercise THRESHOLD=1 pins. Production named admission otherwise requires the existing re-tier path or self-recursive Full compile. Read once; no effect with INLINE2=off. |
 //! | `NEOVM_SYNTAX_PARSE_CACHE_L2` | `=1`/`on`, `=verify` | P3.4 S5–S6 canonical syntax run (`syntax/parse_canon.rs`), with L1 enabled: option-free queries reuse BEGV states by FROM agreement or later full-state synchronization; warm backward-comment scans reuse validated canonical states. `verify` recomputes complete answers and point. Large-file, SMIE and full-suite verify gates pass; S7 graduation awaits the design's quiet-machine run and week of verify-mode oracle CI. |
 //! | `NEOVM_JIT_INLINE_ARITH` | `=on` | Level-B native bit-ops (logand/logior/logxor/lognot) with fixnum-guard deopt. Blocker: skips the compiler-macro bounce; a mixed-type loop falls back to the interpreter ungracefully. |
@@ -85,6 +86,7 @@
 //! | `NEOVM_JIT_DIRECT_SHAPES` | off; `=all`/`=on`, or a comma list of `optional`, `rest`, `constant`, `framed` | With `NEOVM_JIT_DIRECT_CALL=on`, the call shapes beyond a named exact-arity call that direct sites take (P1.1 Stage 2, P1.0 S2.5; `compile::direct_call`). `optional` (2a): a named call of an `&optional` callee (the call fills or lacks its optional slots) passes nil in the registers of the missing ones, and `&optional` bodies take the register ABI. `rest` (2d): a named call of a `&rest` callee (at most 8 arguments) conses the rest list inline after the site's checks and passes it in the last register, and `&rest` bodies take the register ABI; the hit path also checks the slot's key says the leaf takes the call through a list. Both record the call's own arguments in the frame, as GNU's `Bcall` does, and their slow path `neovm_jit_direct_slow` runs `neovm_jit_call_spec` then arms the entry for the site's shape (`spec_slot::arm_shaped_direct_entry`). `constant` (2b): an `Op::Call` whose callee is a constant byte-code object the fuser left a call (a `cl-flet` local, a `lambda` literal) called with exactly its required parameters becomes a source site of the object's own source (`SpecCalleeKind::Constant`): a direct call through the source slot machinery (leaf-slot epoch, frame recording the object), `neovm_jit_call_source_spec` its slow path, the generic call its decline; a callee the lowering cannot prove constant is guarded by its bits. `framed` (2c): exact required-only JIT callees with bindings or handlers keep the memory ABI (named calls up to 8 arguments, source/object calls up to 6). The site pushes the original frame and increments depth inline, then enters `neovm_jit_direct_framed` through the gated lazy shim table; that contained trampoline owns every frame/depth cleanup and preserves boxed precise deoptimization. Slots publish a framed tag after leaf/key initialization with Release; generated framed readers use an atomic Acquire-or-stronger load. AOT sidecars and framed optional/rest marshaling stay on the reference path. Read at compile time and when a body's ABI is decided; unset/`off` is CLIF-identical (single-build A/B). |
 //! | `NEOVM_JIT_CALL_CENSUS` | off | `=on`: a measurement mode. Every JIT `Op::Call`/`Op::Apply` site first calls `neovm_jit_call_census`, which counts the call by site kind (`named` spec site, `const` callee, other `value`, `apply` of a function) and callee shape (`exact_direct`, `exact`, `optional_direct`, `optional`, `rest_direct`, `rest`, `framed`, `unarmed`, `declined`, `other`) read from the slot or the callee's armed leaf (`compile::call_census`); the counts print as `call-census:` in `[neovm-jit-final-builtin-leaves]` under `NEOVM_JIT_COMPILE_STATS=1`. Named spec calls select `neovm_jit_call_spec_census`, whose exact accepted-fast counters print as `spec-shim-fast:armed=N,framed=N`; framed includes AOT sidecars. These counters decide Stage 2c, with direct calls off so the denominator covers all named fast entries. The earlier shape cells describe candidates before guards and count bindings/handlers as `framed`. Do not time runs with it on. Read at compile time; off is CLIF-identical and the ordinary spec shim has no runtime census branch. |
 //! | `NEOVM_JIT_SWITCH_LOOP_POLICY` | off | Compile-time ops-only loop policy: `on` treats operandless Switch as a possible loop for existing regalloc, direct-site and heap/root-window hoisting policies. `off` preserves the original direct-edge policy and emitted CLIF. Exact baseline GC/quit polls always use resolved CFG edges, independently of this knob. |
+//! | `NEOVM_JIT_SWITCH_HOIST` | off | Opt only: rematerialize inline jump-table constants and schedule epoch guards at closed Lisp-free loop entries and every serviced Poll. `off` preserves the original CLIF. |
 //! | `NEOVM_JIT_INLINE_SWITCH` | on | Answer a `switch` jump table whose keys are immediates (nil, t, fixnums, symbols) or cons trees of them -- `pcase` symbol, fixnum and backquote patterns -- inline, behind the table's mutation epoch, with `neovm_jit_switch` as the slow path (`compile/switch_dispatch.rs`); `=off` calls the shim at every switch, CLIF-identical to the lowering before inline dispatch (single-build A/B). |
 //! | `NEOVM_JIT_MIR_REACH` | `=dead` (or `all`) | MIR reach admissions (design `p2-5-mir-reach`; the only legacy-MIR bit is `dead`, the others belong to the opt tier). `dead`: the MIR builder skips a block leader no path reaches (the `Return` `seal_ops` appends after a named-let's or `cl-loop`'s final `goto`) instead of bailing the body as `mir-unreachable-block`. Tier-up compiles only (AOT and inline callees never use it). Read at compile time; unset/`off` bails exactly as before (single-build A/B). Census: `reach_dead=`/`dead_leaders=` in the `mir[...]` summary. Blocker: F-R1 (P2.5 §7): admitted bodies must be at parity with the baseline. |
 //! | `NEOVM_JIT_EQ_PREFILTER` | on | Answer native `eq`/`symbolp` inline unless an operand is a veclike (a symbol-with-pos is one); `=off` calls `neovm_jit_eq_slow`/`neovm_jit_symbolp_slow` for every mismatch/non-symbol (single-build A/B). |
@@ -219,10 +221,16 @@ pub(crate) mod retreat;
 #[cfg(feature = "jit")]
 pub(crate) mod bg;
 
+/// Cold admission and restoration of parked Green native continuations.
+#[cfg(feature = "jit")]
+pub(crate) mod green_owner;
+
 /// Per-source feedback (`SourceFeedback`). Always built: `RuntimeState`
 /// holds it.
 pub(crate) mod feedback;
-#[cfg(test)]
+#[cfg(feature = "jit")]
+pub(crate) mod hof_credit;
+#[cfg(all(test, feature = "jit"))]
 #[path = "tests/test_support.rs"]
 pub(crate) mod test_support;
 
@@ -649,6 +657,11 @@ pub struct RuntimeState {
     /// MIR-inlined or intrinsified ([`retreat::RetreatBit::NoInline`]).
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     site_retreat: retreat::SiteRetreatTable,
+    /// [`HofCallerBit`] as `u8`, computed once on the first callback credit:
+    /// whether this source has a `mapc`/`mapcar` site the default front's
+    /// HOF-only path would select, so callback work may count as its heat.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    hof_caller: std::sync::atomic::AtomicU8,
     /// Test-only: pin this function to the Tier-0 interpreter regardless of
     /// hotness (the benchmark harness measures native vs interpreter in ONE
     /// process — a hot copy and a forced-cold copy — to cancel the
@@ -656,6 +669,15 @@ pub struct RuntimeState {
     /// Absent from the production library (only the test binary carries it).
     #[cfg(test)]
     force_interpret: std::sync::atomic::AtomicBool,
+}
+
+/// [`RuntimeState::hof_caller`]'s cached answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum HofCallerBit {
+    Unknown = 0,
+    No = 1,
+    Yes = 2,
 }
 
 /// Source of process-unique [`Runtime::compiled_id`] values. Ids are
@@ -1009,6 +1031,7 @@ impl RuntimeState {
             aot_retiered: std::sync::atomic::AtomicBool::new(false),
             reopt_level: std::sync::atomic::AtomicU8::new(0),
             site_retreat: retreat::SiteRetreatTable::new(),
+            hof_caller: std::sync::atomic::AtomicU8::new(HofCallerBit::Unknown as u8),
             #[cfg(test)]
             force_interpret: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1427,6 +1450,39 @@ impl RuntimeState {
             .store(prev.saturating_add(credit), Ordering::Relaxed);
     }
 
+    /// Credit callback work a `mapc`/`mapcar` call ran for this caller: its
+    /// heat rises as if it had been entered `credit` more times, so a caller
+    /// driving many callbacks tiers up with its loop inlined at its next
+    /// entry. Relaxed and observational, like [`note_loop_work`](Self::note_loop_work);
+    /// a racing credit may be lost.
+    #[cfg(feature = "jit")]
+    pub(crate) fn note_callback_work(&self, credit: u32) {
+        let prev = self.heat.load(Ordering::Relaxed);
+        self.heat
+            .store(prev.saturating_add(credit), Ordering::Relaxed);
+    }
+
+    /// Whether this caller may take callback credit, deciding once with
+    /// `selectable` (the default front's HOF-only predicate) and caching the
+    /// answer. Concurrent first calls may both compute it; they agree.
+    #[cfg(feature = "jit")]
+    pub(crate) fn hof_caller(&self, selectable: impl FnOnce() -> bool) -> bool {
+        match self.hof_caller.load(Ordering::Relaxed) {
+            bit if bit == HofCallerBit::Yes as u8 => true,
+            bit if bit == HofCallerBit::No as u8 => false,
+            _ => {
+                let yes = selectable();
+                let bit = if yes {
+                    HofCallerBit::Yes
+                } else {
+                    HofCallerBit::No
+                };
+                self.hof_caller.store(bit as u8, Ordering::Relaxed);
+                yes
+            }
+        }
+    }
+
     /// Test-only: force this function "hot" so the next [`dispatch`](Self::dispatch)
     /// tiers it up, without driving `HOT_THRESHOLD` real invocations.
     /// Mark this function as served by a prepopulated AOT leaf (see the
@@ -1681,3 +1737,11 @@ impl Clone for Runtime {
 #[cfg(test)]
 #[path = "tests/jit_test.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "jit"))]
+#[path = "tests/green_owner.rs"]
+mod green_owner_tests;
+
+#[cfg(all(test, feature = "jit"))]
+#[path = "tests/green_arith.rs"]
+mod green_arith_tests;

@@ -5,7 +5,7 @@
 //! leading manager pointer. No mutable aggregate World reference reaches Lisp.
 
 use super::*;
-use crate::buffer::buffer::{BufferStorage, OwnedBufferStorageParts};
+use crate::buffer::buffer::{BufferSelection, BufferStorage, OwnedBufferStorageParts};
 use crate::emacs_core::defvar_bool::ByteBooleanVars;
 use crate::emacs_core::symbol::CanonicalAccess;
 use crate::emacs_core::symbol::{
@@ -22,7 +22,11 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+mod green_owner;
+mod slot;
 mod sole_owner;
+pub(crate) use green_owner::Baton;
+pub(crate) use slot::WorldSlot;
 pub(crate) use sole_owner::{
     PublishedSoleOwnerDriver, SoleOwnerDriver, SoleOwnerRegistration, SoleOwnerVm,
 };
@@ -42,13 +46,34 @@ struct World {
     coding_systems: Box<UnsafeCell<CodingSystemManager>>,
     macro_perf_stats: Box<UnsafeCell<MacroPerfStats>>,
     buffers: Box<UnsafeCell<BufferStorage>>,
+    /// GNU-global state every owner shares (round 3w).
+    global: Box<UnsafeCell<super::global_state::GlobalState>>,
     /// Every owner's slab of dynamic bindings (Phase 0 step 2), for
     /// allocation and the collector's root phase.
     owner_slabs: std::cell::RefCell<super::owner_bindings::OwnerSlabRegistry>,
-    /// Owner-local variable slot assignments (Phase 0 step 2). Test-only
-    /// until stopped admission exists; no view or Context field reaches it.
-    #[cfg(test)]
+    /// Owner-local variable slot assignments (Phase 0 step 2): the
+    /// descriptors admission and later materialization issue. Its stable
+    /// address (inside the shared World allocation) is what a projection
+    /// scope names (`symbol::ProjectionScope`).
     thread_projections: std::cell::RefCell<crate::emacs_core::forward::ThreadProjectionTable>,
+    /// How this World runs Lisp threads, fixed at construction.
+    threading: Cell<super::admission::ThreadingMode>,
+    /// Whether thread admission has run: sticky, never reset.
+    admitted: Cell<bool>,
+    /// The Green runtime (round 3d), once started.
+    green: std::cell::RefCell<Option<Box<super::green::GreenRuntime>>>,
+    /// The OS thread holding the World's Baton, in a Green World
+    /// (`green_owner`'s safety argument; checked in debug builds).
+    baton_holder: Cell<Option<std::thread::ThreadId>>,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        // The obarray's projection scope names this World's table; it goes
+        // with the World, on the World's own thread.
+        let generation = self.obarray.get_mut().generation();
+        crate::emacs_core::symbol::leave_projection_scope(generation);
+    }
 }
 
 impl fmt::Debug for World {
@@ -787,6 +812,8 @@ obarray_method_proxies! {
     pub(crate) fn set_plain_untrapped_value_id(id: SymId, value: Value) -> bool;
     pub(crate) fn mark_runtime_projected_id(id: SymId);
     pub(crate) fn reveal_projection(id: SymId) -> Option<RevealedProjection>;
+    pub(crate) fn owned_thread_projection(id: SymId)
+        -> Option<&'static crate::emacs_core::forward::ThreadProjectionDescriptor>;
     pub(crate) fn conceal_projection(revealed: RevealedProjection) -> ConcealOutcome;
     pub(crate) fn store_plain_value_id(id: SymId, value: Value) -> Result<(), NotPlain>;
     pub(crate) fn set_internal_localized(sym_id: SymId,
@@ -996,6 +1023,7 @@ pub(super) struct WorldStorageBuilder {
     pub(super) coding_systems: CodingSystemManager,
     pub(super) macro_perf_stats: MacroPerfStats,
     pub(super) buffers: OwnedBufferStorageParts,
+    pub(super) global: super::global_state::GlobalState,
 }
 
 static_assertions::assert_not_impl_any!(WorldStorageBuilder: Send, Sync, Clone);
@@ -1020,6 +1048,7 @@ pub(super) struct ReadyWorld {
     pub(super) coding_systems: WorldView<CodingSystemManager>,
     pub(super) macro_perf_stats: WorldView<MacroPerfStats>,
     pub(super) buffers: BufferManager,
+    pub(super) global: super::global_state::GlobalSlots,
 }
 
 static_assertions::assert_not_impl_any!(ReadyWorld: Send, Sync, Clone);
@@ -1059,9 +1088,13 @@ impl WorldStorageBuilder {
             coding_systems: Box::new(UnsafeCell::new(self.coding_systems)),
             macro_perf_stats: Box::new(UnsafeCell::new(self.macro_perf_stats)),
             buffers,
+            global: Box::new(UnsafeCell::new(self.global)),
             owner_slabs: Default::default(),
-            #[cfg(test)]
             thread_projections: Default::default(),
+            threading: Cell::new(super::admission::ThreadingMode::from_env()),
+            admitted: Cell::new(false),
+            green: Default::default(),
+            baton_holder: Cell::new(None),
         }));
         // SAFETY: rederive the upstream TLS installation from the finalized
         // heap cell before any allocation-capable Context setup resumes. All
@@ -1071,6 +1104,13 @@ impl WorldStorageBuilder {
         unsafe {
             crate::tagged::gc::set_tagged_heap(&mut *lease.0.tagged_heap.get());
         }
+        Self::publish_views(&lease, selection)
+    }
+
+    /// The unique set of manager views one owner Context holds over the
+    /// World LEASE names, with SELECTION as its current buffer.
+    #[cold]
+    fn publish_views(lease: &WorldLease, selection: BufferSelection) -> ReadyWorld {
         let ptr = cell_ptr(&lease.0.obarray);
         // SAFETY: final stable UnsafeCell allocation root, not a temporary
         // manager reference. Embedded repr(C) canonical pair has this const
@@ -1132,6 +1172,9 @@ impl WorldStorageBuilder {
                 ptr: cell_ptr(&lease.0.macro_perf_stats),
                 lease: lease.duplicate_for_view(),
             },
+            // SAFETY: the World's stable cell, kept alive by this owner's
+            // leases; World state is touched by one owner at a time.
+            global: unsafe { super::global_state::GlobalSlots::over(cell_ptr(&lease.0.global)) },
             // SAFETY: World owns the exact stable cell and this is its sole
             // selection/view; the supplied lease is for that same World.
             buffers: unsafe {
@@ -1157,16 +1200,110 @@ impl Context {
         self.obarray.lease.0.owner_slabs.borrow_mut().register(heap)
     }
 
-    /// Visit every owner slab's values: each owner's bindings are roots,
-    /// whether or not that owner is running.
+    /// Visit every owner slab's values -- each owner's bindings are roots,
+    /// whether or not that owner is running -- and the canonical plain word
+    /// of every projected variable, which the World's table roots.
     pub(super) fn trace_owner_slabs(&self, visit: &mut dyn FnMut(Value)) {
         let heap = self.tagged_heap.identity();
+        let world = &self.obarray.lease.0;
+        world.owner_slabs.borrow().trace_roots(heap, visit);
+        world.thread_projections.borrow().trace_roots(visit);
+        if let Some(runtime) = world.green.borrow().as_ref() {
+            runtime.trace_roots(visit);
+        }
+    }
+}
+
+/// Threading mode and admission state (Phase 0 step 2).
+impl Context {
+    /// How this Context's World runs Lisp threads.
+    #[inline]
+    pub(crate) fn threading_mode(&self) -> super::admission::ThreadingMode {
+        self.obarray.lease.0.threading.get()
+    }
+
+    /// Fix the World's threading mode. Only construction calls this, before
+    /// any Lisp runs (`Context::new_with_threading`).
+    #[cold]
+    pub(super) fn set_threading_mode_at_construction(
+        &mut self,
+        mode: super::admission::ThreadingMode,
+    ) {
+        debug_assert!(
+            !self.threads_admitted(),
+            "the mode is fixed before admission"
+        );
+        self.obarray.lease.0.threading.set(mode);
+    }
+
+    /// Whether thread admission has run in this World.
+    #[inline]
+    pub(crate) fn threads_admitted(&self) -> bool {
+        self.obarray.lease.0.admitted.get()
+    }
+
+    /// Record that admission has committed: sticky.
+    pub(super) fn mark_threads_admitted(&mut self) {
+        self.obarray.lease.0.admitted.set(true);
+    }
+
+    /// Make room for admission to project OWNED variables onto descriptors
+    /// of their own, plus the VOID one: arena pages and the issued list. A
+    /// refusal changes nothing a reader sees.
+    pub(super) fn reserve_thread_projections(&mut self, owned: usize) -> Result<(), ()> {
         self.obarray
             .lease
             .0
-            .owner_slabs
+            .thread_projections
+            .borrow_mut()
+            .try_reserve(owned)
+            .map_err(|_| ())
+    }
+
+    /// The index the ORDINAL-th next projection this World issues will get.
+    pub(super) fn upcoming_thread_projection(
+        &self,
+        ordinal: usize,
+    ) -> crate::emacs_core::forward::TlsIndex {
+        self.obarray
+            .lease
+            .0
+            .thread_projections
             .borrow()
-            .trace_roots(heap, visit);
+            .upcoming_index(ordinal)
+    }
+
+    /// Admission's projection of CELLS, each as its plan says, in one
+    /// canonical-changing phase. Allocates nothing once
+    /// [`Self::reserve_thread_projections`] covered them.
+    pub(super) fn project_admitted_cells(
+        &mut self,
+        cells: &[(SymId, crate::emacs_core::symbol::AdmissionPlanCell)],
+    ) {
+        let world = Arc::clone(&self.obarray.lease.0);
+        let mut table = world.thread_projections.borrow_mut();
+        self.obarray.with_dispatch_write(|obarray| {
+            for &(id, plan) in cells {
+                obarray.project_admitted_cell(id, plan, &mut table);
+            }
+        });
+    }
+
+    /// Enter this World's projection scope, so its obarray births symbols
+    /// on VOID. Allocates nothing once
+    /// `reserve_projection_scope` and the table's reservation ran.
+    pub(super) fn enter_world_projection_scope(&self) {
+        let world = &self.obarray.lease.0;
+        let void = world.thread_projections.borrow_mut().void_descriptor();
+        // SAFETY: the table is this World's, which owns the obarray of this
+        // generation and leaves the scope when it drops (`World::drop`).
+        unsafe {
+            crate::emacs_core::symbol::enter_projection_scope(
+                self.obarray.generation(),
+                &world.thread_projections,
+                void,
+            );
+        }
     }
 }
 

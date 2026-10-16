@@ -2,6 +2,13 @@
 //! Threading: this is one compilation's SSA state. The emitted activation
 //! owns its Context-local roots and backtrace entry; no mutator state is
 //! cached or published by this module.
+//!
+//! Green switches are possible only at the physical mapping protocol: Start
+//! publishes its eager frame and complete parent roots before entering Lisp,
+//! and the service poll runs between callbacks after clearing active_region.
+//! Cursor publishes the next list tail before that poll. A virtual callback
+//! itself never runs Lisp; its slow guard reconstructs the callback through
+//! resumed_chain before an operation can admit threads, park, or collect.
 
 use super::inline_frames::{Frames, HofChainState};
 use super::lowering::{self, RegionDeopt};
@@ -19,6 +26,12 @@ mod captures;
 #[cfg(test)]
 #[path = "../tests/inline_hof_headers_test.rs"]
 mod tests;
+
+// The same tests through the production front: the default profile's
+// HOF-only path, without the OPT=legacy / INLINE2=hof pins.
+#[cfg(test)]
+#[path = "../tests/inline_hof_headers_test.rs"]
+mod tests_default_profile_tests;
 
 /// Emit one admitted map call, including its internal callback CFG. All
 /// exits before Start resume the caller's original Call. Later guards spill

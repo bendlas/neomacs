@@ -2114,7 +2114,7 @@ pub(crate) fn sync_runtime_face_table_from_frame_lisp_faces(
         Some(palette) => FaceColorResolver::TtyPalette(palette),
         None => FaceColorResolver::Standard,
     };
-    eval.face_table =
+    *eval.face_table =
         runtime_face_table_from_frame_lisp_faces_resolved(eval, frame_id, false, resolver);
     // The palette travels with the table: everything downstream that realizes
     // one more face -- an anonymous attribute plist from a text property, an

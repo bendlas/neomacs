@@ -134,42 +134,29 @@ impl WaitStatusNotifySite {
     }
 }
 
+/// A finite wait has one elapsed-time authority: its fine monotonic `instant`.
+/// Timeout completion cannot precede it, and poll timeouts must include its
+/// entire fine remainder. Earlier completion requires an event allowed by the
+/// request's policy (input, process activity/status, timer activity, or quit).
+///
+/// `timer_deadline` is a separate wall-clock domain used only to order GNU
+/// timers against the wait boundary; it cannot decide elapsed-time expiration.
+/// These immutable scalars contain no mutator-owned state and may cross threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaitDeadline {
     Poll,
     Until {
         instant: Instant,
-        coarse_end: Option<Duration>,
         timer_deadline: GnuTimerTimestamp,
     },
     Forever,
-}
-
-fn monotonic_coarse_now() -> Option<Duration> {
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    {
-        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
-        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, ts.as_mut_ptr()) };
-        if rc == 0 {
-            let ts = unsafe { ts.assume_init() };
-            if ts.tv_sec >= 0 && ts.tv_nsec >= 0 {
-                return Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
-            }
-        }
-    }
-
-    None
 }
 
 impl WaitDeadline {
     fn until(instant: Instant) -> Self {
         let now = Instant::now();
         let remaining = instant.saturating_duration_since(now);
-        Self::until_with_timer_deadline(
-            instant,
-            None,
-            GnuTimerTimestamp::now().add_duration(remaining),
-        )
+        Self::until_with_timer_deadline(instant, GnuTimerTimestamp::now().add_duration(remaining))
     }
 
     fn for_duration(duration: Duration) -> Self {
@@ -188,34 +175,18 @@ impl WaitDeadline {
             // Keep servicing events with the explicit indefinite-wait state.
             return Self::Forever;
         };
-        Self::until_with_timer_deadline(
-            instant,
-            monotonic_coarse_now().and_then(|now| now.checked_add(duration)),
-            timer_deadline,
-        )
+        Self::until_with_timer_deadline(instant, timer_deadline)
     }
 
-    fn until_with_timer_deadline(
-        instant: Instant,
-        coarse_end: Option<Duration>,
-        timer_deadline: GnuTimerTimestamp,
-    ) -> Self {
+    fn until_with_timer_deadline(instant: Instant, timer_deadline: GnuTimerTimestamp) -> Self {
         Self::Until {
             instant,
-            coarse_end,
             timer_deadline,
         }
     }
 
     fn expired(self, now: Instant) -> bool {
         match self {
-            Self::Until {
-                instant,
-                coarse_end: Some(coarse_end),
-                ..
-            } => {
-                monotonic_coarse_now().map_or(now >= instant, |coarse_now| coarse_now >= coarse_end)
-            }
             Self::Until { instant, .. } => now >= instant,
             Self::Poll | Self::Forever => false,
         }
@@ -224,15 +195,6 @@ impl WaitDeadline {
     fn remaining(self, now: Instant) -> Option<Duration> {
         match self {
             Self::Poll => Some(Duration::ZERO),
-            Self::Until {
-                instant,
-                coarse_end: Some(coarse_end),
-                ..
-            } => Some(
-                monotonic_coarse_now()
-                    .map(|coarse_now| coarse_end.saturating_sub(coarse_now))
-                    .unwrap_or_else(|| instant.saturating_duration_since(now)),
-            ),
             Self::Until { instant, .. } => Some(instant.saturating_duration_since(now)),
             Self::Forever => None,
         }
@@ -1081,7 +1043,9 @@ impl super::eval::Context {
         &mut self,
         idle_policy: crate::keyboard::IdleTransitionPolicy,
     ) -> Result<(), Flow> {
-        let mut request = WaitRequest::service_once(true);
+        // Initial batch frames suppress display, including redisplay caused
+        // by a ripe timer, while retaining the ordinary timer/service pass.
+        let mut request = WaitRequest::service_once(self.input_wait_redisplay_allowed());
         request.idle_policy = idle_policy;
         self.service_wait_request_once(&request)
     }
@@ -1548,6 +1512,13 @@ impl super::eval::Context {
         request: &WaitRequest,
         wait_time: Duration,
     ) -> Result<WaitBlockActivity, Flow> {
+        // GNU `thread_select`: other Lisp threads run during the wait.
+        let wait_time = match self.green_select_switch(wait_time)? {
+            crate::emacs_core::eval::SelectTurn::Switched => {
+                return Ok(self.green_resumed_select_activity());
+            }
+            crate::emacs_core::eval::SelectTurn::Block(wait_time) => wait_time,
+        };
         match self.wait_block(request, wait_time) {
             WaitBlock::Poll => Ok(WaitBlockActivity::poll()),
             WaitBlock::Poller(interest) => {
@@ -1579,6 +1550,24 @@ impl super::eval::Context {
                 Ok(WaitBlockActivity::ready_processes(Vec::new()))
             }
         }
+    }
+
+    /// Decode readiness only after the Green owner reacquired the Baton.
+    /// The idle scheduler observes raw OS events without borrowing the World.
+    /// Process registrations are level-triggered, so a zero-time decode
+    /// recovers writable connect/TLS interest as well as readable output.
+    #[cold]
+    #[inline(never)]
+    fn green_resumed_select_activity(&self) -> WaitBlockActivity {
+        self.processes
+            .wait_for_backend_events(
+                Duration::ZERO,
+                ProcessWaitBackendInterest::NotificationsAndProcesses,
+            )
+            .map_or_else(
+                WaitBlockActivity::poll,
+                WaitBlockActivity::from_source_events,
+            )
     }
 
     /// Set `waiting_for_user_input` for the duration of a poller block when the
@@ -1706,3 +1695,7 @@ impl super::eval::Context {
 #[cfg(test)]
 #[path = "tests/wait_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/fine_deadline.rs"]
+mod fine_deadline_tests;

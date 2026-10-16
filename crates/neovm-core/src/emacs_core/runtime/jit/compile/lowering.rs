@@ -889,6 +889,10 @@ pub(crate) fn lower_predicate_flag(
 /// `wrong-type-argument`), while car-safe/cdr-safe yield nil for ANY non-cons
 /// (total, no deopt). Non-allocating; reading a cons field needs no SATB
 /// barrier (the barrier is on writes), and there is no GC safepoint here.
+///
+/// One tag test splits the paths: a cons loads its field at once, and only a
+/// non-cons tests for nil, deopting otherwise. Merging the cons and nil tests
+/// before the guard cost a second tag branch on the cons path.
 pub(crate) fn lower_car_cdr(
     fb: &mut FunctionBuilder,
     deopt: Option<Block>,
@@ -898,17 +902,13 @@ pub(crate) fn lower_car_cdr(
 ) -> ClifValue {
     let tag = band_imm_p(fb, a, TAG_MASK as i64);
     let is_cons = icmp_imm_p(fb, IntCC::Equal, tag, TAG_CONS as i64);
-    if !safe {
-        let is_nil = fb
-            .ins()
-            .icmp_imm_u(IntCC::Equal, a, Value::NIL.bits() as i64);
-        let valid = fb.ins().bor(is_cons, is_nil);
-        emit_guard(
-            fb,
-            deopt.expect("guarded car/cdr lowers with a deopt site"),
-            valid,
-        );
-    }
+    // The J0 harness (`jit_force_deopt`) fails every guard: send every input,
+    // conses included, through the guarded branch.
+    let to_cons = if !safe && jit_force_deopt() {
+        fb.ins().iconst(types::I8, 0)
+    } else {
+        is_cons
+    };
 
     // Branch: cons -> load the field; nil -> nil. The result flows through a
     // fresh SSA variable (Cranelift inserts the phi at the merge).
@@ -916,7 +916,7 @@ pub(crate) fn lower_car_cdr(
     let cons_blk = fb.create_block();
     let nil_blk = fb.create_block();
     let merge = fb.create_block();
-    fb.ins().brif(is_cons, cons_blk, &[], nil_blk, &[]);
+    fb.ins().brif(to_cons, cons_blk, &[], nil_blk, &[]);
 
     fb.switch_to_block(cons_blk);
     let ptr = band_imm_p(fb, a, !(TAG_MASK as i64));
@@ -937,7 +937,15 @@ pub(crate) fn lower_car_cdr(
         let nil = fb.ins().iconst(types::I64, Value::NIL.bits() as i64);
         fb.def_var(res, nil);
     } else {
-        fb.def_var(res, a); // nil -> nil (a already holds nil, guarded above)
+        let is_nil = fb
+            .ins()
+            .icmp_imm_u(IntCC::Equal, a, Value::NIL.bits() as i64);
+        emit_guard(
+            fb,
+            deopt.expect("guarded car/cdr lowers with a deopt site"),
+            is_nil,
+        );
+        fb.def_var(res, a); // nil -> nil (a holds nil past the guard)
     }
     fb.ins().jump(merge, &[]);
 
@@ -7359,8 +7367,9 @@ fn lower_simple_op_arms(
             // a tagged fixnum yields `lognot` exactly (-a == retag(~n)). A non-fixnum
             // arg deopts to the precise-deopt block, where the interpreter re-runs
             // the REAL call from `pc` (graceful for the odd bignum; a fully mixed
-            // loop stays interpreted). Redefinition is caught by the leaf's
-            // inline_epoch eviction (set in compile_bytecode_function_inner). AOT
+            // loop stays interpreted). Green leaves validate the function epoch
+            // at every original call boundary, including after a yield or first
+            // thread admission. Sim retains dependency eviction alone. AOT
             // (`aot`) keeps the shim — its loader owns arm/disarm.
             if jit_inline_arith_on()
                 && !aot
@@ -7369,6 +7378,9 @@ fn lower_simple_op_arms(
                 && super::call_site_inlinable_at(pc)
             {
                 let dsite = deopt_site(fb, pc, handlers.len(), stack, reps, deopt_sites);
+                if let Some(epoch) = super::inline_vars::green_function_epoch() {
+                    emit_mir_inline_entry_guard(fb, rt, epoch, dsite)?;
+                }
                 let sp = stack.len();
                 let is_lognot = op == ARITH_KIND_LOGNOT as u8;
                 let a = stack[sp - if is_lognot { 1 } else { 2 }];

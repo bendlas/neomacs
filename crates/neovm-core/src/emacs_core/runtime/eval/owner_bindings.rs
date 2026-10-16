@@ -27,7 +27,7 @@ use super::{Context, NativeUnwindAction, SpecBinding};
 use crate::buffer::{BufferId, BufferManager};
 use crate::emacs_core::error::Flow;
 use crate::emacs_core::forward::{
-    CanonicalArm, LispBoolFwd, LispBufferObjFwd, ThreadProjectionDescriptor, TlsIndex,
+    CanonicalArm, LispBoolFwd, LispBufferObjFwd, LispInteger, ThreadProjectionDescriptor, TlsIndex,
 };
 use crate::emacs_core::intern::SymId;
 use crate::emacs_core::symbol::{CanonicalAccess, SetInternalBind};
@@ -149,6 +149,37 @@ impl UndoTarget {
     }
 }
 
+/// GNU `specpdl_unrewind`'s exchange of one owner binding whose record
+/// says UNDO while its slot holds SLOT (`backtrace-eval`, eval.c:4177-4228):
+/// what the record would restore and what the slot holds trade places, so
+/// the exchange is its own inverse. A record restores `NoBinding` -- the
+/// canonical value shows through -- when it hides no binding of the owner
+/// (`Inherited`), and the binding it holds otherwise; a binding set aside
+/// while canonical storage shows is `Inherited { suspended }`. `None` when
+/// there is nothing to exchange: a binding whose storage was killed or
+/// dropped.
+pub(super) fn exchanged_binding(
+    undo: UndoTarget,
+    slot: SlotState,
+) -> Option<(UndoTarget, SlotState)> {
+    let restores = match undo {
+        UndoTarget::Inherited { suspended: None } => SlotState::NoBinding,
+        UndoTarget::Inherited {
+            suspended: Some(value),
+        }
+        | UndoTarget::Previous(value) => SlotState::Bound(value),
+        UndoTarget::Captured(_) | UndoTarget::Retired => return None,
+    };
+    let undo = match (slot, restores) {
+        (SlotState::NoBinding, _) => UndoTarget::Inherited { suspended: None },
+        (SlotState::Bound(value), SlotState::NoBinding) => UndoTarget::Inherited {
+            suspended: Some(value),
+        },
+        (SlotState::Bound(value), SlotState::Bound(_)) => UndoTarget::Previous(value),
+    };
+    Some((undo, restores))
+}
+
 /// One binding on an owner's binding stack.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OwnerBindingRecord {
@@ -188,6 +219,12 @@ pub(crate) struct OwnerBindingRef {
 }
 
 impl OwnerBindingRef {
+    /// The specpdl's handle on RECORD, a binding of SYM.
+    #[inline]
+    pub(super) fn new(sym: SymId, record: OwnerRecordId) -> Self {
+        Self { sym, record }
+    }
+
     /// The symbol the binding binds (alias-resolved, as GNU records it).
     #[inline]
     pub(crate) fn symbol(self) -> SymId {
@@ -219,6 +256,9 @@ pub(crate) struct OwnerSlab {
     /// The values of the owner's in-place buffer bindings while it is
     /// parked: its specpdl saves them then, and the slab keeps them traced.
     parked: Vec<Value>,
+    /// This owner's seat in a Green runtime (round 3d): its Lisp thread's
+    /// key, channel and, while it runs, the World's Baton.
+    green: Option<Box<super::green::GreenSeat>>,
     _thread_confined: PhantomData<*const ()>,
 }
 
@@ -263,6 +303,7 @@ impl OwnerSlab {
             next_generation: NonZeroU32::MIN,
             debugger: None,
             parked: Vec::new(),
+            green: None,
             _thread_confined: PhantomData,
         }
     }
@@ -318,6 +359,63 @@ impl OwnerSlab {
         }
     }
 
+    /// Replace a default-channel binding without the local-channel map
+    /// dispatch. This is used only after a projected binding has selected
+    /// its channel; ordinary specbind and unbind paths remain unchanged.
+    #[inline(always)]
+    fn replace_default_slot(&mut self, index: TlsIndex, state: SlotState) -> SlotState {
+        let slot = index.slot();
+        let old = match self
+            .pages
+            .get_mut(slot / SLOT_PAGE)
+            .and_then(Option::as_deref_mut)
+        {
+            Some(page) => std::mem::replace(&mut page[slot % SLOT_PAGE], state),
+            None if matches!(state, SlotState::NoBinding) => SlotState::NoBinding,
+            None => {
+                self.new_page(slot)[slot % SLOT_PAGE] = state;
+                SlotState::NoBinding
+            }
+        };
+        note_dropped(old.value());
+        if let Some((debugger, cell)) = self.debugger
+            && debugger == index
+        {
+            cell.set(debugger_armed(state));
+        }
+        old
+    }
+
+    /// Restore an unwatched default binding without materializing its
+    /// complete record in the unwinder's frame. Eligibility is checked
+    /// against the record's current storage symbol: alias migration can
+    /// change it while the specpdl reference keeps the original symbol.
+    #[inline(always)]
+    fn pop_default_binding(
+        &mut self,
+        id: OwnerRecordId,
+        unwatched: impl FnOnce(SymId) -> bool,
+    ) -> Option<SymId> {
+        let record = self.record(id)?;
+        if record.channel != Channel::Default {
+            return None;
+        }
+        let state = match record.undo {
+            UndoTarget::Previous(outer) => SlotState::Bound(outer),
+            UndoTarget::Inherited { .. } => SlotState::NoBinding,
+            UndoTarget::Captured(_) | UndoTarget::Retired => return None,
+        };
+        let (sym, index) = (record.sym, record.index);
+        if !unwatched(sym) {
+            return None;
+        }
+        // The record was validated above and nothing mutated it. Discard
+        // the returned payload so only stack retirement is needed here.
+        let _ = self.take_record(id);
+        self.replace_default_slot(index, state);
+        Some(sym)
+    }
+
     /// Keep VALUES traced while the owner is parked.
     pub(crate) fn park(&mut self, values: Vec<Value>) {
         debug_assert!(self.parked.is_empty(), "an owner parks once");
@@ -346,6 +444,99 @@ impl OwnerSlab {
                 cell
             }
         }
+    }
+
+    /// Make room for admission's commit to push RECORDS records, bind
+    /// LOCALS buffer-local channels and fill the default-channel SLOTS
+    /// without allocating: their pages are made now, empty.
+    pub(crate) fn try_reserve_admission(
+        &mut self,
+        records: usize,
+        locals: usize,
+        slots: impl Iterator<Item = usize>,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.records.try_reserve(records)?;
+        self.locals.try_reserve(locals)?;
+        for slot in slots {
+            let page = slot / SLOT_PAGE;
+            if page >= self.pages.len() {
+                self.pages.try_reserve(page + 1 - self.pages.len())?;
+                self.pages.resize_with(page + 1, || None);
+            }
+            if self.pages[page].is_none() {
+                let mut fresh = Vec::new();
+                fresh.try_reserve_exact(SLOT_PAGE)?;
+                fresh.resize(SLOT_PAGE, SlotState::NoBinding);
+                let fresh: Box<[SlotState; SLOT_PAGE]> = fresh
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("a page holds SLOT_PAGE slots");
+                self.pages[page] = Some(fresh);
+            }
+        }
+        Ok(())
+    }
+
+    /// A local of SYM was made again on CHANNEL and took VALUE: the
+    /// outermost binding of SYM there whose local had been killed takes it
+    /// back as its storage. Returns the value that binding hid, which the
+    /// new local must hold instead (GNU's entry exchanges with the local it
+    /// finds, `src/eval.c:3871-3883`, `:4204-4228`); `None` when no such
+    /// binding exists.
+    pub(crate) fn reattach_captured(
+        &mut self,
+        sym: SymId,
+        index: TlsIndex,
+        channel: Channel,
+        value: Value,
+    ) -> Option<SlotValue> {
+        let outermost = self.canonical_root_record(sym, channel)?;
+        let UndoTarget::Captured(hidden) = self.record(outermost)?.undo else {
+            return None;
+        };
+        self.replace_undo(outermost, UndoTarget::Inherited { suspended: None });
+        self.set_slot(index, channel, SlotState::Bound(SlotValue::new(value)));
+        Some(hidden)
+    }
+
+    /// The active chain's link to canonical storage. An older chain can be
+    /// suspended by `backtrace-eval` while a new binding starts another one.
+    /// Killing/remaking the local must preserve this newer link's restore,
+    /// rather than selecting the older suspended entry.
+    fn canonical_root_record(&self, sym: SymId, channel: Channel) -> Option<OwnerRecordId> {
+        self.record_ids_of(sym).into_iter().find(|id| {
+            self.record(*id).is_some_and(|record| {
+                record.channel == channel
+                    && matches!(
+                        record.undo,
+                        UndoTarget::Inherited { suspended: None } | UndoTarget::Captured(_)
+                    )
+            })
+        })
+    }
+
+    /// This owner's Green seat, if it runs in a Green runtime.
+    pub(crate) fn green_seat_mut(&mut self) -> Option<&mut super::green::GreenSeat> {
+        self.green.as_deref_mut()
+    }
+
+    /// Seat this owner in a Green runtime (once).
+    pub(crate) fn install_green_seat(&mut self, seat: Box<super::green::GreenSeat>) {
+        debug_assert!(self.green.is_none(), "an owner takes one seat");
+        self.green = Some(seat);
+    }
+
+    /// Whether this owner has its own `debug-on-next-call` cell.
+    pub(crate) fn has_debugger_cell(&self) -> bool {
+        self.debugger.is_some()
+    }
+
+    /// Take CELL, made before admission's commit, as this owner's
+    /// `debug-on-next-call` cell for the variable INDEX names.
+    pub(crate) fn adopt_debugger_cell(&mut self, index: TlsIndex, cell: &'static LispBoolFwd) {
+        debug_assert!(self.debugger.is_none(), "one debug-on-next-call per owner");
+        cell.set(debugger_armed(self.slot(index, Channel::Default)));
+        self.debugger = Some((index, cell));
     }
 
     /// The page holding default-channel SLOT, made on first use.
@@ -484,12 +675,6 @@ impl OwnerSlab {
             })
     }
 
-    /// Whether this owner binds SYM at all (GNU's `kind >= SPECPDL_LET` scan
-    /// for SYM, `src/eval.c:706-710`).
-    pub(crate) fn binds(&self, sym: SymId) -> bool {
-        self.records_of(sym).next().is_some()
-    }
-
     /// GNU `let_shadows_buffer_binding_p` (`src/eval.c:3593-3610`): a
     /// default binding of SYM made with BUFFER current.
     pub(crate) fn shadows_buffer_binding(&self, sym: SymId, buffer: Option<BufferId>) -> bool {
@@ -514,6 +699,9 @@ impl OwnerSlab {
             if let SlotState::Bound(current) = self.slot(record.index, record.channel) {
                 visit(current.get());
             }
+        }
+        if let Some(seat) = &self.green {
+            seat.trace_binding_resume_error(visit);
         }
     }
 }
@@ -753,6 +941,30 @@ impl Context {
         projection: &'static ThreadProjectionDescriptor,
         value: Value,
     ) -> Result<(), Flow> {
+        // An unwatched plain projection always binds the default channel:
+        // no type rule, buffer lookup, or post-watcher routing is needed.
+        if projection.arm() == CanonicalArm::Plain && !self.watchers.has_watchers(resolved) {
+            let index = projection.index();
+            let slab = self.ensure_owner_slab();
+            let old = slab.replace_default_slot(index, SlotState::Bound(SlotValue::new(value)));
+            let undo = match old {
+                SlotState::Bound(outer) => UndoTarget::Previous(outer),
+                SlotState::NoBinding => UndoTarget::Inherited { suspended: None },
+            };
+            // Native page/Vec growth cannot execute Lisp, reach a GC
+            // safepoint, or hand off the Baton. Once pushed, the record
+            // roots the new slot and any prior binding it must restore.
+            let record =
+                slab.push_record(resolved, index, BindingKind::Let, Channel::Default, undo);
+            self.push_specpdl_with(|| SpecBinding::NativeUnwind {
+                action: NativeUnwindAction::OwnerBinding(OwnerBindingRef {
+                    sym: resolved,
+                    record,
+                }),
+            });
+            self.publish_owner_binding(resolved);
+            return Ok(());
+        }
         let (kind, channel) = binding_shape(&self.buffers, resolved, projection);
         // A buffer's own per-buffer slot binds in place (design §1.3b).
         if let (
@@ -762,6 +974,13 @@ impl Context {
         ) = (kind, channel, projection.arm())
         {
             return self.specbind_slot_in_place(resolved, builtin.descriptor(), buffer, value);
+        }
+        // So does its default, in every buffer without a local (§1.3b).
+        if let (BindingKind::LetDefault { where_buf }, CanonicalArm::Forwarded(builtin)) =
+            (kind, projection.arm())
+            && let Some(buf_fwd) = builtin.descriptor().as_buffer_obj_fwd()
+        {
+            return self.specbind_default_in_place(resolved, buf_fwd, where_buf, value);
         }
         let index = projection.index();
         let slab = self.ensure_owner_slab();
@@ -852,8 +1071,42 @@ impl Context {
         Ok(())
     }
 
+    /// GNU `specbind`'s `SPECPDL_LET_DEFAULT` of a per-buffer variable the
+    /// current buffer has no local of (`src/eval.c:3678-3700`), for a
+    /// projected variable: `set_default` in place, so every buffer without
+    /// a local -- and every direct slot reader in it -- sees the binding, as
+    /// GNU's shared default does. The legacy entry restores the default at
+    /// its pop; an owner leaving the baton swaps it out (design §1.3b).
+    #[cold]
+    #[inline(never)]
+    fn specbind_default_in_place(
+        &mut self,
+        resolved: SymId,
+        buf_fwd: &LispBufferObjFwd,
+        where_buf: Option<BufferId>,
+        value: Value,
+    ) -> Result<(), Flow> {
+        let old_default = buf_fwd
+            .buffer_slot()
+            .map(|slot| slot.index())
+            .filter(|&off| off < self.buffers.buffer_defaults.len())
+            .map_or(buf_fwd.default, |off| self.buffers.buffer_defaults[off]);
+        self.push_specpdl_with(|| SpecBinding::LetDefault {
+            sym_id: resolved,
+            old_value: super::SavedBindingValue::from_plain(old_default),
+            buffer_id: super::SavedBufferId::from_option(where_buf),
+        });
+        super::super::data::set_default_internal_resolved(
+            self,
+            resolved,
+            value,
+            SetInternalBind::Bind,
+        )?;
+        Ok(())
+    }
+
     /// Republish host mirrors of RESOLVED after an owner binding changed.
-    #[inline]
+    #[inline(always)]
     fn publish_owner_binding(&mut self, resolved: SymId) {
         if resolved == super::owner_mirrors::debug_on_next_call_symbol() {
             self.point_owner_debugger();
@@ -861,13 +1114,21 @@ impl Context {
         // The mask includes the GC settings, so an unmirrored variable needs
         // neither publication nor the GC-binding sync.
         if self.runtime_binding_has_projection(resolved) {
-            let visible = match self.find_symbol_value_by_id(resolved) {
-                Ok(super::SymbolValueLookup::Bound(value)) => value,
-                _ => Value::NIL,
-            };
-            self.publish_runtime_binding_write_by_resolved_id(resolved, visible);
-            self.sync_user_test_gc_binding_by_id(resolved);
+            self.publish_owner_binding_mirrors(resolved);
         }
+    }
+
+    /// Keep the value lookup and publication frame outside the ordinary
+    /// unmirrored bind/pop path, whose inline gate is only a bit test.
+    #[cold]
+    #[inline(never)]
+    fn publish_owner_binding_mirrors(&mut self, resolved: SymId) {
+        let visible = match self.find_symbol_value_by_id(resolved) {
+            Ok(super::SymbolValueLookup::Bound(value)) => value,
+            _ => Value::NIL,
+        };
+        self.publish_runtime_binding_write_by_resolved_id(resolved, visible);
+        self.sync_user_test_gc_binding_by_id(resolved);
     }
 
     /// GNU `do_one_unbind` (`src/eval.c:3806-3885`) of an owner binding.
@@ -882,6 +1143,24 @@ impl Context {
     #[cold]
     #[inline(never)]
     pub(super) fn unbind_owner_binding(&mut self, binding: OwnerBindingRef) -> Result<(), Flow> {
+        let restored = {
+            let watchers = &self.watchers;
+            self.owner.slab_mut().and_then(|slab| {
+                slab.pop_default_binding(binding.record, |sym| !watchers.has_watchers(sym))
+            })
+        };
+        if let Some(sym) = restored {
+            self.publish_owner_binding(sym);
+            return Ok(());
+        }
+        self.unbind_owner_binding_slow(binding)
+    }
+
+    /// Full-record restoration is needed only for watched, local, captured
+    /// or retired bindings. Keep its larger frame off the common pop.
+    #[cold]
+    #[inline(never)]
+    fn unbind_owner_binding_slow(&mut self, binding: OwnerBindingRef) -> Result<(), Flow> {
         let Some(record) = self
             .owner
             .slab_mut()
@@ -890,21 +1169,8 @@ impl Context {
             return Ok(());
         };
         let watched = self.watchers.has_watchers(record.sym);
-        // The common case: an unwatched default binding is one slot store.
-        if !watched && record.channel == Channel::Default {
-            let state = match record.undo {
-                UndoTarget::Previous(outer) => Some(SlotState::Bound(outer)),
-                UndoTarget::Inherited { .. } => Some(SlotState::NoBinding),
-                UndoTarget::Captured(_) | UndoTarget::Retired => None,
-            };
-            if let Some(state) = state
-                && let Some(slab) = self.owner.slab_mut()
-            {
-                slab.set_slot(record.index, record.channel, state);
-                self.publish_owner_binding(record.sym);
-                return Ok(());
-            }
-        }
+        // The entry wrapper already consumed every unwatched default
+        // Previous/Inherited binding. Only full-record cases reach here.
         let Some(projection) = self.obarray.thread_projection_of(record.sym) else {
             // `defvaralias` retired the projection; the alias resolves to its
             // base, which holds no binding of this owner.
@@ -1171,32 +1437,350 @@ impl Context {
             return;
         }
         let current = slab.slot(record.index, record.channel);
-        let (undo, slot) = match (record.undo, current) {
-            (UndoTarget::Previous(outer), SlotState::Bound(value)) => {
-                (UndoTarget::Previous(value), SlotState::Bound(outer))
-            }
-            (UndoTarget::Inherited { suspended: None }, SlotState::Bound(value)) => (
-                UndoTarget::Inherited {
-                    suspended: Some(value),
-                },
-                SlotState::NoBinding,
-            ),
-            (
-                UndoTarget::Inherited {
-                    suspended: Some(value),
-                },
-                SlotState::NoBinding,
-            ) => (
-                UndoTarget::Inherited { suspended: None },
-                SlotState::Bound(value),
-            ),
-            // A binding whose storage was killed, or a slot another binding
-            // of this owner holds: nothing to exchange.
-            _ => return,
+        let Some((undo, slot)) = exchanged_binding(record.undo, current) else {
+            return;
         };
         slab.set_slot(record.index, record.channel, slot);
         slab.replace_undo(binding.record, undo);
         self.publish_owner_binding(record.sym);
+    }
+
+    /// The saved side of an owner entry after a backtrace exchange, with
+    /// GNU's original specpdl symbol rather than its migrated storage key.
+    #[cold]
+    pub(crate) fn owner_binding_saved_value(
+        &self,
+        binding: OwnerBindingRef,
+    ) -> Option<(SymId, Value)> {
+        let record = self.owner.slab()?.record(binding.record)?;
+        let value = record.undo.values()[0]?;
+        Some((binding.symbol(), value.get()))
+    }
+
+    /// GNU keeps the original symbol in each specpdl entry. If another
+    /// thread aliases it while this owner is parked, resuming that entry
+    /// exchanges its saved binding with the alias's new default storage
+    /// (`eval.c:4181-4208`). Rebuild only the affected owner slots, in the
+    /// original specpdl order, so interleaved bindings of source and target
+    /// become one binding chain. The specpdl reference retains the original
+    /// symbol for GNU's EQ-based let-bound and toplevel scans.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn reconcile_aliased_owner_bindings(&mut self) {
+        self.reconcile_owner_alias_redirect(None);
+    }
+
+    /// GNU's next exchange of a previously failed constant alias will fail
+    /// again. Keywords assigned their own value remain an allowed no-op.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn failed_constant_owner_binding(&self, outgoing: bool) -> Option<SymId> {
+        let slab = self.owner.slab()?;
+        let mut failure = None;
+        // Outgoing exchanges walk inner to outer; returning exchanges walk
+        // outer to inner. Selecting the last or first failure preserves both
+        // orders without allocating a temporary record vector at every park.
+        for (_, record) in slab.live_records() {
+            let UndoTarget::Captured(saved) = record.undo else {
+                continue;
+            };
+            if record.channel != Channel::Default || !self.obarray.is_alias_id(record.sym) {
+                continue;
+            }
+            let Some(base) = self.obarray.indirect_variable_id(record.sym) else {
+                continue;
+            };
+            if matches!(
+                self.obarray.classify_constant_write(base, saved.get()),
+                crate::emacs_core::symbol::ConstantWrite::Refused
+            ) {
+                failure = Some(record.sym);
+                if !outgoing {
+                    break;
+                }
+            }
+        }
+        failure
+    }
+
+    /// The old plain canonical cell is otherwise lost when this owner aliases
+    /// a cell that an older, differently named binding currently reaches.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn owner_alias_redirect_value(&mut self, alias: SymId) -> Option<Value> {
+        if !self
+            .owner
+            .slab()?
+            .live_records()
+            .any(|(_, record)| record.sym == alias && record.channel == Channel::Default)
+        {
+            return None;
+        }
+        Some(self.owner_canonical_value(alias, Channel::Default))
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn finish_owner_alias_redirect(&mut self, alias: SymId, old_value: Value) {
+        self.reconcile_owner_alias_redirect(Some((alias, old_value)));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reconcile_owner_alias_redirect(&mut self, active: Option<(SymId, Value)>) {
+        let Some(slab) = self.owner.slab() else {
+            return;
+        };
+        let changed = self.specpdl.iter().any(|entry| {
+            let SpecBinding::NativeUnwind {
+                action: NativeUnwindAction::OwnerBinding(binding),
+            } = entry
+            else {
+                return false;
+            };
+            slab.record(binding.record).is_some_and(|record| {
+                record.channel == Channel::Default
+                    && !matches!(record.undo, UndoTarget::Captured(_) | UndoTarget::Retired)
+                    && self
+                        .obarray
+                        .indirect_variable_id(binding.symbol())
+                        .is_some_and(|base| base != record.sym)
+            })
+        });
+        if !changed {
+            return;
+        }
+        let mut records: Vec<_> = self
+            .specpdl
+            .iter()
+            .filter_map(|entry| {
+                let SpecBinding::NativeUnwind {
+                    action: NativeUnwindAction::OwnerBinding(binding),
+                } = entry
+                else {
+                    return None;
+                };
+                let record = slab.record(binding.record).copied()?;
+                Some((*binding, record, record.sym, record.index))
+            })
+            .collect();
+        let mut affected = rustc_hash::FxHashSet::default();
+        let mut constants = Vec::new();
+        for (binding, record, target, index) in &mut records {
+            if record.channel != Channel::Default
+                || matches!(record.undo, UndoTarget::Captured(_) | UndoTarget::Retired)
+            {
+                continue;
+            }
+            let Some(base) = self.obarray.indirect_variable_id(binding.symbol()) else {
+                continue;
+            };
+            if base == record.sym {
+                continue;
+            }
+            if self.obarray.is_constant_id(base) {
+                let value = self.variable_value(base).unwrap_or(Value::UNBOUND);
+                constants.push((binding.record, base, value));
+                affected.insert((record.index, record.channel));
+                continue;
+            }
+            let Some(projection) = self.obarray.owned_thread_projection(base) else {
+                continue;
+            };
+            *target = base;
+            *index = projection.index();
+            affected.insert((record.index, record.channel));
+            affected.insert((*index, record.channel));
+        }
+        if affected.is_empty() {
+            return;
+        }
+        records.retain(|(_, record, _, index)| {
+            affected.contains(&(record.index, record.channel))
+                || affected.contains(&(*index, record.channel))
+        });
+        // At an active redirect GNU abandons the old cell's live binding.
+        // Simulate its next reverse exchange now: no peer can run before a
+        // park, and the rebuilt overlay keeps this owner's visible value.
+        let mut active_values = None;
+        if let Some((alias, old_canonical)) = active {
+            let mut physical = FxHashMap::default();
+            let mut assigned = vec![SlotState::NoBinding; records.len()];
+            let mut destinations = FxHashMap::default();
+            for (_, record, target, index) in &records {
+                let key = (*index, record.channel);
+                if !physical.contains_key(&key) {
+                    let canonical = self.owner_canonical_value(*target, record.channel);
+                    let current = self
+                        .owner
+                        .slab()
+                        .and_then(|slab| slab.slot(*index, record.channel).value())
+                        .map_or(canonical, SlotValue::get);
+                    physical.insert(key, current);
+                    destinations.insert(key, *target);
+                }
+            }
+            for (position, (_, record, _, index)) in records.iter().enumerate().rev() {
+                let key = (*index, record.channel);
+                assigned[position] = SlotState::Bound(SlotValue::new(physical[&key]));
+                let restores = match record.undo {
+                    UndoTarget::Inherited { suspended: None } if record.sym == alias => {
+                        old_canonical
+                    }
+                    UndoTarget::Inherited { suspended: None } => {
+                        self.owner_canonical_value(record.sym, record.channel)
+                    }
+                    UndoTarget::Inherited {
+                        suspended: Some(saved),
+                    }
+                    | UndoTarget::Previous(saved)
+                    | UndoTarget::Captured(saved) => saved.get(),
+                    UndoTarget::Retired => continue,
+                };
+                physical.insert(key, restores);
+            }
+            for (key, value) in physical {
+                self.owner_canonical_store(destinations[&key], key.1, value);
+            }
+            active_values = Some(assigned);
+        }
+        let target_canonical: Vec<_> = records
+            .iter()
+            .map(|(_, record, target, _)| self.owner_canonical_value(*target, record.channel))
+            .collect();
+        let target_forwarders: Vec<_> = records
+            .iter()
+            .map(|(_, _, target, _)| {
+                self.obarray
+                    .thread_projection_of(*target)
+                    .and_then(|p| p.logical_forwarder())
+            })
+            .collect();
+        let slab = self.owner.slab_mut().expect("owner records have a slab");
+        let mut old_slots = FxHashMap::default();
+        let mut values = vec![SlotState::NoBinding; records.len()];
+        for (position, (_, record, _, _)) in records.iter().enumerate().rev() {
+            let current = old_slots
+                .entry((record.index, record.channel))
+                .or_insert_with(|| slab.slot(record.index, record.channel));
+            values[position] = *current;
+            *current = match record.undo {
+                UndoTarget::Inherited { suspended: None } => SlotState::NoBinding,
+                UndoTarget::Inherited {
+                    suspended: Some(saved),
+                }
+                | UndoTarget::Previous(saved) => SlotState::Bound(saved),
+                UndoTarget::Captured(_) | UndoTarget::Retired => SlotState::NoBinding,
+            };
+        }
+        if let Some(active_values) = active_values {
+            values = active_values;
+        }
+        for &(index, channel) in &affected {
+            slab.set_slot(index, channel, SlotState::NoBinding);
+        }
+        let mut resume_error = None;
+        let mut forward_error = None;
+        for (position, ((binding, record, target, index), mut value)) in
+            records.into_iter().zip(values).enumerate()
+        {
+            if let Some((_, base, canonical)) =
+                constants.iter().find(|(id, _, _)| *id == binding.record)
+            {
+                // GNU saves the constant's value before its attempted
+                // rebind signals. Keep a restoring record: popping the let
+                // can signal again, even if an inner handler caught the
+                // resume error. No owner overlay may remain on the old cell.
+                let assigned = value.value().map_or(*canonical, SlotValue::get);
+                if matches!(
+                    self.obarray.classify_constant_write(*base, assigned),
+                    crate::emacs_core::symbol::ConstantWrite::Refused
+                ) {
+                    if resume_error.is_none() && forward_error.is_none() {
+                        resume_error = Some(binding.symbol());
+                    }
+                }
+                slab.replace_undo(
+                    binding.record,
+                    UndoTarget::Captured(SlotValue::new(*canonical)),
+                );
+                slab.records[binding.record.position()]
+                    .as_mut()
+                    .expect("live constant alias record")
+                    .sym = binding.symbol();
+                continue;
+            }
+            if matches!(record.undo, UndoTarget::Retired | UndoTarget::Captured(_)) {
+                continue;
+            }
+            if let (Some(forwarder), SlotState::Bound(assigned)) =
+                (target_forwarders[position], value)
+            {
+                match forwarder.store(assigned.get()) {
+                    Ok(stored) => {
+                        value = SlotState::Bound(SlotValue::new(stored.canonical_value()))
+                    }
+                    Err(error) => {
+                        if resume_error.is_none() && forward_error.is_none() {
+                            forward_error = Some((error, assigned.get()));
+                        }
+                        slab.replace_undo(
+                            binding.record,
+                            UndoTarget::Captured(SlotValue::new(target_canonical[position])),
+                        );
+                        slab.records[binding.record.position()]
+                            .as_mut()
+                            .expect("live refused alias record")
+                            .sym = binding.symbol();
+                        continue;
+                    }
+                }
+            }
+            let undo = match (value, slab.slot(index, record.channel), record.undo) {
+                (
+                    SlotState::NoBinding,
+                    SlotState::NoBinding,
+                    suspended @ UndoTarget::Inherited { suspended: Some(_) },
+                ) => suspended,
+                (_, SlotState::Bound(previous), _) => UndoTarget::Previous(previous),
+                (_, SlotState::NoBinding, _) => UndoTarget::Inherited { suspended: None },
+            };
+            slab.replace_undo(binding.record, undo);
+            let migrated = slab.records[binding.record.position()]
+                .as_mut()
+                .expect("live record in the reconciliation plan");
+            migrated.sym = target;
+            migrated.index = index;
+            slab.set_slot(index, record.channel, value);
+        }
+        if let Some(symbol) = resume_error {
+            // condition-wait must first retake its mutex, as it does for a
+            // pending external signal, before this internal error is raised.
+            self.green_defer_binding_resume_error(symbol);
+        } else if let Some((error, value)) = forward_error {
+            self.green_defer_forward_resume_error(error, value);
+        }
+    }
+
+    /// Owner entries naming SYMBOL, preserving GNU's original specpdl
+    /// symbol even after their effective storage followed an alias.
+    fn original_owner_records(
+        &self,
+        symbol: SymId,
+    ) -> impl Iterator<Item = (OwnerRecordId, &OwnerBindingRecord)> {
+        let slab = self.owner.slab();
+        self.specpdl.iter().filter_map(move |entry| {
+            let SpecBinding::NativeUnwind {
+                action: NativeUnwindAction::OwnerBinding(binding),
+            } = entry
+            else {
+                return None;
+            };
+            if binding.symbol() != symbol {
+                return None;
+            }
+            Some((binding.record, slab?.record(binding.record)?))
+        })
     }
 
     /// GNU `Fdefault_toplevel_value`'s answer for an owner binding
@@ -1204,16 +1788,19 @@ impl Context {
     /// hides, `Some(None)` when void, or `None` when this owner has no
     /// default binding of ID.
     pub(crate) fn owner_default_toplevel_value(&mut self, id: SymId) -> Option<Option<Value>> {
-        let outermost = self.owner.slab()?.records_of(id).find(|record| {
-            matches!(
-                record.kind,
-                BindingKind::Let | BindingKind::LetDefault { .. }
-            )
-        })?;
+        let outermost = self
+            .original_owner_records(id)
+            .find(|(_, record)| {
+                matches!(
+                    record.kind,
+                    BindingKind::Let | BindingKind::LetDefault { .. }
+                )
+            })
+            .map(|(_, record)| *record)?;
         let value = match outermost.undo {
             UndoTarget::Previous(value) | UndoTarget::Captured(value) => value.get(),
             UndoTarget::Inherited { .. } | UndoTarget::Retired => {
-                self.owner_canonical_value(id, outermost.channel)
+                self.owner_canonical_value(outermost.sym, outermost.channel)
             }
         };
         Some(SlotValue::new(value).bound())
@@ -1226,14 +1813,16 @@ impl Context {
         let Some(slab) = self.owner.slab() else {
             return false;
         };
-        let Some(outermost) = slab.record_ids_of(id).into_iter().find(|record| {
-            slab.record(*record).is_some_and(|record| {
+        let Some(outermost) = self
+            .original_owner_records(id)
+            .find(|(_, record)| {
                 matches!(
                     record.kind,
                     BindingKind::Let | BindingKind::LetDefault { .. }
                 )
             })
-        }) else {
+            .map(|(record, _)| record)
+        else {
             return false;
         };
         let Some(record) = slab.record(outermost).copied() else {
@@ -1250,7 +1839,7 @@ impl Context {
                 }
             }
             UndoTarget::Inherited { .. } | UndoTarget::Retired => {
-                self.owner_canonical_store(id, record.channel, value);
+                self.owner_canonical_store(record.sym, record.channel, value);
             }
         }
         true
@@ -1318,7 +1907,7 @@ impl Context {
     /// Whether this owner binds ID (`Fdefvaralias`'s let-bound refusal).
     #[inline]
     pub(crate) fn owner_binds(&self, id: SymId) -> bool {
-        self.owner.slab().is_some_and(|slab| slab.binds(id))
+        self.original_owner_records(id).next().is_some()
     }
 
     /// This owner's default-channel binding of the projected variable ID, if
@@ -1381,17 +1970,15 @@ impl Context {
         let Some(slab) = self.owner.slab() else {
             return;
         };
-        let ids = slab.record_ids_of(id);
-        let Some(outermost) = ids.iter().copied().find(|record| {
-            slab.record(*record)
-                .is_some_and(|record| record.channel == channel)
-        }) else {
+        let Some(outermost) = slab.canonical_root_record(id, channel) else {
             return;
         };
         let Some(record) = slab.record(outermost).copied() else {
             return;
         };
-        if let UndoTarget::Inherited { .. } = record.undo
+        // Save the active chain's restore. Older exchanged entries already
+        // carry their own values and must remain untouched.
+        if let UndoTarget::Inherited { suspended: None } = record.undo
             && let Some(slab) = self.owner.slab_mut()
         {
             slab.replace_undo(outermost, UndoTarget::Captured(SlotValue::new(canonical)));
@@ -1512,15 +2099,32 @@ impl Context {
             return;
         };
         let default = slab.slot(projection.index(), Channel::Default).value();
-        let outermost = slab.record_ids_of(id).into_iter().find(|record| {
-            slab.record(*record)
-                .is_some_and(|record| record.channel == channel)
+        // A retired binding is GNU's `SPECPDL_NOP`: it binds nothing.
+        let outermost = slab.canonical_root_record(id, channel).or_else(|| {
+            slab.record_ids_of(id).into_iter().find(|record| {
+                slab.record(*record).is_some_and(|record| {
+                    record.channel == channel && !matches!(record.undo, UndoTarget::Retired)
+                })
+            })
         });
         let start = match default {
             Some(default) => default.get(),
             None => self.owner_canonical_value(id, Channel::Default),
         };
+        let suspended = outermost.is_some_and(|outermost| {
+            self.owner
+                .slab()
+                .and_then(|slab| slab.record(outermost))
+                .is_some_and(|record| {
+                    matches!(record.undo, UndoTarget::Inherited { suspended: Some(_) })
+                })
+        });
         match outermost {
+            // A binding `backtrace-eval` has set aside stays aside: the new
+            // local is what it hides, and the rewind brings the binding back
+            // (GNU's exchange of an entry whose local exists again,
+            // `src/eval.c:4204-4228`).
+            Some(_) if suspended => self.owner_canonical_store(id, channel, start),
             Some(outermost) => {
                 let hidden = match self.owner.slab().and_then(|slab| slab.record(outermost)) {
                     Some(OwnerBindingRecord {
@@ -1571,6 +2175,64 @@ impl Context {
     fn projection_behind(&self, id: SymId) -> Option<(SymId, &'static ThreadProjectionDescriptor)> {
         let base = self.obarray.indirect_variable_id(id)?;
         Some((base, self.obarray.thread_projection_of(base)?))
+    }
+
+    /// Signal-time native integer storage only: no watchers, automatic locals,
+    /// generic forwarder dispatch, or host mirror callbacks. The caller updates
+    /// max_depth after completing the paired depth/reserve stores.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn store_owner_signal_depth_integer(&mut self, id: SymId, value: LispInteger) {
+        debug_assert!(
+            id == super::max_lisp_eval_depth_symbol()
+                || id == super::lisp_eval_depth_reserve_symbol()
+        );
+        let projection = self
+            .obarray
+            .thread_projection_of(id)
+            .expect("projected depth variable");
+        let index = projection.index();
+        let channel = access_channel(&self.buffers, id, projection);
+        let bound = self
+            .owner
+            .slab()
+            .is_some_and(|slab| slab.slot(index, channel).value().is_some());
+        if bound {
+            self.owner
+                .slab_mut()
+                .expect("the active owner binding")
+                .set_slot(
+                    index,
+                    channel,
+                    SlotState::Bound(SlotValue::new(value.value())),
+                );
+            return;
+        }
+        let (forwarder, cell) = match projection.arm() {
+            CanonicalArm::Forwarded(builtin) => (builtin.descriptor(), None),
+            CanonicalArm::Localized(blv) => {
+                // SAFETY: the projection names its obarray's live pooled BLV;
+                // only the retained forwarder and default cons are copied.
+                let blv = unsafe { &*blv.blv().as_ptr() };
+                let cell = match channel {
+                    Channel::Default => blv.defcell,
+                    Channel::BufferLocal(buffer) => self
+                        .buffers
+                        .get(buffer)
+                        .and_then(|buffer| buffer.local_variable_binding_cell(id))
+                        .expect("the selected local depth binding"),
+                };
+                (blv.fwd.expect("native depth forwarder"), Some(cell))
+            }
+            CanonicalArm::Plain => unreachable!("native depth variable retains its forwarder"),
+        };
+        forwarder
+            .as_int_fwd()
+            .expect("native depth variable has integer storage")
+            .set(value);
+        if let Some(cell) = cell {
+            cell.set_cdr(value.value());
+        }
     }
 
     /// [`Context::store_variable`] of a projected cell.

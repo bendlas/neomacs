@@ -26,7 +26,7 @@ impl Context {
     /// Mark this evaluator as a daemon before running normal-top-level.
     /// The name is host-owned; Lisp cannot change daemonp by setting variables.
     pub fn configure_daemon(&mut self, name: Option<String>, notify: Option<DaemonNotifier>) {
-        self.daemon = Some(DaemonState {
+        *self.daemon = Some(DaemonState {
             name,
             initialized: false,
             notify,
@@ -1390,7 +1390,24 @@ impl Context {
     }
 
     pub(crate) fn redisplay_for_input_wait(&mut self) -> Result<(), Flow> {
-        self.redisplay_with_force(false)
+        if self.input_wait_redisplay_allowed() {
+            self.redisplay_with_force(false)?;
+        }
+        Ok(())
+    }
+
+    /// GNU's initial batch frame skips redisplay unless Lisp explicitly
+    /// enables it for testing (xdisp.c:17372-17387, 39295-39301). Keep this
+    /// decision local to the Context's frame and current variable binding;
+    /// independent mutators share no display state here.
+    pub(crate) fn input_wait_redisplay_allowed(&self) -> bool {
+        !(self
+            .frames
+            .selected_frame()
+            .is_some_and(|frame| frame.initial)
+            && self
+                .variable_value_by_name("redisplay-skip-initial-frame")
+                .is_some_and(|value| value.is_truthy()))
     }
 
     /// Preserve the first mode-line non-local exit across a frontend callback.
@@ -1440,7 +1457,7 @@ impl Context {
 
     /// Generation of GNU `update_menu_bar` rebuild requests.
     pub fn menu_bar_rebuild_generation(&self) -> MenuBarRebuildGeneration {
-        MenuBarRebuildGeneration(self.menu_bar_rebuild_generation)
+        MenuBarRebuildGeneration(*self.menu_bar_rebuild_generation)
     }
 
     /// See the `context_instance_id` field.
@@ -1497,7 +1514,7 @@ impl Context {
     pub(crate) fn invalidate_redisplay(&mut self) {
         tracing::debug!(target: "neomacs::redisplay_sig", "invalidate_redisplay");
         self.redisplay_generation = self.redisplay_generation.wrapping_add(1);
-        self.last_redisplay_signature = None;
+        *self.last_redisplay_signature = None;
     }
 
     /// Record an explicit body redisplay request (GNU `Fforce_window_update`,
@@ -1557,7 +1574,7 @@ impl Context {
     /// Cross GNU `update_menu_bar`'s rebuild boundary and schedule redisplay.
     pub(crate) fn request_menu_bar_rebuild(&mut self, reason: MenuBarRebuildReason) {
         tracing::debug!(?reason, "request menu-bar rebuild");
-        self.menu_bar_rebuild_generation = self.menu_bar_rebuild_generation.wrapping_add(1);
+        *self.menu_bar_rebuild_generation = self.menu_bar_rebuild_generation.wrapping_add(1);
         self.invalidate_redisplay();
     }
 
@@ -1811,7 +1828,7 @@ impl Context {
             self.echo_area_resize_exact_pending = false;
             let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
         }
-        self.last_redisplay_signature = Some(self.redisplay_signature());
+        *self.last_redisplay_signature = Some(self.redisplay_signature());
         Ok(())
     }
 
@@ -2198,6 +2215,9 @@ impl Context {
                 let cap = (*heap_ptr).gc_threshold().saturating_mul(4);
                 let must_finish = (*heap_ptr).bytes_since_gc() > cap;
                 let mark_done = (*heap_ptr).concurrent_mark_done();
+                // A tentative done flag is sufficient to stop now. The
+                // stopped-world admission folds every owner's bounded partial;
+                // publishing it and waiting another poll only grows the window.
                 if mark_done || must_finish {
                     if must_finish && !mark_done {
                         // Cap-forced: the GC thread had NOT drained — the
@@ -2678,7 +2698,7 @@ impl Context {
             let hs = self.tagged_heap.handshake_stats();
             eprintln!(
                 "NEOVM_GC concurrent_termination {}us [roots={roots_us}us drain={drain_us}us \
-                 fold={}us deferred={} satb={} str_claimed={} f_claimed={} sub_dropped={} \
+                 fold={}us deferred={} satb={} partial_words={} str_claimed={} f_claimed={} sub_dropped={} \
                  v_claimed={} bc_claimed={} leaf_claimed={} ht_claimed={} kinds[{}] join={}us \
                  runtime={}us({}) remembered={}us({}) ctxroots={}us newsyms={newsyms_us}us({}) \
                  finalizer={}us weak={}us unchain={}us groups[{}] probes[{}]]",
@@ -2686,6 +2706,7 @@ impl Context {
                 stats.last_termination_fold_us,
                 stats.last_termination_deferred,
                 stats.last_termination_satb,
+                stats.last_termination_partial_words,
                 stats.last_concurrent_str_claimed,
                 stats.last_concurrent_float_claimed,
                 stats.last_concurrent_subr_dropped,
@@ -3132,15 +3153,15 @@ impl Context {
     }
 
     pub(crate) fn quit_char(&self) -> i64 {
-        self.quit_char
+        *self.quit_char
     }
 
     pub(crate) fn set_quit_char(&mut self, quit: i64) {
-        self.quit_char = quit & 0o377;
+        *self.quit_char = quit & 0o377;
     }
 
     pub(crate) fn event_is_quit_char(&self, event: &Value) -> bool {
-        event.as_fixnum() == Some(self.quit_char)
+        event.as_fixnum() == Some(*self.quit_char)
     }
 
     pub(crate) fn request_quit_from_keyboard_input(&mut self) {

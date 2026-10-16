@@ -524,10 +524,14 @@ pub(crate) fn install_defvaralias_state(
     ctx.obarray.make_special_id(state_change.alias_id);
     // `defvaralias` refused forwarded and buffer-local NEW-ALIAS cells
     // before this state change was built.
+    let old_owner_value = ctx.owner_alias_redirect_value(state_change.alias_id);
     let installed = ctx
         .obarray
         .make_alias(state_change.alias_id, state_change.base_id);
     debug_assert!(installed.is_ok(), "defvaralias checked the redirect");
+    if let Some(old_value) = old_owner_value {
+        ctx.finish_owner_alias_redirect(state_change.alias_id, old_value);
+    }
     ctx.obarray.make_special_id(state_change.base_id);
     ctx.mark_user_test_gc_settings_volatile_if_gc_symbol(state_change.alias_id);
     ctx.refresh_gc_runtime_settings_after_change_by_id(state_change.alias_id);
@@ -3251,7 +3255,7 @@ pub(crate) fn builtin_redirect_debugging_output(
 ) -> EvalResult {
     expect_args_range("redirect-debugging-output", &args, 1, 2)?;
     if args[0].is_nil() {
-        eval.debugging_output_file = None;
+        *eval.debugging_output_file_mut() = None;
         return Ok(Value::NIL);
     }
     let expanded =
@@ -3271,7 +3275,7 @@ pub(crate) fn builtin_redirect_debugging_output(
                 vec![Value::string(err.to_string())],
             )
         })?;
-    eval.debugging_output_file = Some(file);
+    *eval.debugging_output_file_mut() = Some(file);
     Ok(Value::NIL)
 }
 
@@ -6944,6 +6948,22 @@ pub(crate) fn builtin_make_finalizer(
 pub(crate) fn builtin_make_interpreted_closure(args: Vec<Value>) -> EvalResult {
     expect_args_range("make-interpreted-closure", &args, 3, 5)?;
     make_interpreted_closure_from_parts(&args[0], &args[1], &args[2], args.get(3), args.get(4))
+}
+
+/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+/// thread-local while its World's Baton holder runs, and in the World while
+/// it is parked; the Green runtime moves it at each park and resume, so
+/// every Lisp thread sees one value, as in GNU. (N-mutator mode needs shared
+/// storage instead: a recorded obligation.)
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new(300_i64)
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    let slot = slot.downcast_mut::<i64>().expect("carried World state");
+    LOSSAGE_SIZE.with(|size| std::mem::swap(&mut *size.borrow_mut(), slot));
 }
 
 #[cfg(test)]

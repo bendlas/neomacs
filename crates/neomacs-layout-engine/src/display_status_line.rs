@@ -768,7 +768,7 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
                     result
                         .value()
                         .as_utf8_str()
-                        .map(|s| &s[..s.len().min(120)])
+                        .map(|s| &s[..s.floor_char_boundary(120)])
                         .unwrap_or(""),
                     result.value().as_utf8_str().map(str::len).unwrap_or(0)
                 );
@@ -1379,7 +1379,7 @@ impl<'state, 'services, 'face> WindowChromeRowsRenderState<'state, 'services, 'f
                 image_scale_environment: request.image_scale_environment,
                 glyphless_table_bits: request.tty_glyphless_char_display.table_bits(),
                 automatic_composition,
-                face_change_count: self.evaluator.face_change_count,
+                face_change_count: self.evaluator.face_change_count(),
                 char_table_revision: neovm_core::window::CharTableLayoutRevision::current(),
                 media_generation: self.evaluator.media_generation(),
                 symbol_values,

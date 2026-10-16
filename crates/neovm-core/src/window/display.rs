@@ -558,8 +558,8 @@ impl crate::emacs_core::eval::Context {
             selection: crate::window::WindowLayoutSelectionState {
                 selected_frame: self.frames.selected_frame().map(|frame| frame.id),
                 frame_selected_window: frame.selected_window,
-                minibuffer_selected_window: self.minibuffer_selected_window,
-                active_minibuffer_window: self.active_minibuffer_window,
+                minibuffer_selected_window: (*self.minibuffer_selected_window),
+                active_minibuffer_window: (*self.active_minibuffer_window),
             },
             face_change_count: self.face_change_count,
             media_generation: self.media_generation(),
@@ -1282,4 +1282,23 @@ impl FrameManager {
             );
         }
     }
+}
+
+/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+/// thread-local while its World's Baton holder runs, and in the World while
+/// it is parked; the Green runtime moves it at each park and resume, so
+/// every Lisp thread sees one value, as in GNU. (N-mutator mode needs shared
+/// storage instead: a recorded obligation.)
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new((0_u64, 0_u64))
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    let slot = slot
+        .downcast_mut::<(u64, u64)>()
+        .expect("carried World state");
+    CHAR_TABLE_LAYOUT_MUTATION_EPOCH.with(|cell| slot.0 = cell.replace(slot.0));
+    WINDOW_PARAMETERS_LAYOUT_GENERATION.with(|cell| slot.1 = cell.replace(slot.1));
 }

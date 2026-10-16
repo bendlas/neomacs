@@ -700,7 +700,10 @@ pub struct CompiledLeaf {
     /// R1a: per-leaf heap-constant relocation vector. Generated code loads each
     /// heap-object constant from `reloc_data[idx]` through a baked base pointer
     /// instead of baking the tagged heap pointer as an immediate — so the code
-    /// holds NO heap pointer (GC-traceable here, AOT-portable). Fixnums + non-heap
+    /// normally holds no heap pointer (GC-traceable here, AOT-portable). A JIT
+    /// inline switch may rematerialize its nonmoving static table in cold code;
+    /// this vector still roots it, as it roots the directly addressed epoch.
+    /// AOT always retains slot loads. Fixnums + non-heap
     /// immediates (nil/t) stay baked. Traced as a GC root while the leaf is cached.
     pub(crate) reloc_data: Box<[Value]>,
     /// R1c-sidecar: per-(thread,leaf) base-pointer block the AOT code reads to
@@ -1203,6 +1206,10 @@ impl CompiledLeaf {
         out: &mut i64,
     ) -> i64 {
         debug_assert_eq!(self.entry_shape, EntryShape::RawMemory);
+        // Raw entries bypass invoke_native_frame. Test witnesses still need
+        // their exact native extent, including optimized test binaries.
+        #[cfg(test)]
+        let _native_depth = super::super::cache::NativeDepthGuard::enter();
         debug_assert!(
             self.dynamic_prefix == 0 || !consts.is_null(),
             "a dynamic-prefix leaf needs the callee's constant base"
@@ -1238,6 +1245,10 @@ impl CompiledLeaf {
         args_ptr: *const i64,
     ) -> super::reg_abi::NativeRet {
         debug_assert_eq!(self.entry_shape, EntryShape::RawRegister);
+        // Raw entries bypass invoke_native_frame. Test witnesses still need
+        // their exact native extent, including optimized test binaries.
+        #[cfg(test)]
+        let _native_depth = super::super::cache::NativeDepthGuard::enter();
         // SAFETY: the thunk of the entry's arity, and `args_ptr` addresses
         // that many words (the contract above).
         unsafe { (self.register_thunk)(self.entry, vmctx, consts.cast(), args_ptr) }

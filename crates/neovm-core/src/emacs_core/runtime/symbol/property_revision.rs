@@ -40,3 +40,22 @@ impl SymbolPropertyRevision {
         }
     }
 }
+
+/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
+/// thread-local while its World's Baton holder runs, and in the World while
+/// it is parked; the Green runtime moves it at each park and resume, so
+/// every Lisp thread sees one value, as in GNU. (N-mutator mode needs shared
+/// storage instead: a recorded obligation.)
+#[cold]
+pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
+    Box::new((0_u64, rustc_hash::FxHashSet::<SymId>::default()))
+}
+
+#[cold]
+pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
+    let slot = slot
+        .downcast_mut::<(u64, rustc_hash::FxHashSet<SymId>)>()
+        .expect("carried World state");
+    REVISION.with(|revision| slot.0 = revision.replace(slot.0));
+    OBSERVED.with(|observed| std::mem::swap(&mut *observed.borrow_mut(), &mut slot.1));
+}

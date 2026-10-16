@@ -91,6 +91,9 @@ pub enum ThreadStatus {
     Finished,
     /// Thread was terminated by an error / signal.
     Signaled,
+    /// A Green thread's function returned: GNU's thread is dead from then
+    /// on, joined or not (`thread_live_p`).
+    Exited,
 }
 
 /// Per-thread bookkeeping.
@@ -370,7 +373,7 @@ impl ThreadManager {
         self.threads.get(&id).is_some_and(|t| match t.status {
             ThreadStatus::Created | ThreadStatus::Running | ThreadStatus::Blocked => true,
             ThreadStatus::Finished => !t.joined,
-            ThreadStatus::Signaled => false,
+            ThreadStatus::Signaled | ThreadStatus::Exited => false,
         })
     }
 
@@ -527,6 +530,136 @@ impl ThreadManager {
 
     pub fn clear_thread_blocker(&mut self, id: u64) -> bool {
         self.set_thread_blocker(id, Value::NIL)
+    }
+
+    // -- Green threads (GNU's thread.c rules, threads really running) ------
+
+    /// Green thread ID's function returned (GNU's `run_thread` end).
+    pub fn mark_thread_exited(&mut self, id: u64) {
+        if let Some(thread) = self.threads.get_mut(&id) {
+            thread.status = ThreadStatus::Exited;
+        }
+    }
+
+    /// GNU `thread_set_error`: record SYMBOL and DATA for thread ID to raise
+    /// when it next runs (and for `thread-join` to re-raise), leaving its
+    /// status alone.
+    pub fn set_thread_error(&mut self, id: u64, symbol: Value, data: Value) {
+        if let Some(thread) = self.threads.get_mut(&id) {
+            thread.error_symbol = symbol;
+            thread.error_data = data;
+            thread.last_error = Some(Value::cons(symbol, data));
+        }
+    }
+
+    /// Take thread ID's pending error, as `(SYMBOL, DATA)`, leaving none.
+    pub fn take_thread_error(&mut self, id: u64) -> Option<(Value, Value)> {
+        let thread = self.threads.get_mut(&id)?;
+        if thread.error_symbol.is_nil() {
+            return None;
+        }
+        let symbol = std::mem::replace(&mut thread.error_symbol, Value::NIL);
+        let data = std::mem::replace(&mut thread.error_data, Value::NIL);
+        Some((symbol, data))
+    }
+
+    /// Make SYMBOL and DATA thread ID's pending error again, unless a newer
+    /// one is pending.
+    pub fn restore_thread_error(&mut self, id: u64, symbol: Value, data: Value) {
+        if let Some(thread) = self.threads.get_mut(&id)
+            && thread.error_symbol.is_nil()
+        {
+            thread.error_symbol = symbol;
+            thread.error_data = data;
+        }
+    }
+
+    /// Whether a live Green thread has not ended.
+    fn green_thread_live(thread: &ThreadState) -> bool {
+        matches!(
+            thread.status,
+            ThreadStatus::Created | ThreadStatus::Running | ThreadStatus::Blocked
+        )
+    }
+
+    /// GNU `thread_check_current_buffer`: whether a live thread other than
+    /// the current one has BUFFER current and keeps it alive (its buffer
+    /// disposition is t).
+    pub fn buffer_held_by_other_thread(&self, buffer: crate::buffer::BufferId) -> bool {
+        self.threads.values().any(|thread| {
+            thread.id != self.current_thread
+                && Self::green_thread_live(thread)
+                && thread.current_buffer == Some(buffer)
+                && thread.buffer_disposition.is_t()
+        })
+    }
+
+    /// Whether a live thread other than the current one has BUFFER current.
+    pub fn buffer_current_in_other_thread(&self, buffer: crate::buffer::BufferId) -> bool {
+        self.threads.values().any(|thread| {
+            thread.id != self.current_thread
+                && Self::green_thread_live(thread)
+                && thread.current_buffer == Some(buffer)
+        })
+    }
+
+    /// GNU `thread_all_before_buffer_killed`: every live thread other than
+    /// the current one whose current buffer is BUFFER moves to OTHER and is
+    /// signalled `thread-buffer-killed`, unless its buffer disposition is
+    /// `silently`.
+    pub fn move_threads_off_killed_buffer(
+        &mut self,
+        buffer: crate::buffer::BufferId,
+        other: crate::buffer::BufferId,
+    ) {
+        let current = self.current_thread;
+        for thread in self.threads.values_mut() {
+            if thread.id == current
+                || !Self::green_thread_live(thread)
+                || thread.current_buffer != Some(buffer)
+            {
+                continue;
+            }
+            if !thread.buffer_disposition.is_bare_symbol_named("silently") {
+                let symbol = Value::symbol("thread-buffer-killed");
+                thread.error_symbol = symbol;
+                thread.error_data = Value::NIL;
+                thread.last_error = Some(Value::cons(symbol, Value::NIL));
+            }
+            thread.current_buffer = Some(other);
+        }
+    }
+
+    /// GNU `lisp_mutex_unlock_for_wait`: release MUTEX-ID whatever its
+    /// count, returning the count.
+    pub fn mutex_unlock_for_wait(&mut self, mutex_id: u64) -> u32 {
+        let Some(mutex) = self.mutexes.get_mut(&mutex_id) else {
+            return 0;
+        };
+        debug_assert_eq!(mutex.owner, Some(self.current_thread));
+        mutex.owner = None;
+        std::mem::replace(&mut mutex.lock_count, 0)
+    }
+
+    /// GNU `lisp_mutex_lock_for_thread` with a saved count: take MUTEX-ID
+    /// with COUNT for the current thread if no thread holds it.
+    pub fn mutex_relock_after_wait(&mut self, mutex_id: u64, count: u32) -> bool {
+        let current = self.current_thread;
+        match self.mutexes.get_mut(&mutex_id) {
+            Some(mutex) if mutex.owner.is_none() => {
+                mutex.owner = Some(current);
+                mutex.lock_count = count.max(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether no thread holds MUTEX-ID.
+    pub fn mutex_free(&self, mutex_id: u64) -> bool {
+        self.mutexes
+            .get(&mutex_id)
+            .is_some_and(|mutex| mutex.owner.is_none())
     }
 
     // -- Mutex operations ---------------------------------------------------
@@ -798,7 +931,7 @@ fn split_signal_binding_value(value: Value) -> Option<(Value, Value)> {
 }
 
 /// Extract a thread id from a canonical thread handle object.
-fn expect_thread_id(manager: &ThreadManager, value: &Value) -> Result<u64, Flow> {
+pub(crate) fn expect_thread_id(manager: &ThreadManager, value: &Value) -> Result<u64, Flow> {
     match manager.thread_id_from_handle(value) {
         Some(id) => Ok(id),
         None => Err(signal(
@@ -839,21 +972,28 @@ fn expect_cv_id(manager: &ThreadManager, value: &Value) -> Result<u64, Flow> {
 /// In our single-threaded simulation the function is executed immediately.
 /// Returns a `(thread . ID)` object.
 pub(crate) fn builtin_make_thread(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+    // A Green World runs threads as owners on their own OS threads; the
+    // simulated exchange never runs beside admission.
+    if super::eval::green_world(eval) {
+        return super::eval::green_make_thread(eval, &args);
+    }
     let (thread_id, function) = prepare_make_thread(&mut eval.threads, &args)?;
     eval.threads
         .set_thread_current_buffer(thread_id, eval.buffers.current_buffer_id());
-    let runtime_state = match enter_thread_runtime(eval, thread_id) {
-        Ok(state) => state,
-        Err(flow) => {
-            eval.threads.discard_unstarted_thread(thread_id);
-            return Err(flow);
-        }
-    };
-    let result = eval.apply(function, vec![]);
-    let exit_result = exit_thread_runtime(eval, thread_id, runtime_state);
-    let thread_result = finish_make_thread_result(&mut eval.threads, thread_id, result);
-    exit_result?;
-    thread_result
+    eval.with_sim_creation_local_bindings(|eval| {
+        let runtime_state = match enter_thread_runtime(eval, thread_id) {
+            Ok(state) => state,
+            Err(flow) => {
+                eval.threads.discard_unstarted_thread(thread_id);
+                return Err(flow);
+            }
+        };
+        let result = eval.apply(function, vec![]);
+        let exit_result = exit_thread_runtime(eval, thread_id, runtime_state);
+        let thread_result = finish_make_thread_result(&mut eval.threads, thread_id, result);
+        exit_result?;
+        thread_result
+    })
 }
 
 pub(crate) fn prepare_make_thread(
@@ -991,6 +1131,9 @@ pub(crate) fn builtin_thread_join(
     ctx: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if ctx.green_threads_running() {
+        return ctx.green_thread_join(&args);
+    }
     expect_args("thread-join", &args, 1)?;
     let id = expect_thread_id(&ctx.threads, &args[0])?;
     if !ctx.threads.is_thread(id) {
@@ -1061,6 +1204,9 @@ pub(crate) fn builtin_thread_yield(
     ctx: &mut crate::emacs_core::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if ctx.green_threads_running() {
+        return ctx.green_thread_yield(&args);
+    }
     expect_args("thread-yield", &args, 0)?;
     if ctx.threads.current_thread_id() != 0 {
         return Err(Flow::thread_blocked(
@@ -1145,6 +1291,9 @@ pub(crate) fn builtin_thread_signal(
     let data = args[2];
     if id == ctx.threads.current_thread_id() {
         return Err(signal_with_data_id(error_symbol_id, data));
+    }
+    if ctx.green_threads_running() {
+        return ctx.green_thread_signal(id, error_symbol, data);
     }
     ctx.threads
         .signal_thread(id, Value::cons(error_symbol, data));
@@ -1328,6 +1477,9 @@ pub(crate) fn builtin_mutex_lock(
             vec![Value::symbol("mutexp"), args[0]],
         ));
     }
+    if ctx.green_threads_running() {
+        return ctx.green_mutex_lock(id, args[0]);
+    }
     if !ctx.threads.mutex_lock(id) {
         return Err(Flow::thread_blocked(args[0], Value::NIL));
     }
@@ -1355,6 +1507,9 @@ pub(crate) fn builtin_mutex_unlock(
             "error",
             vec![Value::string("Cannot unlock mutex owned by another thread")],
         ));
+    }
+    if ctx.green_threads_running() {
+        return ctx.green_mutex_unlock(id);
     }
     ctx.threads.mutex_unlock(id);
     ctx.threads.wake_threads_blocked_on(args[0]);
@@ -1501,6 +1656,9 @@ pub(crate) fn builtin_condition_wait(
             )],
         ));
     }
+    if ctx.green_threads_running() {
+        return ctx.green_condition_wait(id, mutex_id, args[0]);
+    }
     Ok(Value::NIL)
 }
 
@@ -1541,6 +1699,9 @@ pub(crate) fn builtin_condition_notify(
                 "Condition variable's mutex is not held by current thread",
             )],
         ));
+    }
+    if ctx.green_threads_running() {
+        return ctx.green_condition_notify(id, args.get(1).is_some_and(|all| all.is_truthy()));
     }
     Ok(Value::NIL)
 }

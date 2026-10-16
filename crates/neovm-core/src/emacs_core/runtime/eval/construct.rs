@@ -15,6 +15,73 @@ pub(super) enum ConstructionSurface {
     MinimalVm,
 }
 
+/// A Context's execution state that is not a World view: what a new owner
+/// is built from, at startup or (a Green owner) from its World's bootstrap.
+pub(super) struct ExecutionSeed {
+    pub(super) core_eval_symbols: CoreEvalSymbols,
+    pub(super) custom: CustomManager,
+    pub(super) standard_syntax_table: Value,
+    pub(super) syntax_code_objects: Value,
+    pub(super) standard_category_table: Value,
+    pub(super) noninteractive: bool,
+    pub(super) symbols_with_pos_enabled: bool,
+    pub(super) print_symbols_bare: bool,
+    pub(super) compiler_function_overrides_active: bool,
+    pub(super) quit_flag: Value,
+    pub(super) inhibit_quit: Value,
+    pub(super) throw_on_input: Value,
+    pub(super) registries: RegistryHandles,
+}
+
+/// The canonical registry handles a Context installs into its thread's
+/// thread-locals (`setup_thread_locals`).
+#[derive(Clone)]
+pub(super) struct RegistryHandles {
+    pub(super) ccl: super::super::ccl::CclRegistryHandle,
+    pub(super) charset: super::super::charset::CharsetRegistryHandle,
+    pub(super) font: super::super::xfaces::FontRegistryHandle,
+    pub(super) terminal: super::super::terminal::pure::TerminalRegistryHandle,
+    pub(super) hash_table_test: super::super::builtins::HashTableTestRegistryHandle,
+    pub(super) file_notify: super::super::builtins::FileNotifyRegistryHandle,
+    pub(super) window_configuration: super::super::builtins::WindowConfigurationRegistryHandle,
+    pub(super) dynamic_module: super::super::dynamic_module::DynamicModuleRegistryHandle,
+    pub(super) in_flight: super::super::error::InFlightRegistryHandle,
+}
+
+impl RegistryHandles {
+    /// This thread's current handles, in the order startup always read them.
+    pub(super) fn current() -> Self {
+        Self {
+            ccl: super::super::ccl::current_ccl_registry_handle(),
+            charset: super::super::charset::current_charset_registry_handle(),
+            font: super::super::xfaces::current_font_registry_handle(),
+            terminal: super::super::terminal::pure::current_terminal_registry_handle(),
+            hash_table_test: super::super::builtins::current_hash_table_test_registry_handle(),
+            file_notify: super::super::builtins::current_file_notify_registry_handle(),
+            window_configuration:
+                super::super::builtins::current_window_configuration_registry_handle(),
+            dynamic_module: super::super::dynamic_module::current_dynamic_module_registry_handle(),
+            in_flight: super::super::error::current_in_flight_registry_handle(),
+        }
+    }
+
+    /// A Context's handles.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn of(ctx: &Context) -> Self {
+        Self {
+            ccl: ctx.ccl_registry.clone(),
+            charset: ctx.charset_registry.clone(),
+            font: ctx.font_registry.clone(),
+            terminal: ctx.terminal_registry.clone(),
+            hash_table_test: ctx.hash_table_test_registry.clone(),
+            file_notify: ctx.file_notify_registry.clone(),
+            window_configuration: ctx.window_configuration_registry.clone(),
+            dynamic_module: ctx.dynamic_module_registry.clone(),
+            in_flight: ctx.in_flight_registry.clone(),
+        }
+    }
+}
+
 impl Context {
     pub fn new() -> Self {
         let mut ctx = Self::new_inner(ConstructionSurface::Full);
@@ -76,28 +143,28 @@ impl Context {
         ev.load_read_cursors.clear();
         ev.last_uncaught_signal_backtrace = None;
         ev.buffers.reset_for_minimal_runtime();
-        ev.xwidgets = super::super::xwidget::XwidgetState::new();
+        *ev.xwidgets = super::super::xwidget::XwidgetState::new();
         ev.last_overlay_modification_hooks.clear();
         ev.interval_insert_behind_hooks = Value::NIL;
         ev.interval_insert_in_front_hooks = Value::NIL;
         ev.match_data = None;
-        ev.processes = ProcessManager::new();
+        *ev.processes = ProcessManager::new();
         *ev.watchers = VariableWatcherList::new();
         ev.current_local_map = Value::NIL;
-        ev.selected_global_map = super::super::keymap::SelectedGlobalMap::default();
-        ev.registers = RegisterManager::new();
-        ev.bookmarks = BookmarkManager::new();
-        ev.abbrevs = AbbrevManager::new();
+        *ev.selected_global_map = super::super::keymap::SelectedGlobalMap::default();
+        *ev.registers = RegisterManager::new();
+        *ev.bookmarks = BookmarkManager::new();
+        *ev.abbrevs = AbbrevManager::new();
         *ev.autoloads = AutoloadManager::new();
         ev.custom = CustomManager::new();
-        ev.rectangle = RectangleState::new();
-        ev.interactive = InteractiveRegistry::new();
-        ev.input_mode_interrupt = false;
+        *ev.rectangle = RectangleState::new();
+        *ev.interactive = InteractiveRegistry::new();
+        ev.set_input_mode_interrupt_flag(false);
         *ev.frames = lisp_frame_manager();
-        ev.modes = ModeRegistry::new();
-        ev.threads = ThreadManager::new();
-        ev.kmacro = KmacroManager::new();
-        ev.command_loop = crate::keyboard::CommandLoop::default();
+        *ev.modes = ModeRegistry::new();
+        *ev.threads = ThreadManager::new();
+        *ev.kmacro = KmacroManager::new();
+        *ev.command_loop = crate::keyboard::CommandLoop::default();
         ev.input_rx = None;
         ev.eval_task_rx = None;
         ev.redisplay_fn = None;
@@ -111,16 +178,16 @@ impl Context {
         ev.scroll_goal = None;
         ev.display_host = None;
         *ev.coding_systems = CodingSystemManager::new();
-        ev.face_table = FaceTable::new();
+        *ev.face_table = FaceTable::new();
         ev.face_change_count = 0;
         ev.display_var_change_count = 0;
         ev.redisplay_generation = 0;
         ev.body_redisplay_all = 0;
         ev.body_redisplay_by_window.clear();
         ev.body_redisplay_by_buffer.clear();
-        ev.menu_bar_rebuild_generation = 0;
+        *ev.menu_bar_rebuild_generation = 0;
         ev.media_generation = 0;
-        ev.last_redisplay_signature = None;
+        *ev.last_redisplay_signature = None;
         ev.depth = 0;
         ev.max_depth = 1600;
         ev.gc_pending = false;
@@ -2021,6 +2088,198 @@ impl Context {
         obarray.define_special_variable("x-show-tooltip-timeout", Value::fixnum(5));
     }
 
+    /// A Context over the World views READY, with SEED's execution state
+    /// and every owner-private manager fresh.
+    pub(super) fn assemble(world: world::ReadyWorld, seed: ExecutionSeed) -> Self {
+        Self {
+            integer_width_context: Default::default(),
+            owned_roots: world.owned_roots,
+            tagged_heap: world.tagged_heap,
+            pdump_image: None,
+            after_pdump_load_hook_pending: false,
+            cached_system_name: world.global.cached_system_name,
+            obarray: world.obarray,
+            window_edge_drag: crate::emacs_core::window_edge_drag::WindowEdgeDrag::default(),
+            specpdl: Vec::new(),
+            suspended_thread_bindings: Vec::new(),
+            profiler: super::super::profiler::ProfilerState::default(),
+            lexenv: Value::NIL,
+            internal_interpreter_environment_symbol: seed
+                .core_eval_symbols
+                .internal_interpreter_environment_symbol,
+            load_read_stream_token: seed.core_eval_symbols.load_read_stream_token,
+            quit_flag_symbol: seed.core_eval_symbols.quit_flag_symbol,
+            inhibit_quit_symbol: seed.core_eval_symbols.inhibit_quit_symbol,
+            throw_on_input_symbol: seed.core_eval_symbols.throw_on_input_symbol,
+            kill_emacs_symbol: seed.core_eval_symbols.kill_emacs_symbol,
+            quit_flag: seed.quit_flag,
+            inhibit_quit: seed.inhibit_quit,
+            throw_on_input: seed.throw_on_input,
+            attention: attention::attention_of(
+                seed.quit_flag,
+                seed.throw_on_input,
+                seed.compiler_function_overrides_active,
+            ),
+            unwind_cleanup_depth: 0,
+            noninteractive_symbol: seed.core_eval_symbols.noninteractive_symbol,
+            noninteractive: seed.noninteractive,
+            symbols_with_pos_enabled_symbol: seed.core_eval_symbols.symbols_with_pos_enabled_symbol,
+            symbols_with_pos_enabled: seed.symbols_with_pos_enabled,
+            print_symbols_bare_symbol: seed.core_eval_symbols.print_symbols_bare_symbol,
+            runtime_projection_mask: seed.core_eval_symbols.runtime_projection_mask,
+            print_symbols_bare: seed.print_symbols_bare,
+            features: world.features,
+            require_stack: Vec::new(),
+            loads_in_progress: Vec::new(),
+            load_read_cursors: Vec::new(),
+            last_uncaught_signal_backtrace: None,
+            buffers: world.buffers,
+            xwidgets: world.global.xwidgets,
+            last_overlay_modification_hooks: Vec::new(),
+            interval_insert_behind_hooks: Value::NIL,
+            interval_insert_in_front_hooks: Value::NIL,
+            match_data: None,
+            combine_after_change_list: Vec::new(),
+            combine_after_change_buffer: None,
+            _reserved_message_log_need_newline: false,
+            processes: world.global.processes,
+            watchers: world.watchers,
+            active_variable_watchers: world.active_variable_watchers,
+            standard_syntax_table: seed.standard_syntax_table,
+            syntax_code_objects: seed.syntax_code_objects,
+            standard_category_table: seed.standard_category_table,
+            current_local_map: Value::NIL,
+            selected_global_map: world.global.selected_global_map,
+            registers: world.global.registers,
+            bookmarks: world.global.bookmarks,
+            abbrevs: world.global.abbrevs,
+            autoloads: world.autoloads,
+            custom: seed.custom,
+            rectangle: world.global.rectangle,
+            interactive: world.global.interactive,
+            treesit: world.treesit,
+            minibuffers: world.global.minibuffers,
+            interactive_minibuffer_read_count: world.global.interactive_minibuffer_read_count,
+            current_message: world.global.current_message,
+            echo_area_buffers: world.global.echo_area_buffers,
+            echo_area_resize_exact_pending: false,
+            _reserved_debugging_output_file: None,
+            _reserved_message_buf_print: false,
+            minibuffer_selected_window: world.global.minibuffer_selected_window,
+            active_minibuffer_window: world.global.active_minibuffer_window,
+            shutdown_request: None,
+            shutdown_in_progress: false,
+            daemon: world.global.daemon,
+            _reserved_input_mode_interrupt: true,
+            quit_char: world.global.quit_char,
+            waiting_for_user_input: false,
+            frames: world.frames,
+            modes: world.global.modes,
+            threads: world.global.threads,
+            kmacro: world.global.kmacro,
+            command_loop: world.global.command_loop,
+            input_rx: None,
+            eval_task_rx: None,
+            quit_requested: QuitRequest::new(),
+            redisplay_fn: None,
+            mode_line_display_flow: None,
+            redisplay_prepare_fn: None,
+            font_shape_fn: None,
+            gstring_shape_cache: world.global.gstring_shape_cache,
+            display_idle_maintenance_fn: None,
+            scroll_preview_fn: None,
+            frame_snapshot_fn: None,
+            window_layout_query_adapter: WindowLayoutQueryAdapter::Unavailable,
+            scroll_goal: None,
+            display_host: None,
+            tty_frame_host_factory: None,
+            visual_config: neomacs_display_protocol::VisualConfig::default(),
+            pending_menu_bar_popup_anchor: None,
+            coding_systems: world.coding_systems,
+            code_conversion_workspace:
+                crate::code_conversion_workspace::CodeConversionWorkspace::default(),
+            face_table: world.global.face_table,
+            face_change_count: 0,
+            materialized_face_table_source: world.global.materialized_face_table_source,
+            display_var_change_count: 0,
+            input_progress: Default::default(),
+            redisplay_generation: 0,
+            body_redisplay_all: 0,
+            body_redisplay_by_window: FxHashMap::default(),
+            body_redisplay_by_buffer: FxHashMap::default(),
+            menu_bar_rebuild_generation: world.global.menu_bar_rebuild_generation,
+            chrome_dirty: Default::default(),
+            gnu_redisplay_hooks: redisplay_hooks::RedisplayHookOwnership::initial(),
+            context_instance_id: next_context_instance_id(),
+            media_generation: 0,
+            last_redisplay_signature: world.global.last_redisplay_signature,
+            depth: 0,
+            eval_counter: 0,
+            max_depth: 1600,
+            gc_pending: false,
+            gc_count: 0,
+            last_activation_thread: None,
+            gc_inhibit_depth: 0,
+            gc_driver_active: false,
+            gc_stress: gc_stress_from_env(),
+            gc_runtime_settings_cache: GcRuntimeSettingsCache::default(),
+            vm_root_frames: Vec::new(),
+            backtrace_args_stack: Vec::new(),
+            eval_temp_roots: Vec::new(),
+            eval_call_roots: Vec::new(),
+            sequence_temp_root_frames: Vec::new(),
+            bc_buf: Vec::with_capacity(4096),
+            jit_root_stack: Vec::new(),
+            jit_root_stack_ptr: std::ptr::null_mut(),
+            jit_root_stack_top: 0,
+            jit_root_stack_cap: 0,
+            jit_stack_limit: 0,
+            jit_stack_scratch: [0; super::native_stack::JIT_STACK_SCRATCH_WORDS],
+            bc_frames: Vec::new(),
+            condition_stack: Vec::new(),
+            next_resume_id: 1,
+            pending_safe_funcalls: world.global.pending_safe_funcalls,
+            compiler_function_overrides_symbol: seed
+                .core_eval_symbols
+                .compiler_function_overrides_symbol,
+            compiler_function_overrides_active: seed.compiler_function_overrides_active,
+            symbol_bytecode_call_cache:
+                crate::emacs_core::bytecode::vm::SymbolByteCodeCallCache::new(),
+            interpreter_stacks: crate::emacs_core::bytecode::vm::InterpreterStackPool::new(),
+            jit_bind_stack: Vec::new(),
+            owner: owner_bindings::OwnerSlot::DORMANT,
+            apply_fast_path_epoch: std::cell::Cell::new(u64::MAX),
+            named_call_cache: FxHashMap::with_capacity_and_hasher(
+                NAMED_CALL_CACHE_CAPACITY,
+                Default::default(),
+            ),
+            form_head_cache: FormHeadCache::default(),
+            lexenv_assq_cache: LexenvAssqCache::default(),
+            lexenv_special_cache: LexenvSpecialCache::default(),
+
+            macro_expansion_scope_depth: 0,
+            macro_expansion_mutation_epoch: 0,
+            macro_expand_calls: 0,
+            macro_expand_total_us: 0,
+            macro_perf_enabled: std::env::var_os("NEOVM_TRACE_MACRO_PERF").is_some(),
+            macro_perf_stats: world.macro_perf_stats,
+            interpreted_closure_filter_fn: None,
+            cconv_memo: cconv_memo::CconvMemo::from_env(),
+            tier_i: tier_i::TierI::from_env(),
+            fringe_bitmaps: world.global.fringe_bitmaps,
+            ccl_registry: seed.registries.ccl,
+            charset_registry: seed.registries.charset,
+            font_registry: seed.registries.font,
+            terminal_registry: seed.registries.terminal,
+            hash_table_test_registry: seed.registries.hash_table_test,
+            file_notify_registry: seed.registries.file_notify,
+            window_configuration_registry: seed.registries.window_configuration,
+            dynamic_module_registry: seed.registries.dynamic_module,
+            in_flight_registry: seed.registries.in_flight,
+            cached_standard_case_table: None,
+        }
+    }
+
     pub(super) fn new_inner(surface: ConstructionSurface) -> Self {
         // Create the heap and set thread-locals so tagged constructors work
         // during evaluator initialization.
@@ -2232,199 +2491,28 @@ impl Context {
             coding_systems: CodingSystemManager::new(),
             macro_perf_stats: MacroPerfStats::default(),
             buffers: world_buffers,
+            global: super::global_state::GlobalState::fresh(command_loop),
             // Prepare allocation-capable managers before retiring the old TLS
             // installation. The closed factory reinstalls the final view.
             tagged_heap,
         }
         .build();
-        let mut ev = Self {
-            integer_width_context: Default::default(),
-            owned_roots: world.owned_roots,
-            tagged_heap: world.tagged_heap,
-            pdump_image: None,
-            after_pdump_load_hook_pending: false,
-            cached_system_name: Value::NIL,
-            obarray: world.obarray,
-            window_edge_drag: crate::emacs_core::window_edge_drag::WindowEdgeDrag::default(),
-            specpdl: Vec::new(),
-            suspended_thread_bindings: Vec::new(),
-            profiler: super::super::profiler::ProfilerState::default(),
-            lexenv: Value::NIL,
-            internal_interpreter_environment_symbol: core_eval_symbols
-                .internal_interpreter_environment_symbol,
-            load_read_stream_token: core_eval_symbols.load_read_stream_token,
-            quit_flag_symbol: core_eval_symbols.quit_flag_symbol,
-            inhibit_quit_symbol: core_eval_symbols.inhibit_quit_symbol,
-            throw_on_input_symbol: core_eval_symbols.throw_on_input_symbol,
-            kill_emacs_symbol: core_eval_symbols.kill_emacs_symbol,
-            quit_flag,
-            inhibit_quit,
-            throw_on_input,
-            attention: attention::attention_of(
-                quit_flag,
-                throw_on_input,
-                compiler_function_overrides_active,
-            ),
-            unwind_cleanup_depth: 0,
-            noninteractive_symbol: core_eval_symbols.noninteractive_symbol,
-            noninteractive,
-            symbols_with_pos_enabled_symbol: core_eval_symbols.symbols_with_pos_enabled_symbol,
-            symbols_with_pos_enabled,
-            print_symbols_bare_symbol: core_eval_symbols.print_symbols_bare_symbol,
-            runtime_projection_mask: core_eval_symbols.runtime_projection_mask,
-            print_symbols_bare,
-            features: world.features,
-            require_stack: Vec::new(),
-            loads_in_progress: Vec::new(),
-            load_read_cursors: Vec::new(),
-            last_uncaught_signal_backtrace: None,
-            buffers: world.buffers,
-            xwidgets: super::super::xwidget::XwidgetState::new(),
-            last_overlay_modification_hooks: Vec::new(),
-            interval_insert_behind_hooks: Value::NIL,
-            interval_insert_in_front_hooks: Value::NIL,
-            match_data: None,
-            combine_after_change_list: Vec::new(),
-            combine_after_change_buffer: None,
-            message_log_need_newline: false,
-            processes: ProcessManager::new(),
-            watchers: world.watchers,
-            active_variable_watchers: world.active_variable_watchers,
+        let seed = ExecutionSeed {
+            core_eval_symbols,
+            custom,
             standard_syntax_table,
             syntax_code_objects,
             standard_category_table,
-            current_local_map: Value::NIL,
-            selected_global_map: super::super::keymap::SelectedGlobalMap::default(),
-            registers: RegisterManager::new(),
-            bookmarks: BookmarkManager::new(),
-            abbrevs: AbbrevManager::new(),
-            autoloads: world.autoloads,
-            custom,
-            rectangle: RectangleState::new(),
-            interactive: InteractiveRegistry::new(),
-            treesit: world.treesit,
-            minibuffers: MinibufferManager::new(),
-            interactive_minibuffer_read_count: 0,
-            current_message: None,
-            echo_area_buffers: EchoAreaBuffers::default(),
-            echo_area_resize_exact_pending: false,
-            debugging_output_file: None,
-            message_buf_print: false,
-            minibuffer_selected_window: None,
-            active_minibuffer_window: None,
-            shutdown_request: None,
-            shutdown_in_progress: false,
-            daemon: None,
-            input_mode_interrupt: true,
-            quit_char: 7,
-            waiting_for_user_input: false,
-            frames: world.frames,
-            modes: ModeRegistry::new(),
-            threads: ThreadManager::new(),
-            kmacro: KmacroManager::new(),
-            command_loop,
-            input_rx: None,
-            eval_task_rx: None,
-            quit_requested: QuitRequest::new(),
-            redisplay_fn: None,
-            mode_line_display_flow: None,
-            redisplay_prepare_fn: None,
-            font_shape_fn: None,
-            gstring_shape_cache: HashMap::new(),
-            display_idle_maintenance_fn: None,
-            scroll_preview_fn: None,
-            frame_snapshot_fn: None,
-            window_layout_query_adapter: WindowLayoutQueryAdapter::Unavailable,
-            scroll_goal: None,
-            display_host: None,
-            tty_frame_host_factory: None,
-            visual_config: neomacs_display_protocol::VisualConfig::default(),
-            pending_menu_bar_popup_anchor: None,
-            coding_systems: world.coding_systems,
-            code_conversion_workspace:
-                crate::code_conversion_workspace::CodeConversionWorkspace::default(),
-            face_table: FaceTable::new(),
-            face_change_count: 0,
-            materialized_face_table_source: None,
-            display_var_change_count: 0,
-            input_progress: Default::default(),
-            redisplay_generation: 0,
-            body_redisplay_all: 0,
-            body_redisplay_by_window: FxHashMap::default(),
-            body_redisplay_by_buffer: FxHashMap::default(),
-            menu_bar_rebuild_generation: 0,
-            chrome_dirty: Default::default(),
-            gnu_redisplay_hooks: redisplay_hooks::RedisplayHookOwnership::initial(),
-            context_instance_id: next_context_instance_id(),
-            media_generation: 0,
-            last_redisplay_signature: None,
-            depth: 0,
-            eval_counter: 0,
-            max_depth: 1600,
-            gc_pending: false,
-            gc_count: 0,
-            last_activation_thread: None,
-            gc_inhibit_depth: 0,
-            gc_driver_active: false,
-            gc_stress: gc_stress_from_env(),
-            gc_runtime_settings_cache: GcRuntimeSettingsCache::default(),
-            vm_root_frames: Vec::new(),
-            backtrace_args_stack: Vec::new(),
-            eval_temp_roots: Vec::new(),
-            eval_call_roots: Vec::new(),
-            sequence_temp_root_frames: Vec::new(),
-            bc_buf: Vec::with_capacity(4096),
-            jit_root_stack: Vec::new(),
-            jit_root_stack_ptr: std::ptr::null_mut(),
-            jit_root_stack_top: 0,
-            jit_root_stack_cap: 0,
-            jit_stack_limit: 0,
-            jit_stack_scratch: [0; super::native_stack::JIT_STACK_SCRATCH_WORDS],
-            bc_frames: Vec::new(),
-            condition_stack: Vec::new(),
-            next_resume_id: 1,
-            pending_safe_funcalls: Vec::new(),
-            compiler_function_overrides_symbol: core_eval_symbols
-                .compiler_function_overrides_symbol,
+            noninteractive,
+            symbols_with_pos_enabled,
+            print_symbols_bare,
             compiler_function_overrides_active,
-            symbol_bytecode_call_cache:
-                crate::emacs_core::bytecode::vm::SymbolByteCodeCallCache::new(),
-            interpreter_stacks: crate::emacs_core::bytecode::vm::InterpreterStackPool::new(),
-            jit_bind_stack: Vec::new(),
-            owner: owner_bindings::OwnerSlot::DORMANT,
-            apply_fast_path_epoch: std::cell::Cell::new(u64::MAX),
-            named_call_cache: FxHashMap::with_capacity_and_hasher(
-                NAMED_CALL_CACHE_CAPACITY,
-                Default::default(),
-            ),
-            form_head_cache: FormHeadCache::default(),
-            lexenv_assq_cache: LexenvAssqCache::default(),
-            lexenv_special_cache: LexenvSpecialCache::default(),
-
-            macro_expansion_scope_depth: 0,
-            macro_expansion_mutation_epoch: 0,
-            macro_expand_calls: 0,
-            macro_expand_total_us: 0,
-            macro_perf_enabled: std::env::var_os("NEOVM_TRACE_MACRO_PERF").is_some(),
-            macro_perf_stats: world.macro_perf_stats,
-            interpreted_closure_filter_fn: None,
-            cconv_memo: cconv_memo::CconvMemo::from_env(),
-            tier_i: tier_i::TierI::from_env(),
-            fringe_bitmaps: super::super::builtins::fringe_bitmap::FringeBitmapRegistry::new(),
-            ccl_registry: super::super::ccl::current_ccl_registry_handle(),
-            charset_registry: super::super::charset::current_charset_registry_handle(),
-            font_registry: super::super::xfaces::current_font_registry_handle(),
-            terminal_registry: super::super::terminal::pure::current_terminal_registry_handle(),
-            hash_table_test_registry:
-                super::super::builtins::current_hash_table_test_registry_handle(),
-            file_notify_registry: super::super::builtins::current_file_notify_registry_handle(),
-            window_configuration_registry:
-                super::super::builtins::current_window_configuration_registry_handle(),
-            dynamic_module_registry:
-                super::super::dynamic_module::current_dynamic_module_registry_handle(),
-            in_flight_registry: super::super::error::current_in_flight_registry_handle(),
-            cached_standard_case_table: None,
+            quit_flag,
+            inhibit_quit,
+            throw_on_input,
+            registries: RegistryHandles::current(),
         };
+        let mut ev = Self::assemble(world, seed);
         super::super::runtime_identity::install(&mut ev);
         match surface {
             ConstructionSurface::Full => {
@@ -2441,5 +2529,27 @@ impl Context {
             ConstructionSurface::MinimalVm => {}
         }
         ev
+    }
+}
+
+/// The evaluator leases its World-owned `TaggedHeap` allocation and publishes a raw
+/// pointer to it in the thread-local allocation slot (`setup_thread_locals` /
+/// the constructors). That publication has no lifetime tied to the box, so the
+/// owner must retract it: without this hook the slot outlived the storage and
+/// the next `Value::` constructor on the thread allocated into freed memory.
+///
+/// Retraction is by pointer identity, so a thread that has since installed a
+/// different evaluator's heap keeps that newer installation. Once the slot is
+/// empty the next allocation re-derives one (the `cfg(test)` fallback heap) or
+/// panics loudly in production, rather than corrupting silently.
+impl Drop for Context {
+    fn drop(&mut self) {
+        // A Green World's main thread ends its other threads first.
+        self.green_teardown();
+        super::super::dynamic_module::retire_dynamic_module_registry(&self.dynamic_module_registry);
+        // Context is !Send, pinned by thread contracts, so Drop stays on its
+        // owner thread. Retain upstream policy retirement as defence in depth.
+        self.integer_width_context.retire();
+        crate::tagged::gc::clear_tagged_heap_if_installed(&self.tagged_heap);
     }
 }

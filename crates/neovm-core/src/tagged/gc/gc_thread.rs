@@ -56,9 +56,7 @@ pub(super) struct ConcurrentMarkJob {
     /// block arithmetic; others (mapped/dump, or new blocks) are deferred.
     pub(super) claims: ConcurrentClaimJob,
     /// Overwritten children appended by the mutator's SATB barrier; drained here.
-    pub(super) satb: SharedMarkQueue,
-    /// Non-cons / non-owned-cons values to trace at the STW termination.
-    pub(super) deferred: SharedMarkQueue,
+    pub(super) satb: std::sync::Arc<SatbHandoff>,
     /// Set when gray + SATB are drained (tentatively done); polled by the mutator.
     pub(super) done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by the mutator to ask this loop to exit.
@@ -194,8 +192,11 @@ impl ConcurrentClaimJob {
 /// Owned worker result, sent only after the last heap/snapshot read.
 /// Headers remain live and non-moving until the coordinator joins the worker;
 /// addresses are never dereferenced after the old/young sweep starts.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct ConcurrentMarkResult {
+    /// Marker-owned work that the stopped mutators trace after receiving this result.
+    /// Only this worker appends; the completion channel transfers ownership.
+    pub(super) deferred: Vec<MarkWord>,
     pub(super) promo: Vec<usize>,
     pub(super) symbols: Vec<SymId>,
 }
@@ -342,53 +343,142 @@ pub(super) enum GcRequest {
     ConcurrentMarkEnabled(Box<EnabledConcurrentMarkJob>),
 }
 
-// The base's ordinary-build sizes (b40: ts7's VectorScanSnapshot carries its
-// heap identity, 8 bytes more than the original 416-byte job). The ON box must
-// preserve these layouts, including the actual channel enum's niche choice.
+// Ordinary-build worker sizes after moving the shared deferred Arc out of
+// the job and adding its owned Vec to the result. The enabled extension stays
+// boxed, so it cannot widen the legacy channel payload or its niche choice.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 const _: () = {
     assert!(size_of::<PageSnapshot>() == 160);
     assert!(size_of::<ConcurrentClaimJob>() == 224);
-    assert!(size_of::<ConcurrentMarkJob>() == 424);
-    assert!(size_of::<GcRequest>() == 424);
-    assert!(size_of::<WorkerMarkLogs>() == 80);
+    assert!(size_of::<ConcurrentMarkJob>() == 416);
+    assert!(size_of::<GcRequest>() == 416);
+    assert!(size_of::<WorkerMarkLogs>() == 104);
 };
 
-pub(super) static GC_THREAD: std::sync::OnceLock<
-    std::sync::Mutex<std::sync::mpsc::Sender<GcRequest>>,
-> = std::sync::OnceLock::new();
+/// The name of every collector thread. Thread names need not be unique: a
+/// process with one heap looks as it did with the single process collector,
+/// and measurement tools keep matching it. The heap identity lives in the
+/// registry and in the `neovm::gc` trace events.
+pub(crate) const COLLECTOR_THREAD_NAME: &str = "neovm-gc";
 
-/// Lazily spawn the process-global GC thread and return its request channel.
-/// The thread lives for the process; it loops draining requests.
-pub(super) fn gc_thread() -> std::sync::MutexGuard<'static, std::sync::mpsc::Sender<GcRequest>> {
-    GC_THREAD
-        .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<GcRequest>();
-            std::thread::Builder::new()
-                .name("neovm-gc".to_string())
-                .spawn(move || {
-                    while let Ok(req) = rx.recv() {
-                        match req {
-                            GcRequest::MarkAll(HeapPtr(p), done) => {
-                                // Exclusive access: the mutator is blocked on
-                                // `done` until we signal.
-                                unsafe { (*p).mark_all() };
-                                let _ = done.send(());
-                            }
-                            GcRequest::ConcurrentMark(job) => {
-                                run_concurrent_mark(job);
-                            }
-                            GcRequest::ConcurrentMarkEnabled(job) => {
-                                run_concurrent_mark_enabled(*job);
-                            }
-                        }
-                    }
-                })
-                .expect("spawn neovm-gc thread");
-            std::sync::Mutex::new(tx)
-        })
+/// One heap's collector: the request channel of its thread and the thread
+/// itself. Each collector serves one heap in FIFO order, so a concurrent job
+/// another heap leaves running cannot hold up this heap's requests (two
+/// Worlds on one OS thread used to deadlock on the single process
+/// collector).
+struct Collector {
+    requests: std::sync::mpsc::Sender<GcRequest>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Collector {
+    /// Spawn `heap`'s collector. Like the process collector it replaces, it
+    /// is spawned by the heap's first GC request, so it inherits that
+    /// mutator's CPU affinity mask and default thread settings.
+    fn spawn(heap: HeapIdentity) -> Self {
+        let (requests, rx) = std::sync::mpsc::channel::<GcRequest>();
+        let thread = std::thread::Builder::new()
+            .name(COLLECTOR_THREAD_NAME.to_owned())
+            .spawn(move || serve_gc_requests(rx))
+            .expect("spawn neovm-gc thread");
+        tracing::debug!(target: "neovm::gc", heap = heap.get(), "collector spawned");
+        Self { requests, thread }
+    }
+}
+
+/// The collector's loop: drain requests until the heap retires (its sender
+/// is dropped).
+fn serve_gc_requests(rx: std::sync::mpsc::Receiver<GcRequest>) {
+    while let Ok(req) = rx.recv() {
+        match req {
+            GcRequest::MarkAll(HeapPtr(p), done) => {
+                // Exclusive access: the mutator is blocked on
+                // `done` until we signal.
+                unsafe { (*p).mark_all() };
+                let _ = done.send(());
+            }
+            GcRequest::ConcurrentMark(job) => {
+                run_concurrent_mark(job);
+            }
+            GcRequest::ConcurrentMarkEnabled(job) => {
+                run_concurrent_mark_enabled(*job);
+            }
+        }
+    }
+}
+
+/// The live collectors, keyed by the heap each serves. Cold: touched once per
+/// GC request and at heap teardown, never by allocation. A side table rather
+/// than a `TaggedHeap` field, so the allocation fast paths keep their field
+/// displacements.
+static COLLECTORS: std::sync::Mutex<FxHashMap<HeapIdentity, Collector>> =
+    std::sync::Mutex::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher));
+
+/// Lock the registry. An entry is inserted only after its thread spawned, so
+/// a panic under the lock leaves the map consistent and a poisoned lock is
+/// still usable (heap teardown must not panic).
+fn collectors() -> std::sync::MutexGuard<'static, FxHashMap<HeapIdentity, Collector>> {
+    COLLECTORS
         .lock()
-        .expect("gc thread channel poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hand `request` to `heap`'s collector, spawning the collector on the heap's
+/// first request.
+pub(super) fn send_to_collector(heap: HeapIdentity, request: GcRequest) {
+    collectors()
+        .entry(heap)
+        .or_insert_with(|| Collector::spawn(heap))
+        .requests
+        .send(request)
+        .unwrap_or_else(|_| panic!("the neovm-gc thread of heap {} is gone", heap.get()));
+}
+
+/// Remove `heap`'s collector at heap teardown and close its request channel:
+/// the thread exits once its current job returns. `None` when the heap never
+/// sent a GC request.
+pub(super) fn retire_collector(heap: HeapIdentity) -> Option<RetiredCollector> {
+    let Collector { requests, thread } = collectors().remove(&heap)?;
+    drop(requests);
+    Some(RetiredCollector { heap, thread })
+}
+
+/// Whether `heap` has a live collector.
+#[cfg(test)]
+pub(crate) fn collector_is_registered(heap: HeapIdentity) -> bool {
+    collectors().contains_key(&heap)
+}
+
+/// A collector whose heap retired: `join` it, or `detach` it when the heap
+/// abandoned a running concurrent job.
+#[must_use = "join or detach the retired collector"]
+pub(super) struct RetiredCollector {
+    heap: HeapIdentity,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl RetiredCollector {
+    /// Wait for the thread to exit. With no job in flight it is parked in
+    /// `recv`, which fails at once now that the channel is closed. A panic
+    /// on the collector already failed its heap's request; teardown only
+    /// logs it.
+    pub(super) fn join(self) {
+        if self.thread.join().is_err() {
+            tracing::error!(target: "neovm::gc", heap = self.heap.get(), "collector panicked");
+        } else {
+            tracing::debug!(target: "neovm::gc", heap = self.heap.get(), "collector joined");
+        }
+    }
+
+    /// Let the thread finish on its own, for a heap that abandoned a running
+    /// concurrent job (Drop never waits for a marker). The job exits once it
+    /// sees `stop`; then `recv` fails on the closed channel and the thread
+    /// ends. What the job may still read is retained by the abandoning heap
+    /// (`TaggedHeap::drop`).
+    pub(super) fn detach(self) {
+        tracing::debug!(target: "neovm::gc", heap = self.heap.get(), "collector detached");
+        drop(self.thread);
+    }
 }
 
 /// Atomically set an OWNED cons cell's mark bit using only its pointer. The mark
@@ -1053,7 +1143,7 @@ fn concurrent_trace_mapped_veclike<const MAJOR: bool, const SYMBOLS: bool, E: Cl
             if SYMBOLS {
                 logs.note_symbol(child);
             } else if seen_symbols.insert(child.bits()) {
-                job.deferred.lock().unwrap().push(MarkWord::of(child));
+                logs.result.deferred.push(MarkWord::of(child));
             }
         } else if child.is_heap_object()
             && !concurrent_try_mark_owned_with_symbols::<MAJOR, SYMBOLS, E>(
@@ -1064,7 +1154,7 @@ fn concurrent_trace_mapped_veclike<const MAJOR: bool, const SYMBOLS: bool, E: Cl
                 logs,
             )
         {
-            job.deferred.lock().unwrap().push(MarkWord::of(child));
+            logs.result.deferred.push(MarkWord::of(child));
         }
     };
     // SAFETY: stopped-start capture admitted these same-heap initialized
@@ -1078,7 +1168,7 @@ fn concurrent_trace_mapped_veclike<const MAJOR: bool, const SYMBOLS: bool, E: Cl
             MappedVeclikeScanItem::Deferred(owner) => {
                 // Direct push bypasses the dispatcher, so its first-cycle
                 // dump-child shortcut cannot discard termination-only owners.
-                job.deferred.lock().unwrap().push(owner);
+                logs.result.deferred.push(owner);
             }
         })
     };
@@ -1120,7 +1210,7 @@ fn route_snapshot_child<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExtensio
                 &mut job.gray,
                 logs,
             ) {
-                job.deferred.lock().unwrap().push(MarkWord::of(child));
+                logs.result.deferred.push(MarkWord::of(child));
             }
         } else if SYMBOLS {
             logs.note_symbol(child);
@@ -1139,7 +1229,7 @@ fn route_snapshot_child<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExtensio
             &mut job.gray,
             logs,
         ) {
-            job.deferred.lock().unwrap().push(MarkWord::of(child));
+            logs.result.deferred.push(MarkWord::of(child));
         }
     }
 }
@@ -1266,7 +1356,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                         if SYMBOLS {
                             logs.note_symbol(child);
                         } else if seen_symbols.insert(child.bits()) {
-                            job.deferred.lock().unwrap().push(MarkWord::of(child));
+                            logs.result.deferred.push(MarkWord::of(child));
                         }
                     } else if child.is_heap_object() {
                         // Same filter as `mark_or_push_child`: immediates
@@ -1280,7 +1370,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                             &mut job.gray,
                             &mut logs,
                         ) {
-                            job.deferred.lock().unwrap().push(MarkWord::of(child));
+                            logs.result.deferred.push(MarkWord::of(child));
                         }
                     }
                 }
@@ -1323,7 +1413,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                 if !job.claims.pages.contains(ChunkClass::Cons, addr) {
                     // Mapped (non-dump) or new-block cons — let the mutator's
                     // termination mark it through the full `mark_value` path.
-                    job.deferred.lock().unwrap().push(MarkWord::of(val));
+                    logs.result.deferred.push(MarkWord::of(val));
                     continue;
                 }
                 if unsafe { atomic_mark_owned_cons_ptr(ptr) } {
@@ -1352,7 +1442,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                             break; // dump cons: permanent black
                         }
                         if !job.claims.pages.contains(ChunkClass::Cons, caddr) {
-                            job.deferred.lock().unwrap().push(MarkWord::of(cdr));
+                            logs.result.deferred.push(MarkWord::of(cdr));
                             break;
                         }
                         if !unsafe { atomic_mark_owned_cons_ptr(cptr) } {
@@ -1379,16 +1469,20 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                 ) {
                     continue;
                 }
-                job.deferred.lock().unwrap().push(MarkWord::of(val));
+                logs.result.deferred.push(MarkWord::of(val));
             } else if <E::Symbols as WorkerSymbolMarks>::ENABLED && SYMBOLS {
                 logs.note_symbol(val);
             }
         }
         // Fold the mutator's SATB log (overwritten children) into gray.
-        let batch = { std::mem::take(&mut *job.satb.lock().unwrap()) };
+        let batch = job.satb.take_all().unwrap();
         if batch.is_empty() {
             // Tentatively drained. Advertise done; exit if the mutator asked.
-            job.done.store(true, Ordering::Release);
+            // Only this worker writes done during a job. A repeated idle pass
+            // can read it without taking ownership of the mutator-polled line.
+            if !job.done.load(Ordering::Relaxed) {
+                job.done.store(true, Ordering::Release);
+            }
             if job.stop.load(Ordering::Acquire) {
                 break 'mark;
             }
@@ -1408,15 +1502,19 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                     .unwrap();
             }
         } else {
-            job.done.store(false, Ordering::Release);
-            job.gray.extend_words(batch);
+            if job.done.load(Ordering::Relaxed) {
+                job.done.store(false, Ordering::Release);
+            }
+            for chunk in batch {
+                job.gray.extend_words(chunk.into_words());
+            }
         }
     }
     // Fix B: residual local gray (a mid-drain stop) joins the deferred
     // handoff; the termination fold routes both through the STW `mark_value`
     // drain. Empty on the normal (idle-stop) path.
     if !job.gray.is_empty() {
-        job.deferred.lock().unwrap().extend(job.gray.drain_words());
+        logs.result.deferred.extend(job.gray.drain_words());
     }
     // Every exit, including either stop quantum, retains the owned logs.
     // No heap/snapshot access follows this handoff.
@@ -1652,8 +1750,9 @@ fn barrier_gate(owner: TaggedValue) -> bool {
 /// Dispatch cons writes admitted by the protocol mirror. A real-window hit
 /// retains the full barrier, including immediate-overwrite preimage capture.
 /// Otherwise admission proves GEN1: its mirror is ALL, whereas GEN0's mirror
-/// equals the real window. Reject generation-only stores before constructing
-/// a record or reading census, tracking or concurrent state.
+/// equals the real window. A generation-only store marks its owner's card
+/// and stops there, before constructing a record or reading census,
+/// tracking or concurrent state.
 #[cold]
 #[inline(never)]
 fn note_cons_write_slow(
@@ -1664,17 +1763,21 @@ fn note_cons_write_slow(
 ) {
     let addr = owner.bits() & !crate::tagged::value::TAG_MASK;
     if !TAGGED_HEAP_BARRIER_WINDOW.with(|w| w.get().covers(addr)) {
-        // Characters share fixnum encoding; symbols must continue through.
-        if value.is_some_and(TaggedValue::is_fixnum) {
-            return;
+        // GEN1 outside the window: an old owner marks its card, as compiled
+        // stores do, with one Relaxed byte store. Characters share fixnum
+        // encoding and create no edge; a symbol's liveness rides on the card
+        // like any heap value.
+        if !value.is_some_and(TaggedValue::is_fixnum) {
+            with_tagged_heap(|heap| {
+                if heap
+                    .old_cons_trailer(owner)
+                    .is_some_and(|(trailer, index)| trailer.age_is_old(index))
+                {
+                    heap.mark_owner_card(addr);
+                }
+            });
         }
-        let needs_log = with_tagged_heap(|heap| {
-            heap.old_cons_trailer(owner)
-                .is_some_and(|(trailer, index)| trailer.is_unlogged(index))
-        });
-        if !needs_log {
-            return;
-        }
+        return;
     }
     note_heap_write_slow(owner, kind, slot, value);
 }
@@ -1738,7 +1841,7 @@ pub(super) fn barrier_needs_heap(
                     .contains(&record.owner.bits())
             } else if record.owner.is_cons() {
                 heap.old_cons_trailer(record.owner)
-                    .is_some_and(|(trailer, index)| trailer.is_unlogged(index))
+                    .is_some_and(|(trailer, index)| trailer.age_is_old(index))
             } else {
                 TaggedHeap::value_heap_addr(record.owner).is_some_and(|addr| unsafe {
                     GcHeader::needs_remembering(addr as *const GcHeader)
@@ -1863,23 +1966,27 @@ pub(crate) fn concurrent_hash_mutation_active() -> bool {
 /// owner) to the shared SATB buffer, deduped once per string address per cycle
 /// (`satb_string_preimage_addrs`, cleared at `begin_collection`): the first
 /// pre-image is a superset of the start-of-cycle children — the same argument
-/// as `push_value_children_to_satb_shared`'s owner dedup. The caller has
+/// as `push_value_children_to_satb`'s owner dedup. The caller has
 /// already checked `concurrent_mark_active()`.
 pub(crate) fn note_string_interval_preimage(
     string_addr: usize,
     table: &crate::buffer::text_props::TextPropertyTable,
 ) {
     with_tagged_heap(|heap| {
-        if !heap.satb_string_preimage_addrs.insert(string_addr) {
+        if !heap
+            .current_mutator_satb_mut()
+            .satb_string_preimage_addrs
+            .insert(string_addr)
+        {
             return; // this string's full pre-image was already logged this cycle
         }
         let major = heap.generational.major_in_progress;
-        let mut shared = heap.satb_shared.lock().unwrap();
+        let (mutator, handoff) = heap.satb_parts();
         table.for_each_root(|value| {
             if value.is_heap_object()
                 || (major && matches!(value.kind(), crate::tagged::value::ValueKind::Symbol(_)))
             {
-                shared.push(MarkWord::of(value));
+                mutator.satb.push(MarkWord::of(value), handoff);
             }
         });
     });

@@ -43,16 +43,8 @@ use std::cell::Cell;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Only a scan whose roots will be seeded can certify cache coverage of the
-/// running collection. Diagnostic snapshots must not advance that stamp.
-#[derive(Clone, Copy)]
-pub(crate) enum CacheRootScan {
-    Collection,
-    #[cfg(test)]
-    Snapshot {
-        collection_in_progress: bool,
-    },
-}
+mod cache_root_scan;
+pub(crate) use cache_root_scan::CacheRootScan;
 
 /// Optional heap-write observation, used by tests/introspection to inspect which
 /// owners (and optionally which individual writes) were mutated since the last
@@ -716,39 +708,17 @@ pub struct TaggedHeap {
     /// True between a concurrent mark's start and termination handshakes — the
     /// mutator runs while the GC thread marks.
     concurrent_mark_running: bool,
-    /// Mutator->GC channel (Phase 5): the SATB barrier appends the overwritten
-    /// children here (locked); the GC thread drains them into its gray worklist.
-    satb_shared: SharedMarkQueue,
-    /// Per-cycle dedup for the COARSE (bulk) SATB barrier. A bulk mutator
-    /// (`with_hash_table_mut`, `with_vector_data_mut`, char-table, …) hands a
-    /// `&mut` to an arbitrary closure, so the barrier — which runs BEFORE the
-    /// store and cannot know which slot the closure will touch — conservatively
-    /// snapshots the owner's WHOLE pre-image. Doing that on every write is O(n)
-    /// per write => O(n²) to build an n-element container (the `(ucs-names)` OOM).
-    /// SATB only needs each owner's start-of-cycle child set logged ONCE: at the
-    /// owner's FIRST mutation this cycle, all its snapshot-time children are still
-    /// present (a child can only be unlinked by a mutation of this owner, which is
-    /// itself this first write firing the barrier pre-store), so that single
-    /// snapshot is a superset of every child reachable at snapshot time. Later
-    /// writes can only overwrite values already logged (or born-black new ones),
-    /// so re-snapshotting is pure waste. We record owners snapshotted this cycle
-    /// here and skip the re-enumeration. Cleared at every mark start
-    /// (`concurrent_begin`/`begin_collection`). Conses (2 children, O(1) barrier)
-    /// bypass it; only multi-child veclike/string owners are deduped.
-    ///
-    /// SECOND ROLE (task 01, load-bearing): this set is exactly "every
-    /// multi-child owner MUTATED this cycle", and `join_concurrent_mark`
-    /// drains it to re-gray each such owner's CURRENT children at the STW
-    /// termination — the INSERTION-COVERAGE re-trace that keeps mid-cycle
-    /// insertions (root→heap motion) live now that concurrently-CLAIMED
-    /// owners (page vectors; interval-free strings that gained a table) are
-    /// no longer re-traced by the termination's `mark_value`.
-    satb_snapshotted_owners: FxHashSet<usize>,
-    /// Veclikes/strings the GC thread reached but did NOT trace (their backing
-    /// can be reallocated by the mutator, so reading it concurrently would be a
-    /// UAF). They are marked black and parked here, then traced at the
-    /// termination handshake while the mutator is stopped.
-    deferred_veclikes: SharedMarkQueue,
+    /// Completed owner-local SATB chunks; the marker polls without locking
+    /// when empty. The owning mutator's partial stays in its cold extension.
+    satb_handoff: std::sync::Arc<SatbHandoff>,
+    /// Inert physical reserve for the former heap-wide owner-dedup set.
+    /// Semantic state belongs to each paired SatbMutatorState. Keeping the
+    /// exact field type and position protects GEN0/JIT-visible heap offsets.
+    _satb_owner_layout_reserve: FxHashSet<usize>,
+    /// Owner-confined SATB cold extension reuses the old pointer-sized slot.
+    /// Its Box retains the original NonNull size/alignment/niche; allocation
+    /// and inactive barriers never follow this pointer.
+    _satb_layout_reserve: mutator_gc::MutatorSatbSlot,
     /// GC thread sets this (Release) when gray + SATB are drained; the mutator
     /// polls it (Acquire) at safe points to decide when to terminate.
     gc_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -776,12 +746,9 @@ pub struct TaggedHeap {
     /// in-flight cycle (see `ConcurrentClaimJob::bc_claimed`) + fold.
     concurrent_bc_claimed: std::sync::Arc<AtomicUsize>,
     last_concurrent_bc_claimed: usize,
-    /// CONCURRENT STRING MARKING: per-cycle dedup for the ENFORCED in-mutator
-    /// string interval SATB barrier (`note_string_interval_preimage`), keyed by
-    /// `LispString` address — stable for the whole cycle because nothing is
-    /// freed while a mark runs. Cleared at `begin_collection`, like
-    /// `satb_snapshotted_owners`.
-    satb_string_preimage_addrs: FxHashSet<usize>,
+    /// Inert physical reserve for former heap-wide string preimage dedup.
+    /// Owner-local sets live in SatbMutatorState; this set stays empty.
+    _satb_string_layout_reserve: FxHashSet<usize>,
     /// Mutator sets this (Release) to ask the GC thread to finish and exit.
     gc_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Task #7 stage 2a (Fix B): wakeup latch for the GC thread's idle nap.
@@ -960,6 +927,18 @@ pub struct TaggedHeap {
     compiled_observation_exclusion_37: Cell<u8>,
     compiled_observation_exclusion_38: Cell<u8>,
     compiled_observation_exclusion_39: Cell<u8>,
+    /// GEN1 card-table base address, one native-endian word in byte Cells
+    /// after the exclusion words for the same reason: compiled cons stores
+    /// read it (`HEAP_JIT_CARD_TABLE`) without moving any older offset.
+    /// Published once, by `install_card_table`, before any GEN1 leaf runs.
+    card_table_base_0: Cell<u8>,
+    card_table_base_1: Cell<u8>,
+    card_table_base_2: Cell<u8>,
+    card_table_base_3: Cell<u8>,
+    card_table_base_4: Cell<u8>,
+    card_table_base_5: Cell<u8>,
+    card_table_base_6: Cell<u8>,
+    card_table_base_7: Cell<u8>,
 }
 
 impl Default for TaggedHeap {
@@ -1094,9 +1073,9 @@ impl TaggedHeap {
             mark_in_progress: false,
             incremental_mark_us: 0,
             concurrent_mark_running: false,
-            satb_shared: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            satb_snapshotted_owners: FxHashSet::default(),
-            deferred_veclikes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            satb_handoff: std::sync::Arc::new(SatbHandoff::new()),
+            _satb_owner_layout_reserve: FxHashSet::default(),
+            _satb_layout_reserve: mutator_gc::MutatorSatbSlot::new(),
             gc_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             concurrent_str_claimed: std::sync::Arc::new(AtomicUsize::new(0)),
             last_concurrent_str_claimed: 0,
@@ -1108,7 +1087,7 @@ impl TaggedHeap {
             last_concurrent_vec_claimed: 0,
             concurrent_bc_claimed: std::sync::Arc::new(AtomicUsize::new(0)),
             last_concurrent_bc_claimed: 0,
-            satb_string_preimage_addrs: FxHashSet::default(),
+            _satb_string_layout_reserve: FxHashSet::default(),
             gc_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gc_wake: std::sync::Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             gc_exited: None,
@@ -1209,9 +1188,20 @@ impl TaggedHeap {
             compiled_observation_exclusion_37: Cell::new(0),
             compiled_observation_exclusion_38: Cell::new(0),
             compiled_observation_exclusion_39: Cell::new(0),
+            card_table_base_0: Cell::new(0),
+            card_table_base_1: Cell::new(0),
+            card_table_base_2: Cell::new(0),
+            card_table_base_3: Cell::new(0),
+            card_table_base_4: Cell::new(0),
+            card_table_base_5: Cell::new(0),
+            card_table_base_6: Cell::new(0),
+            card_table_base_7: Cell::new(0),
         };
         if knobs::concurrent_claims_on() {
             heap.install_concurrent_claims();
+        }
+        if heap.generational.enabled {
+            heap.install_card_table();
         }
         // The census's remembered-set probe widens the window compiled code
         // tests from the start (the thread-local mirror follows when the heap
@@ -1356,6 +1346,13 @@ impl TaggedHeap {
     }
 
     /// Deferred-sweep cost + termination-drain instrumentation snapshot.
+    /// Read the collector's mark bit without exposing collector internals to
+    /// evaluator regression fixtures. Call only while the fixture excludes writes.
+    #[cfg(test)]
+    pub(crate) fn value_is_marked_for_test(&self, value: TaggedValue) -> bool {
+        self.is_value_marked(value)
+    }
+
     pub(crate) fn sweep_stats(&self) -> SweepStats {
         SweepStats {
             sweep_us: self.sweep_slice_us_total,
@@ -1369,6 +1366,7 @@ impl TaggedHeap {
             last_termination_deferred: self.last_termination_deferred,
             max_termination_deferred: self.max_termination_deferred,
             last_termination_satb: self.last_termination_satb,
+            last_termination_partial_words: self.last_termination_partial_words(),
             last_termination_kinds: self.last_termination_kinds,
             max_termination_kinds: self.max_termination_kinds,
             last_concurrent_str_claimed: self.last_concurrent_str_claimed,
@@ -1708,7 +1706,7 @@ impl TaggedHeap {
             // the shared buffer it drains (not the local gray queue, which
             // belongs to the GC thread for the duration). This SATB barrier keeps
             // the start-of-cycle snapshot live without re-reading a mutated owner.
-            self.push_value_children_to_satb_shared(record.owner);
+            self.push_value_children_to_satb(record.owner);
         }
         if self.write_tracking_mode == WriteTrackingMode::Disabled {
             return;
@@ -1740,11 +1738,12 @@ impl TaggedHeap {
                     self.current_mutator_gc_mut().remset.push(owner);
                 }
             } else if owner.is_cons() {
-                if !major_mark
-                    && let Some((trailer, index)) = self.old_cons_trailer(owner)
-                    && trailer.try_claim_unlogged(index)
+                // An old owned cons is remembered by its card alone, as
+                // compiled stores do; the minor traces its dirty cards.
+                if self
+                    .old_cons_trailer(owner)
+                    .is_some_and(|(trailer, index)| trailer.age_is_old(index))
                 {
-                    self.current_mutator_gc_mut().remset.push(owner);
                     self.mark_owner_card(owner.xcons_ptr() as usize);
                 }
             } else if let Some(addr) = Self::value_heap_addr(owner) {
@@ -1760,7 +1759,6 @@ impl TaggedHeap {
                 }
                 if !major_mark && unsafe { &*(addr as *const GcHeader) }.claim_remembered() {
                     self.current_mutator_gc_mut().remset.push(owner);
-                    self.mark_owner_card(addr);
                 }
             }
             return;
@@ -2582,9 +2580,38 @@ impl Drop for TaggedHeap {
         // allocations and returns without waiting for either kind of reader.
         if self.concurrent_mark_running || self.facade_mark_is_excluded() {
             self.abandon_concurrent_mark();
+            // The collector may still be running the abandoned job: detach
+            // it rather than wait.
+            //
+            // SAFETY (ordering): the detached thread cannot touch this heap's
+            // freed memory.
+            // - The job never dereferences the heap (`ConcurrentMarkJob`; the
+            //   mapped-veclike snapshot keeps a heap pointer for identity
+            //   comparison only). It reads its own snapshots and queues, and
+            //   through them the blocks, pages, vector backings and hash
+            //   storage that `abandon_concurrent_mark` just retained
+            //   (forgot) for it. Leased obarray chunks outlive their owner
+            //   the same way.
+            // - `stop` was stored (Release) above, so the job exits at its
+            //   next check. Its final `exited` send fails harmlessly once
+            //   `gc_exited` drops with this heap.
+            // - Retiring closes the request channel, so after the job `recv`
+            //   fails and the thread ends. No other request can be queued:
+            //   `MarkAll` is synchronous (its sender is blocked until done,
+            //   so none is pending while the owner runs Drop), and only one
+            //   concurrent job runs per heap.
+            if let Some(collector) = retire_collector(self.identity) {
+                collector.detach();
+            }
             crate::tagged::gc::clear_tagged_heap_if_installed(self);
             return;
         }
+        // No job is in flight, so the heap's collector is idle in `recv`:
+        // joining it returns at once, and no collector outlives its heap.
+        if let Some(collector) = retire_collector(self.identity) {
+            collector.join();
+        }
+        self._satb_layout_reserve.abandon();
         // No marker is active, so Tier-H's snapshot and retired originals are
         // freed with the claims state when the census carrier drops below;
         // Drop takes none of its locks.
@@ -2745,8 +2772,13 @@ pub use concurrent::MarkFinishError;
 mod heap_identity;
 pub use heap_identity::HeapIdentity;
 mod mark_word;
-use mark_word::{MarkStack, MarkWord, SharedMarkQueue};
+use mark_word::{MarkStack, MarkWord};
+mod satb;
+use satb::SatbHandoff;
 pub(crate) mod mapped_veclike_scan;
+#[cfg(test)]
+#[path = "gc/tests/mutator_registry_test.rs"]
+mod mutator_registry_tests;
 pub(crate) mod scan_contract;
 use mapped_veclike_scan::MappedVeclikeScanSnapshot;
 #[cfg(test)]
@@ -2760,7 +2792,12 @@ mod reclamation;
 use reclamation::ReclamationMode;
 
 mod card_table;
-use card_table::CardTable;
+#[cfg_attr(not(feature = "jit"), allow(unused_imports))]
+pub(crate) use card_table::{
+    CARD_CHUNK_SHIFT, CARD_DIRTY, CARD_INDEX_MASK, CARD_SHIFT, CHUNK_SUMMARY_OFFSET,
+    HEAP_JIT_CARD_TABLE,
+};
+use card_table::{CardSlots, CardTable, ChunkCards, ChunkSlot};
 mod cons_block_trailer;
 use cons_block_trailer::*;
 mod collection_observed;
@@ -2776,8 +2813,8 @@ mod cons_blocks;
 /// The cons-block trailer's shape, for `jit_layout::heap`.
 #[cfg_attr(not(feature = "jit"), allow(unused_imports))]
 pub(crate) use cons_block_trailer::{
-    CONS_BLOCK_BYTES, CONS_BLOCK_SIZE as CONS_BLOCK_CELLS, CONS_MARK_WORDS, CONS_MARKS_OFFSET,
-    CONS_UNLOGGED_OFFSET,
+    CONS_AGE_OFFSET, CONS_BLOCK_BYTES, CONS_BLOCK_SIZE as CONS_BLOCK_CELLS, CONS_MARK_WORDS,
+    CONS_MARKS_OFFSET, ConsAge,
 };
 use cons_blocks::*;
 
@@ -2802,6 +2839,10 @@ mod mutator_gc;
 use mutator_gc::MutatorGcState;
 
 mod knobs;
+#[cfg_attr(not(feature = "jit"), allow(unused_imports))]
+pub(crate) use knobs::card_tag_filter_on;
+#[cfg(test)]
+pub(crate) use knobs::with_card_tag_filter_for_test;
 
 mod chunk_map;
 use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMap, PageSnapshot};
@@ -2909,6 +2950,9 @@ fn maybe_resize_for_test(ht: &mut crate::emacs_core::value::LispHashTable) {
 }
 
 #[cfg(test)]
+#[path = "gc/tests/age_mirror_test.rs"]
+mod age_mirror_tests;
+#[cfg(test)]
 #[path = "gc/tests/card_table_test.rs"]
 mod card_table_tests;
 #[cfg(test)]
@@ -2940,3 +2984,7 @@ mod symbol_barrier_tests;
 #[cfg(test)]
 #[path = "gc/tests/chartable_contract_test.rs"]
 mod chartable_contract_tests;
+
+#[cfg(test)]
+#[path = "gc/tests/satb_gc_stress_test.rs"]
+mod satb_gc_stress_tests;

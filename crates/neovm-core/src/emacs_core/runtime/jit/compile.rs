@@ -1138,7 +1138,15 @@ fn compile_bytecode_function_inner(
     // cannot preserve the v2 annotations, so a fused-v2 body stays on the
     // baseline until the opt builder consumes its frame states. Off keeps
     // the original MIR-first, late-fuser path below.
-    let inline2 = if matches!(
+    // The default profile leaves call-heavy bodies on Legacy, which would
+    // drop their `mapc`/`mapcar` callback loops; the HOF-only front keeps
+    // exactly those (and nothing else) on the v2 path.
+    let hof_only = (front == opt_profit::FrontChoice::Legacy)
+        .then(|| inline_planning::hof_only_fused(f, constants, native_arity))
+        .flatten();
+    let inline2 = if hof_only.is_some() {
+        Inline2Mode::Hof
+    } else if matches!(
         front,
         opt_profit::FrontChoice::Legacy | opt_profit::FrontChoice::SelectedAfterMir
     ) {
@@ -1146,12 +1154,14 @@ fn compile_bytecode_function_inner(
     } else {
         jit_inline2_mode()
     };
-    let early_fused = (!matches!(
-        front,
-        opt_profit::FrontChoice::Legacy | opt_profit::FrontChoice::SelectedAfterMir
-    ))
-    .then(|| inline_planning::early_fused(f, constants, obarray, native_arity, named_t2))
-    .flatten();
+    let early_fused = hof_only.or_else(|| {
+        (!matches!(
+            front,
+            opt_profit::FrontChoice::Legacy | opt_profit::FrontChoice::SelectedAfterMir
+        ))
+        .then(|| inline_planning::early_fused(f, constants, obarray, native_arity, named_t2))
+        .flatten()
+    });
     opt_backend::build_census(f, early_fused.as_deref());
     let fused_v2 = early_fused.as_ref().is_some_and(|body| body.is_v2());
     let (ops, constants) = early_fused.as_ref().map_or((ops, constants), |body| {
@@ -3247,8 +3257,9 @@ fn emit_backedge_jump_with_representations(
     handlers: &[HandlerStatic],
     pending: &mut Vec<PendingDispatch>,
     physical: Option<inline_physical::PollAdmission<'_>>,
+    serviced: Option<Block>,
 ) {
-    if bool_slots.is_none() {
+    if bool_slots.is_none() && serviced.is_none() {
         emit_backedge_jump_with_args(
             fb,
             rt,
@@ -3328,6 +3339,14 @@ fn emit_backedge_jump_with_representations(
     let tagged_reps = vec![SlotRep::Tagged; vals.len()];
     let se = signal_target_for_site(fb, signal_exit, handlers, pending, vals, &tagged_reps);
     let ok = lowering::icmp_imm_p(fb, IntCC::Equal, status, STATUS_OK);
+    // Opt IR guards live only on the successful serviced successor. The
+    // common unserviced edge above still jumps straight to the loop.
+    let serviced_target = serviced.unwrap_or(target_block);
+    let serviced_args = if serviced.is_some() {
+        &[][..]
+    } else {
+        target_args
+    };
     if let Some(cache) = &rt.inline_entry_cache {
         let refreshed = fb.create_block();
         fb.ins().brif(ok, refreshed, &[], se, &[]);
@@ -3344,9 +3363,9 @@ fn emit_backedge_jump_with_representations(
                 admission.pending,
             );
         }
-        fb.ins().jump(target_block, target_args);
+        fb.ins().jump(serviced_target, serviced_args);
     } else {
-        fb.ins().brif(ok, target_block, target_args, se, &[]);
+        fb.ins().brif(ok, serviced_target, serviced_args, se, &[]);
     }
     cold.end(fb, Some(cold_exits::ColdExit::Poll));
 }
@@ -4164,6 +4183,7 @@ mod inline_frames;
 mod inline_hof;
 mod inline_physical;
 mod inline_planning;
+pub(crate) use inline_planning::hof_caller_selectable;
 pub(crate) mod inline_regalloc;
 mod named_frames;
 pub(crate) mod resumed_chain;
@@ -4191,6 +4211,9 @@ mod array_shim_tests;
 #[cfg(test)]
 #[path = "tests/call_feedback_test.rs"]
 mod call_feedback_tests;
+#[cfg(test)]
+#[path = "tests/car_cdr_split_test.rs"]
+mod car_cdr_split_tests;
 mod collection_journal;
 #[cfg(test)]
 #[path = "tests/compile_pipeline_test.rs"]
@@ -4199,6 +4222,12 @@ pub(crate) mod compile_pipeline_tests;
 #[path = "tests/declared_string_guards.rs"]
 mod declared_string_guard_tests;
 pub(crate) mod heap_inline;
+#[cfg(test)]
+#[path = "tests/hof_default_front_test.rs"]
+mod hof_default_front_tests;
+#[cfg(test)]
+#[path = "tests/hof_default_semantics_test.rs"]
+mod hof_default_semantics_tests;
 #[cfg(test)]
 #[path = "tests/inline_heap_ops_test.rs"]
 mod inline_heap_ops_tests;
