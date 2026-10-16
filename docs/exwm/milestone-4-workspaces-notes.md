@@ -1,0 +1,290 @@
+# Milestone 4 notes: workspaces, window types, and RandR (nested-X probe)
+
+**Status:** Passing.  A new, standalone probe covers the Milestone-4 behaviors
+that `exwm-client-probe.el` does not:
+
+- **workspace switching** (`exwm-workspace-switch`): `_NET_CURRENT_DESKTOP`
+  and a managed client's visibility (`MapState`, `_NET_WM_STATE_HIDDEN`)
+  follow the active workspace;
+- **moving a client across workspaces** (`exwm-workspace-move-window`) and
+  **reordering workspaces** (`exwm-workspace-move`): the client's
+  `_NET_WM_DESKTOP` and the root `_NET_CLIENT_LIST` /
+  `_NET_CLIENT_LIST_STACKING` stay in sync;
+- **`_NET_WM_STATE` / window-type semantics**: a
+  `_NET_WM_WINDOW_TYPE_DIALOG` client is managed as floating, gets the
+  floating `_NET_WM_ALLOWED_ACTIONS`, and its `_NET_WM_STATE` matches what
+  EXWM actually sets; and
+- **RandR / monitor layout**: the probe queries the RANDR extension from its
+  own connection and checks that EXWM's `_NET_DESKTOP_GEOMETRY` /
+  `_NET_DESKTOP_VIEWPORT` agree with the server's monitor layout, with a
+  graceful NOTE path for a server without RANDR.
+
+Files (all new; no existing harness file was touched):
+
+- `docs/exwm/harness/exwm-workspace-probe.el`
+- `docs/exwm/harness/run-workspace-probe.sh`
+- `docs/exwm/milestone-4-workspaces-notes.md` (this file)
+
+The probe is timer-driven like `exwm-client-probe.el` (a `(delay . function)`
+stage list, `write-region` trace logging, and a final `HARNESS-RESULT:` line),
+and it reuses `exwm-harness-lib.el`.
+
+## 1. How to run
+
+The fixture is private to this probe.  Use a dedicated state dir and a unique
+display so it can never collide with another probe:
+
+```sh
+nix develop --accept-flake-config --command bash -lc \
+  'NESTED_X_STATE_DIR=/tmp/nx-workspace-probe NESTED_X_DISPLAY=:137 \
+   RUST_LOG=error docs/exwm/harness/run-workspace-probe.sh --server xvfb'
+```
+
+The runner accepts `--server xephyr|xvfb`, `--keep`, and `--neomacs PATH`.
+It wires `EXWM_WORKSPACE_OUT` to a temp file and prints the probe trace.
+
+## 2. Exact result from the run
+
+Server: Xvfb 21.1.24, screen 1280x800x24, Neomacs `target/release/neomacs`.
+The final line is exactly:
+
+```
+HARNESS-RESULT: exwm-workspace PASS (43 checks)
+```
+
+Full probe output (including the diagnostics the probe prints for the
+non-obvious stages):
+
+```
+=== exwm-workspace-probe ===
+init warning=nil
+connection=t root=66 workspaces=1
+creating a second workspace with a plain make-frame
+second workspace created; workspaces=2 current=0
+client connection opened
+--- workspace inventory ---
+PASS: setup: at least two workspaces exist => (:ok t)
+PASS: setup: _NET_NUMBER_OF_DESKTOPS matches the workspace list => (:ok 2)
+--- create tiled client ---
+created tiled client #xa00001
+--- workspace switching: initial state ---
+PASS: switch: client is managed => (10485761 . #<buffer *EXWM*<2>>)
+PASS: switch: client is on desktop 0 => (:ok 0)
+PASS: switch: _NET_CURRENT_DESKTOP is 0 => (:ok 0)
+PASS: switch: client is viewable on its workspace => (:ok 2)
+PASS: switch: client is not HIDDEN => (:ok nil)
+--- switching to workspace 1 ---
+PASS: switch: _NET_CURRENT_DESKTOP updates to 1 => (:ok 1)
+PASS: switch: inactive client is Unmapped => (:ok 0)
+PASS: switch: inactive client gains _NET_WM_STATE_HIDDEN => (:ok t)
+PASS: switch: client still in the root client lists => (:ok t)
+--- switching back to workspace 0 ---
+PASS: switch: _NET_CURRENT_DESKTOP updates back to 0 => (:ok 0)
+PASS: switch: reactivated client is Viewable => (:ok 2)
+PASS: switch: reactivated client drops _NET_WM_STATE_HIDDEN => (:ok nil)
+--- RandR query ---
+randr present=t error=nil
+randr monitors=((0 0 1280 800)) error=nil
+--- RandR / desktop geometry ---
+PASS: randr: extension is present => (:ok 1)
+PASS: randr: at least one active monitor was returned => (:ok t)
+PASS: randr: desktop geometry matches the monitor bounding box => (:ok (1280 800))
+randr: viewport=(0 0) monitor-origin=(0 0)
+PASS: randr: desktop viewport origin matches the monitor origin => (:ok (0 0))
+PASS: randr: current workspace exwm-geometry matches a monitor => (:ok t)
+ewmh: desktop geometry 1280x800 server 1280x800
+PASS: ewmh: _NET_DESKTOP_GEOMETRY equals the server screen size => (:ok (1280 800))
+PASS: ewmh: _NET_DESKTOP_VIEWPORT is a single (0 0) viewport => (:ok (0 0))
+--- exwm-workspace-move-window: client -> workspace 1 ---
+before move-to-1: frame=2097156 windows=(("*EXWM*" t) ("*EXWM*<2>" nil))
+before move-to-1: frame=2097163 windows=(("*scratch*" nil))
+undedicating "*EXWM*" in frame 2097156
+PASS: move-window: client desktop becomes 1 => (:ok 1)
+PASS: move-window: root client lists still contain the client => (:ok t)
+PASS: move-window: client is hidden while on the inactive workspace => (:ok (0 t))
+--- exwm-workspace-move-window: client -> workspace 0 ---
+before move-to-0: frame=2097156 windows=(("*EXWM*" nil) ("*scratch*" nil))
+before move-to-0: frame=2097163 windows=((" *EXWM*<2>" nil))
+PASS: move-window: client desktop returns to 0 => (:ok 0)
+PASS: move-window: client is viewable again => (:ok 2)
+--- exwm-workspace-move: workspace 0 -> position 1 ---
+PASS: workspace-move: current desktop follows the moved workspace => (:ok 1)
+PASS: workspace-move: client _NET_WM_DESKTOP re-indexed to 1 => (:ok 1)
+PASS: workspace-move: client lists stay in sync => (:ok t)
+--- exwm-workspace-move: workspace back to position 0 ---
+PASS: workspace-move: current desktop returns to 0 => (:ok 0)
+PASS: workspace-move: client _NET_WM_DESKTOP returns to 0 => (:ok 0)
+--- dialog window type ---
+PASS: dialog: managed by EXWM => (10485762 . #<buffer *EXWM*<3>>)
+PASS: dialog: _NET_WM_WINDOW_TYPE contains DIALOG => (:ok t)
+PASS: dialog: EXWM manages it as floating (live exwm--floating-frame) => (:ok t)
+dialog: allowed actions=(373 374 375 380 381 382)
+PASS: dialog: _NET_WM_ALLOWED_ACTIONS is the floating set => (:ok t)
+dialog: _NET_WM_STATE=nil internal=nil
+PASS: dialog: _NET_WM_STATE matches EXWM's exwm--ewmh-state => (:ok t)
+PASS: dialog: _NET_WM_STATE has no _NET_WM_STATE_ABOVE (EXWM unsupported) => (:ok nil)
+--- switching to workspace 1 with a floating client ---
+PASS: dialog: hidden with its workspace (_NET_WM_STATE_HIDDEN) => (:ok t)
+PASS: dialog: Unmapped while its workspace is inactive => (:ok 0)
+--- switching back to workspace 0 with a floating client ---
+PASS: dialog: _NET_WM_STATE_HIDDEN removed when reactivated => (:ok nil)
+--- destroying dialog ---
+PASS: dialog: destroyed client is unmanaged => (:ok nil)
+--- destroying tiled client ---
+PASS: client: destroyed client is unmanaged => (:ok nil)
+PASS: client: destroyed client is gone from the root client lists => (:ok nil)
+HARNESS-RESULT: exwm-workspace PASS (43 checks)
+```
+
+## 3. What each check group proves
+
+### Workspace switching (13 checks)
+
+`exwp--check-initial-workspace`, `exwp--check-switched-hidden`,
+`exwp--check-switched-visible`:
+
+- the root `_NET_NUMBER_OF_DESKTOPS` equals the workspace count;
+- the managed client starts on desktop 0, `_NET_CURRENT_DESKTOP` is 0, the
+  client is `MapState:Viewable` and carries no `_NET_WM_STATE_HIDDEN`;
+- after `exwm-workspace-switch 1`, `_NET_CURRENT_DESKTOP` is 1, the client is
+  `MapState:Unmapped` and gains `_NET_WM_STATE_HIDDEN`, and it stays in both
+  root client lists;
+- after switching back to 0, the client is `Viewable` again and the HIDDEN
+  state is gone.
+
+### Moving a client across workspaces (5 checks)
+
+The task named `exwm-workspace-move` for this item, but in EXWM
+`exwm-workspace-move` reorders *workspace frames*; the function that moves a
+*client* across workspaces is `exwm-workspace-move-window`.  The probe covers
+both:
+
+- **`exwm-workspace-move-window`** (`exwp--check-window-moved`,
+  `exwp--check-window-moved-back`): moving the client to workspace 1 sets its
+  `_NET_WM_DESKTOP` to 1, keeps it in `_NET_CLIENT_LIST` and
+  `_NET_CLIENT_LIST_STACKING`, and hides it (Unmapped + HIDDEN) while the
+  workspace is inactive; moving it back to workspace 0 restores desktop 0 and
+  `Viewable`.
+- **`exwm-workspace-move`** (`exwp--check-workspace-move`,
+  `exwp--check-workspace-move-back`): moving workspace 0 to position 1 moves
+  the current desktop and re-indexes the client's `_NET_WM_DESKTOP` to 1, and
+  the client lists stay in sync; moving it back restores both.
+
+### Window type / floating semantics (6 checks)
+
+`exwp--check-floating` and the two floating switch checks:
+
+- a `_NET_WM_WINDOW_TYPE_DIALOG` client is managed;
+- `_NET_WM_WINDOW_TYPE` on the client still reads DIALOG;
+- EXWM gives it a live `exwm--floating-frame` (managed as floating);
+- `_NET_WM_ALLOWED_ACTIONS` is the floating set (it contains
+  `_NET_WM_ACTION_MOVE`/`_NET_WM_ACTION_RESIZE`, which the tiled set omits);
+- `_NET_WM_STATE` is byte-for-byte the set EXWM keeps in `exwm--ewmh-state`;
+- switching to another workspace hides the floating client too
+  (`_NET_WM_STATE_HIDDEN`, `MapState:Unmapped`), and switching back clears
+  HIDDEN.
+
+Note on `_NET_WM_STATE_ABOVE`: EXWM does **not** implement it.  It is
+commented out of EXWM's `_NET_SUPPORTED` list (`exwm.el`, next to
+`_NET_WM_STATE_BELOW`), and floating windows are raised by the WM's own
+stacking rather than through an EWMH state.  The probe therefore asserts the
+*absence* of `_NET_WM_STATE_ABOVE` and equality with `exwm--ewmh-state`,
+rather than expecting ABOVE to appear.
+
+### RandR / monitor layout (7 checks + NOTE path)
+
+`exwp--randr-query` / `exwp--check-randr`:
+
+- query the extension explicitly with
+  `(xcb:get-extension-data conn 'xcb:randr)` before any RandR request;
+- on Xvfb the extension is present (RandR 1.5); `xcb:randr:GetMonitors`
+  returns one `(0 0 1280 800)` monitor;
+- `_NET_DESKTOP_GEOMETRY` equals both the server screen size
+  (`x-display-pixel-width/height`) and the bounding box of the monitors;
+- `_NET_DESKTOP_VIEWPORT` is a single `(0 0)` viewport matching the monitor
+  origin;
+- `exwm-randr-mode` is enabled and `exwm-randr-refresh` run, so the current
+  workspace's `exwm-geometry` frame parameter matches a returned monitor.
+
+If the server has no RANDR, the extension-absent case is reported with
+`NOTE:` (not `FAIL:`), while the two properties are still checked against the
+server screen.  That path is exercised by the code but not by the Xvfb run
+above, which has RANDR.
+
+## 4. Gaps and Neomacs-specific findings
+
+These are not probe failures; they are places where the probe had to step
+around Neomacs behavior.  All are recorded in the run trace.
+
+### 4a. `exwm-workspace-number > 1` cannot initialize
+
+Setting `exwm-workspace-number` to 2 before `exwm--init` makes EXWM's
+`exwm-workspace--init` create the extra workspace with
+`(make-frame '((window-system . x)))`.  In Neomacs that signals:
+
+```
+[EXWM] EXWM fails to start (cl-no-applicable-method:
+  (frame-creation-function ((buffer-predicate . exwm-layout--other-buffer-predicate)
+                            (window-system . x))))
+```
+
+`frame-creation-function` is a `cl-defgeneric` with a
+`&context (window-system x)` method, but passing `(window-system . x)` in the
+frame parameters does not select it here.  EXWM then tears the whole WM down
+(`exwm--init` error handler calls `exwm-wm-mode -1`), so nothing else works.
+
+Workaround used by the probe: keep `exwm-workspace-number` at 1, initialize
+normally, and create the second workspace with a plain `(make-frame)` after
+init.  The `after-make-frame-functions` hook turns it into a workspace, so
+`_NET_NUMBER_OF_DESKTOPS` becomes 2.  This is a Neomacs divergence in GUI
+frame creation, independent of EXWM's workspace logic; fixing it would let
+`exwm-workspace-number` work as upstream expects.
+
+### 4b. Workspace windows are left strongly dedicated
+
+Immediately before a client move, the current workspace frame looked like
+this:
+
+```
+before move-to-1: frame=2097156 windows=(("*EXWM*" t) ("*EXWM*<2>" nil))
+```
+
+The frame's `*EXWM*` window is strongly dedicated (`window-dedicated-p` = t).
+GNU's `set-window-buffer` (correctly) signals when the target window is
+strongly dedicated and does not already display the buffer
+(`docs/.../gnu_table.rs`: "This function throws an error when WINDOW is
+strongly dedicated to its buffer").  EXWM's `exwm-workspace-move-window`
+calls exactly that on the target workspace's selected window, so the move
+back to the active workspace aborted with:
+
+```
+error "Window is dedicated to ‘*EXWM*’"
+```
+
+In a normal GNU session the workspace window is not strongly dedicated, so
+the call is a no-op/change rather than an error.  The probe clears the
+strong-dedication flag on the workspace windows just before each move
+(`exwp--undedicate-workspaces`) and logs it; after that the move and all its
+assertions pass.  This is a Neomacs frame/window-dedication divergence, not an
+EXWM one.  The undedication is a harness accommodation and does not relax any
+assertion about EXWM's EWMH state.
+
+### 4c. Not covered
+
+- Multiple physical monitors / a RandR screen change: the fixture is a single
+  Xvfb screen.  The probe validates the single-monitor geometry/viewport
+  agreement and the `exwm-randr-mode` frame geometry, but does not exercise
+  hotplug or `exwm-randr-workspace-monitor-plist`.
+- `_NET_WM_STATE_ABOVE` (see section 3): EXWM never sets it, so the probe
+  asserts its absence rather than its presence.
+- Floating resize after an external `ConfigureWindow` remains tracked by
+  `exwm-client-probe.el` and `milestone-4-notes.md`; this probe does not
+  repeat that check.
+
+## 5. Relationship to the existing probes
+
+This probe is intentionally independent of `exwm-client-probe.el` and does not
+load or run it.  Each probe gets its own state dir and display, so no two
+probes share a nested X server.  `exwm-workspace-probe.el` reuses only
+`exwm-harness-lib.el` (load path, atom/root helpers) and the same stage-driver
+and `HARNESS-RESULT:` conventions.
