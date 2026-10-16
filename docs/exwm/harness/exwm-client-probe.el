@@ -572,12 +572,11 @@ its own window."
 ;;; --- Floating dialog (Milestone 4 preview, informational) -----------------
 
 (defun excp--floating-check (name thunk)
-  "Check the floating path as PASS/FAIL when EXWM_EXPECT_FLOATING is set.
-Otherwise report it as a NOTE, because Neomacs `make-frame' cannot yet
-create the graphical child frame `exwm-floating--set-floating' requires."
-  (if (getenv "EXWM_EXPECT_FLOATING")
-      (excp--check name thunk)
-    (excp--note name thunk)))
+  "Check the floating path as PASS/FAIL.
+The GNU redisplay-hook driver is the process default, so a non-selected
+floating frame is re-fitted on the command loop's redisplay without an input
+event; the floating checks are therefore unconditional."
+  (excp--check name thunk))
 
 (defun excp--query-tree (window)
   "Return (parent . root) for WINDOW."
