@@ -48,8 +48,8 @@ pub(super) enum RedisplayHookPolicy {
 
 pub(super) fn parse_redisplay_hooks(value: Option<&OsStr>) -> RedisplayHookPolicy {
     match value.and_then(OsStr::to_str) {
-        Some("off" | "0" | "false" | "no") => RedisplayHookPolicy::Legacy,
-        _ => RedisplayHookPolicy::Gnu,
+        Some("on" | "1" | "true" | "yes") => RedisplayHookPolicy::Gnu,
+        _ => RedisplayHookPolicy::Legacy,
     }
 }
 

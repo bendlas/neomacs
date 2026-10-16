@@ -107,17 +107,21 @@ extra full redisplays.
 
 ## Current decision
 
-Per direction, the process default was flipped from `Legacy` to `Gnu` in
-`parse_redisplay_hooks` (`crates/neovm-core/src/emacs_core/runtime/eval/redisplay_hooks.rs`):
-unset (and any unrecognized value) now selects GNU; only an explicit
-`off`/`0`/`false`/`no` selects legacy. The floating probe then passes without
-setting the env var.
+The default was briefly flipped from `Legacy` to `Gnu`, then reverted. The
+user-visible interactive resize symptom turned out to be a separate input-drain
+bug (EXWM-grabbed keys stalled in `unread-command-events` until the next display
+event), fixed in `crates/neovm-core/src/emacs_core/system/wait/mod.rs` and
+`crates/neovm-core/src/keyboard.rs` (`command_read_unbounded`) with the
+regression `docs/exwm/harness/run-interactive-input-repro.sh`. So
+`parse_redisplay_hooks` keeps the original `Legacy` default;
+`NEOMACS_REDISPLAY_GNU_HOOKS=1` still selects the GNU driver, which is what the
+floating probe uses. The legacy gap described above remains open.
 
 ## Open caveat (interactive session)
 
-`NEOMACS_REDISPLAY_GNU_HOOKS=1 docs/exwm/harness/manual-exwm.sh` was reported
-to still show wrong behavior interactively, and the env var is confirmed to
-reach Neomacs. So at least one interactive resize symptom is **not** explained
-by the legacy skip gate and is not fixed by the GNU driver. A concrete
-interactive reproduction is still needed; the timer-driven probe cannot
-observe it.
+`NEOMACS_REDISPLAY_GNU_HOOKS=1 docs/exwm/harness/manual-exwm.sh` still showed
+wrong behavior interactively. That symptom was the EXWM-grabbed key sequence
+stalling in `unread-command-events` until the next display event, not this
+redisplay gap; it was fixed in `wait/mod.rs`/`keyboard.rs`
+(`command_read_unbounded`) with the regression
+`docs/exwm/harness/run-interactive-input-repro.sh`.
