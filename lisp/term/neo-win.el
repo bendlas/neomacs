@@ -286,7 +286,15 @@ DISPLAY is the name of the display Emacs should connect to."
   (add-hook 'suspend-hook #'neomacs-suspend-error)
   (add-hook 'window-setup-hook #'neomacs--window-setup)
 
-  (setq neomacs-initialized t))
+  (setq neomacs-initialized t)
+  ;; Neomacs's native GUI is the X11 backend: GUI frames already report `x'
+  ;; from `framep', but the `window-system'/`initial-window-system' variables
+  ;; are `neo'.  X11 clients such as EXWM create frames with
+  ;; `(window-system . x)'; mark `x' initialized here so `make-frame' routes
+  ;; those requests to the native frame creation below instead of trying to
+  ;; initialize X through the (unloaded) `term/x-win.el' and signalling
+  ;; `cl-no-applicable-method' on `window-system-initialization'.
+  (put 'x 'window-system-initialized t))
 
 ;; Handle args function (required by common-win)
 (cl-defmethod handle-args-function (args &context (window-system neo))
@@ -295,6 +303,14 @@ DISPLAY is the name of the display Emacs should connect to."
 ;; Frame creation for Neomacs
 ;; Use x-create-frame-with-faces to properly initialize faces with colors
 (cl-defmethod frame-creation-function (params &context (window-system neo))
+  (x-create-frame-with-faces params))
+
+;; Accept an explicitly requested X window system.  GNU's X build gets this
+;; method from `term/x-win.el', which `loadup.el' only loads for
+;; `(featurep 'x)' -- false here because Neomacs reports `neo'.  X11 clients
+;; such as EXWM pass `(window-system . x)' to `make-frame'; route that to the
+;; same native frame creation as the `neo' default.
+(cl-defmethod frame-creation-function (params &context (window-system x))
   (x-create-frame-with-faces params))
 
 ;; Typed visual configuration owned by the Rust display protocol.

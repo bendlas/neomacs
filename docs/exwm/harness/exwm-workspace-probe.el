@@ -22,6 +22,11 @@
 ;;      server's monitor layout.  A server without RANDR records a NOTE, not
 ;;      a FAIL.
 ;;
+;; It starts EXWM natively with `exwm-workspace-number' 2, so EXWM itself
+;; creates the extra workspace with `(make-frame '((window-system . x)))' --
+;; the frame type X11 clients request -- and asserts the workspace windows
+;; stay non-dedicated, exactly as a GNU session leaves them.
+;;
 ;; It is deliberately separate from `exwm-client-probe.el' so the two probes
 ;; never share state; each has its own state dir and X display.
 ;;
@@ -265,16 +270,13 @@ window id.  The window lives on `exwp--conn'."
 
 (defun exwp--start-exwm ()
   (exwp--log "=== exwm-workspace-probe ===")
-  ;; Keep EXWM's `exwm-workspace-number' at its default of 1.
-  ;;
-  ;; Neomacs cannot dispatch `frame-creation-function' for the
-  ;; `(window-system . x)' frame that EXWM itself passes when it creates
-  ;; extra workspaces from `exwm-workspace-number' (it signals
-  ;; cl-no-applicable-method).  A plain `make-frame', which the
-  ;; `after-make-frame-functions' hook turns into a workspace, works, so the
-  ;; second workspace is created after initialization instead.  See
-  ;; milestone-4-workspaces-notes.md section "Gaps".
-  (setq exwm-workspace-number 1)
+  ;; Exercise EXWM's native multi-workspace initialization.  With
+  ;; `exwm-workspace-number' at 2, `exwm-workspace--init' creates the second
+  ;; workspace itself with `(make-frame '((window-system . x)))' -- the frame
+  ;; type X11 clients request.  This is the path that used to fail in Neomacs
+  ;; with `cl-no-applicable-method' on `frame-creation-function', forcing the
+  ;; probe to create the extra workspace afterwards with a plain `make-frame'.
+  (setq exwm-workspace-number 2)
   (advice-add 'display-warning :before
               (lambda (_type message &rest _)
                 (unless exwp--init-warning
@@ -291,28 +293,33 @@ window id.  The window lives on `exwp--conn'."
              (and (boundp 'exwm--root) exwm--root)
              (and (boundp 'exwm-workspace--list)
                   (length exwm-workspace--list)))
-  ;; Ensure there are at least two workspaces before switching.
-  (when (and (boundp 'exwm-workspace--list)
-             (< (length exwm-workspace--list) 2))
-    (exwp--log "creating a second workspace with a plain make-frame")
-    (condition-case err
-        (progn
-          (make-frame)
-          (run-hooks 'exwm-workspace-list-change-hook)
-          ;; `make-frame' selects the new frame; return to workspace 0 so the
-          ;; probe's index assumptions hold.
-          (exwm-workspace-switch 0)
-          (exwp--log "second workspace created; workspaces=%S current=%S"
-                     (length exwm-workspace--list)
-                     exwm-workspace-current-index))
-      (error (exwp--log "second workspace make-frame error: %S" err))))
   (setq exwp--conn (exwm-harness-connect))
   (exwp--log "client connection opened"))
+
+(defun exwp--dedicated-windows ()
+  "Return the workspace windows that are strongly dedicated."
+  (cl-loop for f in exwm-workspace--list
+           append (cl-loop for w in (window-list f 'nomini)
+                           when (eq (window-dedicated-p w) t)
+                           collect w)))
 
 (defun exwp--check-workspaces ()
   (exwp--log "--- workspace inventory ---")
   (exwp--check "setup: at least two workspaces exist"
                (lambda () (exwp--expect t (>= (length exwm-workspace--list) 2))))
+  ;; Native init: `exwm-workspace-number' itself created the extra workspace
+  ;; via `(make-frame '((window-system . x)))'.  No post-init `make-frame'.
+  (exwp--check "setup: native init created exactly `exwm-workspace-number' workspaces"
+               (lambda () (exwp--expect exwm-workspace-number
+                                        (length exwm-workspace--list))))
+  (exwp--check "setup: native init produced no warning"
+               (lambda () (exwp--expect nil exwp--init-warning)))
+  ;; The GNU-compatible state EXWM's `exwm-workspace-move-window' relies on:
+  ;; workspace windows must not be strongly dedicated, so `set-window-buffer'
+  ;; may replace their buffer without first clearing the flag.
+  (exwp--check "setup: workspace windows are not strongly dedicated"
+               (lambda () (exwp--log-dedication "inventory")
+                 (exwp--expect nil (exwp--dedicated-windows))))
   (exwp--check "setup: _NET_NUMBER_OF_DESKTOPS matches the workspace list"
                (lambda ()
                  (exwp--expect (length exwm-workspace--list)
@@ -384,26 +391,9 @@ window id.  The window lives on `exwp--conn'."
                                (window-dedicated-p w)))
                        (window-list f 'nomini)))))
 
-(defun exwp--undedicate-workspaces ()
-  "Clear strong dedication on workspace windows.
-`set-window-buffer' correctly signals when the target window is strongly
-dedicated (GNU does the same), and EXWM's `exwm-workspace-move-window'
-calls it on the target workspace's selected window.  Neomacs leaves a
-workspace frame's selected window strongly dedicated to its buffer, which a
-GNU session does not, so EXWM's move aborts there.  Clearing the flag
-restores the GNU precondition; it does not change anything EXWM asserts."
-  (dolist (f exwm-workspace--list)
-    (dolist (w (window-list f 'nomini))
-      (when (eq (window-dedicated-p w) t)
-        (exwp--log "undedicating %S in frame %S"
-                   (buffer-name (window-buffer w))
-                   (frame-parameter f 'exwm-outer-id))
-        (set-window-dedicated-p w nil)))))
-
 (defun exwp--move-window-to-1 ()
   (exwp--log "--- exwm-workspace-move-window: client -> workspace 1 ---")
   (exwp--log-dedication "before move-to-1")
-  (exwp--undedicate-workspaces)
   (exwm-workspace-move-window 1 exwp--w1))
 
 (defun exwp--check-window-moved ()
@@ -420,7 +410,6 @@ restores the GNU precondition; it does not change anything EXWM asserts."
 (defun exwp--move-window-to-0 ()
   (exwp--log "--- exwm-workspace-move-window: client -> workspace 0 ---")
   (exwp--log-dedication "before move-to-0")
-  (exwp--undedicate-workspaces)
   (condition-case err
       (exwm-workspace-move-window 0 exwp--w1)
     (error
@@ -445,7 +434,13 @@ restores the GNU precondition; it does not change anything EXWM asserts."
   (exwp--check "move-window: client is viewable again"
                (lambda ()
                  (exwp--expect xcb:MapState:Viewable
-                               (exwp--map-state exwp--w1)))))
+                               (exwp--map-state exwp--w1))))
+  ;; The back-path used `set-window-buffer' on the workspace's selected
+  ;; window; that is only possible because it is not strongly dedicated.
+  (exwp--check "move-window: back-path needed no undedication"
+               (lambda ()
+                 (exwp--log-dedication "after move-to-0")
+                 (exwp--expect nil (exwp--dedicated-windows)))))
 
 ;;; --- coverage 2b: reordering workspaces ------------------------------------
 

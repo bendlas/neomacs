@@ -1,7 +1,11 @@
 # Milestone 4 notes: workspaces, window types, and RandR (nested-X probe)
 
-**Status:** Passing.  A new, standalone probe covers the Milestone-4 behaviors
-that `exwm-client-probe.el` does not:
+**Status:** Passing (47 checks).  The probe now initializes EXWM natively
+with `exwm-workspace-number` 2 (the `(make-frame '((window-system . x)))`
+path X11 clients use) and never clears `window-dedicated-p`.  Two Neomacs
+GUI-frame divergences found by an earlier version of this probe are fixed;
+see section 4.  The probe covers the Milestone-4 behaviors that
+`exwm-client-probe.el` does not:
 
 - **workspace switching** (`exwm-workspace-switch`): `_NET_CURRENT_DESKTOP`
   and a managed client's visibility (`MapState`, `_NET_WM_STATE_HIDDEN`)
@@ -49,26 +53,31 @@ Server: Xvfb 21.1.24, screen 1280x800x24, Neomacs `target/release/neomacs`.
 The final line is exactly:
 
 ```
-HARNESS-RESULT: exwm-workspace PASS (43 checks)
+HARNESS-RESULT: exwm-workspace PASS (47 checks)
 ```
 
+The probe initializes EXWM natively with `exwm-workspace-number` 2 (no
+post-init `make-frame` workaround) and never clears `window-dedicated-p`.
 Full probe output (including the diagnostics the probe prints for the
 non-obvious stages):
 
 ```
 === exwm-workspace-probe ===
 init warning=nil
-connection=t root=66 workspaces=1
-creating a second workspace with a plain make-frame
-second workspace created; workspaces=2 current=0
+connection=t root=66 workspaces=2
 client connection opened
 --- workspace inventory ---
 PASS: setup: at least two workspaces exist => (:ok t)
+PASS: setup: native init created exactly `exwm-workspace-number' workspaces => (:ok 2)
+PASS: setup: native init produced no warning => (:ok nil)
+inventory: frame=2097156 windows=(("*scratch*" nil))
+inventory: frame=2097161 windows=(("*scratch*" nil))
+PASS: setup: workspace windows are not strongly dedicated => (:ok nil)
 PASS: setup: _NET_NUMBER_OF_DESKTOPS matches the workspace list => (:ok 2)
 --- create tiled client ---
 created tiled client #xa00001
 --- workspace switching: initial state ---
-PASS: switch: client is managed => (10485761 . #<buffer *EXWM*<2>>)
+PASS: switch: client is managed => (10485761 . #<buffer *EXWM*>)
 PASS: switch: client is on desktop 0 => (:ok 0)
 PASS: switch: _NET_CURRENT_DESKTOP is 0 => (:ok 0)
 PASS: switch: client is viewable on its workspace => (:ok 2)
@@ -96,17 +105,19 @@ ewmh: desktop geometry 1280x800 server 1280x800
 PASS: ewmh: _NET_DESKTOP_GEOMETRY equals the server screen size => (:ok (1280 800))
 PASS: ewmh: _NET_DESKTOP_VIEWPORT is a single (0 0) viewport => (:ok (0 0))
 --- exwm-workspace-move-window: client -> workspace 1 ---
-before move-to-1: frame=2097156 windows=(("*EXWM*" t) ("*EXWM*<2>" nil))
-before move-to-1: frame=2097163 windows=(("*scratch*" nil))
-undedicating "*EXWM*" in frame 2097156
+before move-to-1: frame=2097156 windows=(("*EXWM*" nil))
+before move-to-1: frame=2097161 windows=(("*scratch*" nil))
 PASS: move-window: client desktop becomes 1 => (:ok 1)
 PASS: move-window: root client lists still contain the client => (:ok t)
 PASS: move-window: client is hidden while on the inactive workspace => (:ok (0 t))
 --- exwm-workspace-move-window: client -> workspace 0 ---
-before move-to-0: frame=2097156 windows=(("*EXWM*" nil) ("*scratch*" nil))
-before move-to-0: frame=2097163 windows=((" *EXWM*<2>" nil))
+before move-to-0: frame=2097156 windows=(("*scratch*" nil))
+before move-to-0: frame=2097161 windows=((" *EXWM*" nil))
 PASS: move-window: client desktop returns to 0 => (:ok 0)
 PASS: move-window: client is viewable again => (:ok 2)
+after move-to-0: frame=2097156 windows=(("*EXWM*" nil))
+after move-to-0: frame=2097161 windows=(("*scratch*" nil))
+PASS: move-window: back-path needed no undedication => (:ok nil)
 --- exwm-workspace-move: workspace 0 -> position 1 ---
 PASS: workspace-move: current desktop follows the moved workspace => (:ok 1)
 PASS: workspace-move: client _NET_WM_DESKTOP re-indexed to 1 => (:ok 1)
@@ -115,7 +126,7 @@ PASS: workspace-move: client lists stay in sync => (:ok t)
 PASS: workspace-move: current desktop returns to 0 => (:ok 0)
 PASS: workspace-move: client _NET_WM_DESKTOP returns to 0 => (:ok 0)
 --- dialog window type ---
-PASS: dialog: managed by EXWM => (10485762 . #<buffer *EXWM*<3>>)
+PASS: dialog: managed by EXWM => (10485762 . #<buffer *EXWM*<2>>)
 PASS: dialog: _NET_WM_WINDOW_TYPE contains DIALOG => (:ok t)
 PASS: dialog: EXWM manages it as floating (live exwm--floating-frame) => (:ok t)
 dialog: allowed actions=(373 374 375 380 381 382)
@@ -133,7 +144,7 @@ PASS: dialog: destroyed client is unmanaged => (:ok nil)
 --- destroying tiled client ---
 PASS: client: destroyed client is unmanaged => (:ok nil)
 PASS: client: destroyed client is gone from the root client lists => (:ok nil)
-HARNESS-RESULT: exwm-workspace PASS (43 checks)
+HARNESS-RESULT: exwm-workspace PASS (47 checks)
 ```
 
 ## 3. What each check group proves
@@ -211,16 +222,16 @@ If the server has no RANDR, the extension-absent case is reported with
 server screen.  That path is exercised by the code but not by the Xvfb run
 above, which has RANDR.
 
-## 4. Gaps and Neomacs-specific findings
+## 4. Neomacs divergences found and fixed
 
-These are not probe failures; they are places where the probe had to step
-around Neomacs behavior.  All are recorded in the run trace.
+Both divergences below were real and are fixed.  The probe now exercises the
+native paths directly and records the evidence.
 
-### 4a. `exwm-workspace-number > 1` cannot initialize
+### 4a. `exwm-workspace-number > 1` could not initialize
 
 Setting `exwm-workspace-number` to 2 before `exwm--init` makes EXWM's
 `exwm-workspace--init` create the extra workspace with
-`(make-frame '((window-system . x)))`.  In Neomacs that signals:
+`(make-frame '((window-system . x)))`.  Neomacs signalled:
 
 ```
 [EXWM] EXWM fails to start (cl-no-applicable-method:
@@ -228,46 +239,61 @@ Setting `exwm-workspace-number` to 2 before `exwm--init` makes EXWM's
                             (window-system . x))))
 ```
 
-`frame-creation-function` is a `cl-defgeneric` with a
-`&context (window-system x)` method, but passing `(window-system . x)` in the
-frame parameters does not select it here.  EXWM then tears the whole WM down
-(`exwm--init` error handler calls `exwm-wm-mode -1`), so nothing else works.
+`frame-creation-function` (and `window-system-initialization`) dispatch on the
+dynamically bound `window-system` variable, and the `&context (window-system
+x)` methods live in `lisp/term/x-win.el`, which `loadup.el` loads only for
+`(featurep 'x)`.  Neomacs's native GUI is the X11 backend -- its frames
+already answer `x` to `framep` -- but its `window-system` /
+`initial-window-system` variables are `neo`, so `x` had no method and
+`make-frame` raised `cl-no-applicable-method`; EXWM's error handler then tore
+the WM down.
 
-Workaround used by the probe: keep `exwm-workspace-number` at 1, initialize
-normally, and create the second workspace with a plain `(make-frame)` after
-init.  The `after-make-frame-functions` hook turns it into a workspace, so
-`_NET_NUMBER_OF_DESKTOPS` becomes 2.  This is a Neomacs divergence in GUI
-frame creation, independent of EXWM's workspace logic; fixing it would let
-`exwm-workspace-number` work as upstream expects.
+Fix (`lisp/term/neo-win.el`): after the native window system initializes,
+mark `x` as initialized (`(put 'x 'window-system-initialized t)`) so
+`make-frame` routes `(window-system . x)` straight to a native frame, and add
 
-### 4b. Workspace windows are left strongly dedicated
-
-Immediately before a client move, the current workspace frame looked like
-this:
-
-```
-before move-to-1: frame=2097156 windows=(("*EXWM*" t) ("*EXWM*<2>" nil))
+```elisp
+(cl-defmethod frame-creation-function (params &context (window-system x))
+  (x-create-frame-with-faces params))
 ```
 
-The frame's `*EXWM*` window is strongly dedicated (`window-dedicated-p` = t).
-GNU's `set-window-buffer` (correctly) signals when the target window is
-strongly dedicated and does not already display the buffer
-(`docs/.../gnu_table.rs`: "This function throws an error when WINDOW is
-strongly dedicated to its buffer").  EXWM's `exwm-workspace-move-window`
-calls exactly that on the target workspace's selected window, so the move
-back to the active workspace aborted with:
+`window-system` / `initial-window-system` stay `neo`; `x` is accepted only as
+a requested frame type, matching GNU's X build.
+
+### 4b. Workspace windows were strongly dedicated (a symptom of 4a's workaround)
+
+Before 4a was fixed, the probe worked around it by creating the extra
+workspace *after* `exwm--init` with a plain `(make-frame)`.  In that path the
+workspace frame's X window was managed by EXWM; Neomacs's native backend sent
+it a `_NET_WM_STATE_FULLSCREEN` request when EXWM made the workspace frame
+fullscreen, and EXWM's `exwm-layout-set-fullscreen` reacted by strongly
+dedicating the frame's window (`window-dedicated-p` = t).  EXWM's
+`exwm-workspace-move-window` back-path then aborted in `set-window-buffer`:
 
 ```
 error "Window is dedicated to ‘*EXWM*’"
 ```
 
-In a normal GNU session the workspace window is not strongly dedicated, so
-the call is a no-op/change rather than an error.  The probe clears the
-strong-dedication flag on the workspace windows just before each move
-(`exwp--undedicate-workspaces`) and logs it; after that the move and all its
-assertions pass.  This is a Neomacs frame/window-dedication divergence, not an
-EXWM one.  The undedication is a harness accommodation and does not relax any
-assertion about EXWM's EWMH state.
+Tracing `set-window-dedicated-p` showed the single `-> t` call came from
+`exwm-layout-set-fullscreen` inside the `exwm--on-net-wm-state` handler, i.e.
+from Neomacs's own fullscreen request for the frame, not from any Neomacs
+dedication default.  The same probe run under GNU Emacs 31.1 never produced
+that request (GNU's `x_check_fullscreen` / `x_wm_supports` gating leaves the
+unmanaged workspace frame alone), so the GNU workspace window stayed
+non-dedicated.
+
+Fixing 4a removes the symptom: with `exwm-workspace-number` 2 the extra
+workspace is created inside `exwm--init` via `(window-system . x)` and the
+`exwm-workspace--x-create-frame` advice makes it override-redirect before
+`exwm-manage--scan`, so EXWM never manages it and never dedicates it.  The
+probe therefore no longer clears `window-dedicated-p`; it asserts the
+GNU-compatible precondition instead:
+
+- `setup: workspace windows are not strongly dedicated`; and
+- `move-window: back-path needed no undedication` (after the move back).
+
+No dedication semantics were changed and no dedication code was removed: the
+fix only makes the frame type Neomacs was already using addressable.
 
 ### 4c. Not covered
 
