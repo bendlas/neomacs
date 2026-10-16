@@ -144,6 +144,17 @@ separately), so the behavior is not specific to the legacy hook driver.
 
 ### Why the interactive report was not reproducible
 
+> **Correction (see `interactive-input-notes.md`).**  The interactive report
+> *was* real, but not in the code path this probe exercises.  This probe drives
+> the relayout with timer/`sit-for` stages and never enters the command loop's
+> own blocking read while a grabbed key sequence is requeued.  Interactively,
+> EXWM's XELB process filter appends to `unread-command-events` during that
+> read, and the `DisplayActivity` wake gate (below) suppressed the return for
+> the command loop's unbounded read because idle auto-save/display maintenance
+> had made the wait deadline finite.  Fixed by gating on the read's own end
+> time (`command_read_unbounded`) instead of the wait deadline; regression at
+> `docs/exwm/harness/run-interactive-input-repro.sh`.
+
 The user-visible cue "resizes when I click out" is a *redisplay* cue, not an
 *input* cue: the relayout is redisplay-driven (as in GNU), and the command
 loop already redisplays on the input wait, so no click should be required.  A

@@ -314,3 +314,138 @@ load or run it.  Each probe gets its own state dir and display, so no two
 probes share a nested X server.  `exwm-workspace-probe.el` reuses only
 `exwm-harness-lib.el` (load path, atom/root helpers) and the same stage-driver
 and `HARNESS-RESULT:` conventions.
+
+## 6. Milestone-4 follow-up coverage (ICCCM hints, `_NET_WM_STATE`, RandR, absent RANDR)
+
+**Status:** Passing.  `exwm-workspace-probe.el` was extended with the checks
+that `milestone-4-notes.md` (next steps 2-4) and the roadmap still listed as
+to-do.  No new file is needed; the standalone probe and this note are the
+deliverable.  The existing 43 checks are unchanged, and the extended probe
+reports **68 checks**:
+
+```sh
+nix develop --accept-flake-config --command bash -lc \
+  'NESTED_X_STATE_DIR=/tmp/nx-m4 NESTED_X_DISPLAY=:170 RUST_LOG=error \
+   docs/exwm/harness/run-workspace-probe.sh --server xvfb'
+# ... HARNESS-RESULT: exwm-workspace PASS (68 checks)
+```
+
+The 25 new checks fall into four groups.  The stages are appended to the same
+`(delay . function)` driver; each new client window is created with a
+`setup-fn` that writes its ICCCM property *before* `MapWindow` (`exwp--create`
+takes an extra optional argument), so EXWM sees the property at manage time.
+
+### 6a. ICCCM relationships and hints (11 checks)
+
+`exwp--hints-create` / `exwp--check-normal-hints` / `exwp--check-transient` /
+`exwp--check-utility`:
+
+- **`WM_NORMAL_HINTS`.**  A client with `PMinSize | PMaxSize` and
+  `min == max == 320x240` is managed, EXWM derives `exwm--fixed-size` = t
+  from it, the property round-trips on the client
+  (`(:min-w 320 :min-h 240 :max-w 320 :max-h 240)`), and EXWM manages the
+  window as floating.  EXWM's `exwm--update-normal-hints` genuinely uses this
+  hint (`exwm.el`), so the behaviour is asserted, not merely observed.
+- **`WM_TRANSIENT_FOR`.**  A child whose `WM_TRANSIENT_FOR` names the tiled
+  client is managed, EXWM stores the parent in `exwm-transient-for`, the
+  property stays on the client, and EXWM manages the child as floating.
+- **`_NET_WM_WINDOW_TYPE_UTILITY`.**  A UTILITY client is managed and treated
+  as floating exactly like the already-covered DIALOG; its
+  `_NET_WM_WINDOW_TYPE` still reads UTILITY.  (Upstream EXWM lists UTILITY and
+  DIALOG together both in the manage/no-manage decision and in the floating
+  decision, `exwm-manage.el`, so this matches the source.)
+
+All three probe clients get a dedicated "destroyed client is unmanaged" check.
+
+### 6b. `_NET_WM_STATE` semantics (2 checks + NOTE)
+
+`exwp--check-net-supported` / `exwp--demand-attention` /
+`exwp--check-demand-attention`:
+
+- `_NET_SUPPORTED` (46 atoms on this fixture) **does** advertise
+  `_NET_WM_STATE_DEMANDS_ATTENTION` and **does not** advertise
+  `_NET_WM_STATE_ABOVE`.
+- Sending the EWMH `_NET_WM_STATE` ClientMessage (action ADD) with
+  `_NET_WM_STATE_DEMANDS_ATTENTION` for a client on the *inactive* workspace
+  sets that workspace frame's `exwm-urgency` parameter (EXWM's documented
+  reaction, `exwm--on-net-wm-state`).  It is **not** written back into the
+  client's `_NET_WM_STATE` property, so `DEMANDS_ATTENTION` is a transient
+  attention hint here, not a stored window state.
+- NOTE: EXWM has no `PropertyNotify` handling for `_NET_WM_STATE` at all
+  (`exwm--on-PropertyNotify` only covers window type, class, titles,
+  `WM_TRANSIENT_FOR`, `WM_NORMAL_HINTS`, `WM_HINTS` and `WM_PROTOCOLS`), so a
+  client that writes the property directly instead of sending the
+  ClientMessage is ignored.  The probe records this as a NOTE.
+
+### 6c. RandR / monitor layout (5 checks + second-monitor path)
+
+`exwp--randr-plist`, `exwp--randr-extra-begin` and their checks, on top of the
+existing RandR group:
+
+- The primary monitor name is taken from EXWM itself
+  (`exwm-randr-monitor` on the current workspace after `exwm-randr-mode`); on
+  this Xvfb it is `"screen"`.
+- `exwm-randr-workspace-monitor-plist` set to `(1 "screen")` plus
+  `exwm-randr-refresh` makes workspace 1's `exwm-randr-monitor` `"screen"`
+  and its `exwm-geometry` `(0 0 1280 800)`.
+- A genuine **second monitor** is created with `xcb:randr:SetMonitor` (RandR
+  1.5, no outputs): `NEOMACS-M4` at `(640 0 640 800)`.  After mapping
+  workspace 1 to it and refreshing, `exwm-randr-monitor` is `"NEOMACS-M4"`
+  and `exwm-geometry` is `(640 0 640 800)`, while `_NET_DESKTOP_GEOMETRY`
+  stays `(1280 800)` -- EXWM does **not** shrink the desktop to a monitor
+  (`exwm-workspace--set-desktop-geometry` uses `x-display-pixel-width/height`).
+  The monitor is deleted again at the end of the run.
+
+This is the closest a single-screen Xvfb can get to a hotplug/multi-monitor
+test; it exercises the real monitor-rectangle path (`exwm-randr--get-monitors`
+-> `exwm-geometry`) without a physical second output.  A CRTC/output hotplug
+still needs a multi-output server (Xephyr with a second output, or Xvfb with
+`-screen` alternatives) and is not attempted here.
+
+### 6d. Absent-extension fallback (2 checks)
+
+The absent-RANDR path is finally exercised rather than only noted:
+`exwp--randr-absent-begin` disables `exwm-randr-mode`, adds an `:around`
+advice to `xcb:get-extension-data` that reports `present = 0` for
+`xcb:randr`, and calls `exwm-randr--init` directly.  It signals
+
+```
+(error "[EXWM] RandR extension is not supported by the server")
+```
+
+and leaves `exwm-randr--connection` nil (no half-open connection), which the
+two checks assert.  The advice is removed and `exwm-randr-mode` re-enabled so
+the process shuts down cleanly.  The pre-existing NOTE path for a server that
+really lacks RANDR is kept.
+
+## 7. Full result of the extended run
+
+```
+randr primary="screen"
+randr: extra monitor refresh monitor="NEOMACS-M4" geometry=(640 0 640 800)
+PASS: randr: workspace exwm-randr-monitor follows a second monitor => (:ok "NEOMACS-M4")
+PASS: randr: workspace exwm-geometry follows a second monitor => (:ok (640 0 640 800))
+PASS: randr: _NET_DESKTOP_GEOMETRY stays the screen size, not the monitor => (:ok (1280 800))
+demands-attention: frame=2097163 urgency=t
+PASS: demands-attention: marks the inactive workspace frame urgent => (:ok t)
+PASS: demands-attention: not stored back as a window _NET_WM_STATE => (:ok nil)
+PASS: normal-hints: EXWM derives exwm--fixed-size (min == max) => (:ok t)
+normal-hints: (:min-w 320 :min-h 240 :max-w 320 :max-h 240)
+PASS: transient: EXWM reads WM_TRANSIENT_FOR => (:ok 10485761)
+PASS: utility: EXWM manages it as floating like DIALOG => (:ok t)
+randr-absent: error=(error "[EXWM] RandR extension is not supported by the server") connection=nil
+PASS: randr-absent: init fails with no RandR connection left => (:ok t)
+PASS: randr-absent: error names the missing extension => (:ok t)
+HARNESS-RESULT: exwm-workspace PASS (68 checks)
+```
+
+## 8. Remaining gaps
+
+- A real second *output*/CRTC and hotplug are still untested; only a virtual
+  RandR 1.5 monitor on one screen is covered (section 6c).
+- `_NET_WORKAREA` remains absent, matching upstream EXWM (commented out of its
+  `_NET_SUPPORTED`); the work-area path is logged but not a PASS check.
+- `_NET_WM_STATE_ABOVE` is unsupported; the probe asserts its absence.  Note
+  that upstream EXWM's `_NET_WM_STATE` handler treats `ABOVE` as an alias for
+  `FULLSCREEN` (`exwm--on-net-wm-state`), which is a distinct quirk from the
+  advertised state list and is not exercised here.

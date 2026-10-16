@@ -6009,8 +6009,17 @@ impl crate::emacs_core::eval::Context {
             .into_iter()
             .flatten()
             .min();
-            let wait_result =
-                self.wait_for_command_input_with_idle_policy(wait_deadline, idle_policy);
+            let wait_result = self.wait_for_command_input_with_idle_policy(
+                wait_deadline,
+                idle_policy,
+                // The read's own end time, not `wait_deadline`: an unbounded
+                // command read still arms auto-save/display maintenance
+                // deadlines, and a process filter that requeues
+                // `unread-command-events` must wake this wait so the top of the
+                // loop can pop the event (GNU `kbd_buffer_get_event`'s loop
+                // re-checks `Vunread_command_events` after every wait return).
+                deadline.is_none(),
+            );
 
             match wait_result? {
                 CommandInputWaitOutcome::InputPending => {

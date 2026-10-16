@@ -61,6 +61,18 @@
 (defvar exwp--randr-error nil "Error from the RandR query, for diagnostics.")
 (defvar exwp--init-warning nil "First warning raised while EXWM initializes.")
 
+(defvar exwp--wh nil "Fixed-size (WM_NORMAL_HINTS min == max) client.")
+(defvar exwp--wt nil "WM_TRANSIENT_FOR client.")
+(defvar exwp--wu nil "_NET_WM_WINDOW_TYPE_UTILITY client.")
+
+(defvar exwp--randr-raw nil
+  "RandR monitors as plists (:name STR :atom ATOM :rect (X Y W H) :primary BOOL).")
+(defvar exwp--randr-primary nil "Name of the primary RandR monitor.")
+(defvar exwp--randr-extra nil "Name of the extra RandR monitor, if one was created.")
+(defvar exwp--randr-extra-rect nil "Geometry (X Y W H) of the extra monitor.")
+(defvar exwp--randr-absent-error nil
+  "Error signalled by `exwm-randr--init' when RANDR is simulated absent.")
+
 (defun exwp--log (fmt &rest args)
   "Append a formatted line to the trace file and stdout."
   (let ((line (concat (apply #'format fmt args) "\n")))
@@ -121,10 +133,49 @@
                      :window window :property property :type type
                      :format 32 :data-len (length atoms) :data data))))
 
-(defun exwp--create (title class width height &optional wm-type)
+(defun exwp--set-fixed-size-hints (window width height)
+  "Set WM_NORMAL_HINTS on WINDOW to a fixed WIDTH x HEIGHT (min == max).
+The property is written verbatim (type `WM_SIZE_HINTS', format 32) so EXWM's
+`exwm--update-normal-hints' sees PMinSize and PMaxSize and derives
+`exwm--fixed-size'."
+  (let* ((conn exwp--conn)
+         (property (exwm-harness-intern-atom conn "WM_NORMAL_HINTS"))
+         (type (exwm-harness-intern-atom conn "WM_SIZE_HINTS"))
+         (flags (logior xcb:icccm:WM_SIZE_HINTS:PMinSize
+                        xcb:icccm:WM_SIZE_HINTS:PMaxSize))
+         ;; ICCCM WM_SIZE_HINTS, 18 CARD32 values.
+         (values (list flags 0 0 0 0
+                       width height width height
+                       0 0 0 0 0 0 0 0 0))
+         (data (apply #'vconcat (mapcar #'xcb:-pack-u4-lsb values))))
+    (xcb:+request conn
+      (make-instance 'xcb:ChangeProperty
+                     :mode xcb:PropMode:Replace
+                     :window window :property property :type type
+                     :format 32 :data-len (length values) :data data))
+    (xcb:flush conn)))
+
+(defun exwp--set-transient-for (window parent)
+  "Set WM_TRANSIENT_FOR on WINDOW to the X window PARENT."
+  (xcb:+request exwp--conn
+    (make-instance 'xcb:icccm:set-WM_TRANSIENT_FOR
+                   :window window :data parent))
+  (xcb:flush exwp--conn))
+
+(defun exwp--normal-hints (window)
+  "Return WINDOW's WM_NORMAL_HINTS as a plist (:min-w :min-h :max-w :max-h)."
+  (with-slots (min-width min-height max-width max-height)
+      (xcb:+request-unchecked+reply exwp--conn
+        (make-instance 'xcb:icccm:get-WM_NORMAL_HINTS :window window))
+    (list :min-w min-width :min-h min-height
+          :max-w max-width :max-h max-height)))
+
+(defun exwp--create (title class width height &optional wm-type setup-fn)
   "Create and map a client window with TITLE, CLASS, WIDTH and HEIGHT.
-WM-TYPE, if non-nil, is an `_NET_WM_WINDOW_TYPE' atom name.  Return the new
-window id.  The window lives on `exwp--conn'."
+WM-TYPE, if non-nil, is an `_NET_WM_WINDOW_TYPE' atom name.  SETUP-FN, if
+non-nil, is called with the new window before it is mapped, so ICCCM
+properties such as WM_NORMAL_HINTS and WM_TRANSIENT_FOR are visible when EXWM
+manages it.  Return the new window id.  The window lives on `exwp--conn'."
   (let* ((conn exwp--conn)
          (root (exwm-harness-root-window conn))
          (window (xcb:generate-id conn))
@@ -145,6 +196,8 @@ window id.  The window lives on `exwp--conn'."
     (when wm-type
       (exwp--set-atom-prop conn window "_NET_WM_WINDOW_TYPE" "ATOM"
                            (list wm-type)))
+    (when setup-fn
+      (funcall setup-fn window))
     (xcb:+request conn
       (make-instance 'xcb:ChangeWindowAttributes
                      :window window :value-mask xcb:CW:BackPixel
@@ -217,6 +270,40 @@ window id.  The window lives on `exwp--conn'."
          (memq window (nth 1 lists))
          t)))
 
+(defun exwp--atom-name (atom)
+  "Return the name string of ATOM, asked of the X server directly.
+This avoids depending on Neomacs' `x-get-atom-name' and works for atoms EXWM
+creates for RandR monitors."
+  (slot-value (xcb:+request-unchecked+reply
+               exwp--conn
+               (make-instance 'xcb:GetAtomName :atom atom))
+              'name))
+
+(defun exwp--supported-atoms ()
+  "Return the root `_NET_SUPPORTED' atom list."
+  (exwp--root-prop-seq 'xcb:ewmh:get-_NET_SUPPORTED))
+
+(defun exwp--send-wm-state (window atom action)
+  "Send an EWMH `_NET_WM_STATE' client message for WINDOW.
+ATOM names the state atom and ACTION is one of the
+`xcb:ewmh:_NET_WM_STATE_*' constants.  The message is sent to the root window
+with the SubstructureRedirect mask, exactly as a normal client would."
+  (let* ((conn exwp--conn)
+         (root (exwm-harness-root-window conn))
+         (state (exwm-harness-intern-atom conn "_NET_WM_STATE"))
+         (prop (exwm-harness-intern-atom conn atom))
+         (cmd (make-instance 'xcb:ClientMessageData
+                             :data32 (vector action prop 0 1 0)))
+         (cm (make-instance 'xcb:ClientMessage
+                            :window window :format 32 :type state :data cmd))
+         (se (make-instance 'xcb:SendEvent
+                            :propagate 0 :destination root
+                            :event-mask (logior xcb:EventMask:SubstructureRedirect
+                                                xcb:EventMask:SubstructureNotify)
+                            :event (xcb:marshal cm conn))))
+    (xcb:+request conn se)
+    (xcb:flush conn)))
+
 ;;; --- RandR helpers ---------------------------------------------------------
 
 (defun exwp--randr-present-p ()
@@ -240,6 +327,27 @@ window id.  The window lives on `exwp--conn'."
                   (with-slots (x y width height) m
                     (list x y width height)))
                 monitors))
+    (error (setq exwp--randr-error err) nil)))
+
+(defun exwp--randr-query-monitors ()
+  "Return RandR 1.5 monitors as plists.
+Each plist is (:name STR :atom ATOM :rect (X Y W H) :primary BOOL)."
+  (condition-case err
+      (let* ((reply
+              (xcb:+request-unchecked+reply
+                  exwp--conn
+                (make-instance 'xcb:randr:GetMonitors
+                               :window (exwm-harness-root-window exwp--conn)
+                               :get-active 1)))
+             (monitors (append (slot-value reply 'monitors) nil)))
+        (mapcar
+         (lambda (m)
+           (with-slots (name primary x y width height) m
+             (list :atom name
+                   :name (ignore-errors (exwp--atom-name name))
+                   :rect (list x y width height)
+                   :primary (/= 0 primary))))
+         monitors))
     (error (setq exwp--randr-error err) nil)))
 
 (defun exwp--bbox (rects)
@@ -327,6 +435,21 @@ window id.  The window lives on `exwp--conn'."
                                 (exwm-harness-root-window exwp--conn)
                                 'xcb:ewmh:get-_NET_NUMBER_OF_DESKTOPS)))))
 
+(defun exwp--check-net-supported ()
+  "Check the atom set EXWM advertises in `_NET_SUPPORTED'."
+  (exwp--log "--- _NET_SUPPORTED window-state coverage ---")
+  (let ((atoms (exwp--supported-atoms)))
+    (exwp--log "net-supported: %d atoms" (length atoms))
+    (exwp--check "net-supported: advertises _NET_WM_STATE_DEMANDS_ATTENTION"
+                 (lambda ()
+                   (exwp--expect t
+                                 (and (memq xcb:Atom:_NET_WM_STATE_DEMANDS_ATTENTION
+                                            atoms)
+                                      t))))
+    (exwp--check "net-supported: does not advertise _NET_WM_STATE_ABOVE (EXWM unsupported)"
+                 (lambda ()
+                   (exwp--expect nil (memq xcb:Atom:_NET_WM_STATE_ABOVE atoms))))))
+
 (defun exwp--create-w1 ()
   (exwp--log "--- create tiled client ---")
   (setq exwp--w1 (exwp--create "Workspace Probe" "NeomacsWorkspace" 400 300))
@@ -407,6 +530,35 @@ window id.  The window lives on `exwp--conn'."
                                (list (exwp--map-state exwp--w1)
                                      (and (exwp--hidden-p exwp--w1) t))))))
 
+;;; --- coverage 2c: _NET_WM_STATE client messages ----------------------------
+
+(defun exwp--demand-attention ()
+  "Send `_NET_WM_STATE_DEMANDS_ATTENTION' for the client on workspace 1.
+Called while the client sits on the inactive workspace 1, which is the only
+case EXWM reacts to (it marks the workspace frame urgent).  The message is the
+EWMH ClientMessage form; EXWM has no PropertyNotify handler for a directly
+written `_NET_WM_STATE'."
+  (exwp--log "--- _NET_WM_STATE DEMANDS_ATTENTION (ClientMessage) ---")
+  (exwp--send-wm-state exwp--w1 "_NET_WM_STATE_DEMANDS_ATTENTION"
+                       xcb:ewmh:_NET_WM_STATE_ADD))
+
+(defun exwp--check-demand-attention ()
+  (exwp--check "demands-attention: marks the inactive workspace frame urgent"
+               (lambda ()
+                 (let ((frame (buffer-local-value 'exwm--frame
+                                                  (exwm--id->buffer exwp--w1))))
+                   (exwp--log "demands-attention: frame=%S urgency=%S"
+                              (frame-parameter frame 'exwm-outer-id)
+                              (frame-parameter frame 'exwm-urgency))
+                   (exwp--expect t (frame-parameter frame 'exwm-urgency)))))
+  (exwp--check "demands-attention: not stored back as a window _NET_WM_STATE"
+               (lambda ()
+                 (exwp--expect nil
+                               (memq xcb:Atom:_NET_WM_STATE_DEMANDS_ATTENTION
+                                     (exwp--wm-state exwp--w1)))))
+  (exwp--note "demands-attention: EXWM ignores a directly-written _NET_WM_STATE property (no PropertyNotify handler)"
+              (lambda () t)))
+
 (defun exwp--move-window-to-0 ()
   (exwp--log "--- exwm-workspace-move-window: client -> workspace 0 ---")
   (exwp--log-dedication "before move-to-0")
@@ -473,7 +625,9 @@ window id.  The window lives on `exwp--conn'."
   (setq exwp--randr-present (exwp--randr-present-p))
   (exwp--log "randr present=%S error=%S" exwp--randr-present exwp--randr-error)
   (when exwp--randr-present
-    (setq exwp--randr-monitors (exwp--randr-monitors))
+    (setq exwp--randr-raw (exwp--randr-query-monitors))
+    (setq exwp--randr-monitors (mapcar (lambda (m) (plist-get m :rect))
+                                       exwp--randr-raw))
     (exwp--log "randr monitors=%S error=%S"
                exwp--randr-monitors exwp--randr-error)
     ;; EXWM's RandR module is opt-in; enable it to also check the frame's
@@ -481,7 +635,15 @@ window id.  The window lives on `exwp--conn'."
     (setq exwp--randr-mode-ok
           (condition-case err
               (progn (exwm-randr-mode 1) (exwm-randr-refresh) t)
-            (error (exwp--log "exwm-randr-mode error: %S" err) nil)))))
+            (error (exwp--log "exwm-randr-mode error: %S" err) nil)))
+    ;; Take the primary monitor name from EXWM itself.  With an empty plist
+    ;; every workspace maps to the primary monitor, so the frame parameter is
+    ;; exactly the name EXWM resolves; this avoids disagreeing with the atom
+    ;; name EXWM sees through `x-get-atom-name'.
+    (when exwp--randr-mode-ok
+      (setq exwp--randr-primary
+            (frame-parameter (car exwm-workspace--list) 'exwm-randr-monitor))
+      (exwp--log "randr primary=%S" exwp--randr-primary))))
 
 (defun exwp--check-randr ()
   (exwp--log "--- RandR / desktop geometry ---")
@@ -552,6 +714,176 @@ window id.  The window lives on `exwp--conn'."
                  (let ((vp (exwp--root-prop-seq
                             'xcb:ewmh:get-_NET_DESKTOP_VIEWPORT)))
                    (exwp--expect (list 0 0) vp)))))
+
+(defun exwp--randr-plist ()
+  "Assign workspace 1 to the primary monitor through the RandR plist."
+  (when (and exwp--randr-mode-ok exwp--randr-primary)
+    (exwp--log "--- exwm-randr-workspace-monitor-plist (primary monitor) ---")
+    (setq exwm-randr-workspace-monitor-plist (list 1 exwp--randr-primary))
+    (exwm-randr-refresh)
+    (exwp--log "randr: plist=%S primary=%S"
+               exwm-randr-workspace-monitor-plist exwp--randr-primary)))
+
+(defun exwp--check-randr-plist ()
+  (if (and exwp--randr-mode-ok exwp--randr-primary)
+      (let ((m (cl-find-if (lambda (m) (equal (plist-get m :name)
+                                              exwp--randr-primary))
+                           exwp--randr-raw)))
+        (exwp--check "randr: plist assigns workspace 1 to the primary monitor"
+                     (lambda ()
+                       (exwp--expect exwp--randr-primary
+                                     (frame-parameter
+                                      (elt exwm-workspace--list 1)
+                                      'exwm-randr-monitor))))
+        (exwp--check "randr: assigned workspace exwm-geometry follows its monitor"
+                     (lambda ()
+                       (with-slots (x y width height)
+                           (frame-parameter (elt exwm-workspace--list 1)
+                                            'exwm-geometry)
+                         (exwp--expect (plist-get m :rect)
+                                       (list x y width height))))))
+    (exwp--note "randr: workspace-monitor-plist not exercised (RandR mode unavailable)"
+                (lambda () exwp--randr-mode-ok))))
+
+(defun exwp--randr-extra-begin ()
+  "Create a second RandR 1.5 monitor (no outputs) and map workspace 1 to it.
+A single-screen Xvfb cannot hotplug an output, so this virtual monitor is the
+closest available stand-in for a monitor-layout change."
+  (when (and exwp--randr-mode-ok exwp--randr-present)
+    (let* ((conn exwp--conn)
+           (name "NEOMACS-M4")
+           (atom (exwm-harness-intern-atom conn name)))
+      (condition-case err
+          (progn
+            (xcb:+request conn
+              (make-instance 'xcb:randr:SetMonitor
+                             :window (exwm-harness-root-window conn)
+                             :monitorinfo
+                             (make-instance 'xcb:randr:MonitorInfo
+                                            :name atom :primary 0 :automatic 0
+                                            :nOutput 0
+                                            :x 640 :y 0
+                                            :width 640 :height 800
+                                            :width-in-millimeters 169
+                                            :height-in-millimeters 211
+                                            :outputs nil)))
+            (xcb:flush conn)
+            (sit-for 0.2)
+            (setq exwp--randr-raw (exwp--randr-query-monitors))
+            (when (cl-find-if (lambda (m) (equal (plist-get m :name) name))
+                              exwp--randr-raw)
+              (setq exwm-randr-workspace-monitor-plist (list 1 name))
+              (exwm-randr-refresh)
+              (let ((mon (frame-parameter (elt exwm-workspace--list 1)
+                                          'exwm-randr-monitor))
+                    (geom (frame-parameter (elt exwm-workspace--list 1)
+                                           'exwm-geometry)))
+                (exwp--log "randr: extra monitor refresh monitor=%S geometry=%S"
+                           mon (and geom (list (slot-value geom 'x)
+                                               (slot-value geom 'y)
+                                               (slot-value geom 'width)
+                                               (slot-value geom 'height))))
+                ;; Only treat the layout change as exercised if EXWM really
+                ;; moved workspace 1 onto the new monitor.
+                (when (and geom
+                           (equal (list (slot-value geom 'x) (slot-value geom 'y)
+                                        (slot-value geom 'width)
+                                        (slot-value geom 'height))
+                                  (list 640 0 640 800)))
+                  (setq exwp--randr-extra (or mon name)
+                        exwp--randr-extra-rect (list 640 0 640 800))))))
+        (error (exwp--log "randr: SetMonitor failed: %S" err))))))
+
+(defun exwp--check-randr-extra ()
+  (if exwp--randr-extra
+      (progn
+        (exwp--check "randr: workspace exwm-randr-monitor follows a second monitor"
+                     (lambda ()
+                       (exwp--expect exwp--randr-extra
+                                     (frame-parameter
+                                      (elt exwm-workspace--list 1)
+                                      'exwm-randr-monitor))))
+        (exwp--check "randr: workspace exwm-geometry follows a second monitor"
+                     (lambda ()
+                       (with-slots (x y width height)
+                           (frame-parameter (elt exwm-workspace--list 1)
+                                            'exwm-geometry)
+                         (exwp--expect exwp--randr-extra-rect
+                                       (list x y width height)))))
+        (exwp--check "randr: _NET_DESKTOP_GEOMETRY stays the screen size, not the monitor"
+                     (lambda ()
+                       (with-slots (width height)
+                           (xcb:+request-unchecked+reply
+                            exwp--conn
+                            (make-instance 'xcb:ewmh:get-_NET_DESKTOP_GEOMETRY
+                                           :window (exwm-harness-root-window
+                                                    exwp--conn)))
+                         (exwp--expect (list (x-display-pixel-width)
+                                             (x-display-pixel-height))
+                                       (list width height))))))
+    (exwp--note "randr: second RandR 1.5 monitor not available (single Xvfb screen)"
+                (lambda ()
+                  (list :monitors (mapcar (lambda (m) (plist-get m :name))
+                                          exwp--randr-raw))))))
+
+(defun exwp--randr-cleanup ()
+  "Delete the extra RandR monitor created by `exwp--randr-extra-begin'."
+  (when exwp--randr-extra
+    (exwp--log "--- deleting the extra RandR monitor ---")
+    (condition-case err
+        (progn
+          (xcb:+request exwp--conn
+            (make-instance 'xcb:randr:DeleteMonitor
+                           :window (exwm-harness-root-window exwp--conn)
+                           :name (exwm-harness-intern-atom exwp--conn
+                                                           exwp--randr-extra)))
+          (xcb:flush exwp--conn)
+          (sit-for 0.2)
+          (setq exwp--randr-raw (exwp--randr-query-monitors)
+                exwp--randr-extra nil
+                exwp--randr-extra-rect nil))
+      (error (exwp--log "randr: DeleteMonitor failed: %S" err)))))
+
+(defun exwp--randr-absent-advice (orig conn namespace)
+  "Around-advice that reports RANDR as absent for `exwm-randr--init'."
+  (if (eq namespace 'xcb:randr)
+      (make-instance 'xcb:QueryExtension~reply
+                     :present 0 :major-opcode 0
+                     :first-event 0 :first-error 0)
+    (funcall orig conn namespace)))
+
+(defun exwp--randr-absent-begin ()
+  "Exercise EXWM's absent-RANDR fallback by pretending the extension is gone."
+  (exwp--log "--- absent-RANDR fallback (simulated) ---")
+  (when (bound-and-true-p exwm-randr-mode)
+    (exwm-randr-mode -1))
+  (advice-add 'xcb:get-extension-data :around #'exwp--randr-absent-advice)
+  (setq exwp--randr-absent-error
+        (condition-case err
+            (progn (exwm-randr--init) nil)
+          (error err)))
+  (advice-remove 'xcb:get-extension-data #'exwp--randr-absent-advice)
+  (exwp--log "randr-absent: error=%S connection=%S"
+             exwp--randr-absent-error exwm-randr--connection))
+
+(defun exwp--check-randr-absent ()
+  (exwp--check "randr-absent: init fails with no RandR connection left"
+               (lambda ()
+                 (exwp--expect t (and exwp--randr-absent-error
+                                      (null exwm-randr--connection)
+                                      t))))
+  (exwp--check "randr-absent: error names the missing extension"
+               (lambda ()
+                 (exwp--expect t
+                               (and (string-match-p
+                                     "RandR extension is not supported"
+                                     (error-message-string
+                                      exwp--randr-absent-error))
+                                    t))))
+  ;; Restore the module so the process shuts down cleanly.
+  (condition-case err
+      (exwm-randr-mode 1)
+    (error (exwp--log "randr-absent: re-enable error: %S" err))))
 
 ;;; --- coverage 3: window type / floating semantics --------------------------
 
@@ -637,6 +969,101 @@ window id.  The window lives on `exwp--conn'."
                (lambda ()
                  (exwp--expect nil (assoc exwp--wf exwm--id-buffer-alist)))))
 
+;;; --- coverage 1b: ICCCM hints, transient relationships, UTILITY ----------
+
+(defun exwp--hints-create ()
+  (exwp--log "--- ICCCM hints / transient / UTILITY window type ---")
+  (setq exwp--wh
+        (exwp--create "Fixed Size" "NeomacsFixed" 320 240 nil
+                      (lambda (w) (exwp--set-fixed-size-hints w 320 240))))
+  (setq exwp--wt
+        (exwp--create "Transient Child" "NeomacsTransient" 240 180 nil
+                      (lambda (w) (exwp--set-transient-for w exwp--w1))))
+  (setq exwp--wu
+        (exwp--create "Utility" "NeomacsUtility" 260 160
+                      "_NET_WM_WINDOW_TYPE_UTILITY"))
+  (exwp--log "created hinted=#x%x transient=#x%x utility=#x%x"
+             exwp--wh exwp--wt exwp--wu))
+
+(defun exwp--check-normal-hints ()
+  (exwp--check "normal-hints: fixed-size client is managed"
+               (lambda () (assoc exwp--wh exwm--id-buffer-alist)))
+  (exwp--check "normal-hints: EXWM derives exwm--fixed-size (min == max)"
+               (lambda ()
+                 (exwp--expect t
+                               (buffer-local-value 'exwm--fixed-size
+                                                   (exwm--id->buffer exwp--wh)))))
+  (exwp--check "normal-hints: WM_NORMAL_HINTS round-trips on the client"
+               (lambda ()
+                 (let ((h (exwp--normal-hints exwp--wh)))
+                   (exwp--log "normal-hints: %S" h)
+                   (exwp--expect (list 320 240 320 240)
+                                 (list (plist-get h :min-w)
+                                       (plist-get h :min-h)
+                                       (plist-get h :max-w)
+                                       (plist-get h :max-h))))))
+  (exwp--check "normal-hints: fixed-size client is managed as floating"
+               (lambda ()
+                 (with-current-buffer (exwm--id->buffer exwp--wh)
+                   (exwp--expect t (and exwm--floating-frame
+                                        (frame-live-p exwm--floating-frame)
+                                        t))))))
+
+(defun exwp--check-transient ()
+  (exwp--check "transient: client is managed"
+               (lambda () (assoc exwp--wt exwm--id-buffer-alist)))
+  (exwp--check "transient: EXWM reads WM_TRANSIENT_FOR"
+               (lambda ()
+                 (exwp--expect exwp--w1
+                               (buffer-local-value 'exwm-transient-for
+                                                   (exwm--id->buffer exwp--wt)))))
+  (exwp--check "transient: WM_TRANSIENT_FOR stays on the client"
+               (lambda ()
+                 (exwp--expect exwp--w1
+                               (exwp--prop-value
+                                exwp--wt
+                                'xcb:icccm:get-WM_TRANSIENT_FOR))))
+  (exwp--check "transient: transient client is managed as floating"
+               (lambda ()
+                 (with-current-buffer (exwm--id->buffer exwp--wt)
+                   (exwp--expect t (and exwm--floating-frame
+                                        (frame-live-p exwm--floating-frame)
+                                        t))))))
+
+(defun exwp--check-utility ()
+  (exwp--check "utility: client is managed"
+               (lambda () (assoc exwp--wu exwm--id-buffer-alist)))
+  (exwp--check "utility: _NET_WM_WINDOW_TYPE contains UTILITY"
+               (lambda ()
+                 (let ((types (exwp--prop-seq
+                               (exwp--prop-value
+                                exwp--wu
+                                'xcb:ewmh:get-_NET_WM_WINDOW_TYPE))))
+                   (exwp--expect t
+                                 (and (memq xcb:Atom:_NET_WM_WINDOW_TYPE_UTILITY
+                                            types)
+                                      t)))))
+  (exwp--check "utility: EXWM manages it as floating like DIALOG"
+               (lambda ()
+                 (with-current-buffer (exwm--id->buffer exwp--wu)
+                   (exwp--expect t (and exwm--floating-frame
+                                        (frame-live-p exwm--floating-frame)
+                                        t))))))
+
+(defun exwp--destroy-hint-clients ()
+  (exwp--log "--- destroying hint/transient/utility clients ---")
+  (dolist (w (list exwp--wh exwp--wt exwp--wu))
+    (when w (exwp--destroy w))))
+
+(defun exwp--check-hint-clients-destroyed ()
+  (dolist (pair (list (cons "normal-hints" exwp--wh)
+                      (cons "transient" exwp--wt)
+                      (cons "utility" exwp--wu)))
+    (exwp--check (format "%s: destroyed client is unmanaged" (car pair))
+                 (lambda ()
+                   (exwp--expect nil (assoc (cdr pair)
+                                            exwm--id-buffer-alist))))))
+
 (defun exwp--destroy-w1 ()
   (exwp--log "--- destroying tiled client ---")
   (exwp--destroy exwp--w1))
@@ -665,6 +1092,7 @@ window id.  The window lives on `exwp--conn'."
   (setq exwp--pending
         (list (cons 0.5 #'exwp--start-exwm)
               (cons 1.0 #'exwp--check-workspaces)
+              (cons 0.2 #'exwp--check-net-supported)
               (cons 0.2 #'exwp--create-w1)
               (cons 2.0 #'exwp--check-initial-workspace)
               ;; Coverage 1: workspace switching.
@@ -675,9 +1103,16 @@ window id.  The window lives on `exwp--conn'."
               ;; Coverage 4: RandR / monitor layout.
               (cons 0.2 #'exwp--randr-query)
               (cons 0.5 #'exwp--check-randr)
+              (cons 0.2 #'exwp--randr-plist)
+              (cons 0.5 #'exwp--check-randr-plist)
+              (cons 0.2 #'exwp--randr-extra-begin)
+              (cons 0.5 #'exwp--check-randr-extra)
+              (cons 0.2 #'exwp--randr-cleanup)
               ;; Coverage 2: move a client across workspaces.
               (cons 0.2 #'exwp--move-window-to-1)
               (cons 1.5 #'exwp--check-window-moved)
+              (cons 0.2 #'exwp--demand-attention)
+              (cons 1.0 #'exwp--check-demand-attention)
               (cons 0.2 #'exwp--move-window-to-0)
               (cons 1.5 #'exwp--check-window-moved-back)
               ;; Coverage 2b: reorder workspaces with `exwm-workspace-move'.
@@ -694,11 +1129,21 @@ window id.  The window lives on `exwp--conn'."
               (cons 1.5 #'exwp--check-float-visible)
               (cons 0.2 #'exwp--destroy-wf)
               (cons 1.5 #'exwp--check-wf-destroyed)
+              ;; Coverage 1b: ICCCM hints / transient / UTILITY.
+              (cons 0.2 #'exwp--hints-create)
+              (cons 2.0 #'exwp--check-normal-hints)
+              (cons 0.2 #'exwp--check-transient)
+              (cons 0.2 #'exwp--check-utility)
+              (cons 0.2 #'exwp--destroy-hint-clients)
+              (cons 1.5 #'exwp--check-hint-clients-destroyed)
+              ;; Coverage 4b: absent-RANDR fallback (simulated).
+              (cons 0.2 #'exwp--randr-absent-begin)
+              (cons 0.5 #'exwp--check-randr-absent)
               (cons 0.2 #'exwp--destroy-w1)
               (cons 1.5 #'exwp--check-w1-destroyed)
               (cons 0.2 #'exwp--finish)))
   (run-with-timer
-   90 nil
+   150 nil
    (lambda ()
      (exwp--log "WATCHDOG: workspace probe did not finish")
      (kill-emacs 2)))

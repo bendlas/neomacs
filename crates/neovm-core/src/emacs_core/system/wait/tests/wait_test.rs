@@ -434,3 +434,34 @@ fn command_wait_returns_after_callbacks_to_restart_display_maintenance() {
         Some(WaitCompletion::CommandInputPending)
     );
 }
+
+/// Regression: the command loop's read is unbounded, but it arms internal
+/// maintenance deadlines (auto-save, display coverage, delayed echo) whose
+/// `min` makes the wait request finite.  A process filter that requeues
+/// `unread-command-events` during that wait must still return to `read_char`
+/// (GNU `kbd_buffer_get_event` breaks its wait loop on `Vunread_command_events`
+/// once `wait_reading_process_output` returns for the process callback), so the
+/// `command_read_unbounded` flag -- not the wait deadline -- gates the
+/// `DisplayActivity` exit.  A bounded read keeps honoring its deadline.
+#[test]
+fn unbounded_command_read_returns_after_callbacks_despite_internal_deadline() {
+    let mut request = WaitRequest::read_command_input_until(Instant::now() + Duration::from_secs(30));
+    assert_eq!(request.completion_for(WaitServiceOutcome::default()), None);
+
+    let mut process = ProcessOutputServiceOutcome::default();
+    process.record_activity(false);
+    let mut callback = WaitServiceOutcome::default();
+    callback.absorb_process_activity(process);
+
+    // A finite-deadline request without the flag (a Lisp `read-char` timeout,
+    // the process wait) does not take the display-activity exit.
+    assert_eq!(request.completion_for(callback), None);
+
+    // The command loop's unbounded read, even with the same finite internal
+    // deadline, does.
+    request.command_read_unbounded = true;
+    assert_eq!(
+        request.completion_for(callback),
+        Some(WaitCompletion::DisplayActivity)
+    );
+}
