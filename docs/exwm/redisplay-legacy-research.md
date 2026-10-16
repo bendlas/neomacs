@@ -107,15 +107,17 @@ extra full redisplays.
 
 ## Current decision
 
-The default was briefly flipped from `Legacy` to `Gnu`, then reverted. The
-user-visible interactive resize symptom turned out to be a separate input-drain
-bug (EXWM-grabbed keys stalled in `unread-command-events` until the next display
-event), fixed in `crates/neovm-core/src/emacs_core/system/wait/mod.rs` and
+The GNU redisplay-hook driver is the process default. It was briefly reverted
+while the user-visible interactive symptom was being investigated; that symptom
+turned out to be a separate input-drain bug (EXWM-grabbed keys stalled in
+`unread-command-events` until the next display event), fixed in
+`crates/neovm-core/src/emacs_core/system/wait/mod.rs` and
 `crates/neovm-core/src/keyboard.rs` (`command_read_unbounded`) with the
-regression `docs/exwm/harness/run-interactive-input-repro.sh`. So
-`parse_redisplay_hooks` keeps the original `Legacy` default;
-`NEOMACS_REDISPLAY_GNU_HOOKS=1` still selects the GNU driver, which is what the
-floating probe uses. The legacy gap described above remains open.
+regression `docs/exwm/harness/run-interactive-input-repro.sh`. With that bug
+fixed independently, `parse_redisplay_hooks` selects GNU when unset (only an
+explicit `off`/`0`/`false`/`no` restores the legacy driver), so the floating
+resize path works by default. The legacy gap described above remains documented
+but is no longer the default path.
 
 ## Open caveat (interactive session)
 

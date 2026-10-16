@@ -1,10 +1,10 @@
 # Milestone 4 notes: ICCCM, EWMH, workspaces, and monitor behavior
 
 **Status:** In progress.  EWMH/ICCCM root and client properties are now
-covered by the nested-X client probe and pass (47 checks total, including the
-split-window propagation check in section 5).  The floating/transient path is
-reachable; its resize check still fails under the legacy redisplay driver (the
-default) and stays gated behind `EXWM_EXPECT_FLOATING=1` (section 7).
+covered by the nested-X client probe and pass (51 checks total, including the
+split-window propagation check in section 5 and the floating/transient path).
+The floating resize gap is fixed: Neomacs now defaults to the GNU
+redisplay-hook driver (section 7).
 
 ## 1. EWMH / ICCCM coverage (passing)
 
@@ -32,11 +32,10 @@ docs/exwm/harness/run-client-probe.sh --server xvfb
 Still to cover for M4: `_NET_WM_STATE`/window types, `_NET_WM_DESKTOP`,
 workspace switching, and RandR/monitor layout.
 
-## 2. Floating / transient (legacy driver still gated)
+## 2. Floating / transient (now passing)
 
-The floating check passes under the GNU redisplay-hook driver but not under the
-legacy driver (the default), so it stays gated behind `EXWM_EXPECT_FLOATING=1`
-(section 7).
+Fixed by defaulting to the GNU redisplay-hook driver (section 7); the client
+probe's floating checks are unconditional again.
 
 What works now (after the "expose real X11 window ids" merge):
 
@@ -50,11 +49,10 @@ What works now (after the "expose real X11 window ids" merge):
 - Calling `exwm-layout--show`/`exwm-layout--refresh` for the floating frame
   resizes the client to the requested `500x400` (verified by the probe).
 
-Gap: Neomacs applies the external frame resize asynchronously, and under the
-legacy redisplay driver the change to the non-selected floating frame is not
-re-fitted before EXWM reads the client geometry.  The exact root cause is the
-legacy redisplay skip gate hashing only the selected frame (section 7); the GNU
-driver (`NEOMACS_REDISPLAY_GNU_HOOKS=1`) avoids it.
+Gap (resolved): originally attributed to the ordering between Neomacs'
+asynchronous external resize and EXWM's synchronous expectation.  The exact
+root cause is the legacy redisplay skip gate hashing only the selected frame
+(section 7); defaulting to the GNU redisplay-hook driver fixes it.
 
 Evidence from the probe diagnostics:
 
@@ -83,9 +81,9 @@ the final size.  GNU gets this through its synchronous X event handling.
 
 ## 4. Next steps
 
-1. Fix the legacy redisplay gap (see `redisplay-legacy-research.md`) so the
-   floating resize check passes under the default driver and the floating
-   checks can become unconditional.
+1. (Done) The GNU redisplay-hook driver is now the default, so the floating
+   resize check passes; the remaining legacy work is tracked in
+   `redisplay-legacy-research.md`.
 2. Add `_NET_WM_STATE`/window-type and `_NET_WM_DESKTOP` client checks.
 3. Cover workspace switching and root EWMH synchronization
    (`_NET_CURRENT_DESKTOP`, `_NET_CLIENT_LIST` after a move).
@@ -175,12 +173,10 @@ EXWM_EXPECT_FLOATING=1 NESTED_X_DISPLAY=:66 \
 
 ## 7. Floating resize: exact root cause and proposed fix (legacy redisplay driver)
 
-**Status: not fixed (the GNU driver remains an opt-in).**  The floating check
-fails under the legacy redisplay-hook driver (the default) and passes only with
-`NEOMACS_REDISPLAY_GNU_HOOKS=1`.  A default flip was tried and reverted once the
-interactive input-drain bug (EXWM-grabbed keys stalling in
-`unread-command-events`) was found to be the real cause of the user-visible
-resize symptom; the legacy gap here is separate and still open.
+**Status: fixed.**  The GNU redisplay-hook driver is now the process default
+(`parse_redisplay_hooks`; an explicit `off`/`0`/`false`/`no` restores legacy),
+so the floating check passes without `EXWM_EXPECT_FLOATING=1`.  The *legacy*
+driver still has the gap described here; it is not the default path.
 
 ### Experiment (clean build from the committed source, no Rust changes)
 
