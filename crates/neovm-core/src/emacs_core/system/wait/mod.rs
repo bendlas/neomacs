@@ -371,6 +371,16 @@ struct WaitRequest {
     redisplay: bool,
     special_input: SpecialInputWaitPolicy,
     idle_policy: crate::keyboard::IdleTransitionPolicy,
+    /// Whether the read that owns this wait has no end time (`read_char`
+    /// called with no timeout, as the command loop does).  GNU's
+    /// `kbd_buffer_get_event` re-checks `Vunread_command_events` at the top of
+    /// its wait loop and breaks as soon as the wait returns, so an unbounded
+    /// read must return to its caller after timer/process callbacks even when
+    /// the wait itself carries an internal maintenance deadline (auto-save,
+    /// display coverage, delayed echo).  A bounded read (a Lisp `read-char`
+    /// timeout, the retirement wait) honors its deadline and does not take
+    /// this exit.
+    command_read_unbounded: bool,
 }
 
 impl WaitRequest {
@@ -421,6 +431,7 @@ impl WaitRequest {
             redisplay: false,
             special_input: SpecialInputWaitPolicy::ServiceOnly,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -483,6 +494,7 @@ impl WaitRequest {
             redisplay: true,
             special_input: SpecialInputWaitPolicy::ServiceOnly,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: matches!(deadline, WaitDeadline::Forever),
         }
     }
 
@@ -503,6 +515,7 @@ impl WaitRequest {
             redisplay,
             special_input: SpecialInputWaitPolicy::ServiceOnly,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -515,6 +528,7 @@ impl WaitRequest {
             redisplay: false,
             special_input: SpecialInputWaitPolicy::ServiceOnly,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -536,6 +550,7 @@ impl WaitRequest {
             redisplay,
             special_input: SpecialInputWaitPolicy::Suppress,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -549,6 +564,7 @@ impl WaitRequest {
             redisplay: false,
             special_input: SpecialInputWaitPolicy::ServiceOnly,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -564,6 +580,7 @@ impl WaitRequest {
             redisplay: false,
             special_input: SpecialInputWaitPolicy::ServiceOnly,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -576,6 +593,7 @@ impl WaitRequest {
             redisplay: false,
             special_input: SpecialInputWaitPolicy::CompleteOnResize,
             idle_policy: crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded: false,
         }
     }
 
@@ -716,14 +734,18 @@ impl WaitRequest {
         // Timer and process callbacks can replace the displayed buffer. Return
         // to read_char so its bounded display maintenance can discover that
         // change even when its previous coverage request had no more work.
-        // Only the command loop's UNBOUNDED read takes this exit: a bounded
-        // read (a Lisp `read-char` timeout, the retirement wait) has a
-        // deadline contract to honor, and GNU's loop keeps blocking until
-        // that deadline when nothing but timers ran.
-        if matches!(
-            (self.keyboard, self.deadline),
-            (KeyboardWaitPolicy::ReadCommandInput, WaitDeadline::Forever)
-        ) && (outcome.has_timer_activity() || outcome.ran_process_callbacks())
+        // Only an UNBOUNDED read takes this exit: a bounded read (a Lisp
+        // `read-char` timeout, the retirement wait) has a deadline contract to
+        // honor, and GNU's loop keeps blocking until that deadline when
+        // nothing but timers ran.  The gate is the read's own end time
+        // (`command_read_unbounded`), not the wait's deadline: the command
+        // loop's read is unbounded yet still arms internal maintenance
+        // deadlines (auto-save, display coverage, delayed echo), and GNU's
+        // `kbd_buffer_get_event` loop returns through this path so it can
+        // re-check `Vunread_command_events` after a filter requeued one.
+        if self.keyboard == KeyboardWaitPolicy::ReadCommandInput
+            && self.command_read_unbounded
+            && (outcome.has_timer_activity() || outcome.ran_process_callbacks())
         {
             return Some(WaitCompletion::DisplayActivity);
         }
@@ -1488,16 +1510,24 @@ impl super::eval::Context {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<CommandInputWaitOutcome, Flow> {
+        let command_read_unbounded = deadline.is_none();
         self.wait_for_command_input_with_idle_policy(
             deadline,
             crate::keyboard::IdleTransitionPolicy::Manage,
+            command_read_unbounded,
         )
     }
 
+    /// `command_read_unbounded` is the caller's own end time, not the `deadline`
+    /// (which is `min` of that and the internal maintenance deadlines): the
+    /// command loop's read passes `true` so a process filter that requeues
+    /// `unread-command-events` wakes it even when an auto-save or display
+    /// deadline is the wait's shortest one.
     pub(crate) fn wait_for_command_input_with_idle_policy(
         &mut self,
         deadline: Option<Instant>,
         idle_policy: crate::keyboard::IdleTransitionPolicy,
+        command_read_unbounded: bool,
     ) -> Result<CommandInputWaitOutcome, Flow> {
         let mut request = if let Some(deadline) = deadline {
             if deadline <= Instant::now() {
@@ -1508,6 +1538,7 @@ impl super::eval::Context {
             WaitRequest::read_command_input_forever()
         };
         request.idle_policy = idle_policy;
+        request.command_read_unbounded |= command_read_unbounded;
         self.wait_reading_process_output(request)
             .map(CommandInputWaitOutcome::from_completion)
     }
