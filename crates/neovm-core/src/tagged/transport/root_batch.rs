@@ -20,6 +20,13 @@ use crate::tagged::gc::{
 };
 use crate::tagged::value::TaggedValue;
 
+#[allow(dead_code)] // A4 has only synthetic consumers; real tracing follows in A5.
+mod parallel;
+pub(crate) use parallel::{
+    ParallelRootBatchError, ParallelRootBatchLease, ParallelRootBatchReader, ParallelRootIdentity,
+    PreparedParallelRootBatch,
+};
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BatchSlotId(NonZeroUsize);
@@ -268,19 +275,23 @@ impl BatchSlots {
         Ok(())
     }
 
-    /// Closing roots stay visible. This is a synchronous, nonescaping table
-    /// read rather than admission of an explicit `RootBatchReader`. Holding
-    /// the allocator lock retains the immutable storage for the whole walk;
-    /// retirement cannot remove it until the read finishes and releases that
-    /// lock. Closing only forbids new readers that escape this lock.
+    /// Closing roots stay visible through explicitly finished readers. These
+    /// synchronous readers borrow the locked slots, so retirement cannot remove
+    /// their publication or release its exclusion before their final read.
+    /// Closing only forbids new readers that escape this lock.
     pub(super) fn collect_roots(&self, heap: &TaggedHeap, out: &mut Vec<TaggedValue>) {
         for slot in &self.slots {
             match slot.state() {
                 Ok(SlotState::Live | SlotState::Closing) | Err(_) => {
                     // Invalid metadata conservatively retains any installed
                     // roots; it is never a reason to omit them from collection.
-                    if let Some(payload) = slot.payload.get() {
-                        payload.append_roots(heap, out);
+                    if slot.payload.get().is_some() {
+                        let reader = RootBatchReader::admit_locked_scan(self, slot, heap)
+                            .expect("a registered locked batch admits its collector reader");
+                        reader.append_roots(out);
+                        reader
+                            .finish()
+                            .expect("the locked collector reader completes exactly once");
                     }
                 }
                 Ok(SlotState::Reserved | SlotState::Retired | SlotState::Cancelled) => {}
@@ -558,7 +569,7 @@ impl RootBatchLease {
 
     /// Retire a restored owner's publication and reserve the next generation,
     /// reusing its control and initialized storage. The caller needs the same
-    /// restored-owner and quiescent-collector proofs as `try_finish`.
+    /// restored-owner and serialized-collector proofs as `try_finish`.
     ///
     /// Unlike ordinary slot reuse, this requires that no old control or payload
     /// observer exists at all. The table lock excludes synchronous scans and
@@ -643,9 +654,13 @@ impl RootBatchLease {
 
     /// Nonblocking close and retirement after explicit reader completion.
     /// Contention or an unfinished reader retains registration for retry.
-    /// The facade registry must
-    /// additionally require restored/terminated-owner and quiescent-collector
-    /// proofs before invoking this transport primitive; it mints neither.
+    /// The facade registry must additionally prove owner restoration or
+    /// termination and serialized collector admission; this primitive mints
+    /// neither proof. A restored owner requires no active mark, concurrent
+    /// marker or synchronous collection extent. A cooperative sweep after
+    /// completed marking may remain: it never reads root tables, and later
+    /// collections read the restored owner's roots. Terminated-owner cleanup
+    /// instead requires full collector quiescence before retiring its roots.
     pub(crate) fn try_finish(mut self) -> Result<RetiredRootBatch, RootBatchFinishFailure> {
         let result = (|| {
             let ownership = self.ownership.as_ref().ok_or(RootBatchError::Retired)?;
@@ -713,7 +728,9 @@ pub struct RootBatchReader<'r> {
     heap: &'r TaggedHeap,
     payload: Arc<ImmutableRootBatch>,
     control: Arc<BatchControl>,
-    _epoch: FacadeEpochRetention,
+    /// Escaping readers retain their own epoch. A locked collector reader
+    /// borrows the slots for its entire extent; their publication retains it.
+    _epoch: Option<FacadeEpochRetention>,
     obligation: ReadObligation,
     _lease: PhantomData<&'r RootBatchLease>,
     _confined: PhantomData<Rc<()>>,
@@ -769,7 +786,41 @@ impl<'r> RootBatchReader<'r> {
             heap,
             payload,
             control: Arc::clone(&ownership.control),
-            _epoch: epoch,
+            _epoch: Some(epoch),
+            obligation: ReadObligation::Active,
+            _lease: PhantomData,
+            _confined: PhantomData,
+        })
+    }
+
+    /// Admit a synchronous collector read while the caller holds the table
+    /// lock. Borrowing `slots` prevents this reader from escaping that guard.
+    /// Closing and invalid metadata must remain scannable: neither allows the
+    /// collector to discard roots that have not been explicitly retired.
+    fn admit_locked_scan(
+        slots: &'r BatchSlots,
+        control: &Arc<BatchControl>,
+        heap: &'r TaggedHeap,
+    ) -> Result<Self, RootBatchError> {
+        slots.validate(control)?;
+        let payload = control.payload.get().ok_or(RootBatchError::NotPublished)?;
+        if payload.heap != heap.heap_identity() {
+            return Err(RootBatchError::ForeignHeap {
+                owner: payload.heap,
+                reader: heap.heap_identity(),
+            });
+        }
+        control
+            .readers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |readers| {
+                readers.checked_add(1)
+            })
+            .map_err(|_| RootBatchError::ReaderCountExhausted)?;
+        Ok(Self {
+            heap,
+            payload: Arc::clone(payload),
+            control: Arc::clone(control),
+            _epoch: None,
             obligation: ReadObligation::Active,
             _lease: PhantomData,
             _confined: PhantomData,

@@ -25,7 +25,7 @@ use std::sync::Arc;
 mod green_owner;
 mod slot;
 mod sole_owner;
-pub(crate) use green_owner::Baton;
+pub(crate) use green_owner::{Baton, FrozenLegacyRoots};
 pub(crate) use slot::WorldSlot;
 pub(crate) use sole_owner::{
     PublishedSoleOwnerDriver, SoleOwnerDriver, SoleOwnerRegistration, SoleOwnerVm,
@@ -58,8 +58,6 @@ struct World {
     thread_projections: std::cell::RefCell<crate::emacs_core::forward::ThreadProjectionTable>,
     /// How this World runs Lisp threads, fixed at construction.
     threading: Cell<super::admission::ThreadingMode>,
-    /// Whether thread admission has run: sticky, never reset.
-    admitted: Cell<bool>,
     /// The Green runtime (round 3d), once started.
     green: std::cell::RefCell<Option<Box<super::green::GreenRuntime>>>,
     /// The OS thread holding the World's Baton, in a Green World
@@ -69,6 +67,7 @@ struct World {
 
 impl Drop for World {
     fn drop(&mut self) {
+        self.finish_green_registry();
         // The obarray's projection scope names this World's table; it goes
         // with the World, on the World's own thread.
         let generation = self.obarray.get_mut().generation();
@@ -90,6 +89,17 @@ static_assertions::assert_not_impl_any!(World: Send, Sync);
 pub(crate) struct WorldLease(Arc<World>);
 static_assertions::assert_not_impl_any!(WorldLease: Send, Sync, Clone);
 static_assertions::assert_eq_size!(WorldLease, Arc<World>);
+
+#[cfg(test)]
+impl Context {
+    /// Observe allocation lifetime without extending it or exposing World data.
+    pub(in crate::emacs_core::eval) fn world_lifetime_probe_for_test(
+        &self,
+    ) -> impl Fn() -> bool + use<> {
+        let world = Arc::downgrade(&self.obarray.lease.0);
+        move || world.upgrade().is_some()
+    }
+}
 
 impl fmt::Debug for WorldLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1092,7 +1102,6 @@ impl WorldStorageBuilder {
             owner_slabs: Default::default(),
             thread_projections: Default::default(),
             threading: Cell::new(super::admission::ThreadingMode::from_env()),
-            admitted: Cell::new(false),
             green: Default::default(),
             baton_holder: Cell::new(None),
         }));
@@ -1239,12 +1248,7 @@ impl Context {
     /// Whether thread admission has run in this World.
     #[inline]
     pub(crate) fn threads_admitted(&self) -> bool {
-        self.obarray.lease.0.admitted.get()
-    }
-
-    /// Record that admission has committed: sticky.
-    pub(super) fn mark_threads_admitted(&mut self) {
-        self.obarray.lease.0.admitted.set(true);
+        self.tagged_heap.threads_admitted()
     }
 
     /// Make room for admission to project OWNED variables onto descriptors

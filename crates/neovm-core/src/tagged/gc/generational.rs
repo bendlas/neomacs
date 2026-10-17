@@ -218,14 +218,64 @@ impl TaggedHeap {
     }
 }
 
+/// Minor admission belongs to the serialized, stopped heap owner. Residual
+/// major marking must finish before a new cycle may reset any collector state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MinorCollectionAdmissionError {
+    #[error("the heap has unfinished collector work")]
+    CollectorBusy,
+    #[error("minor collection requires the generational collector")]
+    GenerationalDisabled,
+}
+
+static_assertions::assert_impl_all!(MinorCollectionAdmissionError: Send, Sync, std::fmt::Debug);
+
 impl TaggedHeap {
     /// Future global stop-all-mutators handshake belongs before this entry:
     /// join the collector, park every mutator and wait for all barrier appends.
+    /// Minors and an active major mark are mutually exclusive, including the
+    /// residual major after a worker joins or an unpublished capture drops.
     #[cold]
     #[inline(never)]
-    pub(crate) fn begin_minor_collection(&mut self) {
-        assert!(self.generational.enabled);
-        assert!(!self.concurrent_mark_running);
+    pub(crate) fn begin_minor_collection(&mut self) -> Result<(), MinorCollectionAdmissionError> {
+        // Admission precedes EVERY mutation, even for a GEN0 heap. Joining a
+        // worker alone does not finish its major's residual mark or sweep.
+        facade_mark::CollectorQuiescence::check(self)
+            .map_err(|_| MinorCollectionAdmissionError::CollectorBusy)?;
+        if !self.generational.enabled {
+            return Err(MinorCollectionAdmissionError::GenerationalDisabled);
+        }
+        debug_assert!(
+            !self.concurrent_mark_running
+                && !self.mark_in_progress
+                && !self.generational.major_in_progress,
+            "minor stop-all excludes concurrent and unfinished major marking"
+        );
+        self.close_alloc_regions();
+        // SAFETY: the existing collector caller retains stopped ownership;
+        // no callbacks, allocation safepoints or mutator resumes occur here.
+        unsafe { scan_contract::SingleMutatorWorld::from_heap(self) }
+            .with_stopped_heap(|heap, proof| {
+                // SAFETY: admission proved collector quiescence before any
+                // mutation. Every mutator is stopped and its regions are closed;
+                // minor marking/promotion stays in this same stopped extent.
+                let mut logs = super::young_registry::StoppedYoungLogs::new(
+                    &mut heap._satb_layout_reserve,
+                    proof,
+                )
+                .expect("minor admission returned every young-only loan");
+                let mut stopped = unsafe { heap.cons_allocator.stopped_world() };
+                if heap.generational.verify {
+                    stopped
+                        .verify_young_at_begin(&heap.cons_blocks, &mut logs)
+                        .expect("minor verifier uses this heap canonical registry");
+                }
+                // Freeze young logs before mark clearing; promotion hands this set to sweep.
+                let _ = stopped
+                    .capture_minor(&mut logs)
+                    .expect("minor capture uses this heap canonical registry");
+            })
+            .expect("minor admission returned every young-only loan");
         self.generational.cycle = GenerationCycle::Minor;
         self.generational.promo.clear();
         self.incremental_mark_us = 0;
@@ -233,6 +283,7 @@ impl TaggedHeap {
         self.pace_mark_start_bytes = self.bytes_since_gc();
         self.begin_collection_with(false);
         self.mark_in_progress = true;
+        Ok(())
     }
 
     /// Marking and all fixpoints execute on the stopped mutator, then eager
@@ -273,6 +324,11 @@ impl TaggedHeap {
         if !self.generational.enabled {
             return;
         }
+        // Refuse before moving promotion buffers or changing any old bits.
+        // SAFETY: the caller retains the existing stopped-owner contract.
+        unsafe { scan_contract::SingleMutatorWorld::from_heap(self) }
+            .ensure_young_logs_stopped()
+            .expect("promotion requires every young-only loan returned");
         if self.is_minor_collection() && self.generational.verify {
             // Every mutator is stopped and the weak/finalizer fixpoints are
             // complete. Check before promotion could hide a missing mark and
@@ -308,16 +364,56 @@ impl TaggedHeap {
         }
         let major = self.generational.major_in_progress;
         let mut promoted = 0;
-        let mut old_count = 0;
-        for block in &self.cons_blocks {
-            promoted += if major {
-                block.promote_major_world_stopped()
-            } else {
-                block.promote_marked_world_stopped()
-            };
-            old_count += block.count_old();
-        }
-        self.generational.old_cons_count = old_count;
+        // SAFETY: the existing collector caller retains stopped ownership;
+        // no callbacks, allocation safepoints or mutator resumes occur here.
+        unsafe { scan_contract::SingleMutatorWorld::from_heap(self) }
+            .with_stopped_heap(|heap, proof| {
+                let old_count;
+                // SAFETY: all mutators remain parked, regions closed, and any
+                // major worker joined through promotion and flag/work handoff.
+                let mut logs = super::young_registry::StoppedYoungLogs::new(
+                    &mut heap._satb_layout_reserve,
+                    proof,
+                )
+                .expect("promotion requires every young-only loan returned");
+                let mut stopped = unsafe { heap.cons_allocator.stopped_world() };
+                if major {
+                    let mut total = 0;
+                    for block in &heap.cons_blocks {
+                        promoted += block.promote_major_world_stopped();
+                        let block_old = block.count_old();
+                        stopped.record_major_old_count(ConsBlockBase::of(block), block_old);
+                        total += block_old;
+                    }
+                    old_count = total;
+                } else {
+                    // The cloned frozen bases cost O(young); unlike count_old,
+                    // this does no mark/old-bitmap work in untouched old blocks.
+                    let work = stopped.capture_work_snapshot();
+                    for base in work {
+                        let index = heap.cons_block_index_by_base[&base.addr()];
+                        let newly_old = heap.cons_blocks[index].promote_marked_world_stopped();
+                        stopped.record_minor_promoted(base, newly_old);
+                        promoted += newly_old;
+                    }
+                    old_count = heap.generational.old_cons_count + promoted;
+                }
+                heap.generational.old_cons_count = old_count;
+                stopped
+                    .finish_promotion(
+                        heap.generational.cycle,
+                        &heap.cons_blocks,
+                        old_count,
+                        &mut logs,
+                    )
+                    .expect("promotion uses this heap canonical registry");
+                if heap.generational.verify {
+                    stopped
+                        .verify_after_promotion(&heap.cons_blocks, &mut logs)
+                        .expect("promotion verifier uses this heap canonical registry");
+                }
+            })
+            .expect("promotion requires every young-only loan returned");
         if self.generational.verify {
             self.verify_age_mirror_world_stopped();
         }
@@ -645,3 +741,7 @@ impl TaggedHeap {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "tests/minor_admission_test.rs"]
+mod minor_admission_tests;

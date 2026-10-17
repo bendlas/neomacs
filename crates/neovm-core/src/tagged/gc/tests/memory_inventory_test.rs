@@ -15,7 +15,7 @@ fn header(value: TaggedValue) -> &'static mut GcHeader {
 }
 
 fn minor(heap: &mut TaggedHeap, roots: &[TaggedValue]) {
-    heap.begin_minor_collection();
+    heap.begin_minor_collection().unwrap();
     for &root in roots {
         heap.seed_root(root);
     }
@@ -37,7 +37,8 @@ fn memory_inventory_splits_retained_ages_and_owned_payload_capacities() {
     header(permanent_vector).make_permanent();
     let (trailer, index) = heap.old_cons_trailer(old_cons).unwrap();
     trailer.set_old(index);
-    trailer.set_unlogged(index);
+    // Card marking removed the former per-cons unlogged bitmap. These
+    // immediate-valued fields need no remembered edge; set_old mirrors age.
 
     let inventory = snapshot(&heap, false);
     assert_eq!(inventory.ages.young.objects, 2);
@@ -65,7 +66,7 @@ fn memory_inventory_reports_old_dead_only_before_major_promotion() {
     let dead_vector = heap.alloc_vector(vec![TaggedValue::NIL; 17]);
     minor(&mut heap, &[live_cons, dead_cons, live_vector, dead_vector]);
 
-    heap.begin_minor_collection();
+    heap.begin_minor_collection().unwrap();
     heap.seed_root(live_cons);
     heap.seed_root(live_vector);
     heap.incremental_drain_all();

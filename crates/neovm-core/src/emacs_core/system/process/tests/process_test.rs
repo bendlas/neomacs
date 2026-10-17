@@ -3549,6 +3549,7 @@ fn terminal_pty_process_releases_live_io_when_exit_record_is_retained() {
 #[cfg(target_os = "linux")]
 #[test]
 fn deleted_pty_process_releases_live_io_and_reaps_child() {
+    let watchers = super::reap::DeferredWatcherTestScope::new();
     crate::test_utils::init_test_tracing();
     let sh = find_bin("sh");
     let mut processes = ProcessManager::new();
@@ -3577,15 +3578,20 @@ fn deleted_pty_process_releases_live_io_and_reaps_child() {
         baseline_ptmx,
         "deleting must deactivate and release the process's live PTY I/O"
     );
+    // GNU deletion closes I/O immediately and transfers the native child to
+    // deleted_pid_list. Synchronize with its independent exit-event collector,
+    // without running another evaluator wait or reaping by a second owner.
+    watchers.finish();
     assert!(
         !std::path::Path::new(&format!("/proc/{os_pid}")).exists(),
-        "delete-process must wait for the killed child instead of retaining a zombie"
+        "the deferred collector must reap the deleted child"
     );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn dropping_process_manager_terminates_and_reaps_live_child() {
+    let watchers = super::reap::DeferredWatcherTestScope::new();
     crate::test_utils::init_test_tracing();
     let sh = find_bin("sh");
     let mut processes = ProcessManager::new();
@@ -3604,13 +3610,12 @@ fn dropping_process_manager_terminates_and_reaps_live_child() {
 
     drop(processes);
 
-    let child_survived = std::path::Path::new(&format!("/proc/{os_pid}")).exists();
-    if child_survived {
-        let _ = sys::send_signal_to_group(os_pid as i64, signal_kill_number());
-    }
+    // No later Context/ProcessManager wait drives this cleanup. Joining the
+    // native exit watcher is only a test synchronization point.
+    watchers.finish();
     assert!(
-        !child_survived,
-        "dropping the live-resource owner must terminate and reap its child"
+        !std::path::Path::new(&format!("/proc/{os_pid}")).exists(),
+        "dropping the live-resource owner must independently reap its child"
     );
 }
 

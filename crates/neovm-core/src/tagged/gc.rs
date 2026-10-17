@@ -511,9 +511,11 @@ pub struct TaggedHeap {
     /// evaluator drains these after collection through `DisplayHost`.
     pending_video_destroys: Vec<neomacs_display_protocol::VideoId>,
 
-    /// Reclaimed cons cells threaded through the dead cells themselves,
-    /// matching GNU alloc.c's `cons_free_list`.
-    cons_free_list: *mut ConsCell,
+    /// One intrusive free list per block. Before sticky thread admission,
+    /// metadata is mutator-exclusive; afterward one mutex serializes every
+    /// head/count and available-block access. Refill is cold.
+    /// Boxed to preserve the inline heap's JIT-visible layout.
+    cons_allocator: ConsAllocatorOwner,
     /// SIZE-CLASS OBJECT ARENAS (non-cons allocator modernization stage 3 +
     /// task 03/3a): every heap float/string/vector/bytecode lives in a
     /// 64KB-aligned `ObjectPage`
@@ -983,6 +985,9 @@ impl TaggedHeap {
     pub fn new() -> Self {
         super::collection_reads::initialize();
         let chunk_map = knobs::chunk_map_on().then(|| std::sync::Arc::new(ChunkMap::new()));
+        // One existing lifetime identity binds the heap, canonical cold
+        // registry and allocator work indexes; no second identity is issued.
+        let identity = HeapIdentity::issue();
         let mut heap = Self {
             generational: generational::GenState::new(
                 std::env::var("NEOVM_GC_GENERATIONAL").as_deref() == Ok("1"),
@@ -990,7 +995,7 @@ impl TaggedHeap {
             jit: JitHeapState::new(),
             region_book: RegionBook::new(),
             region_stats: RegionStats::default(),
-            identity: HeapIdentity::issue(),
+            identity,
             chunk_map: chunk_map.clone().map(HeapChunkMap::new),
             cons_blocks: Vec::new(),
             cons_block_index_by_base: FxHashMap::default(),
@@ -1020,7 +1025,7 @@ impl TaggedHeap {
             doomed_finalizer_functions: Vec::new(),
             pending_surface_destroys: Vec::new(),
             pending_video_destroys: Vec::new(),
-            cons_free_list: std::ptr::null_mut(),
+            cons_allocator: ConsAllocatorOwner::new(identity),
             float_arena: ObjectArena::new(chunk_map.clone()),
             string_arena: ObjectArena::new(chunk_map.clone()),
             canonical_empty_strings: CanonicalEmptyStrings::default(),
@@ -1075,7 +1080,7 @@ impl TaggedHeap {
             concurrent_mark_running: false,
             satb_handoff: std::sync::Arc::new(SatbHandoff::new()),
             _satb_owner_layout_reserve: FxHashSet::default(),
-            _satb_layout_reserve: mutator_gc::MutatorSatbSlot::new(),
+            _satb_layout_reserve: mutator_gc::MutatorSatbSlot::new(identity),
             gc_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             concurrent_str_claimed: std::sync::Arc::new(AtomicUsize::new(0)),
             last_concurrent_str_claimed: 0,
@@ -2302,17 +2307,14 @@ impl TaggedHeap {
             .iter()
             .map(|block| block.next_index as usize)
             .sum();
-        let mut free = self.cons_free_list;
         let mut free_count = 0usize;
-        while !free.is_null() && free_count < bumped_cons_slots {
-            let base = ConsBlock::block_base_for_ptr(free);
-            if let Some(&block_index) = self.cons_block_index_by_base.get(&base) {
-                free_cells_by_block[block_index] += 1;
+        for (base, count) in self.cons_allocator.free_counts() {
+            if let Some(&block_index) = self.cons_block_index_by_base.get(&base.addr()) {
+                free_cells_by_block[block_index] = count;
             }
-            free_count += 1;
-            free = unsafe { (*free).free_next() };
+            free_count += count;
         }
-        debug_assert!(free.is_null(), "cons free list exceeds bumped cell count");
+        debug_assert!(free_count <= bumped_cons_slots);
 
         let mut cons = ConsLayoutStats {
             pages: self.cons_blocks.len(),
@@ -2572,79 +2574,6 @@ impl TaggedHeap {
     }
 }
 
-impl Drop for TaggedHeap {
-    fn drop(&mut self) {
-        // Explicit finish is the only blocking completion handoff. Drop
-        // cannot establish exclusive ownership while a marker or facade
-        // reader obligation remains, so its fallback retains the backing
-        // allocations and returns without waiting for either kind of reader.
-        if self.concurrent_mark_running || self.facade_mark_is_excluded() {
-            self.abandon_concurrent_mark();
-            // The collector may still be running the abandoned job: detach
-            // it rather than wait.
-            //
-            // SAFETY (ordering): the detached thread cannot touch this heap's
-            // freed memory.
-            // - The job never dereferences the heap (`ConcurrentMarkJob`; the
-            //   mapped-veclike snapshot keeps a heap pointer for identity
-            //   comparison only). It reads its own snapshots and queues, and
-            //   through them the blocks, pages, vector backings and hash
-            //   storage that `abandon_concurrent_mark` just retained
-            //   (forgot) for it. Leased obarray chunks outlive their owner
-            //   the same way.
-            // - `stop` was stored (Release) above, so the job exits at its
-            //   next check. Its final `exited` send fails harmlessly once
-            //   `gc_exited` drops with this heap.
-            // - Retiring closes the request channel, so after the job `recv`
-            //   fails and the thread ends. No other request can be queued:
-            //   `MarkAll` is synchronous (its sender is blocked until done,
-            //   so none is pending while the owner runs Drop), and only one
-            //   concurrent job runs per heap.
-            if let Some(collector) = retire_collector(self.identity) {
-                collector.detach();
-            }
-            crate::tagged::gc::clear_tagged_heap_if_installed(self);
-            return;
-        }
-        // No job is in flight, so the heap's collector is idle in `recv`:
-        // joining it returns at once, and no collector outlives its heap.
-        if let Some(collector) = retire_collector(self.identity) {
-            collector.join();
-        }
-        self._satb_layout_reserve.abandon();
-        // No marker is active, so Tier-H's snapshot and retired originals are
-        // freed with the claims state when the census carrier drops below;
-        // Drop takes none of its locks.
-        // Leave no dangling thread-local pointer behind: a heap installed with
-        // `set_tagged_heap` and dropped by anything but a `Context` (a failed
-        // pdump load drops the half-built one on its error path) used to stay
-        // installed, and the next allocation on this thread wrote into freed
-        // memory. The identity check makes this a no-op when another heap is
-        // installed -- and when a `Context` drop already uninstalled this one,
-        // which is also why the frees below run with no heap installed either
-        // way.
-        crate::tagged::gc::clear_tagged_heap_if_installed(self);
-        // Automatic destruction cannot invoke module finalizers or SQLite
-        // teardown. Explicit shutdown reclaims those resources beforehand;
-        // the fallback retains native payloads and frees inert Rust storage.
-        self.reclaim_intrusive_objects(ReclamationMode::DropFallback);
-        // ConsBlocks are dropped automatically (they implement Drop).
-        // Object arena pages likewise: page floats/strings/vectors/bytecode/
-        // lambdas/macros/records/symbols-with-pos are on NONE of the lists
-        // above (so the walk cannot hand a page pointer to `free_gc_object`'s
-        // `Box::from_raw`), and the arena fields drop after this body, freeing
-        // every page via `ObjectPage::drop`, which walks the allocated slots
-        // and `drop_in_place`s each live object (strings free their byte
-        // storage + interval tables, vectors their element `Vec`, bytecode its
-        // ops/constants vectors + params + GNU byte maps + docstring,
-        // lambdas/macros/records their slot `Vec` + cached params; floats and
-        // symbols-with-pos are POD and the walk compiles out) before releasing
-        // the page storage —
-        // retired pages included. This path only runs without an active mark,
-        // so the GC thread cannot still be reading a page.
-    }
-}
-
 /// TEST-ONLY allocation-profiling counters for the non-cons allocator
 /// modernization probes (size-class arena design inputs): per-kind allocation
 /// counts, a size-class histogram over TOTAL object bytes (fixed struct +
@@ -2809,6 +2738,8 @@ pub(crate) use collection_observed::{
 use collection_observed::{
     clear_cons_observed_block, clear_cons_observed_dead, has_noncons_collection_observations,
 };
+mod cons_allocator;
+use cons_allocator::{ConsAllocatorOwner, ConsBlockBase};
 mod cons_blocks;
 /// The cons-block trailer's shape, for `jit_layout::heap`.
 #[cfg_attr(not(feature = "jit"), allow(unused_imports))]
@@ -2850,6 +2781,7 @@ use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMa
 mod census;
 mod cold_gc;
 mod facade_mark;
+mod mutator_registration;
 #[cfg(test)]
 use census::CensusRecord;
 use census::{CensusCycleKind, GenCensus, census_remset_probe_on};
@@ -2858,6 +2790,15 @@ pub use facade_mark::{
     ConcurrentMarkPermit, FacadeEpochRetention, FacadeMarkExclusion, FacadeMarkExclusionError,
     QuiescentCollector,
 };
+pub use mutator_registration::{
+    AllStopped, AllStoppedFailure, CollectionError, CollectionReport, Mode, Mutator, MutatorEntry,
+    MutatorFinishFailure, MutatorKey, MutatorPermit, MutatorStartFailure, OwnerPublication,
+    ParallelHeapEra, Phase, RegistrationCensus, RegistrationError, Rendezvous, RendezvousError,
+    Request, ResumeGcImage, ResumeGcImageFailure, RootedRetireFailure, RunAccess, Snapshot,
+    StoppedSummaries, YoungWorkerLoan,
+};
+
+pub(crate) use mutator_registration::{OwnerRootAdmission, StoppedRootAdmission};
 
 mod alloc_region;
 #[cfg(test)]
@@ -2988,3 +2929,38 @@ mod chartable_contract_tests;
 #[cfg(test)]
 #[path = "gc/tests/satb_gc_stress_test.rs"]
 mod satb_gc_stress_tests;
+
+/// Young-block tracking, stopped-world flag roles, and verifier mutations.
+#[cfg(test)]
+#[path = "gc/tests/cons_young_tracking_test.rs"]
+mod cons_young_tracking_tests;
+
+#[path = "gc/young_registry.rs"]
+mod young_registry;
+
+#[cfg(test)]
+#[path = "gc/tests/canonical_young_registry_test.rs"]
+mod young_registry_tests;
+
+#[cfg(test)]
+#[path = "gc/tests/cons_young_refill_refund_test.rs"]
+mod cons_young_refill_refund_tests;
+
+#[cfg(test)]
+#[path = "gc/tests/drain_young_preflight_test.rs"]
+mod drain_young_preflight_tests;
+
+/// Minor worklist bounds and untouched old-only mark words.
+#[cfg(test)]
+#[path = "gc/tests/cons_young_minor_work_test.rs"]
+mod cons_young_minor_work_tests;
+
+/// Shared GEN1 allocator stress and exit-retained young logs.
+#[cfg(test)]
+#[path = "gc/tests/cons_young_shared_test.rs"]
+mod cons_young_shared_tests;
+
+/// Exact GEN1 sweep deltas, late births, conditional release and verifier fault.
+#[cfg(test)]
+#[path = "gc/tests/cons_sweep_accounting_test.rs"]
+mod cons_sweep_accounting_tests;

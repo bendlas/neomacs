@@ -35,13 +35,53 @@
 
 use super::*;
 
+#[path = "parallel_roots.rs"]
+mod parallel_roots;
+pub(crate) use parallel_roots::FrozenLegacyRoots;
+
+impl World {
+    /// Finish publications before automatic field destruction reaches the heap.
+    /// World exclusivity proves that every former owner has terminated.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn finish_green_registry(&mut self) {
+        let Some(runtime) = self.green.get_mut().as_mut() else {
+            return;
+        };
+        if !runtime.parked.get_mut().is_empty() {
+            let heap = self.tagged_heap.get_mut();
+            // SAFETY: the final World owns every view exclusively; no owner,
+            // callback or collection extent remains. Its last publications
+            // still exclude concurrent launch. With no Context left, the
+            // transport table contains all remaining external heap roots.
+            let collector = unsafe {
+                heap.drain_to_quiescent(|heap| {
+                    let mut roots = Vec::new();
+                    crate::tagged::transport::collect_shared_root_gc_roots(heap, &mut roots);
+                    for root in roots {
+                        heap.seed_root(root);
+                    }
+                })
+            }
+            .expect("the terminated Green World's collector drains completely");
+            runtime.finish_terminated_roots(&collector);
+        }
+        drop(self.green.get_mut().take());
+        debug_assert!(
+            !self.tagged_heap.get_mut().facade_mark_is_excluded(),
+            "Green publications, reservations and Baton epochs finish before the heap"
+        );
+    }
+}
+
 /// The right to run Lisp in a Green World: whoever holds it is the one OS
 /// thread that may touch the World. See the module's safety argument.
 #[must_use = "the World's Lisp stops while its Baton is dropped"]
 pub(crate) struct Baton {
-    world: Arc<World>,
     /// Keeps concurrent marking excluded for the Green era (point 5).
+    /// Release before `world`: this Baton can own the final World reference.
     _retention: crate::tagged::gc::FacadeEpochRetention,
+    world: Arc<World>,
 }
 
 // SAFETY: the Baton is the World's single, unshareable token (point 1); the
@@ -69,6 +109,24 @@ impl Baton {
     /// Whether the calling OS thread holds the Baton.
     pub(crate) fn held_here(&self) -> bool {
         self.world.baton_holder.get() == Some(std::thread::current().id())
+    }
+
+    /// Identify the retained heap without borrowing its storage. Admission
+    /// separately checks `held_here`; metadata alone grants no World access.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn parallel_heap_identity(&self) -> crate::tagged::gc::HeapIdentity {
+        self._retention.heap_identity()
+    }
+
+    /// Cold metadata retention for parallel root publications, with no heap loan.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn parallel_epoch_retention(
+        &self,
+    ) -> Result<crate::tagged::gc::FacadeEpochRetention, crate::tagged::gc::FacadeMarkExclusionError>
+    {
+        self._retention.retain()
     }
 
     /// A further owner's views of the World, starting in CURRENT. Only the
@@ -107,6 +165,70 @@ impl Baton {
 }
 
 impl Context {
+    /// Build registration fixtures with a real World and its unique keeper.
+    /// The higher-ranked closure cannot return an era or collector heap loan.
+    #[cfg(test)]
+    pub(crate) fn with_test_mutator_era<R>(
+        f: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>) -> R,
+    ) -> R {
+        let mut context = Self::new();
+        let keeper = context
+            .issue_green_baton()
+            .expect("fresh fixture World issues its keeper");
+        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+        // SAFETY: this fresh Context is the sole running owner and holds the
+        // keeper. No manager loan, callback, safepoint or collection extent
+        // survives keeper issuance. Reseeding only enumerates the complete
+        // registered-root census; it cannot execute Lisp. The closure below
+        // cannot outlive the Context, and admission escrows the actual keeper.
+        let collector = unsafe {
+            (*heap).drain_to_quiescent(|heap| {
+                context.seed_registered_mutator_roots_world_stopped(heap);
+            })
+        }
+        .expect("fresh fixture collector drains completely");
+        let era = crate::tagged::gc::ParallelHeapEra::admit(collector, keeper)
+            .unwrap_or_else(|_| panic!("fresh fixture World admits its mutator era"));
+        f(era)
+    }
+
+    /// Real heap roots prepared by its sole serial owner before the synthetic
+    /// parallel era. Participants receive SharedRoot handles, never raw Values.
+    #[cfg(test)]
+    pub(crate) fn with_test_rooted_mutator_era<R>(
+        f: impl for<'heap> FnOnce(
+            crate::tagged::gc::ParallelHeapEra<'heap>,
+            Vec<crate::tagged::transport::SharedRoot>,
+        ) -> R,
+    ) -> R {
+        let mut context = Self::new();
+        let mut roots = Vec::new();
+        for n in 0..4 {
+            let value = context.tagged_heap.alloc_cons(
+                crate::tagged::value::TaggedValue::fixnum(n),
+                crate::tagged::value::TaggedValue::NIL,
+            );
+            // SAFETY: sole serial owner; allocation invokes no collection or
+            // callback and the source word stays live through root admission.
+            roots.push(unsafe {
+                crate::tagged::transport::SharedRoot::new(&context.tagged_heap, value)
+            });
+        }
+        let keeper = context.issue_green_baton().expect("rooted fixture keeper");
+        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+        // SAFETY: same complete frozen-World census as with_test_mutator_era.
+        // SharedRoot table entries keep every synthetic input live as well.
+        let collector = unsafe {
+            (*heap).drain_to_quiescent(|heap| {
+                context.seed_registered_mutator_roots_world_stopped(heap);
+            })
+        }
+        .expect("rooted fixture collector");
+        let era = crate::tagged::gc::ParallelHeapEra::admit(collector, keeper)
+            .unwrap_or_else(|_| panic!("rooted fixture era"));
+        f(era, roots)
+    }
+
     /// Issue this Green World's one Baton to the calling thread, the
     /// owner's: the collector is drained and its facade epoch retained for
     /// the Green era, so no concurrent marker runs while Green owners exist.

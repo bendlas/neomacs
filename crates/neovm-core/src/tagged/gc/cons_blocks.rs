@@ -182,6 +182,10 @@ impl ConsBlock {
     /// Promote marked survivors with every mutator stopped, allocation
     /// regions closed and the concurrent marker's exit handshake complete.
     /// The result is the number of cells entering the old generation.
+    /// Promotion ORs marks into the old bitmap without clearing mark words.
+    /// A block leaving the young set therefore retains marks on now-old cells:
+    /// minors ignore those old cells, and majors clear every block's marks.
+    /// GEN1 verification checks marked => old in every non-young block.
     pub(super) fn promote_marked_world_stopped(&self) -> usize {
         self.trailer()
             .promote_marked_world_stopped(self.next_index as usize)
@@ -256,7 +260,7 @@ impl ConsBlock {
             && self.trailer().is_old(Self::index_of_ptr(ptr))
     }
 
-    /// Sweep: thread reclaimed cells into the global intrusive free list and
+    /// Sweep: thread reclaimed cells into this block's intrusive free list and
     /// return the number of live cells in this block.
     pub(super) fn sweep(&mut self, free_list: &mut *mut ConsCell) -> usize {
         clear_cons_observed_dead(
