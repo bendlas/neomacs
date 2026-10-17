@@ -78,6 +78,11 @@ the final size.  GNU gets this through its synchronous X event handling.
   removed; `exwm--frame` and `exwm-workspace--current` now agree.
 - `frame-edges` follows the synced pixel width/height but keeps the Lisp
   `left`/`top`, so an external move is not reflected in the frame position.
+  **Fixed:** `frame-edges`/`frame-geometry` now query the live root position
+  from the X server (`TranslateCoordinates`); see
+  [`floating-position-notes.md`](./floating-position-notes.md).  This is the
+  root cause of the interactive "floating pop-up stays black / no window on the
+  second monitor" reports.
 
 ## 4. Next steps
 

@@ -2024,12 +2024,15 @@ pub(crate) fn builtin_neomacs_frame_edges(
         return Ok(Value::NIL);
     }
 
-    let (left, top) = eval.frames.frame_origin_in_root(fid).ok_or_else(|| {
-        signal(
-            "error",
-            vec![Value::string("Frame origin unavailable for frame edges")],
-        )
-    })?;
+    let (left, top) = match super::display::gui_frame_native_root_position(eval, fid) {
+        Some(origin) => origin,
+        None => eval.frames.frame_origin_in_root(fid).ok_or_else(|| {
+            signal(
+                "error",
+                vec![Value::string("Frame origin unavailable for frame edges")],
+            )
+        })?,
+    };
     let mut left = left.round() as i64;
     let mut top = top.round() as i64;
     let mut right = left.saturating_add(i64::from(frame.width));
@@ -2077,12 +2080,15 @@ pub(crate) fn builtin_neomacs_frame_geometry(
     if frame.initial || frame.effective_window_system().is_none() {
         return Ok(Value::NIL);
     }
-    let (left, top) = eval.frames.frame_origin_in_root(fid).ok_or_else(|| {
-        signal(
-            "error",
-            vec![Value::string("Frame origin unavailable for frame geometry")],
-        )
-    })?;
+    let (left, top) = match super::display::gui_frame_native_root_position(eval, fid) {
+        Some(origin) => origin,
+        None => eval.frames.frame_origin_in_root(fid).ok_or_else(|| {
+            signal(
+                "error",
+                vec![Value::string("Frame origin unavailable for frame geometry")],
+            )
+        })?,
+    };
     let left = left.round() as i64;
     let top = top.round() as i64;
     let width = i64::from(frame.width);

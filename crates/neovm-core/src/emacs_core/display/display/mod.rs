@@ -388,6 +388,36 @@ fn gui_x_display_for_frame(
         .map(str::to_owned)
 }
 
+/// Live root-relative origin of FRAME's native X11 window, in device pixels.
+///
+/// Neomacs never selects `StructureNotify` on its own frame window, so an
+/// external `ConfigureWindow` (EXWM repositioning a workspace or floating
+/// frame, or reparenting it into a floating container) is invisible to the
+/// Lisp `left`/`top` parameters.  GNU reads the window-manager-updated native
+/// edges instead; ask the server for the live position so `frame-edges`
+/// answers what X actually has and `window-inside-absolute-pixel-edges` (which
+/// EXWM uses to place managed clients) lands on the right monitor.
+///
+/// Returns `None` for child frames, non-X frames, or when the server query
+/// fails, so callers fall back to the Lisp-derived origin.
+pub(crate) fn gui_frame_native_root_position(
+    eval: &super::eval::Context,
+    fid: FrameId,
+) -> Option<(f32, f32)> {
+    let frame = eval.frames.get(fid)?;
+    if frame.parent_frame.as_frame_id().is_some() {
+        return None;
+    }
+    let display = frame.display_identity().x_display()?.to_owned();
+    let (_, outer_window_id) = eval
+        .display_host
+        .as_ref()
+        .and_then(|host| host.native_x11_window_ids(fid))?;
+    x11_compat::window_root_position(&display, outer_window_id as u32)
+        .ok()
+        .map(|(x, y)| (x as f32, y as f32))
+}
+
 /// Signal a hard X connection/protocol failure in GNU's shape.
 fn x11_signal(error: x11_compat::X11Error) -> Flow {
     signal("error", vec![Value::string(error.message())])

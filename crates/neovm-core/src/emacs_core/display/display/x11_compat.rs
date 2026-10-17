@@ -137,6 +137,32 @@ mod imp {
         conn.flush().map_err(protocol_error)?;
         Ok(())
     }
+
+    /// Absolute root-relative position of WINDOW's origin, in device pixels.
+    ///
+    /// GNU reads a frame's native edges from state updated by the window
+    /// manager's `ConfigureNotify`; Neomacs never selected `StructureNotify`
+    /// on its own frame window, so an external move (EXWM's
+    /// `ConfigureWindow`, or its reparent into a floating container) is not
+    /// reflected in the Lisp `left`/`top` parameters.  `TranslateCoordinates`
+    /// asks the server for the live position instead, walking the parent
+    /// chain to the root, so `frame-edges` answers what the X server actually
+    /// has.
+    pub(crate) fn window_root_position(display: &str, window: u32) -> Result<(i64, i64), X11Error> {
+        let conn = connection(display)?;
+        let root = conn
+            .setup()
+            .roots
+            .first()
+            .map(|screen| screen.root)
+            .ok_or_else(|| X11Error::Protocol("X server reports no screens".to_owned()))?;
+        let reply = conn
+            .translate_coordinates(window, root, 0, 0)
+            .map_err(protocol_error)?
+            .reply()
+            .map_err(protocol_error)?;
+        Ok((i64::from(reply.dst_x), i64::from(reply.dst_y)))
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -162,6 +188,13 @@ mod imp {
     pub(crate) fn focus_window(_display: &str, _window: u32) -> Result<(), X11Error> {
         Err(unsupported())
     }
+
+    pub(crate) fn window_root_position(
+        _display: &str,
+        _window: u32,
+    ) -> Result<(i64, i64), X11Error> {
+        Err(unsupported())
+    }
 }
 
-pub(crate) use imp::{atom_name, focus_window, screen_size, server_info};
+pub(crate) use imp::{atom_name, focus_window, screen_size, server_info, window_root_position};

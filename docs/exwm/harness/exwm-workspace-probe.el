@@ -826,6 +826,30 @@ closest available stand-in for a monitor-layout change."
                   (list :monitors (mapcar (lambda (m) (plist-get m :name))
                                           exwp--randr-raw))))))
 
+(defun exwp--check-extra-frame-position ()
+  "The workspace frame mapped to the second monitor must report native edges
+that actually sit on that monitor.
+
+EXWM positions the frame by moving the container it is reparented into, and
+Neomacs never selected `StructureNotify' on its own frame window, so the Lisp
+`left'/`top' parameters stay stale.  `frame-edges' has to ask the X server for
+the live position; otherwise a program opened on the second monitor is fitted
+to the first monitor's coordinates and never appears.  See
+docs/exwm/floating-position-notes.md."
+  (when exwp--randr-extra
+    (let* ((frame (elt exwm-workspace--list 1))
+           (edges (frame-edges frame 'native-edges))
+           (mon-x (nth 0 exwp--randr-extra-rect))
+           (mon-w (nth 2 exwp--randr-extra-rect)))
+      (exwp--log "randr: second-monitor frame native-edges=%S" edges)
+      (exwp--check "randr: second-monitor frame native origin sits on that monitor"
+                   (lambda ()
+                     (exwp--expect
+                      t
+                      (and edges
+                           (>= (nth 0 edges) mon-x)
+                           (< (nth 0 edges) (+ mon-x mon-w)))))))))
+
 (defun exwp--randr-cleanup ()
   "Delete the extra RandR monitor created by `exwp--randr-extra-begin'."
   (when exwp--randr-extra
@@ -1107,6 +1131,7 @@ closest available stand-in for a monitor-layout change."
               (cons 0.5 #'exwp--check-randr-plist)
               (cons 0.2 #'exwp--randr-extra-begin)
               (cons 0.5 #'exwp--check-randr-extra)
+              (cons 0.5 #'exwp--check-extra-frame-position)
               (cons 0.2 #'exwp--randr-cleanup)
               ;; Coverage 2: move a client across workspaces.
               (cons 0.2 #'exwp--move-window-to-1)

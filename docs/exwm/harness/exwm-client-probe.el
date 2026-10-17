@@ -612,7 +612,23 @@ event; the floating checks are therefore unconditional."
                  win (and win (window-frame win)))
       (excp--log "floating diag: client-tree=%S wscf=%S"
                  (ignore-errors (excp--query-tree excp--wf))
-                 excp--wscf))))
+                 excp--wscf)
+      ;; The floating frame is created off-screen (`left'/`top' at
+      ;; `window-min-width * -10000') and EXWM moves the native window to its
+      ;; real position with an external `ConfigureWindow'.  `frame-edges' must
+      ;; report that live position, not the stale Lisp parameter, or
+      ;; `exwm-layout--show' places the client off-screen (visible as a black
+      ;; frame with no pop-up).  See docs/exwm/floating-position-notes.md.
+      (excp--floating-check "floating: native frame origin is on screen, not hidden"
+                            (lambda ()
+                              (let ((edges (frame-edges frame 'native-edges)))
+                                (excp--expect
+                                 t
+                                 (and edges
+                                      (> (nth 0 edges) -1000)
+                                      (> (nth 1 edges) -1000)
+                                      (< (nth 0 edges) (x-display-pixel-width))
+                                      (< (nth 1 edges) (x-display-pixel-height))))))))))
 
 (defun excp--floating-resize ()
   (excp--log "resize floating dialog to 500x400")
@@ -649,7 +665,23 @@ event; the floating checks are therefore unconditional."
                     (sit-for 0.1)
                     (excp--geometry excp--wf))))
     (excp--floating-check "floating: configure request resizes the client"
-                          (lambda () (excp--expect (list 500 400) actual)))))
+                          (lambda () (excp--expect (list 500 400) actual)))
+    (excp--floating-check
+     "floating: client is placed on screen, not at the hidden origin"
+     (lambda ()
+       (with-current-buffer (exwm--id->buffer excp--wf)
+         (let* ((reply (excp--geometry excp--wf))
+                (cx (slot-value reply 'x))
+                (cy (slot-value reply 'y))
+                (edges (exwm--window-inside-absolute-pixel-edges
+                        (get-buffer-window (current-buffer) t))))
+           (excp--log "floating placement diag: client=(%S %S) edges=%S"
+                      cx cy edges)
+           (excp--expect t
+                         (and edges
+                              (>= cx 0) (>= cy 0)
+                              (< cx (x-display-pixel-width))
+                              (< cy (x-display-pixel-height))))))))))
 
 (defun excp--floating-destroy ()
   (excp--destroy excp--wf))
