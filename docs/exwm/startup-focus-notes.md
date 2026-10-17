@@ -51,3 +51,8 @@ the `.el` alone does not take effect until it is rebuilt
 (`cargo xtask fresh-build --release`) or byte-compiled
 (`neomacs -Q --batch -f batch-byte-compile lisp/term/neo-win.el`).  This cost one
 false "still FAIL" run while debugging.
+
+## See also
+
+The separate `initial-window-system` gate that stops EXWM from starting at all
+with `-f exwm-wm-mode` is covered in `startup-init-notes.md`.

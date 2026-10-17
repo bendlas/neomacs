@@ -58,12 +58,18 @@
                   (and (frame-live-p (selected-frame))
                        (frame-parameter nil 'window-id))
                   (and (boundp 'frame-initial-frame) frame-initial-frame))
-        (esp--log "diag: events=%S" (reverse esp--events))
+        (esp--log "diag: exwm--root=%S exwm--connection=%S managed=%S"
+                  (and (boundp 'exwm--root) exwm--root)
+                  (and (boundp 'exwm--connection) exwm--connection)
+                  (and (boundp 'exwm--id-buffer-alist) (length exwm--id-buffer-alist)))
+        (if (and (boundp 'exwm--root) exwm--root)
+            (esp--log "PASS: EXWM initialized (%s start)" esp--mode)
+          (esp--log "FAIL: EXWM not initialized (%s start)" esp--mode))
         (if esp--f9
             (esp--log "PASS: <f9> registered (%s start)" esp--mode)
           (esp--log "FAIL: <f9> not registered (%s start)" esp--mode)))
     (error (esp--log "probe ERROR: %S" err)))
-  (kill-emacs (if esp--f9 0 1)))
+  (kill-emacs (if (and esp--f9 (boundp 'exwm--root) exwm--root) 0 1)))
 
 (if (equal esp--mode "immediate")
     (esp--start)

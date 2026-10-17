@@ -314,7 +314,7 @@ fn imageless_gui_startup_runs_early_init_once_on_the_live_gui_terminal() {
         .as_ref()
         .expect("startup fixture should publish GUI state");
     assert_eq!(state["early_init_count"], 1);
-    assert_eq!(state["initial_window_system"], "neo");
+    assert_eq!(state["initial_window_system"], "x");
 
     let stdout = std::fs::read_to_string(&result.artifacts.stdout)
         .expect("imageless startup stdout artifact");

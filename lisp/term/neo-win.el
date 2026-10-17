@@ -334,7 +334,17 @@ DISPLAY is the name of the display Emacs should connect to."
   ;; those requests to the native frame creation below instead of trying to
   ;; initialize X through the (unloaded) `term/x-win.el' and signalling
   ;; `cl-no-applicable-method' on `window-system-initialization'.
-  (put 'x 'window-system-initialized t))
+  (put 'x 'window-system-initialized t)
+  ;; Neomacs's native GUI runs on X11, so report `x' as the initial window
+  ;; system once setup has happened.  GNU exposes `x' here, and X11 clients
+  ;; branch on it: EXWM defers its first `exwm--init' to `window-setup-hook'
+  ;; only when `(eq initial-window-system 'x)', and otherwise installs it on
+  ;; `after-make-frame-functions' -- which never runs for the initial frame,
+  ;; so EXWM would silently never start.  The window-system dispatch above
+  ;; already ran as `neo' (keeping the startup feature check happy), so
+  ;; flipping the variable afterwards gives client code the GNU value.
+  (when (eq 'x (terminal-live-p (frame-terminal (selected-frame))))
+    (setq initial-window-system 'x)))
 
 ;; Handle args function (required by common-win)
 (cl-defmethod handle-args-function (args &context (window-system neo))

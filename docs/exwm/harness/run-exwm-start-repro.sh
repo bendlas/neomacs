@@ -109,7 +109,8 @@ run_one() {
     echo "--- probe output ---"
     cat "$EXWM_START_OUT" 2>/dev/null || echo "(no probe output)"
     local rc=1
-    if grep -q "^PASS: <f9>" "$EXWM_START_OUT" 2>/dev/null; then
+    if grep -q "^PASS: <f9>" "$EXWM_START_OUT" 2>/dev/null \
+       && grep -q "^PASS: EXWM initialized" "$EXWM_START_OUT" 2>/dev/null; then
         echo "HARNESS-RESULT: exwm-start-${m} PASS"
         rc=0
     else
