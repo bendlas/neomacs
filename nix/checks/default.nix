@@ -56,6 +56,9 @@ let
         test -d ${checkedPackage}/share/neomacs/etc
         test -f ${checkedPackage}/share/emacs/site-lisp/site-start.el
         test -f ${checkedPackage}/share/emacs/site-lisp/subdirs.el
+        # Nixpkgs' Emacs package builders (trivialBuild/melpaBuild/elpaBuild)
+        # rely on this hook to expose `packageRequires` through EMACSLOADPATH.
+        test -f ${checkedPackage}/nix-support/setup-hook
         test -d ${checkedPackage}/share/applications
         test -d ${checkedPackage}/share/icons
         test -d ${checkedPackage}/share/info

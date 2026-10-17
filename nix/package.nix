@@ -168,11 +168,30 @@ craneLib.buildPackage (
       inherit gstreamerRuntime productionCapabilities;
     };
 
+    # Nixpkgs' Emacs package builders (trivialBuild, melpaBuild, elpaBuild)
+    # propagate their `packageRequires` through `propagatedBuildInputs`.  The
+    # setup hook shipped by the `emacs` derivation is what converts those
+    # inputs into `EMACSLOADPATH` entries while a dependent package is being
+    # byte-compiled.  Ship nixpkgs' own hook (from the same nixpkgs whose
+    # builders will consume it) so `pkgs.neomacs` is a drop-in `emacs` for
+    # `emacsPackagesFor`, without duplicating the hook here.
+    #
+    # Deliberately `${pkgs.path}` rather than `pkgs.emacs.setupHook`: aliasing
+    # `pkgs.emacs = pkgs.neomacs` is a supported way to make the package set
+    # use Neomacs, and that would otherwise recurse.
+    setupHook = "${pkgs.path}/pkgs/applications/editors/emacs/setup-hook.sh";
+
     meta = {
       description = "GPU-accelerated Emacs-compatible editor written in Rust";
       homepage = "https://github.com/eval-exec/neomacs";
       license = lib.licenses.gpl3Plus;
       mainProgram = "neomacs";
+      # The flake only advertises these systems.  Emacs package builders copy
+      # this list into every derived package's `meta.platforms`, and nixpkgs'
+      # generic Emacs builder reads `emacs.meta.platforms` unconditionally, so
+      # leaving it unset makes every `trivialBuild`/`melpaBuild` fail with
+      # "attribute 'platforms' missing".
+      platforms = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
     };
   }
 )
