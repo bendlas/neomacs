@@ -7,6 +7,11 @@
 ;; epoch as `startx ... neomacs -f exwm-wm-mode'.  In "delayed" mode it starts
 ;; 0.5 s after load, which is what the working harness (exwm-session.el) does.
 ;;
+;; The frame exists in both modes; the immediate failure was that Neomacs never
+;; gave the frame X input focus (GNU focuses a frame while creating it).  See
+;; `neomacs--focus-initial-gui-frame-setup' in `lisp/term/neo-win.el' and
+;; docs/exwm/startup-focus-notes.md.
+;;
 ;; The driving script injects <f9> with xdotool once "READY" appears; this
 ;; probe only records whether the key reaches Emacs.  `PASS: <f9>' means the
 ;; keyboard path is alive, `FAIL: <f9>' the reported native symptom.

@@ -213,6 +213,7 @@ reads its post-set value."
 (defvar neomacs-initialized nil
   "Non-nil if Neomacs windowing has been initialized.")
 
+(declare-function x-focus-frame "frame.c" (frame &optional noactivate))
 (declare-function x-handle-args "common-win" (args))
 (declare-function x-open-connection "neomacsfns.c"
                   (display &optional xrm-string must-succeed))
@@ -232,9 +233,48 @@ reads its post-set value."
 
 (add-to-list 'display-format-alist '(".*" . neo))
 
+(defvar neomacs--focus-retry-timer nil
+  "Timer retrying X input focus while the initial frame's window id is pending.")
+
+(defun neomacs--focus-initial-gui-frame ()
+  "Move X input focus to the selected GUI frame once its window id exists.
+Return non-nil when focus was requested, nil while the native window is still
+being realized on the render thread."
+  (let ((frame (selected-frame)))
+    (when (and (display-graphic-p frame)
+               (frame-parameter frame 'window-id))
+      (condition-case nil
+          (x-focus-frame frame)
+        (error nil))
+      t)))
+
+(defun neomacs--focus-initial-gui-frame-maybe ()
+  "Retry `neomacs--focus-initial-gui-frame' until it succeeds, then stop."
+  (when (neomacs--focus-initial-gui-frame)
+    (when neomacs--focus-retry-timer
+      (cancel-timer neomacs--focus-retry-timer)
+      (setq neomacs--focus-retry-timer nil))))
+
+(defun neomacs--focus-initial-gui-frame-setup ()
+  "Give the initial GUI frame X input focus, matching GNU frame creation.
+GNU calls `x_focus_frame' while creating a frame, so the frame already holds
+X input focus before user code runs.  Neomacs realizes the native window
+asynchronously on the render thread, so request focus here once the window id
+is published.  Without it, no one focuses the frame when a window manager
+such as EXWM was started during command-line processing (for example
+`neomacs -f exwm-wm-mode' before the frame existed), and all keyboard input
+is lost."
+  (unless (neomacs--focus-initial-gui-frame)
+    (setq neomacs--focus-retry-timer
+          (run-with-timer 0.05 0.05 #'neomacs--focus-initial-gui-frame-maybe))))
+
 (defun neomacs--window-setup ()
   "Finish Neomacs GUI setup after GNU startup completes frame setup."
   (remove-hook 'window-setup-hook #'neomacs--window-setup)
+
+  ;; GNU focuses a frame as part of creating it; Neomacs realizes the native
+  ;; window asynchronously, so do the equivalent once the id is available.
+  (neomacs--focus-initial-gui-frame-setup)
 
   ;; Cursor blinking is handled by the render thread.  Sync blink state to
   ;; the render thread and suppress the Emacs-side blink timer.

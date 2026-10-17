@@ -6,9 +6,12 @@
 #
 #   startx /run/current-system/sw/bin/neomacs -f exwm-wm-mode
 #
-# i.e. EXWM starts during command-line processing, before startup has settled
-# and a live frame exists.  The working harness instead starts EXWM 0.5 s after
-# the frame exists (exwm-session.el).  This script runs both shapes, injects
+# i.e. EXWM starts during command-line processing.  The frame already exists
+# at that point (its X window id is published), but Neomacs never moved X input
+# focus to it, so the frame stayed unfocused and keys were dropped.  The
+# working harness instead starts EXWM 0.5 s after the frame exists
+# (exwm-session.el), by which time EXWM focuses the frame itself.  This script
+# runs both shapes, injects
 # <f9> with xdotool once the session is up, and reports whether the key reached
 # Emacs.  No manual key injection is needed.
 #
