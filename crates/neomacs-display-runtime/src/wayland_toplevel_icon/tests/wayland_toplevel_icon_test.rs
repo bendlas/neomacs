@@ -17,6 +17,7 @@ fn private_wayland_compositor_accepts_native_toplevel_icon() {
                 .create_window(crate::window_identity::apply_platform_window_identity(
                     winit::window::WindowAttributes::default(),
                     event_loop,
+                    false,
                 ))
                 .expect("create private Wayland window");
             let pixels = crate::window_icon::load_window_icon().expect("decode canonical icon");

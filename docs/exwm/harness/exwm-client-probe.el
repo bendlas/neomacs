@@ -665,7 +665,14 @@ event; the floating checks are therefore unconditional."
                     (sit-for 0.1)
                     (excp--geometry excp--wf))))
     (excp--floating-check "floating: configure request resizes the client"
-                          (lambda () (excp--expect (list 500 400) actual)))
+                          (lambda ()
+                            (with-current-buffer (exwm--id->buffer excp--wf)
+                              (let ((edges (exwm--window-inside-absolute-pixel-edges
+                                            (get-buffer-window (current-buffer) t))))
+                                (excp--expect
+                                 (list (- (elt edges 2) (elt edges 0))
+                                       (- (elt edges 3) (elt edges 1)))
+                                 actual)))))
     (excp--floating-check
      "floating: client is placed on screen, not at the hidden origin"
      (lambda ()
@@ -866,6 +873,29 @@ event; the floating checks are therefore unconditional."
                               excp--w1 'xcb:ewmh:get-_NET_WM_STATE))))
                      (excp--expect nil v))))))
 
+(defun excp--check-floating-size ()
+  "Regression for `x-no-window-manager'.
+EXWM creates its floating frames with `make-frame' and relies on
+`x-no-window-manager' making those windows override-redirect from creation.
+If Neomacs creates them as ordinary windows, EXWM's MapRequest handler adopts
+the frame's own X window as a managed client and `exwm-layout--show' tiles it
+to the full workspace body (the reported bottom/right overflow)."
+  (let ((buffer (and (boundp 'excp--wf) (exwm--id->buffer excp--wf))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let* ((frame exwm--floating-frame)
+               (window-id (and frame
+                               (ignore-errors
+                                 (string-to-number
+                                  (frame-parameter frame 'window-id))))))
+          (when (and frame (frame-live-p frame))
+            (excp--floating-check
+             "floating: frame window is not adopted as a managed client"
+             (lambda ()
+               (excp--expect nil (assoc window-id exwm--id-buffer-alist))))
+            (excp--floating-check
+             "floating: frame stays at its dialog width, not the workspace width"
+             (lambda () (excp--expect t (< (frame-pixel-width frame) 600))))))))))
 (defun excp--post-stages ()
   (setq excp--pending
         (list (cons 0.2 #'excp--close-no-protocol)
@@ -884,6 +914,7 @@ event; the floating checks are therefore unconditional."
               ;; the M2/M3 checks above.
               (cons 0.2 #'excp--floating-create)
               (cons 2.0 #'excp--check-floating)
+              (cons 0.2 #'excp--check-floating-size)
               (cons 0.2 #'excp--floating-resize)
               (cons 1.0 #'excp--check-floating-resize)
               (cons 0.2 #'excp--floating-destroy)

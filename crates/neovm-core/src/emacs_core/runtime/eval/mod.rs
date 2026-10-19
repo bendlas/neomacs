@@ -2308,6 +2308,11 @@ pub struct GuiFrameHostRequest {
     pub title: crate::heap_types::LispString,
     pub geometry_hints: crate::window::GuiFrameGeometryHints,
     pub fullscreen: Option<FrameFullscreen>,
+    /// GNU's `x-no-window-manager`: create a new top-level window
+    /// override-redirect so a window manager never adopts Emacs's own frames
+    /// (notably EXWM, which otherwise tiles its floating frames as clients).
+    /// Ignored by resize requests.
+    pub override_redirect: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

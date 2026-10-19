@@ -268,14 +268,16 @@ impl RenderApp {
                 height,
                 title,
                 geometry_hints,
+                override_redirect,
             } => {
                 let emacs_frame_id = frame.raw_id();
                 tracing::info!(
-                    "CreateWindow request: frame_id=0x{:x} {}x{} \"{}\"",
+                    "CreateWindow request: frame_id=0x{:x} {}x{} \"{}\" override_redirect={}",
                     emacs_frame_id,
                     width,
                     height,
-                    title
+                    title,
+                    override_redirect
                 );
                 self.frame_windows.request_create(
                     emacs_frame_id,
@@ -283,6 +285,7 @@ impl RenderApp {
                     height,
                     title,
                     geometry_hints,
+                    override_redirect,
                 );
             }
             WindowCommand::DestroyWindow { frame } => {

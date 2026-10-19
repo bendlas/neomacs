@@ -17,7 +17,7 @@ fn packaged_desktop_entry_matches_typed_runtime_identity() {
 #[test]
 fn linux_window_attributes_use_packaged_desktop_id() {
     for wayland in [true, false] {
-        let attrs = linux_window_identity(WindowAttributes::default(), wayland);
+        let attrs = linux_window_identity(WindowAttributes::default(), wayland, false);
         assert!(format!("{attrs:?}").contains(NEOMACS_APPLICATION.app_id().as_str()));
     }
 }

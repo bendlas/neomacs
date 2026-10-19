@@ -1321,6 +1321,7 @@ fn request_create_adds_to_pending() {
         600,
         "Test Window".to_string(),
         default_geometry_hints(),
+        false,
     );
 
     assert_eq!(mgr.pending_creates.len(), 1);
@@ -1339,6 +1340,7 @@ fn request_create_multiple_preserves_order() {
         600,
         "Window 1".to_string(),
         default_geometry_hints(),
+        false,
     );
     mgr.request_create(
         2,
@@ -1346,6 +1348,7 @@ fn request_create_multiple_preserves_order() {
         768,
         "Window 2".to_string(),
         default_geometry_hints(),
+        false,
     );
     mgr.request_create(
         3,
@@ -1353,6 +1356,7 @@ fn request_create_multiple_preserves_order() {
         1080,
         "Window 3".to_string(),
         default_geometry_hints(),
+        false,
     );
 
     assert_eq!(mgr.pending_creates.len(), 3);
@@ -1364,7 +1368,7 @@ fn request_create_multiple_preserves_order() {
 #[test]
 fn request_create_does_not_modify_windows_map() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 800, 600, "Test".to_string(), default_geometry_hints());
+    mgr.request_create(1, 800, 600, "Test".to_string(), default_geometry_hints(), false);
 
     // The window should NOT be in the windows map yet —
     // only in the pending queue until process_creates runs
@@ -1375,13 +1379,14 @@ fn request_create_does_not_modify_windows_map() {
 #[test]
 fn request_create_allows_duplicate_frame_ids() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 800, 600, "First".to_string(), default_geometry_hints());
+    mgr.request_create(1, 800, 600, "First".to_string(), default_geometry_hints(), false);
     mgr.request_create(
         1,
         1024,
         768,
         "Duplicate".to_string(),
         default_geometry_hints(),
+        false,
     );
 
     // Both are queued (process_creates will skip duplicates)
@@ -1391,7 +1396,7 @@ fn request_create_allows_duplicate_frame_ids() {
 #[test]
 fn request_create_zero_dimensions() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 0, 0, "Zero".to_string(), default_geometry_hints());
+    mgr.request_create(1, 0, 0, "Zero".to_string(), default_geometry_hints(), false);
 
     assert_eq!(mgr.pending_creates.len(), 1);
     assert_eq!(mgr.pending_creates[0].width, 0);
@@ -1401,7 +1406,7 @@ fn request_create_zero_dimensions() {
 #[test]
 fn request_create_empty_title() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 800, 600, String::new(), default_geometry_hints());
+    mgr.request_create(1, 800, 600, String::new(), default_geometry_hints(), false);
 
     assert_eq!(mgr.pending_creates[0].title, "");
 }
@@ -1416,6 +1421,7 @@ fn request_create_large_frame_id() {
         600,
         "Max ID".to_string(),
         default_geometry_hints(),
+        false,
     );
 
     assert_eq!(mgr.pending_creates[0].emacs_frame_id, large_id);
@@ -1553,6 +1559,7 @@ fn pending_window_stores_all_fields() {
         height: 1080,
         title: "My Emacs Frame".to_string(),
         geometry_hints: default_geometry_hints(),
+        override_redirect: false,
     };
 
     assert_eq!(pw.emacs_frame_id, 123);
@@ -1569,6 +1576,7 @@ fn pending_window_unicode_title() {
         height: 600,
         title: "Emacs \u{2014} \u{1F680} Neomacs".to_string(),
         geometry_hints: default_geometry_hints(),
+        override_redirect: false,
     };
 
     assert!(pw.title.contains('\u{2014}')); // em dash
@@ -1583,8 +1591,8 @@ fn pending_window_unicode_title() {
 fn create_and_destroy_queues_are_independent() {
     let mut mgr = GuiFrameWindowManager::new();
 
-    mgr.request_create(1, 800, 600, "Win1".to_string(), default_geometry_hints());
-    mgr.request_create(2, 1024, 768, "Win2".to_string(), default_geometry_hints());
+    mgr.request_create(1, 800, 600, "Win1".to_string(), default_geometry_hints(), false);
+    mgr.request_create(2, 1024, 768, "Win2".to_string(), default_geometry_hints(), false);
     mgr.request_destroy(3);
     mgr.request_destroy(4);
 
@@ -1671,6 +1679,7 @@ fn many_pending_creates() {
             600,
             format!("Window {}", i),
             default_geometry_hints(),
+            false,
         );
     }
     assert_eq!(mgr.pending_creates.len(), 1000);

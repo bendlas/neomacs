@@ -76,13 +76,18 @@ pub(crate) const NEOMACS_APPLICATION: ApplicationIdentity = ApplicationIdentity 
 pub(crate) fn apply_platform_window_identity(
     attrs: WindowAttributes,
     event_loop: &dyn winit::event_loop::ActiveEventLoop,
+    override_redirect: bool,
 ) -> WindowAttributes {
     use winit::platform::wayland::ActiveEventLoopExtWayland;
-    linux_window_identity(attrs, event_loop.is_wayland())
+    linux_window_identity(attrs, event_loop.is_wayland(), override_redirect)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_window_identity(attrs: WindowAttributes, wayland: bool) -> WindowAttributes {
+fn linux_window_identity(
+    attrs: WindowAttributes,
+    wayland: bool,
+    override_redirect: bool,
+) -> WindowAttributes {
     let name = NEOMACS_APPLICATION.app_id().as_str();
     if wayland {
         attrs.with_platform_attributes(Box::new(
@@ -90,7 +95,9 @@ fn linux_window_identity(attrs: WindowAttributes, wayland: bool) -> WindowAttrib
         ))
     } else {
         attrs.with_platform_attributes(Box::new(
-            winit::platform::x11::WindowAttributesX11::default().with_name(name, name),
+            winit::platform::x11::WindowAttributesX11::default()
+                .with_name(name, name)
+                .with_override_redirect(override_redirect),
         ))
     }
 }
@@ -99,6 +106,7 @@ fn linux_window_identity(attrs: WindowAttributes, wayland: bool) -> WindowAttrib
 pub(crate) fn apply_platform_window_identity(
     attrs: WindowAttributes,
     _event_loop: &dyn winit::event_loop::ActiveEventLoop,
+    _override_redirect: bool,
 ) -> WindowAttributes {
     // Lisp's mouse-wheel-scroll-amount owns lines per detent. Request wheel
     // units so a system multiplier is not applied a second time by mwheel.el.
@@ -113,6 +121,7 @@ pub(crate) fn apply_platform_window_identity(
 pub(crate) fn apply_platform_window_identity(
     attrs: WindowAttributes,
     _event_loop: &dyn winit::event_loop::ActiveEventLoop,
+    _override_redirect: bool,
 ) -> WindowAttributes {
     attrs
 }

@@ -6027,6 +6027,7 @@ pub(crate) fn resize_live_gui_frame(
             title,
             geometry_hints,
             fullscreen: None,
+            override_redirect: false,
         })
         .map_err(|message| signal("error", vec![Value::string(message)]))?;
     }
@@ -6102,6 +6103,7 @@ pub(crate) fn request_live_gui_frame_resize(
             title,
             geometry_hints,
             fullscreen: None,
+            override_redirect: false,
         })
         .map_err(|message| signal("error", vec![Value::string(message)]))?;
         return Ok(());
@@ -7295,11 +7297,15 @@ pub(crate) fn builtin_x_create_frame(
     // already have queued resize events before Lisp reaches x-create-frame,
     // so apply them first instead of reusing stale bootstrap dimensions.
     eval.sync_pending_resize_events();
+    let override_redirect = eval
+        .variable_value_by_name("x-no-window-manager")
+        .is_some_and(|value| value.is_truthy());
     let result = x_create_frame_impl(
         &mut eval.frames,
         &mut eval.buffers,
         &mut eval.display_host,
         args,
+        override_redirect,
     );
     eval.sync_keyboard_terminal_owner();
     if let Ok(value) = &result
@@ -7335,6 +7341,7 @@ pub(crate) fn x_create_frame_impl(
     buffers: &mut BufferManager,
     display_host: &mut Option<Box<dyn super::eval::DisplayHost>>,
     args: Vec<Value>,
+    override_redirect: bool,
 ) -> EvalResult {
     expect_args("x-create-frame", &args, 1)?;
 
@@ -7608,6 +7615,7 @@ pub(crate) fn x_create_frame_impl(
             title: host_title,
             geometry_hints,
             fullscreen: parsed.fullscreen,
+            override_redirect,
         })
         .map_err(|message| signal("error", vec![Value::string(message)]))?;
     }

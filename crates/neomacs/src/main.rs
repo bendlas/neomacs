@@ -1658,6 +1658,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                     height: request.height,
                     title: title_string,
                     geometry_hints: request.geometry_hints,
+                    override_redirect: request.override_redirect,
                 }),
                 "failed to create additional GUI window",
             )?;
@@ -3150,6 +3151,7 @@ fn adopt_existing_primary_gui_frame(eval: &mut Context) -> Result<(), String> {
         title,
         geometry_hints,
         fullscreen,
+        override_redirect: false,
     })
 }
 

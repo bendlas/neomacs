@@ -150,7 +150,11 @@ impl RenderApp {
                 .with_transparent(true);
             let attrs =
                 crate::window_chrome::WindowChromeController::prepare(attrs, decorations_enabled);
-            let attrs = crate::window_identity::apply_platform_window_identity(attrs, event_loop);
+            let attrs = crate::window_identity::apply_platform_window_identity(
+                attrs,
+                event_loop,
+                false,
+            );
 
             tracing::info!(
                 "Render thread creating primary window: emacs_pixels={}x{} title={:?}",

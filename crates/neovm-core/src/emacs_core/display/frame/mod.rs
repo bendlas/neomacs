@@ -2350,6 +2350,7 @@ pub(crate) fn request_live_gui_frame_resize_and_keep_pending(
         title,
         geometry_hints,
         fullscreen: None,
+        override_redirect: false,
     })
     .map_err(|message| signal("error", vec![Value::string(message)]))?;
 

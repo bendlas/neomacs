@@ -83,6 +83,14 @@ the final size.  GNU gets this through its synchronous X event handling.
   [`floating-position-notes.md`](./floating-position-notes.md).  This is the
   root cause of the interactive "floating pop-up stays black / no window on the
   second monitor" reports.
+- The floating frame was tiled to the whole workspace body (`1256x264` instead
+  of the requested `300x268`) because Neomacs created the frame's native window
+  as an ordinary managed window: EXWM's `MapRequest` handler adopted Neomacs's
+  own floating frame as a client.  **Fixed:** frame creation now honors GNU's
+  `x-no-window-manager` and creates the window override-redirect; see
+  [`floating-override-redirect-notes.md`](./floating-override-redirect-notes.md).
+  This is the root cause of the interactive "floating frame's bottom/right
+  edges extend past the screen" report.
 
 ## 4. Next steps
 

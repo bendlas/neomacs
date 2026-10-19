@@ -398,6 +398,9 @@ pub enum WindowCommand {
         height: u32,
         title: String,
         geometry_hints: GuiFrameGeometryHints,
+        /// GNU's `x-no-window-manager`: create the window override-redirect so a
+        /// window manager never adopts Emacs's own frames as clients.
+        override_redirect: bool,
     },
     /// Associate the already-created primary OS window with its real Emacs frame ID.
     AdoptPrimaryFrame { frame: FrameRef },

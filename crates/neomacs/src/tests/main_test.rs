@@ -2361,6 +2361,7 @@ fn opening_gui_frame_adoption_does_not_push_stale_window_size() {
                 height_inc: 16,
             },
             fullscreen: None,
+            override_redirect: false,
         },
     )
     .expect("adopt opening gui frame");
@@ -2443,6 +2444,7 @@ fn opening_gui_frame_adoption_applies_fullscreen_mode() {
                 height_inc: 16,
             },
             fullscreen: Some(FrameFullscreen::Maximized),
+            override_redirect: false,
         },
     )
     .expect("adopt opening gui frame");
@@ -3615,6 +3617,7 @@ fn primary_window_resize_does_not_wait_for_host_acknowledgement() {
                 height_inc: 31,
             },
             fullscreen: None,
+            override_redirect: false,
         },
     )
     .expect("primary resize should succeed");

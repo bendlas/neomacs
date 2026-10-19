@@ -1927,6 +1927,8 @@ pub(crate) struct PendingWindow {
     pub height: u32,
     pub title: String,
     pub geometry_hints: GuiFrameGeometryHints,
+    /// Create the window override-redirect (GNU's `x-no-window-manager`).
+    pub override_redirect: bool,
 }
 
 impl GuiFrameWindowManager {
@@ -2067,6 +2069,7 @@ impl GuiFrameWindowManager {
         height: u32,
         title: String,
         geometry_hints: GuiFrameGeometryHints,
+        override_redirect: bool,
     ) {
         self.pending_creates.push(PendingWindow {
             emacs_frame_id,
@@ -2074,6 +2077,7 @@ impl GuiFrameWindowManager {
             height,
             title,
             geometry_hints,
+            override_redirect,
         });
     }
 
@@ -2116,7 +2120,11 @@ impl GuiFrameWindowManager {
                 attrs,
                 self.chrome_defaults.decorations_enabled,
             );
-            let attrs = crate::window_identity::apply_platform_window_identity(attrs, event_loop);
+            let attrs = crate::window_identity::apply_platform_window_identity(
+                attrs,
+                event_loop,
+                req.override_redirect,
+            );
 
             match event_loop.create_window(attrs) {
                 Ok(window) => {
