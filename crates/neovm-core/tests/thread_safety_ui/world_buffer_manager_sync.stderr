@@ -19,11 +19,21 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `UnsafeCell<neovm_core::buffer::buffer::BufferStorage>: Sync`
            which is required by `BufferManager: Sync`
+           `RefCell<eval::owner_bindings::OwnerSlabRegistry>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<ThreadProjectionTable>: Sync`
+           which is required by `BufferManager: Sync`
+           `Cell<eval::admission::ThreadingMode>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<Option<std::boxed::Box<eval::green::GreenRuntime>>>: Sync`
+           which is required by `BufferManager: Sync`
+           `Cell<Option<ThreadId>>: Sync`
+           which is required by `BufferManager: Sync`
+           `NonNull<TaggedHeap>: Sync`
+           which is required by `BufferManager: Sync`
            `*mut (): Sync`
            which is required by `BufferManager: Sync`
            `UnsafeCell<owned_roots::OwnedRootRegistry>: Sync`
-           which is required by `BufferManager: Sync`
-           `UnsafeCell<TaggedHeap>: Sync`
            which is required by `BufferManager: Sync`
            `UnsafeCell<neovm_core::emacs_core::Obarray>: Sync`
            which is required by `BufferManager: Sync`
@@ -43,13 +53,17 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `UnsafeCell<eval::MacroPerfStats>: Sync`
            which is required by `BufferManager: Sync`
+           `UnsafeCell<eval::global_state::GlobalState>: Sync`
+           which is required by `BufferManager: Sync`
            `*mut (): Send`
            which is required by `BufferManager: Sync`
            `*mut GcHeader: Send`
            which is required by `BufferManager: Sync`
-           `*mut ConsCell: Send`
+           `*const (): Send`
            which is required by `BufferManager: Sync`
-           `Rc<Cell<Option<shared::PointBeforeCommand>>>: Send`
+           `*mut GcHeader: Sync`
+           which is required by `BufferManager: Sync`
+           `Cell<u8>: Sync`
            which is required by `BufferManager: Sync`
            `*mut HashTableObj: Send`
            which is required by `BufferManager: Sync`
@@ -57,11 +71,25 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `*mut *mut MarkerObj: Send`
            which is required by `BufferManager: Sync`
-           `*const (): Send`
+           `Rc<Cell<Option<shared::PointBeforeCommand>>>: Send`
            which is required by `BufferManager: Sync`
-           `std::rc::Weak<[TaggedValue]>: Send`
+           `Rc<face::FaceStorage>: Send`
+           which is required by `BufferManager: Sync`
+           `Rc<HashMap<LispFaceId, TaggedValue>>: Send`
+           which is required by `BufferManager: Sync`
+           `Rc<neomacs_display_protocol::tty_palette::TtyPalette>: Send`
+           which is required by `BufferManager: Sync`
+           `NonNull<eval::owner_bindings::OwnerSlab>: Send`
+           which is required by `BufferManager: Sync`
+           `Cell<CanonicalArm>: Sync`
+           which is required by `BufferManager: Sync`
+           `Cell<usize>: Sync`
+           which is required by `BufferManager: Sync`
+           `std::sync::mpsc::Receiver<gc::gc_thread::ConcurrentMarkResult>: Sync`
            which is required by `BufferManager: Sync`
            `*mut u8: Send`
+           which is required by `BufferManager: Sync`
+           `*mut ConsCell: Send`
            which is required by `BufferManager: Sync`
            `*mut FloatObj: Send`
            which is required by `BufferManager: Sync`
@@ -69,15 +97,21 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `*mut StringObj: Send`
            which is required by `BufferManager: Sync`
-           `NonNull<LispBufferLocalValue>: Send`
-           which is required by `BufferManager: Sync`
            `*const u8: Send`
            which is required by `BufferManager: Sync`
-           `*const c_void: Send`
+           `Rc<Cell<*const ()>>: Send`
            which is required by `BufferManager: Sync`
-           `*const tree_sitter::ffi::TSTree: Send`
+           `*const (): Sync`
            which is required by `BufferManager: Sync`
-           `*mut MarkerObj: Send`
+           `*mut HashTableObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut FinalizerObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut *mut MarkerObj: Sync`
+           which is required by `BufferManager: Sync`
+           `Cell<()>: Sync`
+           which is required by `BufferManager: Sync`
+           `std::rc::Weak<[TaggedValue]>: Send`
            which is required by `BufferManager: Sync`
            `*mut VectorObj: Send`
            which is required by `BufferManager: Sync`
@@ -91,9 +125,47 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `*mut SymbolWithPosObj: Send`
            which is required by `BufferManager: Sync`
+           `*mut MarkerObj: Send`
+           which is required by `BufferManager: Sync`
            `*mut BignumObj: Send`
            which is required by `BufferManager: Sync`
-           `*const (): Sync`
+           `NonNull<LispBufferLocalValue>: Send`
+           which is required by `BufferManager: Sync`
+           `NonNull<LispFwd>: Send`
+           which is required by `BufferManager: Sync`
+           `*mut u8: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut ConsCell: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut FloatObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut VecLikeHeader: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut StringObj: Sync`
+           which is required by `BufferManager: Sync`
+           `Rc<()>: Send`
+           which is required by `BufferManager: Sync`
+           `*const c_void: Send`
+           which is required by `BufferManager: Sync`
+           `*const tree_sitter::ffi::TSTree: Send`
+           which is required by `BufferManager: Sync`
+           `RefCell<ccl::CclRegistry>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<charset::CharsetRegistry>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<xfaces::FaceAttrState>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<neovm_core::emacs_core::terminal::pure::TerminalLispRegistry>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<builtins::collections::HashTableTestRegistry>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<builtins::file_notify::FileNotifyState>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<HashMap<i64, builtins::hooks::WindowConfigurationSnapshot>>: Sync`
+           which is required by `BufferManager: Sync`
+           `RefCell<Vec<Option<dynamic_module::GlobalRefEntry>>>: Sync`
+           which is required by `BufferManager: Sync`
+           `Rc<Cell<*const ()>>: Sync`
            which is required by `BufferManager: Sync`
            `Rc<RefCell<neovm_core::buffer::buffer_text::BufferTextStorage>>: Send`
            which is required by `BufferManager: Sync`
@@ -101,7 +173,45 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `Rc<RefCell<shared::SharedUndoStateInner>>: Send`
            which is required by `BufferManager: Sync`
+           `*mut VectorObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut ByteCodeObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut LambdaObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut MacroObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut RecordObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut SymbolWithPosObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut MarkerObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*mut BignumObj: Sync`
+           which is required by `BufferManager: Sync`
+           `*const LispSymbol: Sync`
+           which is required by `BufferManager: Sync`
+           `*const Atomic<u32>: Sync`
+           which is required by `BufferManager: Sync`
+           `NonNull<()>: Send`
+           which is required by `BufferManager: Sync`
+           `Rc<()>: Sync`
+           which is required by `BufferManager: Sync`
            `Rc<Vec<AutomaticCompositionSpan>>: Send`
            which is required by `BufferManager: Sync`
+           `(dyn std::any::Any + 'static): Send`
+           which is required by `BufferManager: Sync`
+           `*const AtomicTaggedValue: Sync`
+           which is required by `BufferManager: Sync`
+           `*const TaggedValue: Sync`
+           which is required by `BufferManager: Sync`
+           `*const CharTableObj: Sync`
+           which is required by `BufferManager: Sync`
+           `UnsafeCell<TaggedValue>: Sync`
+           which is required by `BufferManager: Sync`
            `Rc<OverlayList>: Send`
+           which is required by `BufferManager: Sync`
+           `(dyn for<'a> Fn(&'a LispString) -> Vec<LispString> + 'static): Send`
+           which is required by `BufferManager: Sync`
+           `*mut emacs_value_tag: Send`
            which is required by `BufferManager: Sync`

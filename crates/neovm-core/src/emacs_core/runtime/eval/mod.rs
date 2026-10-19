@@ -5733,6 +5733,9 @@ impl Context {
     /// Refresh the render-facing face table from this frame's Lisp face
     /// vectors before redisplay.
     pub fn sync_runtime_faces_for_frame(&mut self, frame_id: crate::window::FrameId) -> bool {
+        if crate::face::realization::enabled() {
+            return super::xfaces::realization::prepare_runtime_faces(self, frame_id);
+        }
         let source = (frame_id, self.face_change_count);
         if (*self.materialized_face_table_source) == Some(source) {
             return false;
@@ -5968,9 +5971,10 @@ impl Context {
         sym_id: SymId,
         sym: &crate::emacs_core::symbol::LispSymbol,
     ) -> Option<SymbolValueLookup> {
-        let buf_fwd = sym.forwarded_descriptor()?.as_buffer_obj_fwd()?;
+        let fwd = sym.forwarded_descriptor()?;
+        let buf_fwd = fwd.as_buffer_obj_fwd()?;
         let Some(slot) = buf_fwd.buffer_slot() else {
-            return buf_fwd
+            return fwd
                 .thread_projection()
                 .map(|projection| self.projected_value(sym_id, projection));
         };
@@ -6922,7 +6926,7 @@ impl ForwardChecked {
 fn assignment_forwarder(
     obarray: &Obarray,
     sym_id: SymId,
-) -> Option<&'static crate::emacs_core::forward::LispFwd> {
+) -> Option<crate::emacs_core::forward::FwdRef> {
     use crate::emacs_core::symbol::SymbolRedirect;
 
     match obarray.get_by_id(sym_id).map(|symbol| symbol.redirect()) {
@@ -6977,7 +6981,7 @@ pub(crate) fn check_forwarded_store_at(
 /// [`check_forwarded_store_at`] once the governing forwarder FWD is known.
 #[inline(always)]
 fn check_store_through(
-    fwd: &crate::emacs_core::forward::LispFwd,
+    fwd: crate::emacs_core::forward::FwdRef,
     buffers: &BufferManager,
     specpdl: &[SpecBinding],
     sym_id: SymId,
@@ -7824,6 +7828,10 @@ mod gc_forced_first_cycle_tests;
 mod gc_root_ownership_tests;
 
 #[cfg(test)]
+#[path = "tests/gc_atomic_slot_test.rs"]
+mod gc_atomic_slot_tests;
+
+#[cfg(test)]
 #[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;
 
@@ -7922,3 +7930,6 @@ mod positioned_control_tests;
 #[cfg(test)]
 #[path = "tests/issue554_function_policy.rs"]
 mod issue554_function_policy;
+
+mod rows_observation;
+pub use rows_observation::{RowsDependencyMetadata, RowsObservationEpoch, RowsObservationRefusal};

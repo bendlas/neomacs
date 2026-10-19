@@ -13,7 +13,7 @@ fn finish(era: ParallelHeapEra<'_>) {
     drop(keeper);
 }
 
-fn activate_retry<'era>(
+pub(super) fn activate_retry<'era>(
     mut permit: MutatorPermit<'era>,
     heap: HeapIdentity,
     owner: u64,
@@ -29,7 +29,7 @@ fn activate_retry<'era>(
         }
     }
 }
-fn finish_retry(mut token: Mutator<'_>, epoch: NonZeroU64) {
+pub(super) fn finish_retry(mut token: Mutator<'_>, epoch: NonZeroU64) {
     loop {
         match token.finish(epoch) {
             Ok(()) => return,
@@ -327,7 +327,7 @@ fn young_resolver_checks_one_canonical_entry_and_retiring_generation() {
 #[test]
 fn panic_abandonment_poison_retains_owner_state_and_world_authority() {
     Context::with_test_mutator_era(|era| {
-        let initial = era.registry().state.lock().unwrap().entries.len();
+        let initial = era.registry().gate.state.lock().unwrap().entries.len();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut token = era
                 .register(1, 3)
@@ -348,7 +348,7 @@ fn panic_abandonment_poison_retains_owner_state_and_world_authority() {
             Err(RegistrationError::Poisoned)
         ));
         assert_eq!(
-            era.registry().state.lock().unwrap().entries.len(),
+            era.registry().gate.state.lock().unwrap().entries.len(),
             initial + 1
         );
         let failed = era.finish().unwrap_err();

@@ -112,6 +112,7 @@ impl BufferSourceBodyInstallContext {
     pub(crate) fn request<'a>(
         self,
         window_start: i64,
+        accessible_end: i64,
         text_start_byte: usize,
         byte_idx: usize,
         reserve_right_special_col: bool,
@@ -124,6 +125,7 @@ impl BufferSourceBodyInstallContext {
         TextWindowBodyInstallRequest::new(TextWindowBodyInstallRenderContext::new(
             self.output_window_id,
             window_start,
+            accessible_end,
             text_start_byte,
             byte_idx,
             reserve_right_special_col,
@@ -270,6 +272,7 @@ impl<'a> BufferSourceTailRequestContext<'a> {
     ) -> TextWindowBodyInstallRequest<'request> {
         self.body_install_context.request(
             self.window_start,
+            self.params.accessible_end_charpos().get(),
             self.text_start_byte,
             byte_idx,
             self.reserve_right_special_col,
@@ -320,9 +323,10 @@ pub(crate) fn render_buffer_source_tail_and_decide_retry<
     'surface,
     'buf,
     B: LayoutBufferView,
+    FS: crate::neovm_bridge::FaceServices,
 >(
     loop_context: BufferSourceLoopRequestContext,
-    mut source_render: TextRowSourceRenderState<'emit>,
+    mut source_render: TextRowSourceRenderState<'emit, FS>,
     mut row_progress: DisplaySourceRowProgressState<'emit>,
     row_geometry: &'emit mut DisplayRowGeometryState,
     cursor_info: &'emit mut CursorCaptureState,

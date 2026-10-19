@@ -1733,6 +1733,7 @@ fn gui_startup() -> StartupOptions {
         no_site_lisp: true,
         no_loadup: false,
         no_build_details: false,
+        rows_query_admission: neomacs_layout_engine::RowsQueryAdmission::Off,
     }
 }
 
@@ -1810,6 +1811,7 @@ fn gui_startup_with_args(args: &[&str]) -> StartupOptions {
         no_site_lisp: false,
         no_loadup: false,
         no_build_details: false,
+        rows_query_admission: neomacs_layout_engine::RowsQueryAdmission::Off,
     }
 }
 
@@ -1828,6 +1830,7 @@ fn tty_batch_startup_with_args(args: &[&str]) -> StartupOptions {
         no_site_lisp: false,
         no_loadup: false,
         no_build_details: false,
+        rows_query_admission: neomacs_layout_engine::RowsQueryAdmission::Off,
     }
 }
 
@@ -4665,6 +4668,7 @@ fn configure_gnu_startup_state_clears_window_system_for_tty_boots() {
         no_site_lisp: false,
         no_loadup: false,
         no_build_details: false,
+        rows_query_admission: neomacs_layout_engine::RowsQueryAdmission::Off,
     };
     configure_gnu_startup_state(&mut eval, frame_id, &startup);
 
@@ -4769,6 +4773,7 @@ fn live_tty_defface_keeps_dark_color_parent_attributes_through_inverse_video() {
         no_site_lisp: true,
         no_loadup: false,
         no_build_details: false,
+        rows_query_admission: neomacs_layout_engine::RowsQueryAdmission::Off,
     };
     configure_gnu_startup_state(&mut eval, frame_id, &startup);
 
@@ -4852,6 +4857,7 @@ fn configure_gnu_startup_state_marks_batch_mode_noninteractive() {
         no_site_lisp: false,
         no_loadup: false,
         no_build_details: false,
+        rows_query_admission: neomacs_layout_engine::RowsQueryAdmission::Off,
     };
     configure_gnu_startup_state(&mut eval, FrameId(9), &startup);
 
@@ -7256,4 +7262,59 @@ fn superseded_gui_publications_retire_evaluator_records_without_input_roundtrip(
         "superseded publications leaked"
     );
     assert_eq!(frame.active_presentation(), Some(presentation));
+}
+
+#[test]
+fn raw_dump_loadup_invocation_carries_explicit_build_details_policy() {
+    let startup = parse_startup_options([
+        "neomacs-temacs".to_string(),
+        "--no-build-details".to_string(),
+        "--temacs=pdump".to_string(),
+    ])
+    .expect("explicit no-build-details should parse");
+    let LoadupInvocation::Dump(invocation) =
+        raw_dump_loadup_invocation(&startup, LoadupDumpMode::Pdump)
+    else {
+        panic!("raw dump must carry its startup policy");
+    };
+    assert_eq!(
+        invocation.build_details(),
+        neovm_core::emacs_core::load::BuildDetails::Omit
+    );
+    assert!(
+        !invocation
+            .command_line_args()
+            .iter()
+            .any(|arg| arg == "--no-build-details"),
+        "consumed flags travel through typed policy rather than later Lisp argv"
+    );
+
+    let defaults =
+        parse_startup_options(["neomacs-temacs".to_string(), "--temacs=pdump".to_string()])
+            .unwrap();
+    let LoadupInvocation::Dump(default_invocation) =
+        raw_dump_loadup_invocation(&defaults, LoadupDumpMode::Pdump)
+    else {
+        panic!("default raw dump policy");
+    };
+    assert_eq!(
+        default_invocation.build_details(),
+        neovm_core::emacs_core::load::BuildDetails::Include
+    );
+}
+
+#[test]
+fn configure_gnu_startup_state_applies_explicit_no_build_details() {
+    let mut eval = Context::new();
+    let mut startup = gui_startup();
+    startup.no_build_details = true;
+    configure_gnu_startup_state(&mut eval, FrameId(42), &startup);
+    assert_eq!(
+        eval.variable_value_by_name("build-details"),
+        Some(Value::NIL)
+    );
+    assert!(
+        eval.eval_str("(system-name)").unwrap().is_nil(),
+        "normal startup must share raw loadup's explicit omission policy"
+    );
 }

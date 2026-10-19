@@ -25,7 +25,10 @@ use std::sync::Arc;
 mod green_owner;
 mod slot;
 mod sole_owner;
-pub(crate) use green_owner::{Baton, FrozenLegacyRoots};
+#[allow(unused_imports)]
+pub(crate) use green_owner::{
+    Baton, FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection,
+};
 pub(crate) use slot::WorldSlot;
 pub(crate) use sole_owner::{
     PublishedSoleOwnerDriver, SoleOwnerDriver, SoleOwnerRegistration, SoleOwnerVm,
@@ -35,7 +38,10 @@ pub(crate) use sole_owner::{
 struct World {
     sole_context: sole_owner::SoleContextConstruction,
     owned_roots: Box<UnsafeCell<crate::emacs_core::owned_roots::OwnedRootRegistry>>,
-    tagged_heap: Box<UnsafeCell<crate::tagged::gc::TaggedHeap>>,
+    /// The heap's single provenance root (see
+    /// [`crate::tagged::gc::AliasableBox`]): the owning accessors, the
+    /// `Context`'s heap view and the TLS slot all derive from this pointer.
+    tagged_heap: crate::tagged::gc::AliasableBox<crate::tagged::gc::TaggedHeap>,
     obarray: Box<UnsafeCell<Obarray>>,
     features: Box<UnsafeCell<Vec<SymId>>>,
     watchers: Box<UnsafeCell<VariableWatcherList>>,
@@ -165,6 +171,27 @@ impl<T> DerefMut for WorldView<T> {
         unsafe { self.ptr.as_mut() }
     }
 }
+impl WorldView<crate::tagged::gc::TaggedHeap> {
+    /// The heap's provenance root.
+    ///
+    /// Raw-pointer users that keep a heap pointer across other heap accesses
+    /// must start here, not at a `&mut *view` reborrow: a reference-derived
+    /// pointer is a child tag that the next sibling reborrow freezes or pops
+    /// (Tree/Stacked Borrows respectively).
+    pub(crate) fn heap_root(&self) -> NonNull<crate::tagged::gc::TaggedHeap> {
+        self.ptr
+    }
+
+    /// Install this view's heap in the calling thread's allocation slot.
+    ///
+    /// The slot is set from the view's provenance root, which is the same
+    /// root every access through the view derives from, so later `&mut`
+    /// reborrows through the view cannot invalidate the installed pointer.
+    pub(crate) fn install_tagged_heap(&self) {
+        crate::tagged::gc::set_tagged_heap_root(self.ptr);
+    }
+}
+
 impl<T> AsRef<T> for WorldView<T> {
     #[inline(always)]
     fn as_ref(&self) -> &T {
@@ -1022,7 +1049,7 @@ fn cell_ptr<T>(cell: &UnsafeCell<T>) -> NonNull<T> {
 /// Closed factory input; managers are finalized before any view is published.
 pub(super) struct WorldStorageBuilder {
     pub(super) owned_roots: crate::emacs_core::owned_roots::OwnedRootRegistry,
-    pub(super) tagged_heap: Box<crate::tagged::gc::TaggedHeap>,
+    pub(super) tagged_heap: crate::tagged::gc::AliasableBox<crate::tagged::gc::TaggedHeap>,
     pub(super) obarray: Obarray,
     pub(super) features: Vec<SymId>,
     pub(super) watchers: VariableWatcherList,
@@ -1074,16 +1101,11 @@ impl WorldStorageBuilder {
     #[cold]
     pub(super) fn build(self) -> ReadyWorld {
         let (buffers, selection) = self.buffers.into_parts();
-        // SAFETY: UnsafeCell<T> is repr(transparent). Preserve the existing Box
-        // allocation and payload address, with identical
-        // allocator/layout. The new sole Box owns that allocation exactly once.
-        // Published pointer provenance is renewed below after the move; address
-        // stability alone does not preserve a reference-derived TLS designator.
-        let heap = unsafe {
-            Box::from_raw(
-                Box::into_raw(self.tagged_heap).cast::<UnsafeCell<crate::tagged::gc::TaggedHeap>>(),
-            )
-        };
+        // The owner already holds the allocation's single provenance root, so
+        // moving it into the World is a plain move: the address and the root
+        // tag survive it. The TLS installation below re-derives from that
+        // root, never from a `&mut` borrow of the heap.
+        let heap = self.tagged_heap;
         let lease = WorldLease(Arc::new(World {
             sole_context: sole_owner::SoleContextConstruction::new(),
             owned_roots: Box::new(UnsafeCell::new(self.owned_roots)),
@@ -1105,14 +1127,11 @@ impl WorldStorageBuilder {
             green: Default::default(),
             baton_holder: Cell::new(None),
         }));
-        // SAFETY: rederive the upstream TLS installation from the finalized
-        // heap cell before any allocation-capable Context setup resumes. All
-        // builder inputs were prepared before the old Box was moved, and World
-        // grants no second mutable view. Subsequent heap/TLS loan discipline is
-        // unchanged from the existing single-owner runtime.
-        unsafe {
-            crate::tagged::gc::set_tagged_heap(&mut *lease.0.tagged_heap.get());
-        }
+        // Reinstall the upstream TLS slot from the finalized heap's root
+        // before any allocation-capable Context setup resumes. The root (not
+        // a `&mut` borrow) is what makes the slot survive every sibling
+        // access the owner later takes.
+        crate::tagged::gc::set_tagged_heap_root(lease.0.tagged_heap.root());
         Self::publish_views(&lease, selection)
     }
 
@@ -1138,7 +1157,10 @@ impl WorldStorageBuilder {
                 lease: lease.duplicate_for_view(),
             },
             tagged_heap: WorldView {
-                ptr: cell_ptr(&lease.0.tagged_heap),
+                // The heap's provenance root, not a fresh `UnsafeCell::get`
+                // (there is no cell around the heap any more): this copy and
+                // the TLS slot must name the same tag.
+                ptr: lease.0.tagged_heap.root(),
                 lease: lease.duplicate_for_view(),
             },
             obarray: ObarrayView {
@@ -1212,10 +1234,9 @@ impl Context {
     /// Visit every owner slab's values -- each owner's bindings are roots,
     /// whether or not that owner is running -- and the canonical plain word
     /// of every projected variable, which the World's table roots.
-    pub(super) fn trace_owner_slabs(&self, visit: &mut dyn FnMut(Value)) {
-        let heap = self.tagged_heap.identity();
+    pub(super) fn trace_owner_slabs(&self, heap_id: usize, visit: &mut dyn FnMut(Value)) {
         let world = &self.obarray.lease.0;
-        world.owner_slabs.borrow().trace_roots(heap, visit);
+        world.owner_slabs.borrow().trace_roots(heap_id, visit);
         world.thread_projections.borrow().trace_roots(visit);
         if let Some(runtime) = world.green.borrow().as_ref() {
             runtime.trace_roots(visit);

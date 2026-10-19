@@ -702,18 +702,45 @@ impl LambdaData {
 // ---------------------------------------------------------------------------
 
 /// Hash table with configurable test function.
-#[derive(Clone, Debug)]
+///
+/// `test_depth` (proof 2 Rev R2) is the atomic nesting count that replaced
+/// GNU's `mutable` bool: zero means "no owner is inside a user test or hash
+/// function on this table", and every in-flight activation counts, so two
+/// owners' tests nest to 2 and any owner's mutation signals while the count
+/// is nonzero. It sits in the bool's exact field position (1 byte, alignment
+/// 1, `data` still last), so no downstream offset moves. `Clone` copies the
+/// byte and copy-hash-table resets it to zero explicitly.
+#[derive(Debug)]
 pub struct LispHashTable {
     pub test: HashTableTest,
     pub test_name: Option<SymId>,
     pub user_cmp_function: Option<Value>,
     pub user_hash_function: Option<Value>,
-    pub mutable: bool,
+    pub test_depth: std::sync::atomic::AtomicU8,
     pub size: i64,
     pub weakness: Option<HashTableWeakness>,
     pub rehash_size: f64,
     pub rehash_threshold: f64,
     pub data: HashTableStorage,
+}
+
+impl Clone for LispHashTable {
+    fn clone(&self) -> Self {
+        Self {
+            test: self.test.clone(),
+            test_name: self.test_name,
+            user_cmp_function: self.user_cmp_function,
+            user_hash_function: self.user_hash_function,
+            test_depth: std::sync::atomic::AtomicU8::new(
+                self.test_depth.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            size: self.size,
+            weakness: self.weakness,
+            rehash_size: self.rehash_size,
+            rehash_threshold: self.rehash_threshold,
+            data: self.data.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -729,7 +756,10 @@ pub struct HashTableEntry {
 /// number; slot order provides GNU-compatible iteration while storing only
 /// the original Lisp key and value. See [`hash_index`] for how an `equal`
 /// table finds a key.
-#[derive(Clone, Debug, Default)]
+///
+/// `Clone` is manual: the proof-2 authority word at the end is zeroed on
+/// every copy rather than copied (see the field's comment).
+#[derive(Debug, Default)]
 pub struct HashTableStorage {
     index: HashIndex,
     slots: Vec<Option<HashTableEntry>>,
@@ -782,6 +812,34 @@ pub struct HashTableStorage {
     /// JIT code that answers a jump table inline guards on it
     /// ([`switch_plan::SWITCH_EPOCH_OFFSET`]).
     pub(crate) switch_epoch: u64,
+    /// Proof 2 sealed authority (design §2.1), appended AFTER `switch_epoch`
+    /// so every existing field offset — in particular the JIT-read
+    /// `SWITCH_EPOCH_OFFSET` — is unchanged. Bit 63 is the WRITER hold
+    /// (taken by one uncontended CAS from a fully quiescent word, which
+    /// drains every in-flight sealed reader); the low 47 bits count sealed
+    /// readers walking storage under the read count. Zero on every fresh,
+    /// copied, dumped and restored table: a new table object never inherits
+    /// another's in-flight state. Only the sealed lease types
+    /// (`table_authority.rs`) touch this word.
+    pub(crate) authority: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for HashTableStorage {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index.clone(),
+            slots: self.slots.clone(),
+            free_slots: self.free_slots.clone(),
+            user_hashes: self.user_hashes.clone(),
+            user_buckets: self.user_buckets.clone(),
+            pending: self.pending.clone(),
+            switch_plan: self.switch_plan.clone(),
+            switch_epoch: self.switch_epoch,
+            // A copy starts quiescent: it is never mid-drain and never
+            // carries another table object's readers or writer.
+            authority: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 /// Dump entries parked in `HashTableStorage::pending`: each tuple is
@@ -864,6 +922,7 @@ impl HashTableStorage {
             pending: None,
             switch_plan: switch_plan::SwitchPlanCache::default(),
             switch_epoch: 0,
+            authority: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1584,6 +1643,61 @@ impl HashTableStorage {
                     .saturating_mul(size_of::<usize>()),
             )
     }
+
+    /// What a proof-2 sealed edit charges its owner for growth (§4 Rev R3):
+    /// [`Self::known_storage_bytes`] plus every growth source that escapes
+    /// the Vec-capacity accounting there — the user-hash memo maps (a
+    /// `define-hash-table-test` table's hash and bucket maps, plus their
+    /// `SmallVec` spill past one element per bucket) and the boxed
+    /// `HashKey` materialization behind `Bignum`/structural/text keys in
+    /// the index, the pending entries and the memo maps themselves.
+    ///
+    /// Called by the sealed lease wrapper around each edit body; the serial
+    /// path never measures this. The measurement is O(table size): the
+    /// wrapper runs it twice per edit, which is the accepted cost while
+    /// sealed leases target bounded tables — B6/B7 (make/copy) revisit
+    /// amortizing the key walk to capacity-growth events.
+    pub(crate) fn sealed_storage_bytes(&self) -> usize {
+        // Memo map slots: hashbrown allocates capacity * (K + V) plus one
+        // control byte per bucket (~capacity of them). The +1-per-entry
+        // control term is within the load-factor margin.
+        let memo_slot = self
+            .user_hashes
+            .capacity()
+            .saturating_mul(size_of::<HashKey>() + size_of::<i64>() + 1)
+            .saturating_add(self.user_buckets.capacity().saturating_mul(
+                size_of::<i64>() + size_of::<smallvec::SmallVec<[HashKey; 1]>>() + 1,
+            ));
+        // Bucket spill past each SmallVec's inline element. The maps'
+        // invariant (a key is in a bucket exactly when `user_hashes` holds
+        // it) makes the spilled-element count the difference of the two
+        // lengths, so no per-bucket walk is needed.
+        let spill = self
+            .user_hashes
+            .len()
+            .saturating_sub(self.user_buckets.len())
+            .saturating_mul(size_of::<HashKey>());
+        let key_bytes = self
+            .index
+            .iter()
+            .map(|entry| entry.key.heap_bytes())
+            .sum::<usize>()
+            .saturating_add(
+                self.pending
+                    .as_deref()
+                    .map_or(0, |p| p.iter().map(|(key, _, _)| key.heap_bytes()).sum()),
+            )
+            .saturating_add(
+                self.user_hashes
+                    .keys()
+                    .map(HashKey::heap_bytes)
+                    .sum::<usize>(),
+            );
+        self.known_storage_bytes()
+            .saturating_add(memo_slot)
+            .saturating_add(spill)
+            .saturating_add(key_bytes)
+    }
 }
 
 /// Forget `key`'s remembered user hash in both memo maps.
@@ -2124,6 +2238,42 @@ impl HashKey {
     pub fn string_content(bytes: &[u8], schars: usize) -> Self {
         HashKey::StringContent(Box::new((bytes.into(), schars)))
     }
+
+    /// Heap bytes this key's boxed variants own, beyond the enum's inline
+    /// footprint that `size_of::<HashKey>` already covers. Structural keys
+    /// recurse; `eq`-test keys (Nil/True/Int/Symbol/Keyword/Char/Float/Ptr)
+    /// answer 0 without boxing. Measured by the proof-2 sealed lease
+    /// wrapper only (§4 Rev R3); the serial path never calls this.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            HashKey::Bignum(limbs) => limbs.len() * size_of::<u64>(),
+            HashKey::EqualCons(car, cdr) => car.heap_bytes() + cdr.heap_bytes(),
+            HashKey::EqualVec(parts) => parts.iter().map(Self::heap_bytes).sum(),
+            HashKey::ByteCode(parts) => parts.iter().map(ByteCodeKeyPart::heap_bytes).sum(),
+            HashKey::Marker(body) => 0,
+            HashKey::Overlay(body) => body.3.heap_bytes(),
+            HashKey::BoolVector(body) => body.1.len() * size_of::<u64>(),
+            HashKey::SymbolWithPos(sym, pos) => sym.heap_bytes() + pos.heap_bytes(),
+            HashKey::Text(text) => text.len(),
+            HashKey::StringContent(body) => body.0.len(),
+            _ => 0,
+        }
+    }
+}
+
+impl ByteCodeKeyPart {
+    /// Heap bytes beyond the part's inline footprint (see
+    /// [`HashKey::heap_bytes`]).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            ByteCodeKeyPart::Bytes(bytes) => bytes.len(),
+            ByteCodeKeyPart::Ops(ops) => ops.len() * size_of::<super::bytecode::Op>(),
+            ByteCodeKeyPart::Values(parts) => parts.iter().map(HashKey::heap_bytes).sum(),
+            ByteCodeKeyPart::Text { bytes, .. } => bytes.len(),
+            ByteCodeKeyPart::Value(key) => key.heap_bytes(),
+            _ => 0,
+        }
+    }
 }
 
 impl LispHashTable {
@@ -2178,7 +2328,7 @@ impl LispHashTable {
             test_name: None,
             user_cmp_function: None,
             user_hash_function: None,
-            mutable: true,
+            test_depth: std::sync::atomic::AtomicU8::new(0),
             size,
             weakness,
             rehash_size,
@@ -3872,11 +4022,11 @@ impl TaggedValue {
     pub fn char_table_external_slots(self) -> Option<Vec<Value>> {
         let table = self.as_char_table_obj()?;
         let mut slots = Vec::with_capacity(4 + CHAR_TABLE_TOP_SLOTS + table.extras.len());
-        slots.push(table.defalt);
-        slots.push(table.parent);
-        slots.push(table.purpose);
-        slots.push(table.ascii);
-        slots.extend_from_slice(&table.contents);
+        slots.push(table.defalt.get());
+        slots.push(table.parent.get());
+        slots.push(table.purpose.get());
+        slots.push(table.ascii.get());
+        slots.extend(table.contents.iter().map(|cell| cell.get()));
         slots.extend_from_slice(table.extras.as_slice());
         Some(slots)
     }
@@ -4528,11 +4678,11 @@ impl StructuralPseudovectorView<'_> {
         match self {
             Self::Vector(slots) | Self::Record(slots) => slots[index],
             Self::CharTable(table) => match index {
-                0 => table.defalt,
-                1 => table.parent,
-                2 => table.purpose,
-                3 => table.ascii,
-                index if index < 4 + CHAR_TABLE_TOP_SLOTS => table.contents[index - 4],
+                0 => table.defalt.get(),
+                1 => table.parent.get(),
+                2 => table.purpose.get(),
+                3 => table.ascii.get(),
+                index if index < 4 + CHAR_TABLE_TOP_SLOTS => table.contents[index - 4].get(),
                 _ => table.extras.as_slice()[index - 4 - CHAR_TABLE_TOP_SLOTS],
             },
             // GNU stores DEPTH and MIN_CHAR in the packed, non-Lisp prefix of
@@ -5612,12 +5762,15 @@ fn cons_ptr_unchecked(value: Value) -> *const ConsCell {
 
 #[inline(always)]
 unsafe fn cons_car_unchecked(ptr: *const ConsCell) -> Value {
-    unsafe { std::ptr::addr_of!((*ptr).car).read() }
+    // SAFETY: caller proves `ptr` names a live cons cell; `get` is a plain
+    // owner load of the interior-mutable word.
+    unsafe { (*ptr).car.get() }
 }
 
 #[inline(always)]
 unsafe fn cons_cdr_unchecked(ptr: *const ConsCell) -> Value {
-    unsafe { std::ptr::addr_of!((*ptr).cdr_or_next.cdr).read() }
+    // SAFETY: as `cons_car_unchecked`; `cdr` is the active union member.
+    unsafe { (*ptr).cdr_or_next.get() }
 }
 
 /// Mutate a binding in place: set cdr of the `(sym . val)` cons cell.
@@ -5715,3 +5868,7 @@ pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
 #[cfg(test)]
 #[path = "tests/gc_generational_hydration_test.rs"]
 mod gc_generational_hydration;
+
+#[cfg(test)]
+#[path = "tests/p2ht_authority_test.rs"]
+mod p2ht_authority;

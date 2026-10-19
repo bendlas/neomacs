@@ -225,7 +225,7 @@ impl WorkerSymbolMarks for FxHashSet<SymId> {
     const ENABLED: bool = false;
     #[inline]
     fn note(&mut self, value: TaggedValue, symbols: &mut Vec<SymId>) -> bool {
-        let crate::tagged::value::ValueKind::Symbol(id) = value.kind() else {
+        let crate::tagged::value::ValueKind::Symbol(id) = value.gc_kind() else {
             return false;
         };
         if self.insert(id) {
@@ -554,7 +554,7 @@ pub(super) fn concurrent_try_mark_string(
     str_claimed: &AtomicUsize,
 ) -> bool {
     debug_assert!(val.is_string());
-    let Some(ptr) = val.as_string_ptr() else {
+    let Some(ptr) = val.gc_string_ptr() else {
         return false; // malformed value — let the termination's mark_value decide
     };
     if !pages.contains(ChunkClass::String, ptr as usize) {
@@ -590,7 +590,7 @@ fn concurrent_try_mark_string_major<S: WorkerSymbolMarks>(
     logs: &mut WorkerMarkLogs<S>,
 ) -> bool {
     debug_assert!(val.is_string());
-    let Some(ptr) = val.as_string_ptr() else {
+    let Some(ptr) = val.gc_string_ptr() else {
         return false;
     };
     if !job.pages.contains(ChunkClass::String, ptr as usize) {
@@ -771,7 +771,7 @@ fn concurrent_try_mark_owned_with_symbols<
         return true;
     }
     if val.is_veclike() {
-        let Some(ptr) = val.as_veclike_ptr() else {
+        let Some(ptr) = val.gc_veclike_ptr() else {
             return false; // malformed value — let the termination decide
         };
         let addr = ptr as usize;
@@ -1135,7 +1135,7 @@ fn concurrent_trace_mapped_veclike<const MAJOR: bool, const SYMBOLS: bool, E: Cl
                  seen_symbols: &mut FxHashSet<usize>,
                  logs: &mut WorkerMarkLogs<E::Symbols>| {
         if child.is_cons() {
-            let addr = child.xcons_ptr() as usize;
+            let addr = child.gc_cons_ptr() as usize;
             if addr < job.claims.dump_lo || addr >= job.claims.dump_hi {
                 job.gray.push(child);
             }
@@ -1344,7 +1344,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                         // Most children of image conses are image conses;
                         // dropping them here (the drain arm would skip them
                         // anyway) keeps ~2x the image size out of the queue.
-                        let addr = child.xcons_ptr() as usize;
+                        let addr = child.gc_cons_ptr() as usize;
                         if addr < job.claims.dump_lo || addr >= job.claims.dump_hi {
                             job.gray.push(child);
                         }
@@ -1405,7 +1405,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                 continue;
             }
             if val.is_cons() {
-                let ptr = val.xcons_ptr();
+                let ptr = val.gc_cons_ptr();
                 let addr = ptr as usize;
                 if addr >= job.claims.dump_lo && addr < job.claims.dump_hi {
                     continue; // dump cons: permanent black, children via remembered set
@@ -1436,7 +1436,7 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
                             job.gray.push(cdr);
                             break;
                         }
-                        let cptr = cdr.xcons_ptr();
+                        let cptr = cdr.gc_cons_ptr();
                         let caddr = cptr as usize;
                         if caddr >= job.claims.dump_lo && caddr < job.claims.dump_hi {
                             break; // dump cons: permanent black
@@ -1521,12 +1521,49 @@ fn run_concurrent_mark_impl<const MAJOR: bool, const SYMBOLS: bool, E: ClaimExte
     let _ = job.exited.send(logs.result);
 }
 
-/// Set the thread-local tagged heap pointer.
+/// Set the thread-local tagged heap pointer from the heap's provenance root.
+///
+/// `root` must be a copy of the allocation's single root raw pointer (see
+/// [`super::AliasableBox`]), not a pointer derived from a `&mut` borrow of the
+/// heap. The TLS slot hands the pointer back out to `with_tagged_heap`, so it
+/// must remain valid across every other access path the owner takes; a
+/// `&mut`-derived tag is popped by the owning `&mut`'s next use (Stacked
+/// Borrows) or disabled by it (Tree Borrows).
+///
+/// All production installers use this form. Root-owning test fixtures use it
+/// too; the legacy borrow installer is restricted to test builds.
+pub(crate) fn set_tagged_heap_root(mut root: std::ptr::NonNull<TaggedHeap>) {
+    // SAFETY: the caller supplies the live allocation's root pointer.
+    if !tagged_heap_is_current(unsafe { root.as_ref() }) {
+        super::super::collection_reads::reset_recent_reads_for_heap_installation();
+    }
+    TAGGED_HEAP.with(|h| h.set(root.as_ptr()));
+    // The mirrors below need a `&mut`. Deriving it from the root (rather than
+    // from a caller's borrow) is what leaves the stored root tag intact: a
+    // sibling reborrow pops only its predecessor, never the root itself.
+    // SAFETY: the root is live and the caller has exclusive access to the
+    // heap at installation time; no TLS-derived access is live here.
+    sync_heap_tls_mirrors(unsafe { root.as_mut() });
+}
+
+/// Legacy borrow installer for test fixtures awaiting TestHeap migration.
+///
+/// The stored child pointer cannot survive sibling owner/root accesses, and
+/// mirror synchronization can itself invalidate it. New fixtures must own an
+/// AliasableBox root and install with `set_tagged_heap_root` (use TestHeap).
+/// Restrict this legacy surface to unit-test builds while that inventory is
+/// migrated; no production or integration-test caller can use it.
+#[cfg(test)]
 pub fn set_tagged_heap(heap: &mut TaggedHeap) {
     if !tagged_heap_is_current(heap) {
         super::super::collection_reads::reset_recent_reads_for_heap_installation();
     }
     TAGGED_HEAP.with(|h| h.set(heap as *mut TaggedHeap));
+    sync_heap_tls_mirrors(heap);
+}
+
+/// Refresh the per-heap TLS mirrors after the allocation slot was stored.
+fn sync_heap_tls_mirrors(heap: &mut TaggedHeap) {
     TAGGED_HEAP_ID.with(|identity| identity.set(Some(heap.identity())));
     TAGGED_HEAP_WRITE_TRACKING_MODE.with(|mode| mode.set(heap.write_tracking_mode()));
     TAGGED_HEAP_PARTITION_ACTIVE.with(|p| p.set(heap.partition_dump));
@@ -1568,7 +1605,15 @@ pub fn set_tagged_heap(heap: &mut TaggedHeap) {
 /// drop hook: an owner whose heap was already displaced by a later
 /// `set_tagged_heap` leaves the newer installation alone.
 pub fn clear_tagged_heap_if_installed(heap: &TaggedHeap) {
-    let owned = heap as *const TaggedHeap as *mut TaggedHeap;
+    clear_tagged_heap_root_if_installed(std::ptr::NonNull::from(heap));
+}
+
+/// Uninstall by address alone, without creating a heap reference. Admission
+/// may hold an exclusive collector loan while clearing its root-derived TLS
+/// alias; even a shared reference from that root would invalidate the loan.
+/// This compares pointers and resets TLS mirrors, never dereferencing `root`.
+pub(crate) fn clear_tagged_heap_root_if_installed(root: std::ptr::NonNull<TaggedHeap>) {
+    let owned = root.as_ptr();
     let _ = TAGGED_HEAP.try_with(|h| {
         if h.get() == owned {
             super::super::collection_reads::reset_recent_reads_for_heap_installation();
@@ -1668,14 +1713,18 @@ pub fn with_tagged_heap<R>(f: impl FnOnce(&mut TaggedHeap) -> R) -> R {
         #[cfg(test)]
         {
             TEST_FALLBACK_TAGGED_HEAP.with(|fb| {
-                let mut borrow = fb.borrow_mut();
-                if borrow.is_none() {
-                    *borrow = Some(Box::new(TaggedHeap::new()));
-                }
-                let heap_ref: &mut TaggedHeap = borrow.as_mut().unwrap();
-                let ptr = heap_ref as *mut TaggedHeap;
-                set_tagged_heap(heap_ref);
-                f(unsafe { &mut *ptr })
+                // Copy the root out first: holding the `RefCell` borrow across
+                // `f` would both block reentrancy and hand out a `&mut` with a
+                // shorter provenance than the slot needs.
+                let root = {
+                    let mut borrow = fb.borrow_mut();
+                    if borrow.is_none() {
+                        *borrow = Some(AliasableBox::new(TaggedHeap::new()));
+                    }
+                    borrow.as_ref().unwrap().root()
+                };
+                set_tagged_heap_root(root);
+                f(unsafe { &mut *root.as_ptr() })
             })
         }
         #[cfg(not(test))]
@@ -1712,21 +1761,80 @@ pub fn note_heap_slot_write(
     slot: usize,
     value: TaggedValue,
 ) {
-    if barrier_gate(owner) {
-        if owner.is_cons() {
-            note_cons_write_slow(owner, kind, Some(slot), Some(value));
-        } else {
-            note_heap_write_slow(owner, kind, Some(slot), Some(value));
+    if owner.is_cons() {
+        let addr = owner.bits() & !crate::tagged::value::TAG_MASK;
+        // The precomputed mirror comes first: in GEN0 it equals the real
+        // window, so a miss is exactly pre-b125's plain store and the hot
+        // path pays one address test. In GEN1 the mirror is ALL, so every
+        // cons store enters the filter below — where main called the cons
+        // slow path unconditionally.
+        if !TAGGED_HEAP_CONS_BARRIER_WINDOW.with(|w| w.get().covers(addr)) {
+            return;
         }
+        // A real-window hit takes the full barrier in both generations: an
+        // immediate overwrite still needs its preimage during SATB. GEN0's
+        // mirror equals the real window, so a GEN0 owner admitted above
+        // always hits here; only GEN1 can miss.
+        if TAGGED_HEAP_BARRIER_WINDOW.with(|w| w.get().covers(addr)) {
+            note_heap_write_slow(owner, kind, Some(slot), Some(value));
+            return;
+        }
+        // The missed real window and ALL mirror prove an installed GEN1
+        // heap (a GEN0 mirror would have hit above). Uninstall clears both
+        // mirrors. No allocation, callback or safe point can change the
+        // installation. An immediate creates no old-to-young edge, so only
+        // a pointer value reaches the owner check below.
+        if value.is_fixnum() {
+            return;
+        }
+        // Only the zero-old-count certificate stays inline: the old-owner
+        // tail is outlined, because every inline store site carrying it
+        // grew past the setters' outline thresholds and absorbed the whole
+        // barrier instead (b122: specbind_cached +133 instructions, setcdr
+        // call sites inlined away). Young-block stores — the hot
+        // generational case — still return without any call.
+        let ptr = TAGGED_HEAP.with(Cell::get);
+        debug_assert!(!ptr.is_null());
+        // SAFETY: the protocol proof above establishes a live installed
+        // heap, borrowed only for non-allocating atomic metadata accesses.
+        let heap = unsafe { &*ptr };
+        if !heap.region_book.no_old_cons_block_contains(addr) {
+            generation_only_old_cons_store(heap, owner, addr);
+        }
+        return;
+    }
+    if barrier_gate(owner) {
+        let addr = owner.bits() & !crate::tagged::value::TAG_MASK;
+        // Preserve GEN0's persistent owner bookkeeping. GEN0's mirror equals
+        // the real window, so its length is never ALL: one length test and
+        // the admitted GEN0 store reaches the full barrier, as before b125.
+        // An ALL mirror proves GEN1 installed, where an immediate outside
+        // the real window creates no old-to-young edge and needs no
+        // bookkeeping; real-window writes retain it.
+        if TAGGED_HEAP_CONS_BARRIER_WINDOW.with(|w| w.get().len()) == usize::MAX {
+            if value.is_fixnum() && !TAGGED_HEAP_BARRIER_WINDOW.with(|w| w.get().covers(addr)) {
+                return;
+            }
+        }
+        note_heap_write_slow(owner, kind, Some(slot), Some(value));
     }
 }
 
-/// The protocol window handles marking, tracking and mapped owners. Rust
-/// cons stores select their precomputed mirror; with generations disabled it
-/// is identical to the ordinary window. Thus a missed cons window is the
-/// legacy plain store, without a heap or mode read. Non-cons stores retain
-/// the legacy logged-header test. Concurrent preimage capture precedes any
-/// immediate rejection in the outlined filter; symbols remain eligible.
+/// Old-owner tail of the generation-only cons store: prove ownership, read
+/// the age byte, mark the owner's card. Outlined from every store site —
+/// reached only when GEN1 is installed and the canonical zero-old-count
+/// certificate failed, so the owner's block may hold old cells. Scalar
+/// arguments travel in registers; nothing here constructs a record.
+#[cold]
+#[inline(never)]
+fn generation_only_old_cons_store(heap: &TaggedHeap, owner: TaggedValue, addr: usize) {
+    if generation_only_cons_is_old(heap, owner) {
+        heap.mark_owner_card(addr);
+    }
+}
+
+/// Bulk stores and non-cons slot stores retain the legacy window/header
+/// gate. Cons slot stores take their mirror-first path above instead.
 #[inline(always)]
 fn barrier_gate(owner: TaggedValue) -> bool {
     if !owner.is_heap_object() {
@@ -1745,6 +1853,80 @@ fn barrier_gate(owner: TaggedValue) -> bool {
     // object. Promotion is stop-the-world; remember_owner claims the logged
     // byte atomically. Cons owners never read a header.
     !owner.is_cons() && unsafe { GcHeader::needs_remembering(addr as *const GcHeader) }
+}
+
+/// Test an owned cons's atomic age byte after the real window refused it.
+/// Slot stores already require a live, well-formed ConsCell: they dereference
+/// this same owner immediately after the barrier. Foreign conses are valid
+/// inputs, so ownership must still precede every trailer access. This query
+/// does not record a Lisp read; setters own that policy. No arm safepoints.
+#[inline(always)]
+fn generation_only_cons_is_old(heap: &TaggedHeap, owner: TaggedValue) -> bool {
+    let addr = owner.bits() & !crate::tagged::value::TAG_MASK;
+    // Reuse the canonical allocator's zero-old-count certificate from the
+    // current grant. Its young-work flag alone is insufficient: mixed blocks
+    // contain old owners too. All collector entries close this certificate
+    // before changing ages/counts, even when survivors remain young. No
+    // owner memory, registry or allocator mutex is read on this fast path.
+    if heap.region_book.no_old_cons_block_contains(addr) {
+        return false;
+    }
+    let cur = heap.jit.cons_cur.get();
+    let ptr = addr as *const ConsCell;
+    let base = ConsBlock::block_base_for_ptr(ptr);
+    // An open region's cursor belongs to a live owned block, even when it
+    // equals its limit (the payload ends before the block boundary). Every
+    // collector entry closes regions before releasing storage. This proves
+    // ownership, not youth: old cells can share the region's block.
+    if cur == 0 || ConsBlock::block_base_for_ptr(cur as *const ConsCell) != base {
+        let owned = match heap.chunk_map.as_ref() {
+            Some(map) => map.get(ptr as usize).is(ChunkClass::Cons),
+            None => return generation_only_registered_cons_is_old(heap, ptr),
+        };
+        if !owned {
+            return false;
+        }
+    }
+    // A live cell in this owned block necessarily has payload-cell geometry.
+    // Foreign eight-aligned cells fail ownership above, before any trailer read.
+    #[cfg(debug_assertions)]
+    debug_assert!(generation_only_cons_cell_offset(addr).is_some());
+    // SAFETY: ownership plus the slot store's live ConsCell contract proves
+    // the payload index. Release and promotion require mutator exclusion,
+    // and this leaf has no safe point.
+    let trailer = unsafe { ConsBlockTrailer::from_block_base(base) };
+    trailer.age_is_old((addr & (CONS_BLOCK_ALIGN - 1)) / size_of::<ConsCell>())
+}
+
+/// Debug/test witness for the owned slot-store input invariant.
+#[cfg(any(debug_assertions, test))]
+#[inline(always)]
+fn generation_only_cons_cell_offset(addr: usize) -> Option<usize> {
+    let offset = addr & (CONS_BLOCK_ALIGN - 1);
+    if offset < CONS_CELLS_BYTES && offset & (size_of::<ConsCell>() - 1) == 0 {
+        Some(offset)
+    } else {
+        None
+    }
+}
+
+/// Keep registry lookup temporaries inside the map-off fallback. Carrying
+/// its base and index across `contains_key` otherwise adds callee-saved
+/// registers to every setter, including the GEN0 immediate fast path.
+#[cold]
+#[inline(never)]
+fn generation_only_registered_cons_is_old(heap: &TaggedHeap, ptr: *const ConsCell) -> bool {
+    let base = ConsBlock::block_base_for_ptr(ptr);
+    if !heap.cons_block_index_by_base.contains_key(&base) {
+        return false;
+    }
+    let addr = ptr as usize;
+    #[cfg(debug_assertions)]
+    debug_assert!(generation_only_cons_cell_offset(addr).is_some());
+    // SAFETY: the registry proves ownership; the caller's live ConsCell input
+    // proves payload geometry. This leaf cannot safepoint.
+    let trailer = unsafe { ConsBlockTrailer::from_block_base(base) };
+    trailer.age_is_old((addr & (CONS_BLOCK_ALIGN - 1)) / size_of::<ConsCell>())
 }
 
 /// Dispatch cons writes admitted by the protocol mirror. A real-window hit
@@ -1918,7 +2100,10 @@ pub(crate) fn feed_concurrent_roots(values: &[TaggedValue]) {
 #[inline]
 pub(crate) fn note_root_overwrite(pre_image: TaggedValue) {
     if !pre_image.is_heap_object()
-        && !matches!(pre_image.kind(), crate::tagged::value::ValueKind::Symbol(_))
+        && !matches!(
+            pre_image.gc_kind(),
+            crate::tagged::value::ValueKind::Symbol(_)
+        )
     {
         return;
     }
@@ -1934,7 +2119,10 @@ pub(crate) fn note_root_overwrite(pre_image: TaggedValue) {
 #[inline]
 pub(crate) fn note_root_overwrite_while_marking(pre_image: TaggedValue) {
     if !pre_image.is_heap_object()
-        && !matches!(pre_image.kind(), crate::tagged::value::ValueKind::Symbol(_))
+        && !matches!(
+            pre_image.gc_kind(),
+            crate::tagged::value::ValueKind::Symbol(_)
+        )
     {
         return;
     }
@@ -1984,13 +2172,41 @@ pub(crate) fn note_string_interval_preimage(
         let (mutator, handoff) = heap.satb_parts();
         table.for_each_root(|value| {
             if value.is_heap_object()
-                || (major && matches!(value.kind(), crate::tagged::value::ValueKind::Symbol(_)))
+                || (major && matches!(value.gc_kind(), crate::tagged::value::ValueKind::Symbol(_)))
             {
                 mutator.satb.push(MarkWord::of(value), handoff);
             }
         });
     });
 }
+
+#[cfg(test)]
+#[path = "tests/canonical_cons_block_barrier_test.rs"]
+mod canonical_cons_block_barrier_tests;
+
+#[cfg(test)]
+#[path = "tests/cons_payload_alignment_test.rs"]
+mod cons_payload_alignment_tests;
+
+#[cfg(test)]
+#[path = "tests/inline_cons_owner_test.rs"]
+mod inline_cons_owner_tests;
+
+#[cfg(test)]
+#[path = "tests/inline_slot_barrier_test.rs"]
+mod inline_slot_barrier_tests;
+
+#[cfg(test)]
+#[path = "tests/foreign_cons_footer_test.rs"]
+mod foreign_cons_footer_tests;
+
+#[cfg(test)]
+#[path = "tests/cons_real_window_first_test.rs"]
+mod cons_real_window_first_tests;
+
+#[cfg(test)]
+#[path = "tests/once_survived_young_cons_test.rs"]
+mod once_survived_young_cons_tests;
 
 #[cfg(test)]
 #[path = "tests/concurrent_major_worker_test.rs"]

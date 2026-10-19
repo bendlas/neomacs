@@ -4,6 +4,7 @@
 //! character position, computes line breaks, positions glyphs on a fixed-width
 //! grid, and publishes `FrameDisplayState` snapshots for render backends.
 
+mod diagnostic_knobs;
 mod mini_eob_scroll;
 mod mini_source_start;
 mod mini_source_stop;
@@ -15,6 +16,12 @@ mod retained_face_gather;
 #[cfg(test)]
 #[path = "engine/tests/retained_face_gather_support.rs"]
 pub(crate) mod retained_face_gather_test_support;
+mod rows_face_services;
+use rows_face_services::{BoundFaceServices, FaceServiceFactory};
+mod rows_fontification;
+mod rows_lifetime;
+mod rows_query_policy;
+pub use rows_query_policy::{RowsQueryAdmission, RowsQueryPolicy};
 mod scroll_coverage;
 pub use scroll_coverage::ScrollCoverageProgress;
 mod scroll_preview;
@@ -945,6 +952,21 @@ pub struct LayoutEngine {
     /// retries discard that attempt, and only a sealed presentation replaces
     /// the committed arena.
     frame_face_arenas: rustc_hash::FxHashMap<neovm_core::window::FrameId, FrameFaceArena>,
+    /// The previous frame layout's composed-source cache and the face table
+    /// snapshot it was folded against.
+    ///
+    /// A [`super::neovm_bridge::FaceResolver`] lives for one redisplay
+    /// transaction; without this pin, every transaction refolded every named
+    /// face from the table and rebuilt its composed sources from scratch.
+    /// GNU keeps a frame's face cache across redisplays and frees it only when
+    /// a face definition changes (`face_change`, src/xfaces.c:349 and
+    /// src/xfaces.c:3098-3105) — the pinned snapshot plays that role here.
+    face_composed_sources: Option<super::neovm_bridge::ComposedSourcePin>,
+    /// The previous frame layout's realized terminal faces, valid while the
+    /// binding stamp and table snapshot recorded with them still hold. This is
+    /// GNU's per-frame realized-face reuse (src/xfaces.c:3098-3105) carried
+    /// across the per-transaction resolver boundary.
+    face_tty_realization: Option<super::neovm_bridge::TtyRealizationPin>,
     /// Last accepted layout per window, used by cursor, scroll, and edit
     /// replay. Speculative attempts never replace this state.
     retained_window_matrices: rustc_hash::FxHashMap<DisplayWindowId, RetainedWindowMatrix>,
@@ -1121,6 +1143,10 @@ enum LeafLayoutAttempt {
     /// numeric budget is spent.
     Retry(Box<WindowLayoutRetry>),
     LogicalInputsChanged,
+    /// A `when` clause the walk took by the structural rule evaluated nil
+    /// after the walk: relayout the frame once with the evaluated answers,
+    /// which the ledger carries (`display_when::settle_display_when_visits`).
+    DisplayWhenReplay,
 }
 
 /// Iterative continuation of `layout_window_rust` for one visibility retry.
@@ -1180,9 +1206,12 @@ impl FrameWindowEndAttempts {
 /// retries must not replay Lisp that the logical redisplay already ran.
 #[derive(Default)]
 struct RedisplayLispLedger {
+    rows_fontification: rows_fontification::RowsFontificationDemand,
     acknowledged_scroll_hooks: rustc_hash::FxHashSet<WindowScrollHookSite>,
     exact_hook_resumes: rustc_hash::FxHashMap<neovm_core::window::WindowId, ResolvedWindowStart>,
     mini_eob_scroll: mini_eob_scroll::MiniEobScrollLedger,
+    /// `when` answers evaluated after a walk, carried to its one replay.
+    display_when: crate::display_when::DisplayWhenReplayLedger,
 }
 
 impl RedisplayLispLedger {
@@ -1413,6 +1442,33 @@ impl Default for LayoutEngine {
 }
 
 impl LayoutEngine {
+    /// Attach the previous transaction's composed-source cache to this
+    /// transaction's resolver when the face table snapshot still matches, and
+    /// re-pin the result for the next transaction.
+    fn bind_face_composed_sources(
+        &mut self,
+        face_resolver: &mut super::neovm_bridge::FaceResolver,
+    ) {
+        if let Some(pin) = self.face_composed_sources.take() {
+            pin.apply_to(face_resolver);
+        }
+        self.face_composed_sources = Some(face_resolver.composed_source_pin());
+    }
+
+    /// Bind the resolver's terminal realization, adopting the previous
+    /// transaction's realized faces when their stamp and snapshot still hold,
+    /// and re-pinning the result for the next transaction.
+    fn prepare_face_resolver_tty(
+        &mut self,
+        face_resolver: &mut super::neovm_bridge::FaceResolver,
+        frame_id: neovm_core::window::FrameId,
+        evaluator: &mut neovm_core::emacs_core::Context,
+    ) {
+        let previous = self.face_tty_realization.take();
+        face_resolver.prepare_tty_realization(frame_id, evaluator, previous);
+        self.face_tty_realization = face_resolver.tty_realization_pin();
+    }
+
     /// Invalidate every retained value whose geometry or identity was derived
     /// from old font-selection inputs. This is deliberately one exhaustive
     /// owner rather than a list of clears spread across redisplay fast paths.
@@ -1420,6 +1476,8 @@ impl LayoutEngine {
         self.query_cache.clear();
         self.frame_visual_histories = FrameVisualHistories::default();
         self.frame_face_arenas.clear();
+        self.face_composed_sources = None;
+        self.face_tty_realization = None;
         self.retained_window_matrices.clear();
         self.prepared_viewports = PreparedViewports::default();
         self.scroll_coverage.cancel();
@@ -1598,6 +1656,8 @@ impl LayoutEngine {
             last_frame_display_state: None,
             scroll_preview_coverage: Vec::new(),
             frame_face_arenas: rustc_hash::FxHashMap::default(),
+            face_composed_sources: None,
+            face_tty_realization: None,
             retained_window_matrices: rustc_hash::FxHashMap::default(),
             prepared_viewports: PreparedViewports::default(),
             scroll_coverage: scroll_coverage::ScrollCoverage::default(),
@@ -1640,6 +1700,8 @@ impl LayoutEngine {
             last_frame_display_state: None,
             scroll_preview_coverage: Vec::new(),
             frame_face_arenas: rustc_hash::FxHashMap::default(),
+            face_composed_sources: None,
+            face_tty_realization: None,
             retained_window_matrices: rustc_hash::FxHashMap::default(),
             prepared_viewports: PreparedViewports::default(),
             scroll_coverage: scroll_coverage::ScrollCoverage::default(),
@@ -1752,8 +1814,15 @@ impl LayoutEngine {
         if evaluator.redisplay_hook_flow_pending() {
             return FrameLayoutAttempt::Aborted;
         }
-        self.layout_frame_rust_for_purpose_inner(evaluator, frame_id, purpose);
-        if evaluator.has_mode_line_display_flow() {
+        self.layout_frame_rust_for_purpose_inner(
+            evaluator,
+            frame_id,
+            purpose,
+            None,
+            #[cfg(test)]
+            None,
+        );
+        if evaluator.has_mode_line_display_flow() || evaluator.redisplay_hook_flow_pending() {
             self.last_frame_display_state = None;
             return FrameLayoutAttempt::Aborted;
         }
@@ -1779,6 +1848,32 @@ impl LayoutEngine {
         evaluator: &mut neovm_core::emacs_core::Context,
         frame_id: neovm_core::window::FrameId,
         purpose: LayoutPurpose,
+        rows_lifetime: Option<&mut rows_lifetime::Producer>,
+        #[cfg(test)] rows_fontification_sink: Option<
+            &mut dyn FnMut(neovm_core::emacs_core::xdisp::RedisplayFontificationWitness),
+        >,
+    ) -> Option<neovm_core::window::WindowLayoutQuery> {
+        self.layout_frame_rust_with_face_services(
+            evaluator,
+            frame_id,
+            purpose,
+            rows_lifetime,
+            #[cfg(test)]
+            rows_fontification_sink,
+            &rows_face_services::NoopFaceServiceFactory,
+        )
+    }
+
+    fn layout_frame_rust_with_face_services<F: FaceServiceFactory>(
+        &mut self,
+        evaluator: &mut neovm_core::emacs_core::Context,
+        frame_id: neovm_core::window::FrameId,
+        purpose: LayoutPurpose,
+        mut rows_lifetime: Option<&mut rows_lifetime::Producer>,
+        #[cfg(test)] mut rows_fontification_sink: Option<
+            &mut dyn FnMut(neovm_core::emacs_core::xdisp::RedisplayFontificationWitness),
+        >,
+        face_services: &F,
     ) -> Option<neovm_core::window::WindowLayoutQuery> {
         // Anything recorded since the last pass that no pass has reported yet.
         // The drain below covers what this pass observes; this one covers
@@ -1897,6 +1992,14 @@ impl LayoutEngine {
             window_system.clone(),
             self.font_sizing,
         );
+        self.bind_face_composed_sources(&mut face_resolver);
+        self.prepare_face_resolver_tty(&mut face_resolver, frame_id, evaluator);
+        let mut resolver_face_change_count = evaluator.face_change_count();
+        enum FaceResolverRefresh {
+            Current,
+            Required,
+        }
+        let mut resolver_refresh = FaceResolverRefresh::Current;
         let default_resolved = face_resolver.default_face();
         let frame_font_domain =
             FrameFontDomain::for_frame(window_system.is_some(), bootstrap_font_size);
@@ -1968,7 +2071,18 @@ impl LayoutEngine {
         // speculative output; only an iteration that requests no relayout can
         // reach presentation sealing below.
         let mut layout_coordinator = FrameLayoutCoordinator::new(MAX_FRAME_LAYOUT_RETRIES);
-        let mut lisp_ledger = RedisplayLispLedger::default();
+        // The Lisp objects of the `when` sites a walk records and of the
+        // answers carried to a replay stay rooted for the whole logical frame
+        // attempt: window chrome and the replay's preparation run Lisp (and
+        // may collect) between a walk and the evaluation or reuse of them.
+        // Every leaf attempt that records runs inside this function.
+        let _display_when_gc_roots = ScratchGcRootScope::new();
+        let mut lisp_ledger = RedisplayLispLedger {
+            rows_fontification: rows_fontification::RowsFontificationDemand::for_purpose(
+                evaluator, frame_id, purpose,
+            ),
+            ..RedisplayLispLedger::default()
+        };
         let mut window_chrome_metrics = self.retained_window_chrome_metrics.clone();
         let committed_face_arena = self
             .frame_face_arenas
@@ -2006,6 +2120,56 @@ impl LayoutEngine {
             // was rejected. Restore every leaf publication before collecting
             // the next attempt's canonical previous-viewport evidence.
             frame_window_end_attempts.reject_all(evaluator);
+            if face_resolver.has_tty_realization() {
+                // A color callback may mutate face definitions while a prior
+                // leaf is being rendered. Recollect the immutable resolver at
+                // the transaction restart, before any cached row is admitted.
+                let before_sync = evaluator.face_change_count();
+                let refreshed = evaluator.sync_runtime_faces_for_frame(frame_id);
+                let after_sync = evaluator.face_change_count();
+                if matches!(resolver_refresh, FaceResolverRefresh::Required)
+                    || refreshed
+                    || resolver_face_change_count != after_sync
+                {
+                    let Some(frame) = evaluator.frame_manager().get(frame_id) else {
+                        evaluator.retire_interaction_presentation(presentation_id);
+                        return None;
+                    };
+                    let bootstrap = super::neovm_bridge::frame_params_from_neovm(
+                        frame,
+                        evaluator.face_table(),
+                        evaluator.variables(),
+                    );
+                    face_resolver = super::neovm_bridge::FaceResolver::new_with_font_sizing(
+                        evaluator.face_table(),
+                        0x00FFFFFF,
+                        bootstrap.background,
+                        frame.font_pixel_size,
+                        None,
+                        self.font_sizing,
+                    );
+                    self.bind_face_composed_sources(&mut face_resolver);
+                    self.prepare_face_resolver_tty(&mut face_resolver, frame_id, evaluator);
+                    resolver_face_change_count = after_sync;
+                    resolver_refresh = FaceResolverRefresh::Current;
+                }
+                if before_sync != after_sync {
+                    let request = FrameRelayoutRequest::FaceRealizationInputsChanged {
+                        before: before_sync,
+                        after: after_sync,
+                    };
+                    if !Self::accept_frame_relayout_request(
+                        &mut layout_coordinator,
+                        evaluator,
+                        &mut frame_window_end_attempts,
+                        presentation_id,
+                        request,
+                    ) {
+                        return None;
+                    }
+                    continue 'frame_layout;
+                }
+            }
             // Layout retries are speculative. GNU logs invalid face references
             // observed by the accepted redisplay, not once per discarded
             // geometry attempt.
@@ -2162,6 +2326,10 @@ impl LayoutEngine {
                 .other_window_buffer_changed(evaluator.buffer_manager());
 
             self.reset_frame_attempt_state();
+            // A relayout pass must not inherit `when` records settled by the
+            // rejected pass. The replay budget in the same ledger is per
+            // logical attempt, not per pass, so it stays.
+            lisp_ledger.display_when.begin_frame_pass();
             let mut face_attempt = committed_face_arena.begin_attempt();
             self.frame_output.set_face_attempt(face_attempt.clone());
             self.frame_output.set_presentation_id(presentation_id);
@@ -2653,13 +2821,36 @@ impl LayoutEngine {
                 };
                 let mut viewport_retry_phase = ViewportResolutionPhase::Resolve;
                 let window_layout = loop {
+                    // A leaf hook/visibility continuation can re-enter this
+                    // loop without visiting the outer transaction restart.
+                    // Reject before rendering any stale logical face sources.
+                    let current_face_change_count = evaluator.face_change_count();
+                    if face_resolver.has_tty_realization()
+                        && current_face_change_count != resolver_face_change_count
+                    {
+                        let request = FrameRelayoutRequest::FaceRealizationInputsChanged {
+                            before: resolver_face_change_count,
+                            after: current_face_change_count,
+                        };
+                        if !Self::accept_frame_relayout_request(
+                            &mut layout_coordinator,
+                            evaluator,
+                            &mut frame_window_end_attempts,
+                            presentation_id,
+                            request,
+                        ) {
+                            return None;
+                        }
+                        continue 'frame_layout;
+                    }
+                    let bound_faces = face_services.bind(&face_resolver);
                     match self.layout_window_rust(
                         evaluator,
                         frame_id,
                         &live_inputs.window,
                         &live_inputs.frame,
                         &layout_box,
-                        &face_resolver,
+                        bound_faces.services(),
                         window_geometry.reserve_terminal_right_border_col,
                         visibility_retry_budget,
                         viewport_retry_phase.clone(),
@@ -2788,6 +2979,26 @@ impl LayoutEngine {
                                 return None;
                             }
                             let request = FrameRelayoutRequest::LogicalInputsChanged {
+                                window_id: DisplayWindowId::new(live_inputs.window.window_id),
+                            };
+                            if !Self::accept_frame_relayout_request(
+                                &mut layout_coordinator,
+                                evaluator,
+                                &mut frame_window_end_attempts,
+                                presentation_id,
+                                request,
+                            ) {
+                                return None;
+                            }
+                            continue 'frame_layout;
+                        }
+                        LeafLayoutAttempt::DisplayWhenReplay => {
+                            if evaluator.has_mode_line_display_flow() {
+                                frame_window_end_attempts.reject_all(evaluator);
+                                evaluator.retire_interaction_presentation(presentation_id);
+                                return None;
+                            }
+                            let request = FrameRelayoutRequest::DisplayWhenAnswerChanged {
                                 window_id: DisplayWindowId::new(live_inputs.window.window_id),
                             };
                             if !Self::accept_frame_relayout_request(
@@ -2968,7 +3179,9 @@ impl LayoutEngine {
                         .body_rows
                         .retain(|row| Some(row.output_row) <= last);
                 }
-                for face_name in face_resolver.take_invalid_face_references() {
+                let invalid_face_references = face_resolver.take_invalid_face_references();
+                face_services.note_invalid_face_references(&invalid_face_references);
+                for face_name in invalid_face_references {
                     evaluator.add_to_log(&format!("Invalid face reference: {face_name}"));
                 }
                 frame_window_end_attempts.reject_all(evaluator);
@@ -2997,6 +3210,20 @@ impl LayoutEngine {
                 // The completed query owns these small certificates until
                 // `query_window_layout` transfers them into its cache entry.
                 self.query_restart_rows = query_restart_rows;
+                let witness = lisp_ledger
+                    .rows_fontification
+                    .finish(evaluator, geometry.as_ref());
+                if let Some(producer) = rows_lifetime.as_deref_mut() {
+                    producer.note_fontification(witness.as_ref());
+                }
+                #[cfg(test)]
+                if let (Some(witness), Some(sink)) =
+                    (witness, rows_fontification_sink.as_deref_mut())
+                {
+                    sink(witness);
+                }
+                #[cfg(not(test))]
+                let _ = witness;
                 return Some(neovm_core::window::WindowLayoutQuery::new(end, geometry));
             }
 
@@ -3094,6 +3321,39 @@ impl LayoutEngine {
                 .and_then(|direction| {
                     pending_frame_navigation.filter(|intent| intent.direction() == direction)
                 });
+
+            // Color advice may signal after a row has already produced fallback
+            // paint. Preserve the original pending flow and reject speculative
+            // rows before they can seal matrices, faces, or unchanged regions.
+            if evaluator.has_mode_line_display_flow() || evaluator.redisplay_hook_flow_pending() {
+                frame_window_end_attempts.reject_all(evaluator);
+                evaluator.retire_interaction_presentation(presentation_id);
+                self.last_frame_display_state = None;
+                self.reset_frame_attempt_state();
+                return None;
+            }
+
+            if face_resolver.has_tty_realization() {
+                let refreshed = evaluator.sync_runtime_faces_for_frame(frame_id);
+                let after = evaluator.face_change_count();
+                if refreshed || after != resolver_face_change_count {
+                    resolver_refresh = FaceResolverRefresh::Required;
+                    let request = FrameRelayoutRequest::FaceRealizationInputsChanged {
+                        before: resolver_face_change_count,
+                        after,
+                    };
+                    if !Self::accept_frame_relayout_request(
+                        &mut layout_coordinator,
+                        evaluator,
+                        &mut frame_window_end_attempts,
+                        presentation_id,
+                        request,
+                    ) {
+                        return None;
+                    }
+                    continue 'frame_layout;
+                }
+            }
 
             let current_topology_generation =
                 evaluator.frame_manager().window_topology_generation();
@@ -3657,15 +3917,13 @@ impl LayoutEngine {
         // accepted frame when NEOMACS_LAYOUT_STATS_FILE names a path. This is
         // the only consumer-facing view of LayoutStats; the TTY typing
         // harness uses it to verify which fast path actually engaged.
-        if let Ok(stats_path) = std::env::var("NEOMACS_LAYOUT_STATS_FILE")
-            && !stats_path.is_empty()
-        {
+        if let Some(stats_path) = diagnostic_knobs::layout_stats_path() {
             use std::io::Write as _;
             let s = &self.layout_stats;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&stats_path)
+                .open(stats_path)
             {
                 let _ = writeln!(
                     f,
@@ -3726,9 +3984,37 @@ impl LayoutEngine {
             evaluator.note_chrome_generated(neovm_core::window::WindowId(window_id as u64));
         }
 
+        // The accepted `when` dependency record per window, committed with
+        // the sealed presentation exactly like the retained matrices.  The
+        // chrome-dirty generation is frame-wide: one value describes every
+        // window the sealed pass laid out.
+        let display_when_generation = evaluator.chrome_dirty().all_generation();
+        let mut accepted_display_when: rustc_hash::FxHashMap<
+            DisplayWindowId,
+            crate::display_when::DisplayWhenRetention,
+        > = lisp_ledger
+            .display_when
+            .settled_entries()
+            .map(|(window, record)| {
+                (
+                    DisplayWindowId::new(window.0 as i64),
+                    crate::display_when::DisplayWhenRetention {
+                        record,
+                        mode_line_generation: display_when_generation,
+                    },
+                )
+            })
+            .collect();
+        // Exactly the windows this sealed presentation committed (the same
+        // set the retained-matrix commit writes); a window that settled but
+        // did not reach the presentation is not evidence.
+        accepted_display_when.retain(|window, _| curr_window_infos.contains_key(window));
         self.frame_visual_histories.commit(
             frame_id,
-            FrameVisualHistory::from_accepted_presentation(curr_window_infos),
+            FrameVisualHistory::from_accepted_presentation(
+                curr_window_infos,
+                accepted_display_when,
+            ),
         );
         {
             let frame_manager = evaluator.frame_manager_mut();
@@ -3879,6 +4165,9 @@ impl LayoutEngine {
             LayoutPurpose::MiniPreparation {
                 window_id: request.window,
             },
+            None,
+            #[cfg(test)]
+            None,
         );
         self.report_image_failures(evaluator);
         let query = query.ok_or_else(|| {
@@ -3995,46 +4284,236 @@ impl LayoutEngine {
         scope: neovm_core::window::WindowLayoutQueryScope,
     ) -> Result<neovm_core::window::WindowLayoutQuery, neovm_core::window::WindowLayoutQueryFailure>
     {
+        self.query_window_layout_observed(
+            evaluator,
+            frame_id,
+            window_id,
+            scope,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Select native observation/admission for this engine-local query only.
+    /// The policy is configuration, never evidence that geometry is reusable.
+    pub fn query_window_layout_with_policy(
+        &mut self,
+        evaluator: &mut neovm_core::emacs_core::Context,
+        frame_id: neovm_core::window::FrameId,
+        window_id: neovm_core::window::WindowId,
+        scope: neovm_core::window::WindowLayoutQueryScope,
+        policy: &RowsQueryPolicy,
+    ) -> Result<neovm_core::window::WindowLayoutQuery, neovm_core::window::WindowLayoutQueryFailure>
+    {
+        self.query_window_layout_observed_with_policy(
+            evaluator,
+            frame_id,
+            window_id,
+            scope,
+            policy,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    // The test sink runs after the proof/source lease have been consumed and
+    // dropped, before the original publication candidate is revalidated.
+    fn query_window_layout_observed(
+        &mut self,
+        evaluator: &mut neovm_core::emacs_core::Context,
+        frame_id: neovm_core::window::FrameId,
+        window_id: neovm_core::window::WindowId,
+        scope: neovm_core::window::WindowLayoutQueryScope,
+        #[cfg(test)] mut report_sink: Option<
+            &mut dyn FnMut(&mut neovm_core::emacs_core::Context, rows_lifetime::Report),
+        >,
+    ) -> Result<neovm_core::window::WindowLayoutQuery, neovm_core::window::WindowLayoutQueryFailure>
+    {
+        self.query_window_layout_observed_with_policy(
+            evaluator,
+            frame_id,
+            window_id,
+            scope,
+            &RowsQueryPolicy::disabled(),
+            #[cfg(test)]
+            report_sink.take(),
+        )
+    }
+
+    fn query_window_layout_observed_with_policy(
+        &mut self,
+        evaluator: &mut neovm_core::emacs_core::Context,
+        frame_id: neovm_core::window::FrameId,
+        window_id: neovm_core::window::WindowId,
+        scope: neovm_core::window::WindowLayoutQueryScope,
+        policy: &RowsQueryPolicy,
+        #[cfg(test)] mut report_sink: Option<
+            &mut dyn FnMut(&mut neovm_core::emacs_core::Context, rows_lifetime::Report),
+        >,
+    ) -> Result<neovm_core::window::WindowLayoutQuery, neovm_core::window::WindowLayoutQueryFailure>
+    {
         let text_extent = matches!(
             scope,
             neovm_core::window::WindowLayoutQueryScope::TextExtent { .. }
         );
-        if !text_extent
-            && let Some(query) = self.query_cache.get(evaluator, frame_id, window_id, scope)
-        {
-            return Ok(query);
-        }
-        if let Some(query) = self
-            .prepared_viewports
-            .measure_rows(evaluator, frame_id, window_id, scope)
-        {
-            return Ok(query);
+        let certified_rows = matches!(
+            (policy.environment(), policy.admission(), scope),
+            (
+                rows_query_policy::RowsQueryEnvironment::Terminal(_),
+                RowsQueryAdmission::ExactProven,
+                neovm_core::window::WindowLayoutQueryScope::Rows { .. }
+            )
+        );
+        if certified_rows {
+            if self.font_metrics.is_none()
+                && let Some(hit) = self
+                    .query_cache
+                    .get_certified(evaluator, frame_id, window_id, scope)
+            {
+                // This success-only native move is the sole certified return.
+                // No trace, sink or callback follows its final validation.
+                return Ok(hit.into_query());
+            }
+            // An unproved selected Rows request must run the canonical walk;
+            // neither a legacy observation nor a prepared viewport can answer.
+        } else {
+            if !text_extent
+                && let Some(query) = self.query_cache.get(evaluator, frame_id, window_id, scope)
+            {
+                return Ok(query);
+            }
+            if let Some(query) = self
+                .prepared_viewports
+                .measure_rows(evaluator, frame_id, window_id, scope)
+            {
+                return Ok(query);
+            }
         }
         self.query_body_reuse_allowed = true;
         self.query_restart_rows.clear();
         self.query_row_coverage = QueryRowCoverage::Complete;
         self.query_target_prefix_policy = false;
         self.mini_preparation_height = None;
-        let (query, collections) = neovm_core::tagged::collection_reads::capture_normalized(
-            evaluator,
-            |evaluator| {
-                evaluator.sync_runtime_faces_for_frame(frame_id);
-            },
-            |evaluator| {
-                self.layout_frame_rust_for_purpose_inner(
-                    evaluator,
-                    frame_id,
-                    LayoutPurpose::SynchronousQuery { window_id, scope },
-                )
-            },
-        );
+        // Snapshot only actual canonical Rows misses; no ordinary frame,
+        // prepared-viewport or existing cache-hit maintenance is added.
+        let mut lifetime = matches!(
+            scope,
+            neovm_core::window::WindowLayoutQueryScope::Rows { .. }
+        )
+        .then(|| {
+            (match policy.environment() {
+                rows_query_policy::RowsQueryEnvironment::Graphical => {
+                    rows_lifetime::Producer::begin(self, evaluator, frame_id, window_id, scope)
+                }
+                rows_query_policy::RowsQueryEnvironment::Terminal(ref host) => {
+                    rows_lifetime::Producer::begin_tty(
+                        self,
+                        evaluator,
+                        frame_id,
+                        window_id,
+                        scope,
+                        Some(host),
+                    )
+                }
+            })
+            .and_then(|producer| {
+                if certified_rows {
+                    producer.for_admission(evaluator)
+                } else {
+                    Ok(producer)
+                }
+            })
+        });
+        let (query, mut collections) = if matches!(
+            scope,
+            neovm_core::window::WindowLayoutQueryScope::Rows { .. }
+        ) {
+            let face_services = rows_face_services::RowsFaceServiceFactory::new();
+            let captured = neovm_core::tagged::collection_reads::capture_normalized(
+                evaluator,
+                |evaluator| {
+                    evaluator.sync_runtime_faces_for_frame(frame_id);
+                },
+                |evaluator| {
+                    self.layout_frame_rust_with_face_services(
+                        evaluator,
+                        frame_id,
+                        LayoutPurpose::SynchronousQuery { window_id, scope },
+                        lifetime.as_mut().and_then(|pending| pending.as_mut().ok()),
+                        #[cfg(test)]
+                        None,
+                        &face_services,
+                    )
+                },
+            );
+            if let Some(producer) = lifetime.as_mut().and_then(|pending| pending.as_mut().ok()) {
+                producer.note_face_entry(Some(face_services.cold_entry()));
+                producer.note_diagnostic_effects(face_services.diagnostic_effects());
+            }
+            captured
+        } else {
+            neovm_core::tagged::collection_reads::capture_normalized(
+                evaluator,
+                |evaluator| {
+                    evaluator.sync_runtime_faces_for_frame(frame_id);
+                },
+                |evaluator| {
+                    self.layout_frame_rust_for_purpose_inner(
+                        evaluator,
+                        frame_id,
+                        LayoutPurpose::SynchronousQuery { window_id, scope },
+                        lifetime.as_mut().and_then(|pending| pending.as_mut().ok()),
+                        #[cfg(test)]
+                        None,
+                    )
+                },
+            )
+        };
         self.report_image_failures(evaluator);
-        let query = query.ok_or(neovm_core::window::WindowLayoutQueryFailure::DidNotConverge)?;
+        let mut query =
+            query.ok_or(neovm_core::window::WindowLayoutQueryFailure::DidNotConverge)?;
+        let collections_captured = collections.is_some();
+        let mut candidate = None;
+        if let Some(pending) = lifetime {
+            let report = if certified_rows {
+                let completed = rows_lifetime::finish_for_admission(
+                    pending,
+                    self,
+                    evaluator,
+                    query,
+                    collections.take(),
+                );
+                query = completed.canonical_query;
+                candidate = completed.candidate;
+                rows_lifetime::trace_report(completed.report);
+                completed.report
+            } else {
+                rows_lifetime::finish_and_drop(
+                    pending,
+                    self,
+                    evaluator,
+                    &query,
+                    collections.as_ref(),
+                )
+            };
+            #[cfg(test)]
+            if let Some(sink) = report_sink.as_deref_mut() {
+                sink(evaluator, report);
+            }
+            #[cfg(not(test))]
+            let _ = report;
+        }
         let query_restart_rows = std::mem::take(&mut self.query_restart_rows);
         tracing::trace!(target: "neomacs_layout_engine::query_cache",
             body_reuse_allowed = self.query_body_reuse_allowed,
-            collections_captured = collections.is_some(), "query completed");
-        if !text_extent
+            collections_captured, "query completed");
+        if certified_rows {
+            if let Some(candidate) = candidate {
+                // All arbitrary trace/sink boundaries precede this original
+                // epoch/source/read-set revalidation and native insertion.
+                self.query_cache.remember_certified(evaluator, candidate);
+            }
+        } else if !text_extent
             && self.query_body_reuse_allowed
             && let Some(collections) = collections
         {
@@ -4190,7 +4669,7 @@ impl LayoutEngine {
         current: &RetainedWindowKey,
         evaluator: &neovm_core::emacs_core::Context,
     ) -> bool {
-        use neovm_core::buffer::{BufferId, CharPos0, EmacsByteRange};
+        use neovm_core::buffer::{BufferId, CharPos0, EmacsByteRange, LineIndexBuild};
         let Some(buffer) = evaluator.buffer_manager().get(BufferId(current.buffer_id)) else {
             return false;
         };
@@ -4211,7 +4690,10 @@ impl LayoutEngine {
             .filter(|row| row.enabled && !RetainedWindowMatrix::is_chrome_role(row.role))
             .count()
             / 2;
-        if let Some(lines) = buffer.indexed_newline_count(range) {
+        // An estimate that only picks an optimization: an existing index may
+        // answer it, but it must not build one (the bounded scan below is the
+        // documented fallback).
+        if let Some(lines) = buffer.indexed_newline_count(range, LineIndexBuild::ExistingOnly) {
             return lines <= limit;
         }
         let mut lines = 0;
@@ -4221,6 +4703,41 @@ impl LayoutEngine {
                 if lines > limit { Err(()) } else { Ok(()) }
             })
             .is_ok()
+    }
+
+    /// Source newlines in a dirty span, the mirror of GNU `find_newline` over
+    /// a changed region (backed by the buffer's newline cache; the line delta
+    /// `try_window_id` scrolls its matrix by, src/xdisp.c). An existing text
+    /// index answers without touching bytes; an uncovered range falls back to
+    /// a chunked `\n` count. This replaces a per-character
+    /// `char_at_emacs_byte_pos` walk that cost ~77 Ir per inserted character
+    /// on the first redisplay after a bulk insert — the dominant linear term
+    /// of a cold redisplay over a newline-less tail.
+    fn span_source_newline_count(
+        buffer: &neovm_core::buffer::Buffer,
+        dirty_start: i64,
+        dirty_end: i64,
+    ) -> usize {
+        use neovm_core::buffer::{CharPos0, EmacsByteRange, LineIndexBuild};
+        let start = CharPos0::new(dirty_start.max(0) as usize);
+        let end = CharPos0::new(dirty_end.max(0) as usize);
+        let from = buffer.char_pos_to_emacs_byte_pos_clamped(start);
+        let to = buffer.char_pos_to_emacs_byte_pos_clamped(end.max(start));
+        let range = EmacsByteRange::new(from, to);
+        // This is a scan of the CHANGED region, so its cost is the edit's,
+        // never the buffer's: an existing index may answer it, but it must
+        // not build one. GNU counts the same newlines with `find_newline`
+        // over the changed area (src/search.c:675), whose newline cache only
+        // covers regions something scanned (src/search.c:595).
+        if let Some(count) = buffer.indexed_newline_count(range, LineIndexBuild::ExistingOnly) {
+            return count;
+        }
+        let mut count = 0;
+        let _ = buffer.try_for_each_emacs_byte_range_chunk(range, |chunk| {
+            count += memchr::memchr_iter(b'\n', chunk).count();
+            Ok::<(), std::convert::Infallible>(())
+        });
+        count
     }
 
     /// Phase 3: if this window's previous-frame matrix can be reused after a
@@ -4271,6 +4788,48 @@ impl LayoutEngine {
         use crate::incremental_layout::edit_sync::{self, BelowReuse, EditSyncMode};
         use crate::incremental_layout::{EditReplayPositions, EditReplaySourceProof};
         let positions = EditReplayPositions::new(dirty_start, dirty_end, delta);
+        let span_newlines = Self::span_source_newline_count(buffer, dirty_start, dirty_end);
+        // The one-line-one-row ASCII proof is this engine's extra safety for
+        // below-reuse; GNU gets the same guarantee by re-syncing its
+        // regenerated region against the old matrix after the walk and never
+        // scans the changed text semantically. Bound the proof by the WINDOW,
+        // not the buffer: a dirty span longer than the whole narrowed region
+        // the window can display (`get_narrowed_len` = width × height,
+        // src/xdisp.c:3732) is never proven. That is the O(window) cap that
+        // keeps a cold first redisplay after a bulk insert from walking every
+        // inserted character; the window then re-lays, the bounded cost GNU
+        // pays in the same situation.
+        //
+        // The window-start condition is narrower than GNU `try_window_id`'s
+        // GIVE_UP (15), which declines whenever the start lies anywhere in the
+        // changed area (`CHARPOS (start) >= first_changed_charpos && CHARPOS
+        // (start) <= last_changed_charpos`, src/xdisp.c:22816-22825) and
+        // re-lays with `try_window` (:21052, :21266). This replay supports the
+        // bounded case GNU's give-up rejects: edit eligibility already pins
+        // the window start position (`RetainedWindowKey::edit_eligible`,
+        // `!window_start_moved`; the start marker stays before text inserted
+        // at it, `START_INSERTION_TYPE`), so when the span merely BEGINS at
+        // the window start the retained first row is dirty, nothing above it
+        // is reused, and the walk starts from that same charpos with the NEW
+        // text — exactly the rows `try_window` would re-lay — while the rows
+        // below reuse through the usual post-walk validation. A span that
+        // CROSSES a length-changing edit over the window start is the case
+        // where the position stops denoting the same source text; decline it
+        // like GIVE_UP (15). Properties-only damage (delta == 0) leaves every
+        // character in place, so the start stays valid even inside the span.
+        // The newline count above is kept: it feeds the Sync walk's damage
+        // record the way GNU feeds `find_newline` counts to its matrix
+        // scroll, and costs bytes-per-span rather than chars-per-span.
+        let dirty_end_old = dirty_end.saturating_sub(delta);
+        let window_start_inside_changed_text = delta != 0
+            && dirty_start < curr_key.window_start
+            && curr_key.window_start < dirty_end_old;
+        let proof_scan_allowed = self.allow_below_reuse
+            && !window_start_inside_changed_text
+            && (dirty_end.saturating_sub(dirty_start).max(0) as usize)
+                <= params
+                    .source_interpretation_rows()
+                    .saturating_mul(params.narrowed_width_chars());
         let (replay, span_newlines, span_structure_safe) = if edit_sync::lazy_proof_enabled()
             && self.allow_below_reuse
             && edit_sync::edit_sync_mode() == EditSyncMode::Sync
@@ -4284,22 +4843,19 @@ impl LayoutEngine {
             let replay = prev.edit_replay_sync_lazy(&curr_key, positions, || {
                 #[cfg(test)]
                 crate::incremental_layout::lazy_proof_test_support::note_source_proof();
-                let mut newlines = 0usize;
-                let simple = (dirty_start..dirty_end).all(|cp| {
-                    #[cfg(test)]
-                    crate::incremental_layout::lazy_proof_test_support::note_char_query();
-                    let byte = buffer.char_pos_to_emacs_byte_pos_clamped(
-                        neovm_core::buffer::CharPos0::new(cp as usize),
-                    );
-                    match buffer.char_at_emacs_byte_pos(byte) {
-                        Some('\n') => {
-                            newlines += 1;
-                            true
+                let simple = proof_scan_allowed
+                    && (dirty_start..dirty_end).all(|cp| {
+                        #[cfg(test)]
+                        crate::incremental_layout::lazy_proof_test_support::note_char_query();
+                        let byte = buffer.char_pos_to_emacs_byte_pos_clamped(
+                            neovm_core::buffer::CharPos0::new(cp as usize),
+                        );
+                        match buffer.char_at_emacs_byte_pos(byte) {
+                            Some('\n') => true,
+                            Some(c) => c.is_ascii_graphic() || c == ' ',
+                            None => false,
                         }
-                        Some(c) => c.is_ascii_graphic() || c == ' ',
-                        None => false,
-                    }
-                });
+                    });
                 let structure_range = neovm_core::buffer::CharRange::new(
                     neovm_core::buffer::CharPos0::new(dirty_start.max(0) as usize),
                     neovm_core::buffer::CharPos0::new(dirty_end.max(0) as usize),
@@ -4312,10 +4868,12 @@ impl LayoutEngine {
                         &EditReplayStructureProperty::symbols(),
                     )
                 };
-                observed_newlines = Some(newlines);
+                observed_newlines = Some(span_newlines);
                 observed_safe = Some(safe);
                 if safe {
-                    EditReplaySourceProof::Simple { newlines }
+                    EditReplaySourceProof::Simple {
+                        newlines: span_newlines,
+                    }
                 } else {
                     EditReplaySourceProof::Rejected
                 }
@@ -4339,12 +4897,18 @@ impl LayoutEngine {
             // A pure delete has an empty NEW span (its old extent is the deleted
             // range) — vacuously ASCII-safe; edit_replay + the post-walk
             // validation own the delete-specific safety.
+            //
+            // The scan itself is window-bounded through `proof_scan_allowed`
+            // above (get_narrowed_len): a span longer than the window can
+            // display skips the proof and pays one bounded window re-lay, and
+            // a length-changing edit crossing the window start declines like
+            // GNU try_window_id's GIVE_UP (15). Newlines come from
+            // `span_source_newline_count`, not this scan.
             #[cfg(test)]
             if self.allow_below_reuse {
                 crate::incremental_layout::lazy_proof_test_support::note_source_proof();
             }
-            let mut span_newlines = 0usize;
-            let simple_span = self.allow_below_reuse
+            let simple_span = proof_scan_allowed
                 && (dirty_start..dirty_end).all(|cp| {
                     #[cfg(test)]
                     crate::incremental_layout::lazy_proof_test_support::note_char_query();
@@ -4352,10 +4916,7 @@ impl LayoutEngine {
                         neovm_core::buffer::CharPos0::new(cp as usize),
                     );
                     match buffer.char_at_emacs_byte_pos(byte) {
-                        Some('\n') => {
-                            span_newlines += 1;
-                            true
-                        }
+                        Some('\n') => true,
                         Some(c) => c.is_ascii_graphic() || c == ' ',
                         None => false,
                     }
@@ -4578,14 +5139,14 @@ impl LayoutEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layout_window_rust(
+    fn layout_window_rust<FS: crate::neovm_bridge::FaceServices>(
         &mut self,
         evaluator: &mut neovm_core::emacs_core::Context,
         frame_id: neovm_core::window::FrameId,
         params: &WindowParams,
         frame_params: &FrameParams,
         layout_box: &WindowLayoutBox,
-        face_resolver: &super::neovm_bridge::FaceResolver,
+        face_services: &FS,
         reserve_right_border_col: bool,
         remaining_visibility_retries: usize,
         viewport_resolution: ViewportResolutionPhase,
@@ -4602,6 +5163,7 @@ impl LayoutEngine {
         topology_generation: u64,
         face_attempt: &FrameFaceAttempt,
     ) -> LeafLayoutAttempt {
+        let face_resolver = face_services.resolver();
         #[cfg(test)]
         let _viewport_retry_depth = viewport_retry_depth_probe::Guard::enter();
         tracing::debug!(
@@ -4685,7 +5247,11 @@ impl LayoutEngine {
         else {
             return LeafLayoutAttempt::LogicalInputsChanged;
         };
-        let _ = Self::ensure_fontified_rust(evaluator, buf_id, window_start, fontify_end);
+        lisp_ledger.rows_fontification.begin_leaf(window_id, buf_id);
+        let fontification_outcome =
+            lisp_ledger
+                .rows_fontification
+                .ensure(evaluator, buf_id, window_start, fontify_end);
         // `(when FORM . SPEC)` display specs need Lisp, which the walk cannot
         // run while it holds the buffer: evaluate the forms of the span the
         // walk can reach (the same one fontification just covered) here, so
@@ -4694,7 +5260,57 @@ impl LayoutEngine {
         let display_target = crate::display_property::DisplayPropertyTarget::for_window_system(
             face_resolver.is_window_system(),
         );
-        let display_when = if params.source_extent == WindowSourceExtent::AccessibleEnd
+        // GNU `try_cursor_movement` reuses the rows of a window whose text
+        // did not change and never evaluates a reused row's `when` FORM
+        // again (src/xdisp.c:19838-19876).  Take the cursor-only replay
+        // without evaluating when its retained rows were built from known
+        // answers and none of GNU's refusals holds since: the chrome-dirty
+        // generation (`update_mode_lines`, `force-mode-line-update`), an
+        // invalidated window end, `windows_or_buffers_changed` (the GNU policy's
+        // pending window scope, and a buffer change another window shows),
+        // the minibuffer, `show-trailing-whitespace`, line numbers and an
+        // overlay arrow.  Anything else that can move the rows is in the
+        // retained key the replay already matched.
+        // The accepted dependency record for this window. It lives in the
+        // sealed per-frame visual history, not in the retained matrix and not
+        // in LayoutEngine: per-thread state may not grow.
+        let accepted_display_when = self
+            .frame_visual_histories
+            .get(frame_id)
+            .and_then(|history| history.display_when_for(DisplayWindowId::new(params.window_id)));
+        let display_when_reuse = cursor_only_replay.is_some()
+            && accepted_display_when.is_some_and(|retention| {
+                retention.record == crate::display_when::DisplayWhenRecord::Known
+                    && retention.mode_line_generation
+                        == evaluator.chrome_dirty().all_generation()
+            })
+            // Rows from the retained matrix: a replay of a prepared viewport
+            // carries rows the record does not describe.
+            && !self
+                .prepared_window_ids
+                .contains(&DisplayWindowId::new(params.window_id))
+            && !position_publication.is_synchronous_query()
+            && !matches!(&viewport_resolution, ViewportResolutionPhase::Measure(_))
+            // GNU `current_matrix_up_to_date_p` requires `w->window_end_valid`,
+            // which `set-window-start` and a buffer switch clear even when
+            // the start does not move (src/xdisp.c:20557).
+            && evaluator
+                .frame_manager()
+                .get(frame_id)
+                .and_then(|frame| frame.find_window(window_id))
+                .and_then(neovm_core::window::Window::window_end_valid)
+                == Some(true)
+            && !evaluator.gnu_redisplay_refuses_cursor_movement()
+            && !self.frame_other_windows_changed
+            && !params.is_minibuffer()
+            && !params.show_trailing_whitespace
+            && !params.display_line_numbers.enabled()
+            && scroll_coverage::inactive_overlay_arrows(evaluator);
+        let display_when = if display_when_reuse {
+            crate::display_when::DisplayWhenConditions::reused_without_evaluation(
+                neovm_core::emacs_core::value::Value::make_buffer(buf_id),
+            )
+        } else if params.source_extent == WindowSourceExtent::AccessibleEnd
             && evaluator.gnu_redisplay_hooks_policy_enabled()
         {
             let condition_end =
@@ -4718,12 +5334,31 @@ impl LayoutEngine {
                 display_target,
             )
         };
+        // The walk records the clauses it has to take by the structural rule
+        // (sites the scan did not reach); a replay of this window finds the
+        // answers evaluated after the first walk carried in the ledger.
+        let display_when = display_when
+            .with_visit_recording()
+            .with_carried_answers(lisp_ledger.display_when.carried(window_id));
         // The retained key tracks buffer/face changes, not arbitrary Lisp
         // dependencies. A newly evaluated condition can change glyphs without
         // moving any of those ticks. This applies to cursor, scroll, and edit
         // replay alike; static windows keep their existing fast paths.
         self.query_body_reuse_allowed &= display_when.allows_body_reuse();
-        let (cursor_only_replay, scroll_replay, is_edit) = if display_when.allows_body_reuse() {
+        // Rows whose `when` answers stayed unverified (the replay bound's
+        // fallback, an unevaluable site, a failed evaluation) are never
+        // reused, even when this attempt's scan finds nothing to evaluate:
+        // the clauses they were drawn by lie outside the scan.
+        let retained_rows_unverified = self
+            .frame_visual_histories
+            .get(frame_id)
+            .is_some_and(|history| history.any_display_when_unverified())
+            && accepted_display_when.is_some_and(|retention| {
+                retention.record == crate::display_when::DisplayWhenRecord::Unknown
+            });
+        let (cursor_only_replay, scroll_replay, is_edit) = if display_when_reuse {
+            (cursor_only_replay, None, false)
+        } else if display_when.allows_body_reuse() && !retained_rows_unverified {
             (cursor_only_replay, scroll_replay, is_edit)
         } else {
             (None, None, false)
@@ -4731,12 +5366,17 @@ impl LayoutEngine {
         if evaluator.frame_manager().window_topology_generation() != topology_generation {
             return LeafLayoutAttempt::LogicalInputsChanged;
         }
-        let Some(freshness_after_fontification) =
-            evaluator.window_layout_attempt_freshness(frame_id, window_id, buf_id)
-        else {
+        let freshness_mode = crate::attempt_freshness::mode();
+        let freshness_after_fontification = crate::attempt_freshness::after_span(
+            evaluator,
+            &freshness_before_fontification,
+            crate::attempt_freshness::preparation_admission(fontification_outcome, &display_when),
+            freshness_mode,
+        );
+        let Some(freshness_after_fontification) = freshness_after_fontification else {
             return LeafLayoutAttempt::LogicalInputsChanged;
         };
-        if freshness_after_fontification != freshness_before_fontification {
+        if freshness_after_fontification.as_ref() != &freshness_before_fontification {
             return LeafLayoutAttempt::LogicalInputsChanged;
         }
 
@@ -4830,7 +5470,7 @@ impl LayoutEngine {
             && scroll_replay
                 .as_ref()
                 .is_some_and(|replay| replay.edit && replay.sync.is_some());
-        let render_outcome = BufferWindowRenderRequest::new(
+        let render_request = BufferWindowRenderRequest::new(
             frame_id,
             window_id,
             params,
@@ -4846,13 +5486,13 @@ impl LayoutEngine {
         .with_forward_viewport_measurement(match &viewport_resolution {
             ViewportResolutionPhase::Measure(measurement) => Some(measurement.clone()),
             ViewportResolutionPhase::Resolve | ViewportResolutionPhase::Commit(_) => None,
-        })
-        .render_into(
+        });
+        let render_outcome = render_request.render_into(
             BufferSourceRenderAttemptContext::from_frame_output_owner(
                 &mut self.frame_output,
                 evaluator,
                 &mut self.font_metrics,
-                face_resolver,
+                face_services,
                 face_attempt.clone(),
                 &mut self.window_snapshots,
             ),
@@ -4867,8 +5507,29 @@ impl LayoutEngine {
         // equals the one they were produced from. Reject before attaching the
         // post-callback token to those rows; otherwise stale geometry could be
         // certified as fresh.
-        let freshness_after_leaf =
-            evaluator.window_layout_attempt_freshness(frame_id, window_id, buf_id);
+        let freshness_after_leaf = match &render_outcome {
+            BufferSourceRenderAttemptOutcome::Finished {
+                freshness_before_chrome,
+                chrome_lisp_admission,
+                ..
+            } => crate::attempt_freshness::after_span(
+                evaluator,
+                freshness_before_chrome,
+                *chrome_lisp_admission,
+                freshness_mode,
+            ),
+            BufferSourceRenderAttemptOutcome::Skipped
+            | BufferSourceRenderAttemptOutcome::LogicalInputsChanged
+            | BufferSourceRenderAttemptOutcome::GnuMiniEobCursorUnavailable { .. }
+            | BufferSourceRenderAttemptOutcome::Retry { .. }
+            | BufferSourceRenderAttemptOutcome::ResolveViewport { .. }
+            | BufferSourceRenderAttemptOutcome::RetryPointIntoWindow { .. }
+            | BufferSourceRenderAttemptOutcome::ReplayMispredicted
+            | BufferSourceRenderAttemptOutcome::SyncSourceHorizonExhausted { .. }
+            | BufferSourceRenderAttemptOutcome::QuerySourceHorizonExhausted => evaluator
+                .window_layout_attempt_freshness(frame_id, window_id, buf_id)
+                .map(std::borrow::Cow::Owned),
+        };
         let lisp_boundaries_remain_valid = match (&render_outcome, &freshness_after_leaf) {
             (
                 BufferSourceRenderAttemptOutcome::Finished {
@@ -4886,7 +5547,7 @@ impl LayoutEngine {
                 )
             }
             (_, Some(freshness_after_leaf)) => {
-                freshness_after_leaf == &freshness_after_fontification
+                freshness_after_leaf.as_ref() == freshness_after_fontification.as_ref()
             }
             (_, None) => false,
         };
@@ -4917,23 +5578,41 @@ impl LayoutEngine {
                 .map(WindowPresentationSnapshot::display_snapshot)
                 .find(|snapshot| snapshot.window_id == window_id)
                 .map(|snapshot| {
-                    VisibleFontificationCoverage::inspect_for_edit_sync(
-                        buffer,
-                        snapshot,
-                        neovm_core::buffer::CharPos0::new(fontify_end.max(0) as usize),
-                        admitted_edit_sync_fontify_attempt,
-                    )
+                    let prepass_end =
+                        neovm_core::buffer::CharPos0::new(fontify_end.max(0) as usize);
+                    if admitted_edit_sync_fontify_attempt {
+                        VisibleFontificationCoverage::inspect_for_edit_sync(
+                            buffer,
+                            snapshot,
+                            prepass_end,
+                            true,
+                        )
+                    } else {
+                        // Finished plus the body/chrome freshness and topology
+                        // checks above certify this attempt's actual rows.
+                        // Numeric refusal retains the exact global iterator.
+                        VisibleFontificationCoverage::inspect_completed(
+                            buffer,
+                            snapshot,
+                            prepass_end,
+                        )
+                    }
                 })
                 .unwrap_or(VisibleFontificationCoverage::Complete);
 
             if let VisibleFontificationCoverage::Requires(plan) = coverage {
                 for span in plan.spans() {
-                    let outcome =
-                        Self::ensure_fontified_rust(evaluator, buf_id, span.start(), span.end());
+                    let outcome = lisp_ledger.rows_fontification.ensure(
+                        evaluator,
+                        buf_id,
+                        span.start(),
+                        span.end(),
+                    );
                     let freshness_after_visible_fontification =
                         evaluator.window_layout_attempt_freshness(frame_id, window_id, buf_id);
                     if evaluator.frame_manager().window_topology_generation() != topology_generation
-                        || freshness_after_visible_fontification != freshness_after_leaf
+                        || freshness_after_visible_fontification.as_ref()
+                            != freshness_after_leaf.as_deref()
                         || outcome.requires_layout_retry()
                     {
                         if let Some(attempt) = window_end_attempt.take() {
@@ -4945,6 +5624,64 @@ impl LayoutEngine {
             }
         }
 
+        // The `when` clauses the walk took by the structural rule: evaluate
+        // them now with GNU's bindings, and replay the frame once if an
+        // answer disagrees with the rule the rows were drawn by.
+        if matches!(
+            &render_outcome,
+            BufferSourceRenderAttemptOutcome::Finished { .. }
+        ) {
+            let conditions = layout_buffer.display_when_conditions();
+            let evaluates_lisp = conditions.has_recorded_visits();
+            let settlement = crate::display_when::settle_display_when_visits(
+                evaluator,
+                buf_id,
+                window_id,
+                conditions,
+                display_target,
+                &mut lisp_ledger.display_when,
+            );
+            if evaluates_lisp
+                && (evaluator.frame_manager().window_topology_generation() != topology_generation
+                    || evaluator
+                        .window_layout_attempt_freshness(frame_id, window_id, buf_id)
+                        .as_ref()
+                        != freshness_after_leaf.as_deref())
+            {
+                if let Some(attempt) = window_end_attempt.take() {
+                    evaluator.reject_redisplay_window_end_attempt(attempt);
+                }
+                return LeafLayoutAttempt::LogicalInputsChanged;
+            }
+            match settlement {
+                crate::display_when::DisplayWhenSettlement::Replay => {
+                    if let Some(attempt) = window_end_attempt.take() {
+                        evaluator.reject_redisplay_window_end_attempt(attempt);
+                    }
+                    return LeafLayoutAttempt::DisplayWhenReplay;
+                }
+                crate::display_when::DisplayWhenSettlement::Settled(record) => {
+                    // A reuse without evaluation keeps the rows, and so the
+                    // record, it reused.
+                    let record = if display_when_reuse
+                        && record == crate::display_when::DisplayWhenRecord::NoSites
+                    {
+                        crate::display_when::DisplayWhenRecord::Known
+                    } else {
+                        record
+                    };
+                    tracing::trace!(target: "neomacs_layout_engine::display_when",
+                        window = window_id.0, ?record, display_when_reuse,
+                        "walk's `when' record settled");
+                    // The record lives with the frame attempt's display-when
+                    // ledger (a stack local), not in LayoutEngine: it must not
+                    // add bytes to the thread-local redisplay runtime.
+                    lisp_ledger.display_when.settle_window(window_id, record);
+                }
+            }
+        }
+
+        drop(freshness_after_leaf);
         let (redisplay_positions, effective_default_face, line_number_field) = match render_outcome
         {
             BufferSourceRenderAttemptOutcome::LogicalInputsChanged => {
@@ -5196,6 +5933,7 @@ impl LayoutEngine {
                 query_target_prefix_policy,
                 window_end_record,
                 freshness_before_chrome: _,
+                chrome_lisp_admission: _,
                 effective_default_face,
                 cursor_only,
                 reused_matrix_rows,
@@ -5303,7 +6041,7 @@ impl LayoutEngine {
             Ok(outcome) => outcome,
             Err(e) => {
                 tracing::debug!("ensure_fontified_rust: fontification error: {:?}", e);
-                neovm_core::emacs_core::xdisp::RedisplayFontificationOutcome::Unchanged
+                neovm_core::emacs_core::xdisp::RedisplayFontificationOutcome::CallbacksUnchanged
             }
         }
     }
@@ -5333,31 +6071,49 @@ impl LayoutEngine {
         face_attempt: &FrameFaceAttempt,
     ) -> Option<f32> {
         let width = frame_params.width;
-        let tab_bar_face =
+        let mut tab_bar_face =
             face_resolver.default_base_face_for_origin_without_buffer(&DisplayOrigin::TabBar);
+        face_resolver.realize_for_display(&mut tab_bar_face, evaluator);
         let tab_bar_ascent = frame_params.char_height * 0.8;
         let fallback_metrics =
             DisplayRowFallbackMetrics::from_frame_defaults(frame_params, tab_bar_ascent);
         let metrics = DisplayRowFaceRealizer::new(&mut self.font_metrics)
             .row_metrics_for_face(&tab_bar_face, fallback_metrics);
         let mut face_ids = face_attempt.clone();
-        let rendered_tab_bar = self.frame_output.render_frame_tab_bar_row(
-            FrameTabBarDisplayRowRequest {
-                row_index: 0,
-                y: 0.0,
-                width,
-                height: tab_bar_height,
-                metrics,
-                base_face: &tab_bar_face,
-                text: tab_bar.text,
-                image_scale_environment: frame_params.image_scale_environment,
-            },
-            ChromeRowRenderServices::new(&mut self.font_metrics, face_resolver, &mut face_ids)
-                .with_automatic_composition(crate::neovm_bridge::current_string_composition_rules(
-                    evaluator,
-                )),
-            evaluator.display_host.as_deref(),
-        )?;
+        let automatic_composition =
+            crate::neovm_bridge::current_string_composition_rules(evaluator);
+        let rendered_tab_bar = {
+            let (display_host, evaluator) = if face_resolver.has_tty_realization() {
+                (None, Some(&mut *evaluator))
+            } else {
+                (evaluator.display_host.as_deref(), None)
+            };
+            let evaluator = std::cell::RefCell::new(evaluator);
+            let realize = |face: &mut super::neovm_bridge::ResolvedFace| {
+                if let Some(evaluator) = evaluator.borrow_mut().as_deref_mut() {
+                    face_resolver.realize_for_display(face, evaluator);
+                }
+            };
+            let realizer = face_resolver
+                .has_tty_realization()
+                .then_some(&realize as &dyn Fn(&mut super::neovm_bridge::ResolvedFace));
+            self.frame_output.render_frame_tab_bar_row(
+                FrameTabBarDisplayRowRequest {
+                    row_index: 0,
+                    y: 0.0,
+                    width,
+                    height: tab_bar_height,
+                    metrics,
+                    base_face: &tab_bar_face,
+                    text: tab_bar.text,
+                    image_scale_environment: frame_params.image_scale_environment,
+                },
+                ChromeRowRenderServices::new(&mut self.font_metrics, face_resolver, &mut face_ids)
+                    .with_face_realizer(realizer)
+                    .with_automatic_composition(automatic_composition),
+                display_host,
+            )
+        }?;
         let FrameTabBarDisplayRowRender::Measured(measured) = rendered_tab_bar else {
             return None;
         };

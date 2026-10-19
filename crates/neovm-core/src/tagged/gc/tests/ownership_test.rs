@@ -1,5 +1,51 @@
 use super::*;
 
+/// Promotion and reclamation may reborrow the heap between consecutive
+/// unlinks, including while the cursor still points at the list head.
+#[test]
+fn miriub3_eager_sweep_preserves_young_and_old_survivors() {
+    let mut heap = TaggedHeap::new();
+    set_tagged_heap(&mut heap);
+    let values: Vec<_> = (0..5)
+        .map(|_| heap.alloc_char_table(TaggedValue::NIL, TaggedValue::NIL, 0))
+        .collect();
+    let mut headers: Vec<_> = values
+        .iter()
+        .map(|value| {
+            value
+                .as_veclike_ptr()
+                .unwrap()
+                .cast_mut()
+                .cast::<GcHeader>()
+        })
+        .collect();
+    // Allocation prepends: dead -> old -> dead -> young -> old. These are
+    // real residual Box objects, so the normal reclamation path runs too.
+    unsafe {
+        (*headers[0]).tenured = true;
+        (*headers[3]).tenured = true;
+        (*headers[2])
+            .marked
+            .store(UNMARKED_AT_REST, Ordering::Relaxed);
+        (*headers[4])
+            .marked
+            .store(UNMARKED_AT_REST, Ordering::Relaxed);
+    }
+    let young_bytes = heap.collector_object_bytes(headers[1]);
+    assert_eq!(heap.sweep_objects(), young_bytes);
+    assert_eq!(heap.non_cons_object_addrs.len(), 3);
+    assert_eq!(heap.all_objects, headers[1]);
+    assert_eq!(heap.generational.old_objects, headers[0]);
+    unsafe {
+        assert!((*headers[1]).next.is_null());
+        assert_eq!((*headers[0]).next, headers[3]);
+        assert!((*headers[3]).next.is_null());
+    }
+    assert_eq!(heap.sweep_objects(), young_bytes);
+    assert_eq!(heap.all_objects, headers[1]);
+    assert_eq!(heap.non_cons_object_addrs.len(), 3);
+}
+
 /// TASK 10 — the `dirty_owners` ABA regression.
 ///
 /// The owner-tracking side tables (`dirty_owners` / `dirty_owner_bits` /
@@ -1319,7 +1365,8 @@ fn concurrent_vector_slot_insertion_of_inflight_value_survives() {
         (*(v.as_veclike_ptr().unwrap() as *const VectorObj))
             .data
             .load_atomic(0)
-    };
+    }
+    .expect("vector slot");
     assert_eq!(slot0.0, x.0);
 }
 
@@ -1997,7 +2044,7 @@ fn parity_allocate_black_object_survives_two_cycles() {
     run_concurrent_cycle(&mut heap, &[spine, v, s]);
     assert!(heap.owns_non_cons_object(v_ptr));
     assert!(heap.owns_non_cons_object(s_ptr));
-    let slot = unsafe { (*(v_ptr as *const VectorObj)).data.load_atomic(0) };
+    let slot = unsafe { (*(v_ptr as *const VectorObj)).data.load_atomic(0) }.expect("vector slot");
     assert_eq!(slot.0, TaggedValue::fixnum(77).0, "vector payload intact");
     assert_eq!(
         unsafe { (*(s_ptr as *const StringObj)).data.as_bytes() },
@@ -3296,10 +3343,8 @@ fn concurrent_first_cycle_keeps_weak_entries_keyed_by_live_image_objects() {
         // Fake image cons, registered exactly as the pdump loader registers
         // one (extends the dump span, turns the partition on).
         let cell = Box::into_raw(Box::new([ConsCell {
-            car: TaggedValue::fixnum(1),
-            cdr_or_next: crate::tagged::header::ConsCdrOrNext {
-                cdr: TaggedValue::NIL,
-            },
+            car: crate::tagged::header::ConsWord::new(TaggedValue::fixnum(1)),
+            cdr_or_next: crate::tagged::header::ConsCdrWord::new(TaggedValue::NIL),
         }])) as *mut ConsCell;
         unsafe { heap.register_mapped_cons_range(cell, 1) };
         let key = unsafe { TaggedValue::from_cons_ptr(cell) };
@@ -3384,17 +3429,15 @@ fn a_forced_collection_during_the_concurrent_first_cycle_keeps_image_held_object
     // Fake image cons X, registered exactly as the pdump loader registers
     // one; the roots never reach it.
     let x = Box::into_raw(Box::new([ConsCell {
-        car: TaggedValue::NIL,
-        cdr_or_next: crate::tagged::header::ConsCdrOrNext {
-            cdr: TaggedValue::NIL,
-        },
+        car: crate::tagged::header::ConsWord::new(TaggedValue::NIL),
+        cdr_or_next: crate::tagged::header::ConsCdrWord::new(TaggedValue::NIL),
     }])) as *mut ConsCell;
     unsafe { heap.register_mapped_cons_range(x, 1) };
     // `keeper` is rooted and keeps H's cons block from being released, so a
     // freed H reads as a dead cell rather than unmapped memory.
     let keeper = heap.alloc_cons(TaggedValue::fixnum(0), TaggedValue::NIL);
     let h = heap.alloc_cons(TaggedValue::fixnum(1), TaggedValue::fixnum(2));
-    unsafe { (*x).car = h };
+    unsafe { (*x).car.set_plain(h) };
     assert!(heap.is_partition_first_cycle());
 
     // The safe-point path arms and starts the concurrent first cycle.

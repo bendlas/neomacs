@@ -991,7 +991,28 @@ pub(crate) fn update_face_from_frame_parameter(
         };
         set_lisp_face_vector_attr(vector, attr, value);
         realize_default_lisp_face_for_frame(eval, frame_id);
-        eval.face_change_count += 1;
+        super::xfaces::realization::record_face_change_for(
+            eval,
+            super::xfaces::realization::FaceChangeScope::Frames(&[frame_id]),
+            Some("default"),
+        );
+        if crate::face::realization::enabled() && eval.frame_is_tty_face_target(frame_id) {
+            // GNU update_face_from_frame_parameter realizes basics immediately,
+            // then sets f->face_change: xfaces.c:3894,3910,3936-3945. The next
+            // display iterator therefore rebuilds them once more.
+            super::xfaces::realization::prepare_runtime_faces_result(eval, frame_id)?;
+            let affected = [frame_id];
+            let scope = super::xfaces::realization::named_face_change_scope(
+                eval,
+                "default",
+                super::xfaces::realization::FaceChangeScope::Frames(&affected),
+            );
+            if scope.invalidates(frame_id)
+                && let Some(frame) = eval.frames.get_mut(frame_id)
+            {
+                frame.face_realization.invalidate();
+            }
+        }
     }
     Ok(())
 }
@@ -1066,7 +1087,11 @@ pub fn seed_live_frame_default_face_from_font_parameter(
     for (attr_name, attr_value) in derived_face_attrs_from_font_value(&font_value) {
         set_lisp_face_vector_attr(vector, attr_name, attr_value);
     }
-    eval.face_change_count += 1;
+    super::xfaces::realization::record_face_change_for(
+        eval,
+        super::xfaces::realization::FaceChangeScope::Frames(&[frame_id]),
+        Some("default"),
+    );
 }
 
 // ---------------------------------------------------------------------------

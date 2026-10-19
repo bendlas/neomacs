@@ -13,7 +13,7 @@ impl Context {
     /// before calling this.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_dump(
-        tagged_heap: Box<crate::tagged::gc::TaggedHeap>,
+        tagged_heap: crate::tagged::gc::AliasableBox<crate::tagged::gc::TaggedHeap>,
         obarray: Obarray,
         lexenv: Value,
         features: Vec<SymId>,
@@ -41,8 +41,8 @@ impl Context {
         let dumped_function_surface = obarray.clone();
         let mut obarray = obarray;
         let core_eval_symbols = install_core_eval_symbols(&mut obarray, false);
-        let mut tagged_heap = tagged_heap;
-        crate::tagged::gc::set_tagged_heap(&mut tagged_heap);
+        let tagged_heap = tagged_heap;
+        crate::tagged::gc::set_tagged_heap_root(tagged_heap.root());
         let noninteractive = obarray
             .canonical_value_or_nil(
                 CanonicalAccess::DUMP,
@@ -300,10 +300,10 @@ impl Context {
         // surface, so restore that surface immediately afterward.
         builtins::init_builtins(&mut ev);
         for (sym_id, symbol) in dumped_function_surface.iter_symbols() {
-            if !symbol.function.is_nil() {
+            if !symbol.function.get().is_nil() {
                 ev.obarray.set_symbol_function_id_for(
                     sym_id,
-                    symbol.function,
+                    symbol.function.get(),
                     crate::emacs_core::symbol::FunctionEpochBump::PdumpRestore,
                 );
             } else if dumped_function_surface.is_function_unbound_id(sym_id) {

@@ -36,7 +36,11 @@
 //! and walker closes them first. An open free-list region whose reserved
 //! cells were swept would hand them out twice.
 
+use super::cons_allocator::ConsCarveAge;
 use super::*;
+
+const CONS_RECORDING_INACTIVE: usize = 2;
+const CONS_RECORDING_MIXED: usize = 4;
 
 /// The most cells one cons region takes (2 KiB).
 pub(super) const CONS_REGION_MAX_CELLS: usize = 128;
@@ -77,22 +81,97 @@ pub(super) enum RegionColor {
     Black,
 }
 
-/// The open regions' bookkeeping that only Rust reads.
+/// The open regions' bookkeeping that only Rust reads. Keep the previous
+/// footprint and cache a canonical recorded-block proof with the phase color.
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RegionBook {
     pub(super) cons: ConsRegionSource,
-    pub(super) cons_color: RegionColor,
     /// Floats have no color: a slot is born at the current parity, which a
     /// region cannot outlive (it closes before every parity flip).
     pub(super) float: FloatRegionSource,
+    /// Successfully recorded canonical block plus color in bit0 and a mixed
+    /// old/young classification in bit2. Bit1 means inactive, even for base0.
+    /// This is an allocation-epoch certificate, not a second young registry.
+    /// Every collector entry closes it before changing ages/counts. Mixed
+    /// blocks have an unaligned encoded base, so the store predicate below
+    /// remains conservative without another hot-path branch.
+    pub(super) cons_block_and_color: usize,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(CONS_BLOCK_ALIGN == 1 << 16);
+    assert!(std::mem::size_of::<RegionBook>() == 40);
+    assert!(std::mem::align_of::<RegionBook>() == 8);
+    assert!(std::mem::offset_of!(RegionBook, cons) == 0);
+    assert!(std::mem::offset_of!(RegionBook, float) == 16);
+    assert!(std::mem::offset_of!(RegionBook, cons_block_and_color) == 32);
+};
 
 impl RegionBook {
     pub(super) const fn new() -> Self {
         Self {
             cons: ConsRegionSource::Closed,
-            cons_color: RegionColor::White,
             float: FloatRegionSource::Closed,
+            cons_block_and_color: CONS_RECORDING_INACTIVE,
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn no_old_cons_block_contains(&self, addr: usize) -> bool {
+        (addr & !(CONS_BLOCK_ALIGN - 1)) == (self.cons_block_and_color & !1)
+    }
+
+    #[inline]
+    pub(super) fn cons_color(&self) -> RegionColor {
+        if self.cons_block_and_color & 1 == 0 {
+            RegionColor::White
+        } else {
+            RegionColor::Black
+        }
+    }
+
+    #[inline]
+    pub(super) fn set_cons_block_and_color(
+        &mut self,
+        no_old_block: Option<usize>,
+        color: RegionColor,
+    ) {
+        debug_assert!(no_old_block.is_none_or(|base| base & (CONS_BLOCK_ALIGN - 1) == 0));
+        let color_bit = match color {
+            RegionColor::White => 0,
+            RegionColor::Black => 1,
+        };
+        self.cons_block_and_color = no_old_block.unwrap_or(CONS_RECORDING_INACTIVE) | color_bit;
+    }
+
+    #[inline]
+    pub(super) fn clear_cons_block(&mut self) {
+        self.cons_block_and_color = (self.cons_block_and_color & 1) | CONS_RECORDING_INACTIVE;
+    }
+
+    #[inline]
+    fn recorded_cons_age(word: usize, base: usize) -> Option<ConsCarveAge> {
+        if word & CONS_RECORDING_INACTIVE != 0 || word & !(CONS_BLOCK_ALIGN - 1) != base {
+            return None;
+        }
+        Some(if word & CONS_RECORDING_MIXED == 0 {
+            ConsCarveAge::NoOldOwners
+        } else {
+            ConsCarveAge::MayHaveOldOwners
+        })
+    }
+
+    #[inline]
+    fn set_cons_recording_and_color(
+        &mut self,
+        recorded: Option<(usize, ConsCarveAge)>,
+        color: RegionColor,
+    ) {
+        self.set_cons_block_and_color(recorded.map(|(base, _)| base), color);
+        if let Some((_, ConsCarveAge::MayHaveOldOwners)) = recorded {
+            self.cons_block_and_color |= CONS_RECORDING_MIXED;
         }
     }
 }
@@ -137,32 +216,61 @@ impl TaggedHeap {
     #[cold]
     #[inline(never)]
     fn refill_cons_region(&mut self) -> *mut ConsCell {
+        // Only this non-safepoint refill may carry a certificate over its own
+        // close. Collector/admission closes leave no certificate to copy.
+        // A reserved run stays registered/retained throughout this extent;
+        // other mutators cannot reset canonical logs/ages before stop-all.
+        let previous_recording = self.region_book.cons_block_and_color;
         self.close_cons_region();
         let want = self.region_budget(size_of::<ConsCell>(), CONS_REGION_MAX_CELLS);
         let (first, n, source) = self.reserve_cons_run(want);
         debug_assert!(n >= 1 && n <= want);
-        if self.generational.enabled {
-            // All three region sources have installed their base registry
-            // entry before this point. Record the carve before initializing
-            // or publishing a cell, once per cold refill rather than per cons.
-            let base = ConsBlock::block_base_for_ptr(first);
-            let block_index = self.cons_block_index_by_base[&base];
+        let recorded_block = if self.generational.enabled {
+            // All three sources prove retained, registered storage before
+            // returning a run. Record it before initializing/publishing cells,
+            // unless this same epoch already recorded the identical block.
+            let base = ConsBlockBase::of_cell(first);
+            let identity = self.heap_identity();
+            #[cfg(test)]
+            let can_cache = !cons_allocator::carve_fault_active();
+            #[cfg(not(test))]
+            let can_cache = true;
             let recorded = match self._satb_layout_reserve.current_young_log_mut() {
-                Ok(log) => self
-                    .cons_allocator
-                    .note_carve(ConsBlockBase::of(&self.cons_blocks[block_index]), log),
+                Ok(log) if log.id().heap_identity() != identity => {
+                    Err(young_registry::YoungRegistryError::WrongHeap)
+                }
+                Ok(log) => {
+                    // Even a hit must borrow the CURRENT resident, active log
+                    // and validate its domain before publishing a grant. The
+                    // canonical entry may belong to another mutator's log.
+                    if can_cache
+                        && let Some(age) =
+                            RegionBook::recorded_cons_age(previous_recording, base.addr())
+                    {
+                        Ok(age)
+                    } else {
+                        self.cons_allocator.note_carve(base, log)
+                    }
+                }
                 Err(error) => Err(error),
             };
-            if let Err(error) = recorded {
-                // No cell was initialized, marked, charged or handed out.
-                // SAFETY: reserve_cons_run gave us this entire exclusive,
-                // unmarked/young range in a still-owned registered block.
-                // Returning it to the private free list also handles a fresh
-                // or bump-tail grant without leaving untracked used cells.
-                unsafe { self.cons_allocator.return_unused(first, n) };
-                panic!("canonical young recording refused an unhanded cons grant: {error:?}");
+            match recorded {
+                // Faults must still exercise the real canonical path on the
+                // next grant; SkipCarveRecording is not a successful record.
+                Ok(age) => can_cache.then_some((base.addr(), age)),
+                Err(error) => {
+                    // No cell was initialized, marked, charged or handed out.
+                    // SAFETY: reserve_cons_run gave us this entire exclusive,
+                    // unmarked/young range in a still-owned registered block.
+                    // Returning it to the private free list also handles a fresh
+                    // or bump-tail grant without leaving untracked used cells.
+                    unsafe { self.cons_allocator.return_unused(first, n) };
+                    panic!("canonical young recording refused an unhanded cons grant: {error:?}");
+                }
             }
-        }
+        } else {
+            None
+        };
         let color = if self.allocates_black() {
             let base = ConsBlock::block_base_for_ptr(first);
             ConsBlock::mark_run_at(base, ConsBlock::index_of_ptr(first), n, true);
@@ -173,12 +281,13 @@ impl TaggedHeap {
         };
         self.charge_conses(n);
         self.region_book.cons = source;
-        self.region_book.cons_color = color;
         let stats = &mut self.region_stats;
         stats.cons_refills += 1;
         stats.cons_cells_granted += n as u64;
         stats.cons_short_runs += u64::from(n < 8);
         let first_addr = first as usize;
+        self.region_book
+            .set_cons_recording_and_color(recorded_block, color);
         self.jit.cons_cur.set(first_addr + size_of::<ConsCell>());
         self.jit
             .cons_lim
@@ -421,13 +530,14 @@ impl TaggedHeap {
         self.close_black_cons_region(cur);
         self.jit.cons_cur.set(0);
         self.jit.cons_lim.set(0);
+        self.region_book.clear_cons_block();
         self.region_book.cons = ConsRegionSource::Closed;
         if source == ConsRegionSource::Closed {
             debug_assert!(cur == 0 && lim == 0, "a closed region has no cursor");
             return;
         }
         debug_assert_eq!(
-            self.region_book.cons_color,
+            self.region_book.cons_color(),
             if self.allocates_black() {
                 RegionColor::Black
             } else {
@@ -444,7 +554,7 @@ impl TaggedHeap {
         let first = cur as *mut ConsCell;
         let base = ConsBlock::block_base_for_ptr(first);
         let start = ConsBlock::index_of_ptr(first);
-        if self.region_book.cons_color == RegionColor::Black {
+        if self.region_book.cons_color() == RegionColor::Black {
             ConsBlock::mark_run_at(base, start, unused, false);
         }
         if let ConsRegionSource::BlockTail { block } = source
@@ -528,3 +638,7 @@ impl TaggedHeap {
         self.cons_live_count - self.open_cons_unused()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/cons_region_recording_cache_test.rs"]
+mod recording_cache_tests;

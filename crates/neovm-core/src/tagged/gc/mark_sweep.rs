@@ -214,10 +214,9 @@ impl TaggedHeap {
         // Clearing at begin makes the tables hold only writes made SINCE this
         // cycle started, so no entry outlives the object it names into a
         // sweep+reuse. This is the exact ABA-safety argument the SATB sets rely
-        // on (per-cycle; no free during mark; cleared at begin). The tables are
-        // the seam for the future generational remembered set (task 06), whose
-        // consumer walks them per cycle and needs no cross-cycle accumulation;
-        // every reader today is a test.
+        // on (per-cycle; no free during mark; cleared at begin). These optional
+        // observation tables are separate from generational remembered sets;
+        // their readers are tests and introspection.
         self.clear_dirty_owners();
         self.clear_dirty_writes();
         self.seed_internal_runtime_roots();
@@ -306,7 +305,9 @@ impl TaggedHeap {
                     let vptr = obj as *mut VecLikeHeader;
                     if (*vptr).type_tag == VecLikeType::HashTable {
                         let ht_ptr = vptr as *mut HashTableObj;
-                        if (*ht_ptr).table.weakness.is_some()
+                        if self
+                            .collector_tables()
+                            .inspect(ht_ptr, |ht| ht.weakness.is_some())
                             && !self.permanent_weak_hash_tables_set.contains(&ht_ptr)
                         {
                             self.permanent_weak_hash_tables_set.insert(ht_ptr);
@@ -367,7 +368,10 @@ impl TaggedHeap {
                 unsafe {
                     if (*header).type_tag == VecLikeType::HashTable {
                         let ht_ptr = header as *mut HashTableObj;
-                        if (*ht_ptr).table.weakness.is_some() {
+                        if self
+                            .collector_tables()
+                            .inspect(ht_ptr, |ht| ht.weakness.is_some())
+                        {
                             return Some(ht_ptr);
                         }
                     }
@@ -559,6 +563,7 @@ impl TaggedHeap {
     fn veclike_has_young_child(&self, ptr: *mut VecLikeHeader) -> bool {
         let mut young = false;
         Self::for_each_veclike_child(
+            self.collector_tables(),
             ptr,
             &mut VisitChild(|child| {
                 if !young && self.permanent_child_needs_trace(child) {
@@ -575,7 +580,7 @@ impl TaggedHeap {
         if !self.generational.enabled {
             return self.is_heap_young(value);
         }
-        if let crate::tagged::value::ValueKind::Symbol(id) = value.kind() {
+        if let crate::tagged::value::ValueKind::Symbol(id) = value.gc_kind() {
             return !crate::emacs_core::intern::is_canonical_id(id);
         }
         if self.owner_is_mapped(value) {
@@ -810,13 +815,13 @@ impl TaggedHeap {
     /// both need. Mirrors `trace_veclike`/cons/string child enumeration.
     pub(super) fn push_value_children_to_gray(&mut self, owner: TaggedValue, origin: &'static str) {
         if owner.is_cons() {
-            let ptr = owner.xcons_ptr();
+            let ptr = owner.gc_cons_ptr();
             let car = unsafe { (*ptr).load_car() };
             let cdr = unsafe { (*ptr).load_cdr() };
             self.mark_or_push_child(car, origin);
             self.mark_or_push_child(cdr, origin);
         } else if owner.is_veclike() {
-            if let Some(ptr) = owner.as_veclike_ptr() {
+            if let Some(ptr) = owner.gc_veclike_ptr() {
                 // A dumped/tenured WEAK hash table is permanent-black, so the main
                 // mark never re-runs `trace_veclike` on it and it would otherwise
                 // never re-register for the weak sweep. Register it here (the
@@ -841,6 +846,7 @@ impl TaggedHeap {
                     // permanent owner to be marked, or it is swept while still
                     // referenced (UAF).
                     Self::for_each_veclike_child(
+                        self.collector_tables(),
                         ptr as *mut VecLikeHeader,
                         &mut VisitChild(|child| {
                             self.mark_or_push_child(child, origin);
@@ -849,7 +855,7 @@ impl TaggedHeap {
                 }
             }
         } else if owner.is_string()
-            && let Some(ptr) = owner.as_string_ptr()
+            && let Some(ptr) = owner.gc_string_ptr()
         {
             let intervals = unsafe { (*ptr).data.intervals() };
             if !intervals.is_empty() {
@@ -878,7 +884,7 @@ impl TaggedHeap {
     /// side bits, which its pre-mark (`premark_mapped_image`) has set for
     /// the whole image: the same answer again.
     pub(super) fn is_value_marked(&self, value: TaggedValue) -> bool {
-        if let crate::tagged::value::ValueKind::Symbol(id) = value.kind() {
+        if let crate::tagged::value::ValueKind::Symbol(id) = value.gc_kind() {
             // Skipping old owners removes their historical symbol-mark
             // repair. Symbol ids have no generation byte, so retain them
             // conservatively on minors; current full cycles still mark them.
@@ -888,7 +894,7 @@ impl TaggedHeap {
         }
         let image_live = self.partition_dump && !self.dump_blackened && self.first_cycle_concurrent;
         if value.is_cons() {
-            let ptr = value.xcons_ptr();
+            let ptr = value.gc_cons_ptr();
             if ConsBlock::ptr_is_cell_aligned(ptr) {
                 let base = ConsBlock::block_base_for_ptr(ptr);
                 let found = match self.chunk_map.as_ref() {
@@ -983,7 +989,7 @@ impl TaggedHeap {
             } else if child.is_float() {
                 "float".to_string()
             } else if child.is_veclike() {
-                format!("{:?}", child.veclike_type())
+                format!("{:?}", child.gc_veclike_type())
             } else {
                 "other".to_string()
             };
@@ -1365,12 +1371,13 @@ impl TaggedHeap {
             if (*ptr).type_tag != VecLikeType::HashTable {
                 return None;
             }
-            let ht = &(*ht_ptr).table;
-            (
-                ht.weakness.is_some(),
-                ht.user_cmp_function,
-                ht.user_hash_function,
-            )
+            self.collector_tables().inspect(ht_ptr, |ht| {
+                (
+                    ht.weakness.is_some(),
+                    ht.user_cmp_function,
+                    ht.user_hash_function,
+                )
+            })
         };
         if !is_weak {
             return None;
@@ -1391,7 +1398,7 @@ impl TaggedHeap {
     /// Direct children of a mapped vectorlike object (read-only) for the verifier.
     pub(super) fn collect_veclike_children(&self, ptr: *mut VecLikeHeader) -> Vec<TaggedValue> {
         let mut out = Vec::new();
-        Self::for_each_veclike_child(ptr, &mut out);
+        Self::for_each_veclike_child(self.collector_tables(), ptr, &mut out);
         out
     }
 
@@ -1399,7 +1406,11 @@ impl TaggedHeap {
     /// without collecting them: the remembered-set rescan and the SATB log
     /// visit ~80K children twice per cycle, and building a vector per owner
     /// cost more than the visits (jemalloc growth was most of it).
-    pub(super) fn for_each_veclike_child(ptr: *mut VecLikeHeader, sink: &mut impl ChildSink) {
+    pub(super) fn for_each_veclike_child(
+        tables: collector_tables::CollectorTables,
+        ptr: *mut VecLikeHeader,
+        sink: &mut impl ChildSink,
+    ) {
         unsafe {
             match (*ptr).type_tag {
                 VecLikeType::Vector => {
@@ -1415,8 +1426,13 @@ impl TaggedHeap {
                 }
                 VecLikeType::CharTable => {
                     let o = &*(ptr as *const CharTableObj);
-                    sink.children([o.defalt, o.parent, o.purpose, o.ascii]);
-                    sink.children(o.contents.iter().copied());
+                    sink.children([
+                        o.defalt.get(),
+                        o.parent.get(),
+                        o.purpose.get(),
+                        o.ascii.get(),
+                    ]);
+                    sink.children(o.contents.iter().map(AtomicTaggedValue::get));
                     sink.children(o.extras.iter().copied());
                 }
                 VecLikeType::SubCharTable => {
@@ -1429,30 +1445,31 @@ impl TaggedHeap {
                     sink.children((*(ptr as *const LambdaObj)).data.iter().copied());
                 }
                 VecLikeType::HashTable => {
-                    let ht = &(*(ptr as *const HashTableObj)).table;
-                    if let Some(pending) = ht.data.pending_entries() {
-                        // Un-hydrated dump table (see `trace_veclike`).
-                        for (_, value, snapshot) in pending {
-                            sink.child(*value);
-                            if let Some(snapshot) = snapshot {
-                                sink.child(*snapshot);
+                    tables.inspect(ptr.cast(), |ht| {
+                        if let Some(pending) = ht.data.pending_entries() {
+                            // Un-hydrated dump table (see `trace_veclike`).
+                            for (_, value, snapshot) in pending {
+                                sink.child(*value);
+                                if let Some(snapshot) = snapshot {
+                                    sink.child(*snapshot);
+                                }
                             }
                         }
-                    }
-                    sink.children(ht.data.values().copied());
-                    sink.children(ht.key_snapshots().copied());
-                    // Custom test/hash closures (`define-hash-table-test`) live
-                    // ONLY in these fields and are traced by `trace_veclike`; keep
-                    // the two enumerations in sync so the remembered/SATB strong-
-                    // trace (which uses this) and the dump-partition verifier both
-                    // cover them — otherwise a dumped/tenured custom-test table's
-                    // closures are swept while the table still calls them (UAF).
-                    if let Some(f) = ht.user_cmp_function {
-                        sink.child(f);
-                    }
-                    if let Some(f) = ht.user_hash_function {
-                        sink.child(f);
-                    }
+                        sink.children(ht.data.values().copied());
+                        sink.children(ht.key_snapshots().copied());
+                        // Custom test/hash closures (`define-hash-table-test`) live
+                        // ONLY in these fields and are traced by `trace_veclike`; keep
+                        // the two enumerations in sync so the remembered/SATB strong-
+                        // trace (which uses this) and the dump-partition verifier both
+                        // cover them — otherwise a dumped/tenured custom-test table's
+                        // closures are swept while the table still calls them (UAF).
+                        if let Some(f) = ht.user_cmp_function {
+                            sink.child(f);
+                        }
+                        if let Some(f) = ht.user_hash_function {
+                            sink.child(f);
+                        }
+                    });
                 }
                 VecLikeType::ByteCode => {
                     let obj = ptr as *const ByteCodeObj;
@@ -1541,7 +1558,7 @@ impl TaggedHeap {
     }
 
     pub(crate) fn seed_root_with_origin(&mut self, root: TaggedValue, origin: &str) {
-        if let crate::tagged::value::ValueKind::Symbol(id) = root.kind() {
+        if let crate::tagged::value::ValueKind::Symbol(id) = root.gc_kind() {
             self.mark_symbol(id);
             return;
         }
@@ -1775,23 +1792,27 @@ impl TaggedHeap {
                 // SAFETY: `tptr` was recorded this cycle from a live veclike; the
                 // heap is exclusively owned here (mutator stopped), and nothing
                 // below mutates the table.
-                let ht = unsafe { &(*tptr).table };
-                let weakness = ht.weakness;
-                for entry in ht.data.entries_in_slot_order() {
-                    let (key, value) = (entry.key, entry.value);
-                    let key_survives = self.is_value_marked(key);
-                    let value_survives = self.is_value_marked(value);
-                    if Self::keep_weak_entry(weakness, key_survives, value_survives) {
-                        if !key_survives {
-                            self.mark_or_push_child(key, "weak-hash-key");
-                            marked = true;
+                let tables = self.collector_tables();
+                unsafe {
+                    tables.inspect(tptr, |ht| {
+                        let weakness = ht.weakness;
+                        for entry in ht.data.entries_in_slot_order() {
+                            let (key, value) = (entry.key, entry.value);
+                            let key_survives = self.is_value_marked(key);
+                            let value_survives = self.is_value_marked(value);
+                            if Self::keep_weak_entry(weakness, key_survives, value_survives) {
+                                if !key_survives {
+                                    self.mark_or_push_child(key, "weak-hash-key");
+                                    marked = true;
+                                }
+                                if !value_survives {
+                                    self.mark_or_push_child(value, "weak-hash-value");
+                                    marked = true;
+                                }
+                            }
                         }
-                        if !value_survives {
-                            self.mark_or_push_child(value, "weak-hash-value");
-                            marked = true;
-                        }
-                    }
-                }
+                    })
+                };
             }
             // Drain whatever those surviving entries reached, then re-check.
             self.mark_all();
@@ -1806,15 +1827,19 @@ impl TaggedHeap {
         for tptr in tables {
             // SAFETY: as above; exclusive heap access. Mirrors `builtin_remhash`'s
             // removal, in the same order.
-            let ht = unsafe { &mut (*tptr).table };
-            let weakness = ht.weakness;
-            ht.data.retain_entries(|key, value| {
-                Self::keep_weak_entry(
-                    weakness,
-                    self.is_value_marked(key),
-                    self.is_value_marked(value),
-                )
-            });
+            let tables = self.collector_tables();
+            unsafe {
+                tables.edit(tptr, |ht| {
+                    let weakness = ht.weakness;
+                    ht.data.retain_entries(|key, value| {
+                        Self::keep_weak_entry(
+                            weakness,
+                            self.is_value_marked(key),
+                            self.is_value_marked(value),
+                        )
+                    });
+                })
+            };
         }
     }
 

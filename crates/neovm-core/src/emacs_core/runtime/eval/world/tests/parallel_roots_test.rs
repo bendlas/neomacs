@@ -54,7 +54,7 @@ fn rooted_admission_rejects_real_capture_from_another_heap_and_returns_capabilit
     let keeper = second.issue_green_baton().unwrap();
     let second_heap = keeper.parallel_heap_identity();
     assert_ne!(first_heap, second_heap);
-    let heap: *mut crate::tagged::gc::TaggedHeap = &mut *second.tagged_heap;
+    let heap: *mut crate::tagged::gc::TaggedHeap = second.tagged_heap.heap_root().as_ptr();
     // SAFETY: this fresh Context is the sole serial owner; enumeration only
     // seeds its roots, and all capture/identity reads precede the heap loan.
     let collector = unsafe {
@@ -92,7 +92,7 @@ fn assert_fixture_refuses_before_registration(
     let keeper = context.issue_green_baton().unwrap();
     let expected = keeper.parallel_heap_identity();
     let frozen = context.capture_parallel_legacy_roots(&keeper).unwrap();
-    let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+    let heap: *mut crate::tagged::gc::TaggedHeap = context.tagged_heap.heap_root().as_ptr();
     // SAFETY: sole serial Context, no callback/manager loan, private capture
     // completed before this heap loan, and keeper excludes concurrent mark.
     let collector = unsafe {
@@ -224,4 +224,105 @@ fn a5_admission_refuses_full_context_with_gnu_default_weak_table() {
             .tagged_heap
             .alloc_cons(TaggedValue::fixnum(5104), TaggedValue::NIL)
     });
+}
+
+#[cfg(not(feature = "gc-memory-telemetry"))]
+#[test]
+fn a6_owned_admission_pins_shell_census_and_restores_empty_weak_table() {
+    let mut context = Context::new();
+    let shell = context
+        .tagged_heap
+        .alloc_cons(TaggedValue::fixnum(11), TaggedValue::fixnum(13));
+    context.lexenv = shell;
+    let shell_bits = shell.bits();
+    context
+        .admit_owned_parallel(|projection| {
+            assert!(
+                crate::tagged::gc::current_tagged_heap_identity().is_none(),
+                "overlap must not install the legacy heap TLS facade"
+            );
+            {
+                let era = projection.era();
+                let mut stopped = era.stop().expect("empty membership stops");
+                assert!(era.collect_stopped(&mut stopped).unwrap().major);
+                era.with_stopped_heap_for_test(&stopped, |heap| {
+                    let shell = TaggedValue::from_bits(shell_bits);
+                    assert!(heap.owns_heap_value_for_test(shell));
+                    assert_eq!(shell.cons_car_unobserved().as_fixnum(), Some(11));
+                    assert_eq!(shell.cons_cdr_unobserved().as_fixnum(), Some(13));
+                })
+                .unwrap();
+                stopped.complete().unwrap();
+                assert!(
+                    crate::tagged::gc::current_tagged_heap_identity().is_none(),
+                    "stopped collection must not install the legacy heap TLS facade"
+                );
+            }
+            let (collector, keeper) = projection.finish().unwrap();
+            (collector, keeper, ())
+        })
+        .unwrap_or_else(|error| panic!("owned admission: {error:?}"));
+    assert_eq!(context.lexenv.bits(), shell_bits);
+    assert_eq!(context.lexenv.cons_car_unobserved().as_fixnum(), Some(11));
+    let table = context.eval_str("window-dead-windows-table").unwrap();
+    let hash = table
+        .as_hash_table()
+        .expect("serial recovery installs a fresh empty weak table");
+    assert_eq!(hash.test, HashTableTest::Eql);
+    assert_eq!(hash.weakness, Some(HashTableWeakness::Value));
+    assert_eq!(hash.data.len(), 0);
+    assert!(
+        hash.data
+            .pending_entries()
+            .is_none_or(|entries| entries.is_empty())
+    );
+}
+
+#[cfg(not(feature = "gc-memory-telemetry"))]
+#[test]
+fn a6_owned_admission_refuses_nonempty_weak_table_without_clearing_it() {
+    let mut context = Context::new();
+    context
+        .eval_str("(puthash 1 2 window-dead-windows-table)")
+        .unwrap();
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let refused: Result<(), OwnedParallelError> = context.admit_owned_parallel(|_| {
+        started.store(true, std::sync::atomic::Ordering::Relaxed);
+        unreachable!("non-empty weak table must refuse before the body");
+    });
+    let error = refused.expect_err("non-empty GNU weak table stays outside admission");
+    assert_eq!(error, OwnedParallelError::Publication);
+    assert!(!started.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        context
+            .eval_str("(gethash 1 window-dead-windows-table)")
+            .unwrap()
+            .as_fixnum(),
+        Some(2)
+    );
+    assert!(
+        !context
+            .eval_str("window-dead-windows-table")
+            .unwrap()
+            .is_nil()
+    );
+}
+
+#[test]
+fn heapborrow_r9_collection_fixture_clears_and_restores_serial_tls() {
+    Context::with_test_collection_era_then(
+        |_| (),
+        |era, ()| {
+            assert!(!crate::tagged::gc::tagged_heap_is_installed());
+            let (collector, keeper) = era.finish().unwrap_or_else(|_| panic!("fixture finish"));
+            (collector, keeper, ())
+        },
+        |context, ()| {
+            assert!(crate::tagged::gc::tagged_heap_is_current(
+                &context.tagged_heap
+            ));
+            let value = TaggedValue::cons(TaggedValue::fixnum(53), TaggedValue::NIL);
+            assert_eq!(value.cons_car(), TaggedValue::fixnum(53));
+        },
+    );
 }

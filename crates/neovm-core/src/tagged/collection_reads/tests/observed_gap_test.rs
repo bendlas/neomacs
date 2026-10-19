@@ -12,7 +12,7 @@ use crate::emacs_core::jit::compile::{
 };
 use crate::heap_types::LispString;
 use crate::tagged::gc::{BarrierWindow, neovm_jit_unobserved_collection_owner, set_tagged_heap};
-use crate::tagged::header::{ConsCdrOrNext, ConsCell};
+use crate::tagged::header::{ConsCdrWord, ConsCell, ConsWord};
 use crate::tagged::value::TAG_MASK;
 
 struct ObservedMode;
@@ -44,7 +44,7 @@ fn context() -> Context {
         }
     }
     let _restore = RestoreGeneration(std::env::var_os("NEOVM_GC_GENERATIONAL"));
-    unsafe { std::env::remove_var("NEOVM_GC_GENERATIONAL") };
+    unsafe { std::env::set_var("NEOVM_GC_GENERATIONAL", "0") };
     let mut context = Context::new();
     context.gc_stress = false;
     context.tagged_heap.set_gc_threshold(usize::MAX);
@@ -269,10 +269,8 @@ fn observed_heap_switch_dump_change_discards_empty_gap() {
     // This valid writable image allocation outlives both heaps, as an actual
     // pdump mapping does. No fabricated header or non-object address is used.
     let image = Box::leak(Box::new(ConsCell {
-        car: TaggedValue::make_int(7),
-        cdr_or_next: ConsCdrOrNext {
-            cdr: TaggedValue::NIL,
-        },
+        car: ConsWord::new(TaggedValue::make_int(7)),
+        cdr_or_next: ConsCdrWord::new(TaggedValue::NIL),
     }));
     unsafe { second.tagged_heap.register_mapped_cons_range(image, 1) };
     let dump = second.tagged_heap.collection_dump_window();

@@ -5,6 +5,8 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+use super::super::a8_probes;
 use super::super::image::PublishedGcImage;
 use super::super::{EntryPhase, Mutator, RegistrationError};
 use super::{Mode, Phase, RendezvousError, entry_state, finish_debt, wait};
@@ -118,6 +120,7 @@ impl<'era> Mutator<'era> {
         let registry = self.registry;
         // A stopped-summary or root callback may reenter on this thread.
         // Retained control/entry guards must cause Busy rather than a spin.
+        let _park = registry.park_ticket();
         let mut gate = registry.lock()?;
         loop {
             registry.validate(&gate, self.entry.key)?;
@@ -156,10 +159,7 @@ impl<'era> Mutator<'era> {
             if registry.completed_epoch.load(Ordering::Acquire) != gate.rendezvous.completed {
                 return Err(RendezvousError::Publication);
             }
-            if state.run_loan
-                || state.worker_loan
-                || self.entry.live_run_loan.load(Ordering::Acquire)
-            {
+            if state.run_loan || state.worker_loan || self.entry.admitted() {
                 return Err(RendezvousError::Loan);
             }
             if state.readers != 0 {
@@ -244,10 +244,7 @@ impl<'owner, 'era> ResumeGcImage<'owner, 'era> {
         if registry.completed_epoch.load(Ordering::Acquire) != gate.rendezvous.completed {
             return Err(RendezvousError::Publication);
         }
-        if state.run_loan
-            || state.worker_loan
-            || self.owner.entry.live_run_loan.load(Ordering::Acquire)
-        {
+        if state.run_loan || state.worker_loan || self.owner.entry.admitted() {
             return Err(RendezvousError::Loan);
         }
         if state.readers != 0 {
@@ -270,6 +267,12 @@ impl<'owner, 'era> ResumeGcImage<'owner, 'era> {
             .finish_restore(self.owner.entry.key, &mut state.rendezvous);
         if completion.is_ok() {
             state.phase = EntryPhase::Running;
+            #[cfg(test)]
+            a8_probes::mark(
+                a8_probes::OWNER_RUNNING,
+                self.epoch,
+                self.owner.entry.key.owner,
+            );
         }
         drop(state);
         let completion = completion.and_then(|()| finish_debt(registry, &mut gate));
@@ -279,7 +282,7 @@ impl<'owner, 'era> ResumeGcImage<'owner, 'era> {
             gate.rendezvous.poison();
             registry.poison();
         }
-        registry.wake.notify_all();
+        registry.park.wake.notify_all();
         completion
     }
 

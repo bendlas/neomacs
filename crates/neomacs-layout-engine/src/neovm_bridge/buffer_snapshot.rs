@@ -136,6 +136,11 @@ impl LayoutBufferSnapshot {
     }
 
     /// Attach the `(when FORM . SPEC)` results evaluated for this walk.
+    /// The walk's `when` conditions, borrowed (the trait accessor clones).
+    pub(crate) fn display_when_conditions(&self) -> &crate::display_when::DisplayWhenConditions {
+        &self.display_when
+    }
+
     pub fn with_display_when(
         mut self,
         display_when: crate::display_when::DisplayWhenConditions,
@@ -377,7 +382,8 @@ impl LayoutBufferView for LayoutBufferSnapshot {
     }
 
     fn layout_indexed_newline_count(&self, range: EmacsByteRange) -> Option<usize> {
-        self.text_snapshot.indexed_newline_count(range)
+        self.text_snapshot
+            .indexed_newline_count(range, neovm_core::buffer::LineIndexBuild::IfLarge)
     }
 
     fn layout_text_prop_at_emacs_byte_pos(&self, pos: EmacsBytePos, name: Value) -> Option<Value> {

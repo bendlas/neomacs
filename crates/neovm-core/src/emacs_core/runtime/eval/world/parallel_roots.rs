@@ -7,6 +7,10 @@ use crate::gc_trace::GcTrace;
 use crate::tagged::gc::{AllStopped, HeapIdentity, RendezvousError};
 use crate::tagged::value::TaggedValue;
 
+#[path = "parallel_admission.rs"]
+mod parallel_admission;
+pub(crate) use parallel_admission::{OwnedParallelError, OwnedParallelProjection};
+
 /// An immutable census of the original Context, whose execution is suspended
 /// for the entire era. Construction is sealed to that Context before the
 /// QuiescentCollector heap loan exists. Values never cross an owner thread.
@@ -34,9 +38,10 @@ impl Context {
     #[cold]
     #[inline(never)]
     // No external capture factory: a same-heap snapshot could become stale
-    // after arbitrary Context execution. A5's only constructors are the closed
-    // fixture sequences below; a future production admission transaction must
-    // live in this module and preserve the same capture-to-admission boundary.
+    // after arbitrary Context execution. The production transaction is
+    // `admit_owned_parallel` in the child module. It calls this capture and
+    // then `admit_rooted` with no Context execution between them. The fixture
+    // sequences below remain the test-only NIL preclean.
     fn capture_parallel_legacy_roots(
         &self,
         keeper: &Baton,
@@ -217,7 +222,7 @@ impl Context {
         let frozen = context
             .capture_parallel_legacy_roots(&keeper)
             .expect("collection fixture frozen legacy roots");
-        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+        let heap: *mut crate::tagged::gc::TaggedHeap = context.tagged_heap.heap_root().as_ptr();
         // SAFETY: the original Context is serial and suspended, has no live
         // manager loan/callback, and captured its private roots before this
         // exclusive heap loan. The retained keeper excludes concurrent mark.
@@ -227,6 +232,9 @@ impl Context {
             })
         }
         .expect("collection fixture drain");
+        // Compare only the root address while the exclusive collector loan
+        // is retained. Synthetic participants cannot use the serial TLS view.
+        crate::tagged::gc::clear_tagged_heap_root_if_installed(context.tagged_heap.heap_root());
         let era = crate::tagged::gc::ParallelHeapEra::admit_rooted(collector, keeper, frozen)
             .unwrap_or_else(|failure| panic!("collection fixture admission: {:?}", failure.reason));
         body(era, input)
@@ -255,7 +263,7 @@ impl Context {
             .expect("collection fixture frozen legacy roots");
         let expected_heap = keeper.parallel_heap_identity();
         let expected_world = Arc::clone(&keeper.world);
-        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+        let heap: *mut crate::tagged::gc::TaggedHeap = context.tagged_heap.heap_root().as_ptr();
         // SAFETY: same sole-owner/capture-before-loan proof as the fixture above.
         let collector = unsafe {
             (*heap).drain_to_quiescent(|heap| {
@@ -263,6 +271,9 @@ impl Context {
             })
         }
         .expect("collection fixture drain");
+        // Compare only the root address while the exclusive collector loan
+        // is retained. Synthetic participants cannot use the serial TLS view.
+        crate::tagged::gc::clear_tagged_heap_root_if_installed(context.tagged_heap.heap_root());
         let era = crate::tagged::gc::ParallelHeapEra::admit_rooted(collector, keeper, frozen)
             .unwrap_or_else(|failure| panic!("collection fixture admission: {:?}", failure.reason));
         let (collector, keeper, output) = body(era, input);
@@ -275,6 +286,8 @@ impl Context {
         );
         drop(collector);
         drop(keeper);
+        // Both finish capabilities returned; their loans ended above.
+        context.tagged_heap.install_tagged_heap();
         after(&mut context, output);
     }
 }
@@ -282,3 +295,7 @@ impl Context {
 #[cfg(test)]
 #[path = "tests/parallel_roots_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/symbol_fixture.rs"]
+mod symbol_fixture;

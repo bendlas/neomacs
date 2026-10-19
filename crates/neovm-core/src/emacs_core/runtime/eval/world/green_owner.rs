@@ -37,7 +37,7 @@ use super::*;
 
 #[path = "parallel_roots.rs"]
 mod parallel_roots;
-pub(crate) use parallel_roots::FrozenLegacyRoots;
+pub(crate) use parallel_roots::{FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection};
 
 impl World {
     /// Finish publications before automatic field destruction reaches the heap.
@@ -99,6 +99,22 @@ impl fmt::Debug for Baton {
 }
 
 impl Baton {
+    /// Cold proof-3 backing admission. Original allocation roots only; no
+    /// Context view, heap reference or ordinary mutable manager borrow.
+    pub(crate) fn parallel_symbol_backing(
+        &self,
+    ) -> crate::emacs_core::symbol::parallel::SymbolBacking {
+        assert!(self.held_here(), "symbol backing keeper must be held here");
+        // SAFETY: era admission has escrowed the serial Context and retains
+        // this Baton for every owner loan, including abandoned-era retention.
+        unsafe {
+            crate::emacs_core::symbol::parallel::SymbolBacking::new(
+                std::ptr::NonNull::new(self.world.obarray.get()).expect("World obarray root"),
+                std::ptr::NonNull::from(&self.world.thread_projections),
+                Arc::as_ptr(&self.world) as usize,
+            )
+        }
+    }
     /// The calling OS thread has received the Baton: it is the holder.
     pub(crate) fn enter(&self) {
         self.world
@@ -175,7 +191,7 @@ impl Context {
         let keeper = context
             .issue_green_baton()
             .expect("fresh fixture World issues its keeper");
-        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+        let heap: *mut crate::tagged::gc::TaggedHeap = context.tagged_heap.heap_root().as_ptr();
         // SAFETY: this fresh Context is the sole running owner and holds the
         // keeper. No manager loan, callback, safepoint or collection extent
         // survives keeper issuance. Reseeding only enumerates the complete
@@ -187,6 +203,9 @@ impl Context {
             })
         }
         .expect("fresh fixture collector drains completely");
+        // Compare only the root address while the exclusive collector loan
+        // is retained. Synthetic participants cannot use the serial TLS view.
+        crate::tagged::gc::clear_tagged_heap_root_if_installed(context.tagged_heap.heap_root());
         let era = crate::tagged::gc::ParallelHeapEra::admit(collector, keeper)
             .unwrap_or_else(|_| panic!("fresh fixture World admits its mutator era"));
         f(era)
@@ -215,7 +234,7 @@ impl Context {
             });
         }
         let keeper = context.issue_green_baton().expect("rooted fixture keeper");
-        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *context.tagged_heap;
+        let heap: *mut crate::tagged::gc::TaggedHeap = context.tagged_heap.heap_root().as_ptr();
         // SAFETY: same complete frozen-World census as with_test_mutator_era.
         // SharedRoot table entries keep every synthetic input live as well.
         let collector = unsafe {
@@ -224,6 +243,9 @@ impl Context {
             })
         }
         .expect("rooted fixture collector");
+        // Compare only the root address while the exclusive collector loan
+        // is retained. Synthetic participants cannot use the serial TLS view.
+        crate::tagged::gc::clear_tagged_heap_root_if_installed(context.tagged_heap.heap_root());
         let era = crate::tagged::gc::ParallelHeapEra::admit(collector, keeper)
             .unwrap_or_else(|_| panic!("rooted fixture era"));
         f(era, roots)
@@ -237,7 +259,7 @@ impl Context {
     pub(in crate::emacs_core::eval) fn issue_green_baton(
         &mut self,
     ) -> Result<Baton, super::super::green::GreenStartError> {
-        let heap: *mut crate::tagged::gc::TaggedHeap = &mut *self.tagged_heap;
+        let heap: *mut crate::tagged::gc::TaggedHeap = self.tagged_heap.heap_root().as_ptr();
         // SAFETY: the sole running owner, at a safe point, with no manager
         // loan or callback live; the reseed enumerates the registered root
         // census and only adds mark roots (as admission's collector-closed

@@ -53,6 +53,13 @@ pub(in crate::tagged::gc) struct OwnerGcState {
     pub(in crate::tagged::gc) regions: RegionBook,
     pub(in crate::tagged::gc) region_stats: RegionStats,
     pub(in crate::tagged::gc) root_scratch: Vec<MarkWord>,
+    pub(super) root_slot_limit: usize,
+    pub(super) root_slot_generation: u64,
+    pub(super) catalog_region: Option<super::super::cons_storage::CatalogRegion>,
+    /// Owner-exclusive cons tails awaiting ACK/native-stop publication. Held
+    /// tails block publication exactly like an open region: the collector's
+    /// stopped picture must see one coherent catalog.
+    pub(super) cons_tails: Vec<super::super::cons_storage::OwnedConsTail>,
 }
 
 impl std::fmt::Debug for OwnerGcState {
@@ -295,15 +302,22 @@ impl OwnerGcState {
             regions: RegionBook::new(),
             region_stats: RegionStats::default(),
             root_scratch,
+            root_slot_limit: root_capacity,
+            root_slot_generation: 1,
+            catalog_region: None,
+            cons_tails: Vec::new(),
         })
     }
 
     pub(in crate::tagged::gc) fn validate_publication(&self) -> Result<(), ImageError> {
+        if self.catalog_region.is_some() || !self.cons_tails.is_empty() {
+            return Err(ImageError::RegionsOpen);
+        }
         validate_closed(&self.hot, &self.cold, &self.jit, &self.regions)
     }
 
     pub(in crate::tagged::gc) fn publish(&mut self) -> Result<PublishedGcImage, ImageError> {
-        validate_closed(&self.hot, &self.cold, &self.jit, &self.regions)?;
+        self.validate_publication()?;
         let young = self.cold.young.take_owner_payload()?;
         let roots = std::mem::take(&mut self.root_scratch);
         let stats = std::mem::take(&mut self.region_stats);

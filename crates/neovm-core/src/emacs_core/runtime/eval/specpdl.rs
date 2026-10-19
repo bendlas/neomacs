@@ -493,7 +493,7 @@ impl Context {
                 self.buffers
                     .current_buffer()
                     .and_then(|buffer| buffer.local_variable_binding_cell(resolved))
-                    .unwrap_or(blv.defcell)
+                    .unwrap_or(blv.defcell.get())
                     .cons_cdr()
             } else {
                 self.visible_runtime_variable_value_by_id_resolved(resolved)
@@ -734,6 +734,32 @@ impl Context {
         self.specbind_uncached(sym_id, value)
     }
 
+    // Keep bind's exact existing classifier, including its symbol identity
+    // and lazy initialization, out of the inline storage path. This call
+    // takes no Context for ordinary non-chrome bindings.
+    #[inline(never)]
+    fn local_chrome_binding_needs_publication(resolved: SymId) -> bool {
+        crate::buffer::buffer::variable_affects_chrome_by_sym_id(resolved)
+    }
+
+    // A local restoration continues to chrome publication after these
+    // existing syncs. Keep that whole continuation out of the inline unbind
+    // arms so they do not duplicate the plain binding's shared sync tail.
+    #[inline(never)]
+    fn finish_local_binding_restoration(&mut self, sym_id: SymId, old_value: Value) {
+        self.sync_cached_runtime_binding_by_id(sym_id, old_value);
+        self.sync_user_test_gc_binding_by_id(sym_id);
+        if crate::buffer::buffer::variable_affects_chrome_by_sym_id(sym_id) {
+            self.publish_local_chrome_binding(sym_id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn publish_local_chrome_binding(&mut self, resolved: SymId) {
+        self.mark_redisplay_dirty_if_display_var_resolved(resolved);
+    }
+
     /// [`Self::specbind_resolved`] after both cached tiers have refused: the
     /// general `specbind`. The JIT's `varbind` shim, which tries the tiers
     /// itself before it roots VALUE, enters here directly.
@@ -869,6 +895,12 @@ impl Context {
                             // Always-local slots need no flag
                             // change; conditional slots already
                             // have the bit set (has_local check).
+                        }
+                        // GNU's chrome-format watchers request redisplay on
+                        // let as well as set (frame.el). This direct slot
+                        // store bypasses the setter's publication.
+                        if Self::local_chrome_binding_needs_publication(resolved) {
+                            self.publish_local_chrome_binding(resolved);
                         }
                         return Ok(());
                     } else {
@@ -1762,8 +1794,9 @@ impl Context {
                             .buffers
                             .set_buffer_local_property_by_sym_id(buffer_id, sym_id, old_value);
                     }
-                    self.sync_cached_runtime_binding_by_id(sym_id, old_value);
-                    self.sync_user_test_gc_binding_by_id(sym_id);
+                    // The matching direct restoration must also repaint
+                    // chrome within the current command, before later Lisp.
+                    self.finish_local_binding_restoration(sym_id, old_value);
                 }
             }
             SpecBinding::LetDefault {
@@ -2101,3 +2134,7 @@ impl<'a> RestrictionScope<'a> {
         self.0.finish(result)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/specpdl_chrome_binding_test.rs"]
+mod chrome_binding_tests;

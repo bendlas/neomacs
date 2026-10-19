@@ -4,15 +4,11 @@
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use super::{LispCollectionRevision, note_heap_write};
 use crate::tagged::gc::HeapWriteKind;
-use crate::tagged::header::{CharTableObj, LispValueVec, SubCharTableObj};
+use crate::tagged::header::{AtomicTaggedValue, CharTableObj, LispValueVec, SubCharTableObj};
 use crate::tagged::value::TaggedValue;
-
-static_assertions::assert_eq_size!(TaggedValue, AtomicUsize);
-static_assertions::assert_eq_align!(TaggedValue, AtomicUsize);
 
 /// The sole slot-store seam. Its constructor is private to the barriered
 /// capability constructors below; there is no unbarriered public writer.
@@ -25,27 +21,18 @@ impl SlotWrite {
     /// The capability's pre-write barrier has run, with no intervening safe
     /// point. Concurrent marker access uses Acquire atomic loads.
     #[inline(always)]
-    unsafe fn publish(&self, slot: *mut TaggedValue, value: TaggedValue) {
-        // Publish newly constructed pointees too: a Release fence followed by
-        // this Relaxed store synchronizes with the marker's Acquire load that
-        // reads it. Both compile away to the original mov on x86; omitting the
-        // fence would lose constructor publication on arm64.
-        fence(Ordering::Release);
-        // SAFETY: the caller supplies the retained aligned word and the
-        // barrier-before-store contract; the pins above admit its atomic view.
-        unsafe { (*slot.cast::<AtomicUsize>()).store(value.bits(), Ordering::Relaxed) };
+    unsafe fn publish(&self, slot: *const AtomicTaggedValue, value: TaggedValue) {
+        // SAFETY: the capability retains actual cell storage and its barrier.
+        // Release also publishes the new pointee's constructor to marker loads.
+        unsafe { &*slot }.store_atomic(value);
     }
 
     #[inline(always)]
     fn backing_slot(&self, backing: &mut LispValueVec, index: usize, value: TaggedValue) {
-        // Table shapes never grow after construction. On a mapped backing,
-        // ensure_owned copies the immutable image; the marker keeps its
-        // start-captured span and never rereads this storage enum.
-        let data = backing.ensure_owned();
-        if index < data.len() {
-            // SAFETY: the bounds check proves an initialized aligned slot.
-            // This capability cannot resize or retire an owned table backing.
-            unsafe { self.publish(data.as_mut_ptr().add(index), value) };
+        // Fixed-shape writes retain captured owned cells; only immutable
+        // mapped storage is copied. Never create an exclusive bulk view here.
+        if index < backing.len() {
+            backing.store_atomic(index, value);
         }
     }
 }
@@ -111,7 +98,7 @@ impl CharTableWrite<'_> {
             unsafe {
                 self.slots.publish(
                     std::ptr::addr_of_mut!((*self.object.as_ptr()).contents)
-                        .cast::<TaggedValue>()
+                        .cast::<AtomicTaggedValue>()
                         .add(index),
                     value,
                 )

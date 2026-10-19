@@ -26,7 +26,9 @@
 //!   (bitmap), and the intrusive list (GcHeader chain), freeing unmarked
 //!   objects.
 //!
-//! No ObjId. No generations. No stale references.
+//! Generational collection (GEN1) is enabled by default. Set
+//! `NEOVM_GC_GENERATIONAL=0` before heap construction to use full-heap-only
+//! collection (GEN0); an unset or empty value keeps GEN1 enabled.
 
 use super::header::*;
 use super::value::TaggedValue;
@@ -61,7 +63,7 @@ pub enum WriteTrackingMode {
 ///
 /// GNU Emacs performs direct object/cell writes (`XSETCAR`, `XSETCDR`, `ASET`,
 /// symbol value writes, etc.).  Neomacs keeps the same Lisp-visible semantics,
-/// but records mutation metadata here so future generational or incremental
+/// but records mutation metadata here so generational and concurrent
 /// collectors have a single write-barrier surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeapWriteKind {
@@ -219,8 +221,11 @@ thread_local! {
     static TAGGED_HEAP_SATB_CACHE: [Cell<usize>; BARRIER_CACHE_SLOTS] =
         const { [const { Cell::new(0) }; BARRIER_CACHE_SLOTS] };
     /// Auto-allocated heap for tests that construct Values without a Context.
+    /// The owner keeps the allocation's single provenance root, so the raw
+    /// pointer installed in `TAGGED_HEAP` is never derived from a borrow that
+    /// a later `borrow_mut` would invalidate.
     #[cfg(test)]
-    static TEST_FALLBACK_TAGGED_HEAP: std::cell::RefCell<Option<Box<TaggedHeap>>> =
+    static TEST_FALLBACK_TAGGED_HEAP: std::cell::RefCell<Option<AliasableBox<TaggedHeap>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -618,9 +623,9 @@ pub struct TaggedHeap {
 
     /// Owners mutated since the last full collection.
     ///
-    /// This is the minimal remembered-set precursor for future generational
-    /// or incremental GC. We keep owner identity, not child edges, because the
-    /// current collector is still full-heap mark-sweep.
+    /// Optional write-observation metadata for tests and introspection.
+    /// Generational remembered sets and concurrent SATB logs are maintained
+    /// separately, independently of this tracking mode.
     write_tracking_mode: WriteTrackingMode,
     dirty_owners: Vec<TaggedValue>,
     /// FIRST-CYCLE-CONCURRENT: armed by the driver (`arm_first_cycle_concurrent`)
@@ -781,7 +786,7 @@ pub struct TaggedHeap {
     /// points at these immutable buffers, so they must stay alive until the GC thread
     /// joins. Drained + dropped in `join_concurrent_mark` (the GC thread has provably
     /// exited — the only safe free point). Empty unless a clone-on-write fired.
-    retired_vector_buffers: Vec<Vec<TaggedValue>>,
+    retired_vector_buffers: Vec<Vec<super::header::AtomicTaggedValue>>,
     /// Stage 2 Tier B CONCURRENT VECTOR SCAN: per-cycle clone-on-write dedup set,
     /// keyed on each vector owner's `TaggedValue` bits. On an owner's FIRST bulk
     /// mutation this cycle we clone+retire its OWNED backing once; later mutations of
@@ -990,7 +995,7 @@ impl TaggedHeap {
         let identity = HeapIdentity::issue();
         let mut heap = Self {
             generational: generational::GenState::new(
-                std::env::var("NEOVM_GC_GENERATIONAL").as_deref() == Ok("1"),
+                std::env::var("NEOVM_GC_GENERATIONAL").as_deref() != Ok("0"),
             ),
             jit: JitHeapState::new(),
             region_book: RegionBook::new(),
@@ -1681,7 +1686,7 @@ impl TaggedHeap {
                         .push(record.owner);
                 }
                 if let Some(value) = record.value
-                    && let crate::tagged::value::ValueKind::Symbol(id) = value.kind()
+                    && let crate::tagged::value::ValueKind::Symbol(id) = value.gc_kind()
                 {
                     // Bare symbols have no born-black heap header. Keep the
                     // inserted-symbol fact for roots and non-cons owners too.
@@ -1749,7 +1754,7 @@ impl TaggedHeap {
                     .old_cons_trailer(owner)
                     .is_some_and(|(trailer, index)| trailer.age_is_old(index))
                 {
-                    self.mark_owner_card(owner.xcons_ptr() as usize);
+                    self.mark_owner_card(owner.gc_cons_ptr() as usize);
                 }
             } else if let Some(addr) = Self::value_heap_addr(owner) {
                 let header = unsafe { &*(addr as *const GcHeader) };
@@ -1809,17 +1814,7 @@ impl TaggedHeap {
     /// Raw object address for a heap-tagged value (cons/veclike/string/float),
     /// used for the dump-partition address-span test.
     fn value_heap_addr(value: TaggedValue) -> Option<usize> {
-        if value.is_cons() {
-            Some(value.xcons_ptr() as usize)
-        } else if value.is_veclike() {
-            value.as_veclike_ptr().map(|ptr| ptr as usize)
-        } else if value.is_string() {
-            value.as_string_ptr().map(|ptr| ptr as usize)
-        } else if value.is_float() {
-            value.as_float_ptr().map(|ptr| ptr as usize)
-        } else {
-            None
-        }
+        value.gc_heap_ptr().map(|ptr| ptr as usize)
     }
 
     /// True if `value` is a mapped (pdump) object, via the address span that
@@ -2264,7 +2259,11 @@ impl TaggedHeap {
         }
     }
 
-    fn note_boxed_list_layout(mut header: *const GcHeader, stats: &mut Vec<BoxedKindLayoutStats>) {
+    fn note_boxed_list_layout(
+        &self,
+        mut header: *const GcHeader,
+        stats: &mut Vec<BoxedKindLayoutStats>,
+    ) {
         while !header.is_null() {
             let class = Self::boxed_class(header);
             let index = stats
@@ -2281,7 +2280,7 @@ impl TaggedHeap {
             item.objects += 1;
             item.known_bytes = item
                 .known_bytes
-                .saturating_add(Self::object_bytes_from_header(header));
+                .saturating_add(self.collector_object_bytes(header));
             unsafe {
                 item.tenured_objects += usize::from((*header).tenured);
                 header = (*header).gc_link();
@@ -2410,10 +2409,10 @@ impl TaggedHeap {
         }
 
         let mut boxed = Vec::new();
-        Self::note_boxed_list_layout(self.all_objects, &mut boxed);
-        Self::note_boxed_list_layout(self.tenured_objects, &mut boxed);
-        Self::note_boxed_list_layout(self.generational.old_objects, &mut boxed);
-        Self::note_boxed_list_layout(self.generational.old_sweep_pending, &mut boxed);
+        self.note_boxed_list_layout(self.all_objects, &mut boxed);
+        self.note_boxed_list_layout(self.tenured_objects, &mut boxed);
+        self.note_boxed_list_layout(self.generational.old_objects, &mut boxed);
+        self.note_boxed_list_layout(self.generational.old_sweep_pending, &mut boxed);
         boxed.sort_by_key(|layout| std::cmp::Reverse(layout.known_bytes));
 
         let page_backing_bytes = cons
@@ -2554,7 +2553,13 @@ impl TaggedHeap {
             // concurrent mark this is allocate-black; otherwise it pre-arms
             // the bit so the next begin_collection flip reads it as white.
             (*header).gc.set_marked(self.mark_parity);
-            let gc_header = &mut (*header).gc as *mut GcHeader;
+            // `addr_of_mut!`, not `&mut (*header).gc as *mut GcHeader`: a
+            // reference to the field is retagged with just the GcHeader's
+            // extent, while the pointer names the whole VecLikeHeader and is
+            // read beyond that extent (the test probe reads `type_tag` at
+            // offset 0x10). The raw place projection keeps the allocation's
+            // full provenance.
+            let gc_header = std::ptr::addr_of_mut!((*header).gc);
             let inserted = self.non_cons_object_addrs.insert(gc_header as usize);
             debug_assert!(inserted, "veclike object linked twice");
             // Task #7 stage 2a (Fix A): maintain the incremental vector
@@ -2684,6 +2689,7 @@ mod record_arena_tests;
 /// matters) VERIFY_PARTITION.
 mod allocation;
 
+mod collector_tables;
 mod mark_sweep;
 
 #[cfg(feature = "gc-memory-telemetry")]
@@ -2716,6 +2722,9 @@ mod shutdown_tests;
 pub(crate) use concurrent::{concurrent_hash_snapshot, prepare_concurrent_hash_write};
 pub(crate) mod concurrent_hash;
 
+mod rows_observation;
+pub(crate) use rows_observation::RowsOwnedDomain;
+
 mod incremental;
 mod reclamation;
 use reclamation::ReclamationMode;
@@ -2739,6 +2748,7 @@ use collection_observed::{
     clear_cons_observed_block, clear_cons_observed_dead, has_noncons_collection_observations,
 };
 mod cons_allocator;
+mod cons_storage;
 use cons_allocator::{ConsAllocatorOwner, ConsBlockBase};
 mod cons_blocks;
 /// The cons-block trailer's shape, for `jit_layout::heap`.
@@ -2748,6 +2758,15 @@ pub(crate) use cons_block_trailer::{
     CONS_MARKS_OFFSET, ConsAge,
 };
 use cons_blocks::*;
+
+mod aliasable;
+mod collector_reads;
+pub(crate) use aliasable::AliasableBox;
+#[cfg(test)]
+#[path = "gc/tests/test_heap.rs"]
+mod test_heap;
+#[cfg(test)]
+pub(crate) use test_heap::TestHeap;
 
 mod arena_pages;
 pub(crate) use arena_pages::*;
@@ -2791,14 +2810,18 @@ pub use facade_mark::{
     QuiescentCollector,
 };
 pub use mutator_registration::{
-    AllStopped, AllStoppedFailure, CollectionError, CollectionReport, Mode, Mutator, MutatorEntry,
-    MutatorFinishFailure, MutatorKey, MutatorPermit, MutatorStartFailure, OwnerPublication,
-    ParallelHeapEra, Phase, RegistrationCensus, RegistrationError, Rendezvous, RendezvousError,
-    Request, ResumeGcImage, ResumeGcImageFailure, RootedRetireFailure, RunAccess, Snapshot,
-    StoppedSummaries, YoungWorkerLoan,
+    AllStopped, AllStoppedFailure, CollectionError, CollectionReport, GlobalError, KeeperSymbols,
+    KeeperTableMut, Mode, Mutator, MutatorEntry, MutatorFinishFailure, MutatorKey, MutatorPermit,
+    MutatorStartFailure, NativeReturn, NativeRoots, OwnerPublication, OwnerRootSlot,
+    ParallelHeapEra, Phase, PlainSymbolBacking, RegistrationCensus, RegistrationError, Rendezvous,
+    RendezvousError, Request, ResumeGcImage, ResumeGcImageFailure, RootedRetireFailure, RunAccess,
+    RunSlice, SealedTableAccess, SliceRoot, Snapshot, StoppedSummaries, SymbolHandle, SymbolMut,
+    SymbolRef, TableMut, TableRef, YoungWorkerLoan,
 };
 
-pub(crate) use mutator_registration::{OwnerRootAdmission, StoppedRootAdmission};
+pub(crate) use mutator_registration::{
+    OwnerRootAdmission, StoppedRootAdmission, SymbolReadToken, SymbolWriteToken,
+};
 
 mod alloc_region;
 #[cfg(test)]

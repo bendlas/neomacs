@@ -1,0 +1,19 @@
+error[E0599]: the associated function or constant `transfer` exists for struct `ThreadTransfer<NativeRoots<'static>>`, but its trait bounds were not satisfied
+ --> tests/p1rv_ui/native_roots_cannot_cross_threads.rs:8:45
+  |
+8 |     ThreadTransfer::<NativeRoots<'static>>::transfer(roots);
+  |                                             ^^^^^^^^ associated function or constant cannot be called on `ThreadTransfer<NativeRoots<'static>>` due to unsatisfied trait bounds
+  |
+ ::: src/tagged/gc/mutator_registration/native_extent.rs
+  |
+  | pub struct NativeRoots<'extent> {
+  | ------------------------------- doesn't satisfy `NativeRoots<'static>: Send`
+  |
+ ::: tests/p1rv_ui/../thread_safety_ui/support/thread_bounds.rs
+  |
+  | pub struct ThreadTransfer<T>(PhantomData<T>);
+  | ---------------------------- associated function or constant `transfer` not found for this struct
+  |
+  = note: the following trait bounds were not satisfied:
+          `Rc<()>: Send`
+          which is required by `NativeRoots<'static>: Send`

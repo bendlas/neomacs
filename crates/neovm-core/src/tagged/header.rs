@@ -15,16 +15,19 @@ use super::value::TaggedValue;
 use malachite::integer::Integer;
 use neomacs_display_protocol::{VideoId, WebViewId};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+mod atomic_value;
+pub use atomic_value::AtomicTaggedValue;
+mod value_vec;
+pub use value_vec::OwnedValueVec;
 
 // ---------------------------------------------------------------------------
 // ConsCell — no header, minimal size
 // ---------------------------------------------------------------------------
 
-/// A cons cell: two tagged values, no header.
-///
-/// 16 bytes on 64-bit. GC marks cons cells via an external bitmap
-/// in the block allocator, not via an in-object flag.
+/// A cons cell word's cdr/next-free union.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union ConsCdrOrNext {
@@ -32,12 +35,216 @@ pub union ConsCdrOrNext {
     pub next_free: *mut ConsCell,
 }
 
-#[derive(Clone, Copy)]
+/// One cons cell word: an interior-mutable, atomically writable place.
+///
+/// See the [`ConsCell`] interior-mutability contract.
+#[repr(transparent)]
+pub struct ConsWord(UnsafeCell<TaggedValue>);
+
+impl ConsWord {
+    #[inline(always)]
+    pub const fn new(value: TaggedValue) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    /// Plain owner read.
+    ///
+    /// Sound while the only concurrent access is the marker's atomic load:
+    /// two reads never conflict. A thread that writes this word must also be
+    /// the thread that reads it plainly (the single-owner contract).
+    #[inline(always)]
+    pub fn get(&self) -> TaggedValue {
+        // SAFETY: reads through an UnsafeCell are always allowed; the owner
+        // contract above bounds concurrent writers.
+        unsafe { *self.0.get() }
+    }
+
+    /// Atomic (acquire) read for the concurrent marker. Acquire pairs with the
+    /// release publication stores (see the module's publication-ordering
+    /// contract on [`load_value_atomic`]): dereferencing a freshly-published
+    /// heap pointer loaded here observes the pointee's fully-written
+    /// `GcHeader`.
+    #[inline]
+    pub fn load_atomic(&self) -> TaggedValue {
+        // SAFETY: the cell is live and aligned; concurrent access is atomic.
+        let word =
+            unsafe { AtomicUsize::from_ptr(self.0.get().cast::<usize>()).load(Ordering::Acquire) };
+        TaggedValue::from_bits(word)
+    }
+
+    /// Atomic (release) store. Release-ordered: publishing a heap pointer into
+    /// a GC-visible cell must happen-after the pointee's header/constructor
+    /// writes (the publication-ordering contract on [`load_value_atomic`]).
+    /// On x86-TSO both release stores and plain stores compile to `mov`.
+    ///
+    /// Takes `&self`, not `&mut self`: the marker may hold shared provenance
+    /// to this cell concurrently, and taking `&mut` would invalidate it.
+    #[inline(always)]
+    pub fn store_atomic(&self, value: TaggedValue) {
+        // SAFETY: the cell is live and aligned, and all concurrent writes use
+        // this atomic path. `UnsafeCell` supplies the write permission.
+        unsafe {
+            AtomicUsize::from_ptr(self.0.get().cast::<usize>())
+                .store(value.bits(), Ordering::Release)
+        };
+    }
+
+    /// Plain store for a reclaimed free-list cell, which no marker can reach.
+    ///
+    /// `&mut self` proves the word is unshared, so this is an ordinary safe
+    /// write through the interior-mutable place.
+    #[inline]
+    pub fn set_plain(&mut self, value: TaggedValue) {
+        *self.0.get_mut() = value;
+    }
+}
+
+impl std::ops::Deref for ConsWord {
+    type Target = TaggedValue;
+    /// Plain owner read, exposed as a reference so the ordinary `TaggedValue`
+    /// method surface (`.as_fixnum()`, `.bits()`, ...) stays usable.
+    ///
+    /// The referenced word may be written atomically by the *owner*, never by
+    /// the marker, so this is the same read/read situation as
+    /// [`ConsWord::get`]. `TaggedValue` is `!Send`/`!Sync`, so the reference
+    /// cannot reach another thread through safe code.
+    #[inline(always)]
+    fn deref(&self) -> &TaggedValue {
+        // SAFETY: see above; the cell is live for `&self`'s lifetime.
+        unsafe { &*self.0.get() }
+    }
+}
+
+impl PartialEq<TaggedValue> for ConsWord {
+    #[inline(always)]
+    fn eq(&self, other: &TaggedValue) -> bool {
+        self.get() == *other
+    }
+}
+
+impl std::fmt::Debug for ConsWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+/// The cons cell's cdr/next-free union word, with the same interior-mutability
+/// contract as [`ConsWord`].
+#[repr(transparent)]
+pub struct ConsCdrWord(UnsafeCell<ConsCdrOrNext>);
+
+impl ConsCdrWord {
+    #[inline(always)]
+    pub const fn new(cdr: TaggedValue) -> Self {
+        Self(UnsafeCell::new(ConsCdrOrNext { cdr }))
+    }
+
+    #[inline(always)]
+    pub const fn from_next(next: *mut ConsCell) -> Self {
+        Self(UnsafeCell::new(ConsCdrOrNext { next_free: next }))
+    }
+
+    /// Plain owner read of the live `cdr` member. See [`ConsWord::get`].
+    #[inline(always)]
+    pub fn get(&self) -> TaggedValue {
+        // SAFETY: the caller keeps `cdr` the active member; every bit pattern
+        // of the union's first word is a valid TaggedValue.
+        unsafe { (*self.0.get()).cdr }
+    }
+
+    /// Atomic (acquire) read of the cdr word for the concurrent marker.
+    #[inline]
+    pub fn load_atomic(&self) -> TaggedValue {
+        // SAFETY: the cell is live and aligned; concurrent access is atomic.
+        let word =
+            unsafe { AtomicUsize::from_ptr(self.0.get().cast::<usize>()).load(Ordering::Acquire) };
+        TaggedValue::from_bits(word)
+    }
+
+    /// Atomic (release) store of the cdr word. See [`ConsWord::store_atomic`].
+    #[inline(always)]
+    pub fn store_atomic(&self, value: TaggedValue) {
+        // SAFETY: as `ConsWord::store_atomic`.
+        unsafe {
+            AtomicUsize::from_ptr(self.0.get().cast::<usize>())
+                .store(value.bits(), Ordering::Release)
+        };
+    }
+
+    /// Plain read of the free-list link from a reclaimed cell.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be a free cons cell, making `next_free` the active member.
+    #[inline]
+    pub unsafe fn free_next(&self) -> *mut ConsCell {
+        // SAFETY: the caller proves the union holds `next_free`.
+        unsafe { (*self.0.get()).next_free }
+    }
+
+    /// Plain overwrite of the whole union word for a reclaimed cell.
+    ///
+    /// As [`ConsWord::set_plain`]: `&mut self` proves the word is unshared.
+    #[inline]
+    pub fn set_plain(&mut self, word: ConsCdrOrNext) {
+        *self.0.get_mut() = word;
+    }
+}
+
+/// A cons cell: two tagged values, no header.
+///
+/// 16 bytes on 64-bit. GC marks cons cells via an external bitmap
+/// in the block allocator, not via an in-object flag.
+///
+/// # Interior mutability
+///
+/// A live cons cell is read by the concurrent marker while its owner mutator
+/// writes it, so both words are [`UnsafeCell`]s. That interior mutability is
+/// load-bearing, not stylistic:
+///
+/// - The marker holds **shared** provenance to the cell (`&ConsCell` or a
+///   `*const` derived from one). A store derived from that shared provenance
+///   would be UB under both Stacked and Tree Borrows *and* would be a data
+///   race against the owner's plain loads in the language memory model.
+/// - With the words in `UnsafeCell`s, every writer — the owner mutator and any
+///   GC helper mutator — stores atomically through the same interior-mutable
+///   place, and no writer needs `&mut` to the cell. Taking `&mut` would
+///   invalidate the marker's shared tag under Stacked Borrows even when the
+///   store itself is atomic.
+/// - The owner's own reads stay plain loads ([`ConsWord::get`]): the marker
+///   only ever reads, and read/read does not conflict.
+///
+/// Layout is byte-identical to the former `(TaggedValue, union)` pair
+/// (`UnsafeCell` is `repr(transparent)`); the static assertions below pin it.
+impl PartialEq<TaggedValue> for ConsCdrWord {
+    #[inline(always)]
+    fn eq(&self, other: &TaggedValue) -> bool {
+        self.get() == *other
+    }
+}
+
+impl std::fmt::Debug for ConsCdrWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
 #[repr(C)]
 pub struct ConsCell {
-    pub car: TaggedValue,
-    pub cdr_or_next: ConsCdrOrNext,
+    pub car: ConsWord,
+    pub cdr_or_next: ConsCdrWord,
 }
+
+// The words must stay bit-compatible with a bare `TaggedValue`: the JIT bakes
+// car/cdr offsets and reads the words as tagged values directly.
+static_assertions::assert_eq_size!(ConsCell, [usize; 2]);
+static_assertions::assert_eq_align!(ConsCell, usize);
+static_assertions::assert_eq_size!(ConsWord, TaggedValue);
+static_assertions::assert_eq_align!(ConsWord, TaggedValue);
+static_assertions::assert_eq_size!(ConsCdrWord, ConsCdrOrNext);
+static_assertions::assert_eq_align!(ConsCdrWord, ConsCdrOrNext);
+const _: () = assert!(std::mem::offset_of!(ConsCell, car) == 0);
+const _: () = assert!(std::mem::offset_of!(ConsCell, cdr_or_next) == std::mem::size_of::<usize>());
 
 impl ConsCell {
     /// Read the live cons cell's cdr union member.
@@ -48,7 +255,7 @@ impl ConsCell {
     /// the active union field rather than `next_free`.
     #[inline(always)]
     pub unsafe fn cdr(&self) -> TaggedValue {
-        unsafe { self.cdr_or_next.cdr }
+        self.cdr_or_next.get()
     }
 
     /// Atomic (acquire) read of `car` — used by GC tracing, which may run on a
@@ -64,10 +271,7 @@ impl ConsCell {
     /// the atomic load/store helpers while concurrent collection is possible.
     #[inline]
     pub unsafe fn load_car(&self) -> TaggedValue {
-        let p = &self.car as *const TaggedValue as *const AtomicUsize;
-        // SAFETY: the caller keeps this cons live and uses atomic slot access.
-        // TaggedValue's pinned word size/alignment admits the AtomicUsize view.
-        TaggedValue::from_bits(unsafe { (*p).load(Ordering::Acquire) })
+        self.car.load_atomic()
     }
 
     /// Atomic (acquire) read of `cdr` (the cdr/next-free union word).
@@ -78,10 +282,7 @@ impl ConsCell {
     /// field, and concurrent writes must use [`Self::set_cdr`].
     #[inline]
     pub unsafe fn load_cdr(&self) -> TaggedValue {
-        let p = &self.cdr_or_next as *const ConsCdrOrNext as *const AtomicUsize;
-        // SAFETY: the caller proves this live union contains `cdr` and all
-        // concurrent writes are atomic. Its word has AtomicUsize alignment.
-        TaggedValue::from_bits(unsafe { (*p).load(Ordering::Acquire) })
+        self.cdr_or_next.load_atomic()
     }
 
     /// Store `car` atomically so a concurrent GC read sees a whole value,
@@ -93,11 +294,11 @@ impl ConsCell {
     /// # Safety
     ///
     /// `self` must be a live cons cell and the supplied tagged value must obey
-    /// the GC publication contract described above.
+    /// the GC publication contract described above. Takes `&self` because the
+    /// word is interior-mutable and the marker may hold a shared tag.
     #[inline(always)]
-    pub unsafe fn set_car(&mut self, value: TaggedValue) {
-        let p = &self.car as *const TaggedValue as *const AtomicUsize;
-        unsafe { (*p).store(value.0, Ordering::Release) };
+    pub unsafe fn set_car(&self, value: TaggedValue) {
+        self.car.store_atomic(value);
     }
 
     /// Store the cdr using release ordering.
@@ -106,10 +307,10 @@ impl ConsCell {
     ///
     /// `self` must be a live cons cell and `value` must be a valid tagged value
     /// whose pointee, if any, has been fully initialized before publication.
+    /// Takes `&self`, like [`Self::set_car`].
     #[inline(always)]
-    pub unsafe fn set_cdr(&mut self, value: TaggedValue) {
-        let p = &self.cdr_or_next as *const ConsCdrOrNext as *const AtomicUsize;
-        unsafe { (*p).store(value.0, Ordering::Release) };
+    pub unsafe fn set_cdr(&self, value: TaggedValue) {
+        self.cdr_or_next.store_atomic(value);
     }
 
     /// Read the free-list link from a reclaimed cons cell.
@@ -120,7 +321,7 @@ impl ConsCell {
     /// field.
     #[inline]
     pub unsafe fn free_next(&self) -> *mut ConsCell {
-        unsafe { self.cdr_or_next.next_free }
+        unsafe { self.cdr_or_next.free_next() }
     }
 
     /// Convert a reclaimed cons cell into a free-list node.
@@ -140,8 +341,9 @@ impl ConsCell {
         // perfectly ordinary Lisp value; `dead_object` is one no live object
         // can hold, so the car answers "this cell is on the free list" in O(1)
         // (GNU's `deadp`, src/alloc.c:425-429).
-        self.car = TaggedValue::DEAD;
-        self.cdr_or_next.next_free = next;
+        self.car.set_plain(TaggedValue::DEAD);
+        self.cdr_or_next
+            .set_plain(ConsCdrOrNext { next_free: next });
     }
 }
 
@@ -963,7 +1165,7 @@ impl<'a> IntoIterator for &'a &'a LispValueSlice {
 }
 
 enum LispValueVecStorage {
-    Owned(Vec<TaggedValue>),
+    Owned(Vec<AtomicTaggedValue>),
     Mapped { ptr: *const TaggedValue, len: usize },
 }
 
@@ -982,7 +1184,7 @@ impl std::fmt::Debug for LispValueVec {
 impl LispValueVec {
     pub fn owned(items: Vec<TaggedValue>) -> Self {
         Self {
-            storage: LispValueVecStorage::Owned(items),
+            storage: LispValueVecStorage::Owned(value_vec::into_cells(items)),
         }
     }
 
@@ -1088,7 +1290,13 @@ impl LispValueVec {
 
     pub fn as_slice(&self) -> &[TaggedValue] {
         match self.storage {
-            LispValueVecStorage::Owned(ref items) => items,
+            LispValueVecStorage::Owned(ref items) => {
+                // SAFETY: cells have the same word layout. This owner-only
+                // read view never supplies the concurrent marker's provenance.
+                unsafe {
+                    &*(items.as_slice() as *const [AtomicTaggedValue] as *const [TaggedValue])
+                }
+            }
             LispValueVecStorage::Mapped { ptr, len } => {
                 if len == 0 {
                     &[]
@@ -1099,15 +1307,22 @@ impl LispValueVec {
         }
     }
 
-    pub fn ensure_owned(&mut self) -> &mut Vec<TaggedValue> {
-        if let LispValueVecStorage::Mapped { .. } = self.storage {
-            let items = self.as_slice().to_vec();
-            self.storage = LispValueVecStorage::Owned(items);
-        }
+    /// Exclusive bulk mutation of an uncaptured backing. The barriered bulk
+    /// seams retire captured allocations before creating this ownership guard.
+    #[inline]
+    pub fn ensure_owned(&mut self) -> OwnedValueVec<'_> {
+        OwnedValueVec::new(self.owned_cells())
+    }
+
+    /// Promote immutable mapped words without borrowing any owned slot uniquely.
+    #[inline]
+    fn owned_cells(&mut self) -> &mut Vec<AtomicTaggedValue> {
         match self.storage {
             LispValueVecStorage::Owned(ref mut items) => items,
             LispValueVecStorage::Mapped { .. } => {
-                unreachable!("mapped vector storage was copied to owned slots")
+                let items = value_vec::into_cells(self.as_slice().to_vec());
+                self.storage = LispValueVecStorage::Owned(items);
+                self.owned_cells()
             }
         }
     }
@@ -1122,41 +1337,45 @@ impl LispValueVec {
     /// Atomic (acquire) load of element `i`, for GC tracing that may run on a
     /// concurrent collector thread while the mutator stores via `store_atomic`
     /// (see the publication-ordering contract on [`load_value_atomic`]).
-    /// Panics on out-of-bounds, like slice indexing.
+    /// Returns None for an out-of-bounds index.
     #[inline]
-    pub fn load_atomic(&self, i: usize) -> TaggedValue {
-        let p = &self.as_slice()[i] as *const TaggedValue as *const AtomicUsize;
-        // SAFETY: indexing proves a live, aligned slot in the borrowed backing.
-        // TaggedValue is one aligned word; concurrent slot writes use Release.
-        TaggedValue::from_bits(unsafe { (*p).load(Ordering::Acquire) })
+    pub fn load_atomic(&self, i: usize) -> Option<TaggedValue> {
+        match &self.storage {
+            LispValueVecStorage::Owned(items) => items.get(i).map(AtomicTaggedValue::load_atomic),
+            // Mapped image words are immutable, never published in place.
+            LispValueVecStorage::Mapped { .. } => self.as_slice().get(i).copied(),
+        }
     }
 
-    /// Atomic (release) store to element `i` of owned storage. The element must
-    /// exist; this is for in-place slot writes (e.g. `aset`), not growth.
-    /// Release publishes the stored pointee's header/constructor writes to the
-    /// GC thread's acquire loads (contract on [`load_value_atomic`]).
+    /// Release-publish an existing slot through its actual cell. Promotion of
+    /// an immutable image creates fresh cells; it never casts mapped words to cells.
+    /// Returns false for an out-of-bounds index.
     #[inline]
-    pub fn store_atomic(&mut self, i: usize, value: TaggedValue) {
-        let data = self.ensure_owned();
-        let p = &data[i] as *const TaggedValue as *const AtomicUsize;
-        unsafe { (*p).store(value.0, Ordering::Release) };
+    pub fn store_atomic(&mut self, i: usize, value: TaggedValue) -> bool {
+        let Some(slot) = self.owned_cells().get(i) else {
+            return false;
+        };
+        slot.store_atomic(value);
+        true
     }
 
-    /// Iterate every element via atomic (acquire) loads — the GC tracing read
-    /// path. Yields owned `TaggedValue`s (snapshots of each slot word).
+    /// Acquire owned cells; read immutable mapped words plainly. Both iterators
+    /// retain their actual storage's provenance.
     #[inline]
     pub fn iter_atomic(&self) -> impl Iterator<Item = TaggedValue> + '_ {
-        self.as_slice().iter().map(|slot| {
-            let p = slot as *const TaggedValue as *const AtomicUsize;
-            // SAFETY: the backing borrow retains this aligned word slot, and
-            // its concurrent accesses follow the atomic publication contract.
-            TaggedValue::from_bits(unsafe { (*p).load(Ordering::Acquire) })
-        })
+        let (owned, mapped): (&[AtomicTaggedValue], &[TaggedValue]) = match &self.storage {
+            LispValueVecStorage::Owned(items) => (items, &[]),
+            LispValueVecStorage::Mapped { .. } => (&[], self.as_slice()),
+        };
+        owned
+            .iter()
+            .map(AtomicTaggedValue::load_atomic)
+            .chain(mapped.iter().copied())
     }
 
     /// Stage 2 Tier B CONCURRENT VECTOR SCAN: capture this backing's base pointer,
-    /// length, and storage kind for the start-of-cycle [`VectorScanSnapshot`]. The
-    /// GC thread reads `[base, base+len)` via atomic loads (`load_value_atomic`).
+    /// length, and storage kind for the start-of-cycle [`VectorScanSnapshot`].
+    /// The GC reads owned cells atomically and immutable mapped words plainly.
     ///
     /// The base pointer is the backing's contiguous `TaggedValue` array — the `Vec`'s
     /// heap buffer for `Owned`, the immutable mapped span for `Mapped`. It stays
@@ -1166,16 +1385,11 @@ impl LispValueVec {
     #[inline]
     pub(crate) fn scan_entry(&self) -> VectorScanEntry {
         match self.storage {
-            LispValueVecStorage::Owned(ref items) => VectorScanEntry {
+            LispValueVecStorage::Owned(ref items) => VectorScanEntry::Owned {
                 base: items.as_ptr(),
                 len: items.len(),
-                is_mapped: false,
             },
-            LispValueVecStorage::Mapped { ptr, len } => VectorScanEntry {
-                base: ptr,
-                len,
-                is_mapped: true,
-            },
+            LispValueVecStorage::Mapped { ptr, len } => VectorScanEntry::Mapped { base: ptr, len },
         }
     }
 
@@ -1192,52 +1406,58 @@ impl LispValueVec {
     /// backing's `Vec` with a clone and return the ORIGINAL `Vec` so the caller can
     /// retire it (keep it alive + immutable until the GC thread joins). The GC's
     /// snapshot pointer still addresses the returned original; subsequent mutations
-    /// touch the fresh clone. Must only be called when `is_owned()` is true.
+    /// touch the fresh clone. Mapped backings return None.
     #[inline]
-    pub(crate) fn clone_owned_backing(&mut self) -> Vec<TaggedValue> {
+    pub(crate) fn clone_owned_backing(&mut self) -> Option<Vec<AtomicTaggedValue>> {
         match self.storage {
             LispValueVecStorage::Owned(ref mut items) => {
                 let clone = items.clone();
-                std::mem::replace(items, clone)
+                Some(std::mem::replace(items, clone))
             }
-            LispValueVecStorage::Mapped { .. } => {
-                unreachable!("clone_owned_backing called on a mapped vector backing")
-            }
+            LispValueVecStorage::Mapped { .. } => None,
         }
     }
 }
 
-/// One entry of a [`VectorScanSnapshot`]: a vector backing's contiguous slot array
-/// captured at the world-stopped start handshake. `base`/`len` delimit the slots the
-/// GC thread reads via [`load_value_atomic`]; `is_mapped` records whether the backing
-/// was `Mapped` (immutable pdump span) or `Owned` (a Rust `Vec` buffer kept alive +
-/// immutable for the cycle by the clone-on-write retire path). The scan reads both
-/// kinds identically (both are contiguous `TaggedValue` arrays).
+/// A captured backing retains the provenance of either actual mutable cells
+/// or immutable mapped words. No plain owner read view can create an owned span.
 #[derive(Debug)]
-pub(crate) struct VectorScanEntry {
-    base: *const TaggedValue,
-    len: usize,
-    is_mapped: bool,
+pub(crate) enum VectorScanEntry {
+    Owned {
+        base: *const AtomicTaggedValue,
+        len: usize,
+    },
+    Mapped {
+        base: *const TaggedValue,
+        len: usize,
+    },
 }
 
 impl VectorScanEntry {
     pub(crate) fn is_mapped(&self) -> bool {
-        self.is_mapped
+        matches!(self, Self::Mapped { .. })
     }
 
-    /// Read a captured span without rereading the owner's mutable backing
-    /// metadata (in particular, its pdump copy-on-write storage enum).
+    /// Read a captured span without rereading owner metadata.
     ///
     /// # Safety
-    /// The initialized span captured at this cycle's stopped handshake is
-    /// retained until marker join. Racing slot stores follow the atomic
-    /// publication contract, and no plain stores or reclamation touch it.
+    /// The initialized span captured at the stopped handshake is retained until
+    /// marker join. Owned slots are atomically published; mapped slots are immutable.
+    #[inline]
     pub(crate) unsafe fn scan_values(&self, mut visit: impl FnMut(TaggedValue)) {
-        for index in 0..self.len {
-            // SAFETY: the caller retains this initialized, aligned span;
-            // the bounded index and atomic view satisfy the scan contract.
-            let slot = unsafe { &*self.base.add(index) };
-            visit(load_value_atomic(slot));
+        match *self {
+            Self::Owned { base, len } => {
+                for index in 0..len {
+                    // SAFETY: the retained span addresses actual cell storage.
+                    visit(unsafe { &*base.add(index) }.load_atomic());
+                }
+            }
+            Self::Mapped { base, len } => {
+                for index in 0..len {
+                    // SAFETY: the retained mapped span is immutable.
+                    visit(unsafe { *base.add(index) });
+                }
+            }
         }
     }
 }
@@ -1318,8 +1538,8 @@ impl VectorScanSnapshot {
     /// Scan every snapshotted vector backing ONCE, on the GC thread, reading each
     /// slot via an atomic load and invoking `push` for each heap-object child. The
     /// caller routes each pushed child to the gray worklist (conses) or the deferred
-    /// list (non-cons), exactly like the gray-drain cons branch. Both Owned and
-    /// Mapped entries are contiguous `TaggedValue` arrays, read identically.
+    /// list (non-cons), exactly like the gray-drain cons branch. Owned cells use
+    /// Acquire loads; immutable mapped words use plain loads.
     ///
     /// # Safety
     /// Must run on the GC thread for a snapshot captured at the world-stopped start
@@ -1346,33 +1566,38 @@ impl VectorScanSnapshot {
     /// this reader finishes; publication follows the atomic slot protocol.
     unsafe fn scan_children<const MAJOR: bool>(&self, mut push: impl FnMut(TaggedValue)) {
         for entry in &self.entries {
-            for i in 0..entry.len {
-                // SAFETY: `base` addresses a contiguous `[TaggedValue; len]` backing
-                // kept alive + immutable for the cycle; `i < len` is in bounds. The
-                // read is an Acquire atomic load (pairs with the mutator's Release slot
-                // stores on the live, non-retired backing — never this retired one).
-                let slot = unsafe { &*entry.base.add(i) };
-                let child = load_value_atomic(slot);
-                if child.is_heap_object()
-                    || (MAJOR && matches!(child.kind(), crate::tagged::value::ValueKind::Symbol(_)))
-                {
-                    push(child);
-                }
-            }
+            // SAFETY: the caller retains this cycle's typed backing spans.
+            unsafe {
+                entry.scan_values(|child| {
+                    if child.is_heap_object()
+                        || (MAJOR
+                            && matches!(child.kind(), crate::tagged::value::ValueKind::Symbol(_)))
+                    {
+                        push(child);
+                    }
+                })
+            };
         }
     }
 }
 
-/// Atomic (acquire) load of a single `TaggedValue` slot in place — for GC reads
-/// of individual object fields (char-table default/parent/..., symbol-with-pos,
-/// xwidget, overlay plist, module-function docs) and the concurrent obarray /
-/// vector-backing scans.
+/// Acquire a GC-visible interior-mutable value slot. Owner reads use
+/// [`AtomicTaggedValue::get`]; immutable mapped/leased words and fields traced
+/// only by their owner use ordinary Value reads.
+///
+/// A plain shared Value cannot supply atomic publication provenance:
+///
+/// ```compile_fail,E0308
+/// use neovm_core::tagged::header::load_value_atomic;
+/// use neovm_core::tagged::value::TaggedValue;
+/// let plain = TaggedValue::NIL;
+/// let _ = load_value_atomic(&plain);
+/// ```
 ///
 /// PUBLICATION-ORDERING CONTRACT (concurrent GC, task #24 fix A): every store
 /// that can make a heap pointer visible to the GC thread mid-mark (cons
 /// car/cdr, vector slots, symbol value/function/plist cells — this module's
-/// atomic store helpers) is `Release`, or is preceded by a Release fence
-/// (the fixed-slot char-table seam uses fence-then-Relaxed publication), and
+/// atomic store helpers, including fixed char-table cells) is `Release`, and
 /// every GC-thread load that can be
 /// the first acquisition of such a pointer (cons car/cdr, slot/field loads —
 /// this module's atomic load helpers) is `Acquire`. The pairing makes the
@@ -1389,23 +1614,26 @@ impl VectorScanSnapshot {
 /// already-snapshotted cell and read back mid-cycle. The mark bits themselves
 /// (`GcHeader.marked`, cons block bitmaps) stay `Relaxed`: they never
 /// publish field data, and a claim's field reads are ordered by this
-/// contract's pointer chain, not by the bit. Fence-then-Relaxed publication
-/// likewise compiles to a plain `mov` on x86-64, but uses `dmb` plus `str`
-/// rather than `stlr` on AArch64.
+/// contract's pointer chain, not by the bit.
 #[inline]
-pub fn load_value_atomic(slot: &TaggedValue) -> TaggedValue {
-    let p = slot as *const TaggedValue as *const AtomicUsize;
-    // SAFETY: the borrow identifies a live slot with pinned word alignment.
-    // Concurrent access uses the atomic publication contract documented above.
-    TaggedValue::from_bits(unsafe { (*p).load(Ordering::Acquire) })
+pub fn load_value_atomic(slot: &AtomicTaggedValue) -> TaggedValue {
+    slot.load_atomic()
 }
 
-/// Atomic (release) store to a single `TaggedValue` slot in place. See the
-/// publication-ordering contract on [`load_value_atomic`].
+/// Release-publish through the actual interior-mutable cell, without a unique
+/// slot borrow. See the publication contract on [`load_value_atomic`].
+///
+/// A plain mutable Value is also insufficient storage:
+///
+/// ```compile_fail,E0308
+/// use neovm_core::tagged::header::store_value_atomic;
+/// use neovm_core::tagged::value::TaggedValue;
+/// let mut plain = TaggedValue::NIL;
+/// store_value_atomic(&mut plain, TaggedValue::T);
+/// ```
 #[inline]
-pub fn store_value_atomic(slot: &mut TaggedValue, value: TaggedValue) {
-    let p = slot as *const TaggedValue as *const AtomicUsize;
-    unsafe { (*p).store(value.0, Ordering::Release) };
+pub fn store_value_atomic(slot: &AtomicTaggedValue, value: TaggedValue) {
+    slot.store_atomic(value);
 }
 
 impl From<Vec<TaggedValue>> for LispValueVec {
@@ -1430,7 +1658,10 @@ impl std::ops::Deref for LispValueVec {
 
 impl std::ops::DerefMut for LispValueVec {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.ensure_owned().as_mut_slice()
+        let items = self.owned_cells();
+        // SAFETY: this exclusive owner mutation must follow the bulk COW seam
+        // if a scan captured the backing. No cell reference escapes this view.
+        unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast(), items.len()) }
     }
 }
 
@@ -1481,11 +1712,11 @@ pub const CHAR_TABLE_TOP_SLOTS: usize = 64;
 #[repr(C)]
 pub struct CharTableObj {
     pub header: VecLikeHeader,
-    pub defalt: TaggedValue,
-    pub parent: TaggedValue,
-    pub purpose: TaggedValue,
-    pub ascii: TaggedValue,
-    pub contents: [TaggedValue; CHAR_TABLE_TOP_SLOTS],
+    pub defalt: AtomicTaggedValue,
+    pub parent: AtomicTaggedValue,
+    pub purpose: AtomicTaggedValue,
+    pub ascii: AtomicTaggedValue,
+    pub contents: [AtomicTaggedValue; CHAR_TABLE_TOP_SLOTS],
     pub extras: LispValueVec,
 }
 
@@ -2183,6 +2414,15 @@ pub struct SqliteObj {
 ///
 /// The finalizer function pointer signature follows GNU Emacs:
 /// `void (*fin)(void *ptr)`.
+///
+/// # Safety
+///
+/// A registered callback must accept its paired live native payload and obey
+/// GNU's module finalizer contract: it cannot interact with Emacs, including
+/// through a saved `emacs_env`, Lisp allocation, heap TLS, or evaluator reentry.
+/// It must return normally. This applies to both user-pointer and function
+/// finalizers. See `docs/lispref/internals.texi`, "Module Function Finalizers",
+/// and the module API's prohibition on interaction during garbage collection.
 pub type EmacsFinalizer = Option<unsafe extern "C" fn(*mut std::ffi::c_void)>;
 
 #[repr(C)]

@@ -64,7 +64,7 @@ impl TaggedHeap {
         if !owner.is_cons() || self.owner_is_mapped(owner) {
             return None;
         }
-        let ptr = owner.xcons_ptr();
+        let ptr = owner.gc_cons_ptr();
         if !ConsBlock::ptr_is_cell_aligned(ptr) {
             return None;
         }
@@ -356,7 +356,7 @@ impl TaggedHeap {
                 if !header.tenured {
                     debug_assert!(header.is_marked_at(self.mark_parity));
                     header.tenured = true;
-                    let bytes = Self::object_bytes_from_header(ptr);
+                    let bytes = self.collector_object_bytes(ptr);
                     self.generational.old_bytes = self.generational.old_bytes.saturating_add(bytes);
                     newly_promoted_header_bytes = newly_promoted_header_bytes.saturating_add(bytes);
                 }
@@ -509,7 +509,7 @@ impl TaggedHeap {
     #[inline]
     pub(super) fn owner_card_addr(owner: TaggedValue) -> Option<usize> {
         if owner.is_cons() {
-            Some(owner.xcons_ptr() as usize)
+            Some(owner.gc_cons_ptr() as usize)
         } else {
             Self::value_heap_addr(owner)
         }

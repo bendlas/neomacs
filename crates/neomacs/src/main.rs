@@ -207,7 +207,7 @@ use neovm_core::emacs_core::image_catalog::{
 };
 use neovm_core::emacs_core::intern::intern;
 use neovm_core::emacs_core::load::{
-    LoadupDumpInvocation, LoadupDumpMode, LoadupInvocation, RuntimeImageRole,
+    BuildDetails, LoadupDumpInvocation, LoadupDumpMode, LoadupInvocation, RuntimeImageRole,
     TEMACS_ROLE_BINARY_NAME, find_file_in_load_path, get_load_path, load_file,
 };
 #[cfg(test)]
@@ -303,6 +303,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartupOptions {
     gui: startup_resources::GuiStartupOptions,
+    rows_query_admission: neomacs_layout_engine::RowsQueryAdmission,
     frontend: FrontendKind,
     forwarded_args: Vec<String>,
     terminal_device: Option<String>,
@@ -428,6 +429,7 @@ const EARLY_HELP_BODY: &str = concat!(
     "--no-splash                 do not display a splash screen on startup\n",
     "--no-window-system, -nw     do not communicate with X, ignoring $DISPLAY\n",
     "--init-directory=DIR        use DIR when looking for the Emacs init files.\n",
+    "--rows-query-admission=MODE  TTY Rows reuse: exact-proven (default) or off\n",
     "--quick, -Q                 equivalent to:\n",
     "                              -q --no-site-file --no-site-lisp --no-splash\n",
     "                              --no-x-resources\n",
@@ -584,6 +586,7 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
     let mut no_site_lisp = false;
     let mut no_loadup = false;
     let mut no_build_details = false;
+    let mut rows_query_admission = neomacs_layout_engine::RowsQueryAdmission::default();
     let mut gui = startup_resources::GuiStartupOptions::default();
     let mut idx = 0usize;
 
@@ -601,6 +604,29 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
         if next == "--" {
             forwarded_args.extend(parsed[idx + 1..].iter().cloned());
             break;
+        }
+
+        // Native engine policy, consumed before Lisp startup. The sorter keeps
+        // value-taking options and their operands together, including --eval.
+        match argmatch(
+            &parsed,
+            &mut idx,
+            "-rows-query-admission",
+            Some("--rows-query-admission"),
+            "--rows-query-admission".len(),
+            true,
+        ) {
+            ArgMatch::Value(value) => {
+                rows_query_admission = value.parse().map_err(|_| {
+                    format!("neomacs: invalid --rows-query-admission value `{value}`")
+                })?;
+                continue;
+            }
+            ArgMatch::MissingValue => {
+                return Err("neomacs: --rows-query-admission requires an argument".to_owned());
+            }
+            ArgMatch::NoMatch => {}
+            ArgMatch::Bare => unreachable!(),
         }
 
         if let Some(options) = daemon::parse_option(next) {
@@ -909,6 +935,7 @@ fn parse_startup_options(args: impl IntoIterator<Item = String>) -> Result<Start
 
     Ok(StartupOptions {
         gui,
+        rows_query_admission,
         frontend,
         forwarded_args,
         terminal_device,
@@ -3532,10 +3559,10 @@ fn raw_dump_loadup_invocation(
     startup: &StartupOptions,
     dump_mode: LoadupDumpMode,
 ) -> LoadupInvocation {
-    LoadupInvocation::Dump(LoadupDumpInvocation::new(
-        dump_mode,
-        raw_loadup_command_line(startup, dump_mode),
-    ))
+    LoadupInvocation::Dump(
+        LoadupDumpInvocation::new(dump_mode, raw_loadup_command_line(startup, dump_mode))
+            .with_build_details(BuildDetails::from_omit_flag(startup.no_build_details)),
+    )
 }
 
 fn load_neomacs_gui_term_layer(evaluator: &mut Context) {
@@ -4754,6 +4781,30 @@ pub fn run(mode: RuntimeMode) {
             secondary_quit_requested,
         )));
         install_diagnostics_eval_hooks(&mut evaluator);
+    } else if neovm_core::face::realization::enabled() {
+        // GNU allows an explicit make-terminal-frame even in --batch
+        // (frame.c:1754-1823). Install the deferred auxiliary-device factory
+        // without initializing a primary terminal or a keyboard receiver.
+        let (auxiliary_input_tx, _auxiliary_input_rx) = crossbeam_channel::unbounded();
+        let mut factory = secondary_tty::SecondaryTtyFactory::new(
+            secondary_ttys.clone(),
+            auxiliary_input_tx,
+            evaluator.wait_notifier(),
+            evaluator.quit_requested.clone(),
+        );
+        // A noninteractive daemon still installs redisplay immediately below.
+        // Plain --batch waits until make-terminal-frame opens a device
+        // (frame.c:1811) so elb-style batch never builds the display runtime.
+        if startup.daemon.is_none() {
+            let render_registry = secondary_ttys.clone();
+            factory.defer_redisplay_until_open(Box::new(move |eval| {
+                frame_layout::install_headless_tty_redisplay(
+                    eval,
+                    Some(Box::new(move |eval| render_registry.render_selected(eval))),
+                );
+            }));
+        }
+        evaluator.set_tty_frame_host_factory(Box::new(factory));
     }
 
     // 8. Set up redisplay callback (layout engine + TTY RIF render).
@@ -5500,14 +5551,7 @@ fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &
             Value::NIL
         },
     );
-    eval.set_variable(
-        "build-details",
-        if startup.no_build_details {
-            Value::NIL
-        } else {
-            Value::T
-        },
-    );
+    BuildDetails::from_omit_flag(startup.no_build_details).apply(eval);
     let (terminal_frame, frame_initial_frame, default_minibuffer_frame) = match startup.frontend {
         FrontendKind::Gui => {
             let terminal_frame_id = ensure_gnu_startup_terminal_frame(eval, frame_id);
@@ -5600,6 +5644,9 @@ fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &
             "failed to realize initial-frame faces from defface specs"
         );
     }
+    // GNU init_frame_faces realizes the basic display faces before an
+    // interactive frame reaches its first iterator (xfaces.c:671-688).
+    eval.initialize_display_faces_for_frame(frame_id);
     // Skip the splash screen — its fill-region is extremely slow through
     // with_mirrored_evaluator.  Users who want it can set this to nil in
     // their init file.
@@ -5976,3 +6023,7 @@ fn initialize_system_locale() {}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/rows_query_admission_test.rs"]
+mod rows_query_admission_test;

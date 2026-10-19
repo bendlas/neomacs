@@ -8,6 +8,11 @@ use super::root_table::{RootLease, TracedWord};
 use crate::tagged::gc::{HeapIdentity, TaggedHeap, current_tagged_heap_identity};
 use crate::tagged::value::TaggedValue;
 
+#[path = "cons_root.rs"]
+mod cons_root;
+pub use cons_root::RootedSlot;
+pub(crate) use cons_root::{ConsRootSeal, RootSlotOps, RootedConsInputs, cons_into};
+
 /// A Lisp value detached from any one mutator thread.
 ///
 /// A raw [`TaggedValue`] is thread-confined: it stays valid only while the
@@ -227,11 +232,12 @@ impl SharedRoot {
         self.heap
     }
 
-    /// Copy an opaque, already-rooted word for a sealed owner publication.
-    /// This neither dereferences Lisp storage nor materializes a LocalRoot.
+    /// Copy an opaque, already-rooted word for a sealed owner publication or
+    /// a native-safe extent's retained-handle table. This neither
+    /// dereferences Lisp storage nor materializes a LocalRoot.
     #[cold]
     #[inline(never)]
-    pub(super) fn parallel_word(&self) -> usize {
+    pub(crate) fn parallel_word(&self) -> usize {
         self.word()
     }
 

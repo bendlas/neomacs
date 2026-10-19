@@ -1,21 +1,46 @@
 //! Cold canonical registration, rooted rendezvous and scoped stopped collection.
-//! Running heap execution remains excluded. The serial inline iterator remains
-//! the Sim representation.
+//! Running authority admits rooted cons and sealed hash-table allocation.
+//! The serial inline iterator remains the Sim representation. The overlap executor
+//! is the `restricted_lisp` test module and is absent from every
+//! `NEOVM_THREADS` mode. Production still has no public Lisp overlap entry.
 //!
 //! An era owns the actual World Baton and the quiescent heap loan. Only a
 //! metadata permit crosses a thread boundary; owner buffers are built there.
 //! Unfinished teardown retains both authority and backing instead of returning
 //! a usable serial World after an abandoned owner.
-#![allow(dead_code)] // Production Context execution admission remains a later proof batch.
+#![allow(dead_code)]
 
+mod admission;
+mod authority_word;
 mod collection;
+mod cons_allocation;
+mod cons_catalog;
 mod gate;
 mod image;
+mod native_extent;
+mod root_slot;
+mod run_slice;
+mod table_allocation;
+mod table_authority;
+mod weak_policy;
 pub use collection::{CollectionError, CollectionReport};
 use gate::RegistryGuard;
+pub use root_slot::OwnerRootSlot;
+pub use run_slice::{RunSlice, SliceRoot};
 mod rendezvous;
 mod summaries;
+mod symbol_authority;
+#[cfg(test)]
+mod symbol_globals;
+pub use symbol_authority::{
+    GlobalError, KeeperSymbols, PlainSymbolBacking, SymbolHandle, SymbolMut, SymbolRef,
+};
+pub(crate) use symbol_authority::{SymbolReadToken, SymbolWriteToken};
 mod token;
+// The extent API ships ahead of its first production call site (the Green
+// mutex/condition release points); the re-export is for that integration.
+#[allow(unused_imports)]
+pub use native_extent::{NativeReturn, NativeRoots};
 pub use rendezvous::{
     AllStopped, AllStoppedFailure, Mode, Phase, Rendezvous, RendezvousError, Request,
     ResumeGcImage, ResumeGcImageFailure, RootedRetireFailure, Snapshot,
@@ -23,16 +48,18 @@ pub use rendezvous::{
 pub(crate) use rendezvous::{OwnerRootAdmission, StoppedRootAdmission};
 
 pub use summaries::{RegistrationCensus, StoppedSummaries};
+pub use table_authority::{KeeperTableMut, SealedTableAccess, TableMut, TableRef};
 pub use token::{
     Mutator, MutatorFinishFailure, MutatorPermit, MutatorStartFailure, OwnerPublication, RunAccess,
     YoungWorkerLoan,
 };
 
+use admission::{AdmissionWord, PhaseLine, admissions_quiescent};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
@@ -42,6 +69,7 @@ use super::young_registry::{YoungRegistrationId, YoungRegistryError};
 use super::{HeapIdentity, QuiescentCollector};
 use crate::emacs_core::eval::world::{Baton, FrozenLegacyRoots};
 use image::{OwnerGcState, PublishedGcImage};
+use weak_policy::WeakSweepPermit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistrationError {
@@ -141,11 +169,15 @@ struct EntryState {
 
 /// Stable Send + Sync metadata. It never contains a Context, heap reference,
 /// owner-state borrow, or owner-confined SATB buffer.
+/// Line-padded so adjacent entries' admission words and the entry mutex
+/// never share a cacheline across owners.
+#[repr(align(64))]
 pub struct MutatorEntry {
     key: MutatorKey,
     young: YoungRegistrationId,
     cancelled_start: AtomicBool,
-    live_run_loan: AtomicBool,
+    /// Owner-written slice admission word (single writer: the owner thread).
+    admission: AtomicU64,
     state: Mutex<EntryState>,
 }
 
@@ -176,20 +208,43 @@ struct RegistryState {
     young_index: FxHashMap<YoungRegistrationId, usize>,
     next_registration: u64,
     generation_limit: u64,
+    catalog_transition: bool,
     rendezvous: rendezvous::control::State,
+}
+
+/// Per-acquisition gate words packed on one line: a single exclusive
+/// cacheline transfer per lock covers both the mutex word and the owner tag.
+#[repr(align(64))]
+struct GateLine {
+    state: Mutex<RegistryState>,
+    gate_owner: AtomicU64,
+}
+
+/// Park/poison/notify words on their own line. `parked` is read on every
+/// run-slice drop, so it must not ride the gate line's transfers, and the
+/// condvar is RMW'd only while some waiter is parked.
+#[repr(align(64))]
+struct ParkLine {
+    parked: AtomicUsize,
+    poisoned: AtomicBool,
+    wake: std::sync::Condvar,
 }
 
 struct Registry {
     heap: HeapIdentity,
     world: HeapIdentity,
-    state: Mutex<RegistryState>,
-    poisoned: AtomicBool,
-    gate_owner: AtomicU64,
-    wake: std::sync::Condvar,
+    gate: GateLine,
+    park: ParkLine,
+    /// Read-mostly phase word; the only shared line the per-slice fast
+    /// path loads. Kept off the gate and park lines so gate transfers and
+    /// park RMWs never invalidate an owner's poll.
+    phase: PhaseLine,
     request_epoch: AtomicU64,
     completed_epoch: AtomicU64,
     keeper_thread: ThreadId,
     root_epoch: super::FacadeEpochRetention,
+    cons_catalog: super::cons_storage::ConsCatalog,
+    symbols: symbol_authority::SymbolSidecar,
 }
 
 impl Registry {
@@ -198,6 +253,17 @@ impl Registry {
         state: &RegistryState,
         key: MutatorKey,
     ) -> Result<Arc<MutatorEntry>, RegistrationError> {
+        let entry = self.validate_ref(state, key)?;
+        Ok(Arc::clone(entry))
+    }
+
+    /// Admission identity check without the per-slice reference-count RMW.
+    /// The borrow is only used while the caller still holds the gate.
+    fn validate_ref<'a>(
+        &self,
+        state: &'a RegistryState,
+        key: MutatorKey,
+    ) -> Result<&'a Arc<MutatorEntry>, RegistrationError> {
         if key.heap != self.heap || key.world != self.world {
             return Err(RegistrationError::WrongHeap);
         }
@@ -213,7 +279,7 @@ impl Registry {
         if entry.key != key {
             return Err(RegistrationError::StaleRegistration);
         }
-        Ok(Arc::clone(entry))
+        Ok(entry)
     }
 }
 
@@ -222,7 +288,10 @@ impl Registry {
 #[must_use = "finish explicitly; abandonment retains the World and poisons the era"]
 pub struct ParallelHeapEra<'heap> {
     collector: RefCell<Option<QuiescentCollector<'heap>>>,
+    suspended_cons: RefCell<Option<super::facade_mark::SuspendedConsCollector<'heap>>>,
     legacy_roots: Option<FrozenLegacyRoots>,
+    #[cfg(test)]
+    weak_sweep: Option<WeakSweepPermit>,
     keeper: Option<Baton>,
     registry: Option<Arc<Registry>>,
     _thread: PhantomData<Rc<()>>,
@@ -327,7 +396,7 @@ impl<'heap> ParallelHeapEra<'heap> {
             key,
             young,
             cancelled_start: AtomicBool::new(false),
-            live_run_loan: AtomicBool::new(false),
+            admission: AtomicU64::new(AdmissionWord::OUT),
             state: Mutex::new(EntryState {
                 phase: EntryPhase::Frozen,
                 owner_thread: Some(std::thread::current().id()),
@@ -344,27 +413,41 @@ impl<'heap> ParallelHeapEra<'heap> {
         });
         let mut young_index = FxHashMap::default();
         young_index.insert(young, 0);
+        let symbols =
+            symbol_authority::SymbolSidecar::new(keeper.parallel_symbol_backing(), generation);
         Ok(Self {
             collector: RefCell::new(Some(collector)),
+            suspended_cons: RefCell::new(None),
             legacy_roots: None,
+            #[cfg(test)]
+            weak_sweep: None,
             keeper: Some(keeper),
             registry: Some(Arc::new(Registry {
                 heap,
                 world: heap,
-                poisoned: AtomicBool::new(false),
-                gate_owner: AtomicU64::new(0),
-                wake: std::sync::Condvar::new(),
+                gate: GateLine {
+                    state: Mutex::new(RegistryState {
+                        entries: vec![entry],
+                        young_index,
+                        next_registration: 2,
+                        generation_limit: u64::MAX,
+                        catalog_transition: false,
+                        rendezvous: rendezvous::control::State::new(),
+                    }),
+                    gate_owner: AtomicU64::new(0),
+                },
+                park: ParkLine {
+                    parked: AtomicUsize::new(0),
+                    poisoned: AtomicBool::new(false),
+                    wake: std::sync::Condvar::new(),
+                },
+                phase: PhaseLine::new(),
                 request_epoch: AtomicU64::new(0),
                 completed_epoch: AtomicU64::new(0),
                 keeper_thread: std::thread::current().id(),
                 root_epoch,
-                state: Mutex::new(RegistryState {
-                    entries: vec![entry],
-                    young_index,
-                    next_registration: 2,
-                    generation_limit: u64::MAX,
-                    rendezvous: rendezvous::control::State::new(),
-                }),
+                cons_catalog: super::cons_storage::ConsCatalog::new(heap),
+                symbols,
             })),
             _thread: PhantomData,
         })
@@ -426,7 +509,7 @@ impl<'heap> ParallelHeapEra<'heap> {
             key,
             young,
             cancelled_start: AtomicBool::new(false),
-            live_run_loan: AtomicBool::new(false),
+            admission: AtomicU64::new(AdmissionWord::OUT),
             state: Mutex::new(EntryState {
                 phase: EntryPhase::Starting,
                 owner_thread: None,
@@ -474,6 +557,10 @@ impl<'heap> ParallelHeapEra<'heap> {
     }
 
     fn prepare_finish(&mut self) -> Result<(), RegistrationError> {
+        self.registry().symbols.ready()?;
+        if self.suspended_cons.get_mut().is_some() {
+            return Err(RegistrationError::OpenRegion);
+        }
         use crate::tagged::transport::{ParallelRootBatchError, RootBatchError};
 
         fn entry_guard<'a>(
@@ -511,11 +598,7 @@ impl<'heap> ParallelHeapEra<'heap> {
             index: usize,
             current: &EntryState,
         ) -> Result<(), RegistrationError> {
-            if entry.live_run_loan.load(Ordering::Acquire)
-                || current.run_loan
-                || current.worker_loan
-                || current.readers != 0
-            {
+            if entry.admitted() || current.run_loan || current.worker_loan || current.readers != 0 {
                 return Err(RegistrationError::OutstandingLoan);
             }
             if entry.cancelled_start.load(Ordering::Acquire) {
@@ -728,3 +811,24 @@ mod tests;
 
 #[cfg(all(test, not(feature = "gc-memory-telemetry")))]
 mod collection_scalar_tests;
+
+#[cfg(test)]
+mod cons_allocation_tests;
+#[cfg(test)]
+mod cons_micro_tests;
+#[cfg(test)]
+mod cons_tails_tests;
+#[cfg(test)]
+mod root_slot_tests;
+
+#[cfg(test)]
+mod slice_tests;
+
+#[cfg(test)]
+mod a8_latency;
+#[cfg(test)]
+mod a8_probes;
+#[cfg(test)]
+mod native_extent_tests;
+#[cfg(test)]
+mod restricted_lisp;

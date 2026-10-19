@@ -21,6 +21,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use typed_index_collections::TiVec;
 
+/// Canonical old-owner classification at a region carve. This snapshot may
+/// certify only the carving mutator's open region: collection closes every
+/// region before old counts or cell ages can change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConsCarveAge {
+    NoOldOwners,
+    MayHaveOldOwners,
+}
+
+impl ConsCarveAge {
+    #[inline]
+    pub(super) fn no_old_owners(self) -> bool {
+        self == Self::NoOldOwners
+    }
+}
+
 /// Own the cold allocator without introducing a pointer niche into the inline
 /// heap. A bare Box changes repr(Rust) field ordering and JIT offsets; the
 /// Option's null representation preserves the former raw-pointer layout.
@@ -81,7 +97,7 @@ impl ConsAllocatorOwner {
         &mut self,
         base: ConsBlockBase,
         log: &mut YoungBlockLog,
-    ) -> Result<(), YoungRegistryError> {
+    ) -> Result<ConsCarveAge, YoungRegistryError> {
         self.0
             .as_deref_mut()
             .expect("allocator owner is initialized")
@@ -209,7 +225,9 @@ impl ConsBlockBase {
         self.0
     }
 
-    fn of_cell(cell: *const ConsCell) -> Self {
+    /// Recover an identity without dereferencing the cell. Canonical
+    /// operations still validate registration and the heap/log binding.
+    pub(super) fn of_cell(cell: *const ConsCell) -> Self {
         Self(ConsBlock::block_base_for_ptr(cell))
     }
 }
@@ -576,7 +594,7 @@ impl AllocatorState {
         base: ConsBlockBase,
         mode: AllocatorAccessMode,
         log: &mut YoungBlockLog,
-    ) -> Result<(), YoungRegistryError> {
+    ) -> Result<ConsCarveAge, YoungRegistryError> {
         // Refuse a crossed heap binding BEFORE touching flag/backlink/log state.
         // Root supplies this existing-domain getter in the registry companion.
         if log.id().heap_identity() != self.identity {
@@ -584,7 +602,7 @@ impl AllocatorState {
         }
         #[cfg(test)]
         if test_fault_is(ConsAllocatorFault::SkipCarveRecording) {
-            return Ok(());
+            return Ok(ConsCarveAge::MayHaveOldOwners);
         }
         let state = self;
         let slot = state.slot(base);
@@ -594,6 +612,11 @@ impl AllocatorState {
             BlockAvailability::Ready,
             "carve from withheld block"
         );
+        let age = if block.old_count == 0 {
+            ConsCarveAge::NoOldOwners
+        } else {
+            ConsCarveAge::MayHaveOldOwners
+        };
         let newly_young = match mode {
             AllocatorAccessMode::Sole => {
                 let young = block.young.get_mut();
@@ -617,7 +640,7 @@ impl AllocatorState {
             let slot = state.slot(base);
             state.blocks_with_free.push(slot);
         }
-        Ok(())
+        Ok(age)
     }
 
     pub(super) fn mark_work_snapshot(&self) -> Vec<ConsBlockBase> {
@@ -1051,7 +1074,7 @@ impl ConsAllocator {
         &mut self,
         base: ConsBlockBase,
         log: &mut YoungBlockLog,
-    ) -> Result<(), YoungRegistryError> {
+    ) -> Result<ConsCarveAge, YoungRegistryError> {
         self.with_state_mut(|state, mode| state.note_carve(base, mode, log))
     }
 
@@ -1268,7 +1291,7 @@ impl SharedConsAllocator<'_> {
         &self,
         base: ConsBlockBase,
         log: &mut YoungBlockLog,
-    ) -> Result<(), YoungRegistryError> {
+    ) -> Result<ConsCarveAge, YoungRegistryError> {
         self.with_state_mut(|state, mode| state.note_carve(base, mode, log))
     }
 
@@ -1573,6 +1596,9 @@ impl ConsStopAll<'_> {
 
     /// One-way admission commits at the stop-all boundary. Consuming this
     /// capability prevents using its former unlocked state after publication.
+    // Keep this small phase transition in its stopped caller. Adding a cold
+    // catalog caller must not outline another serial admission entry point.
+    #[inline(always)]
     pub(super) fn admit_threads(mut self) {
         let StoppedAllocatorState::Owner { storage, .. } = &mut self.state else {
             panic!("admission requires the sole-owner stop-all capability");
@@ -1791,7 +1817,7 @@ impl ConsStopAll<'_> {
                 // SAFETY: this guard proves stopped mutators/closed regions,
                 // and its caller retains every listed block's storage.
                 let cell = unsafe { &*block.cells_ptr().add(index) };
-                if !cell.car.is_dead() && !block.trailer().is_old(index) {
+                if !cell.car.get().is_dead() && !block.trailer().is_old(index) {
                     assert!(
                         metadata.young.load(Ordering::Relaxed),
                         "allocated young cell missing flag"
@@ -1856,6 +1882,13 @@ fn test_fault_is(fault: ConsAllocatorFault) -> bool {
     CONS_ALLOCATOR_FAULT.with(|slot| slot.get() == Some(fault))
 }
 
+/// Refill-cache tests must preserve every existing canonical fault site.
+/// Read the existing slot; no additional thread-local or allocator state.
+#[cfg(test)]
+pub(super) fn carve_fault_active() -> bool {
+    CONS_ALLOCATOR_FAULT.with(|slot| slot.get().is_some())
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 #[must_use = "hold fault injection for the test extent"]
@@ -1915,3 +1948,7 @@ mod parallel_young_tests;
 #[cfg(test)]
 #[path = "tests/cons_allocator_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/cons_allocator_carve_age_test.rs"]
+mod carve_age_tests;

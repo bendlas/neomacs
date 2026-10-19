@@ -41,11 +41,14 @@ use crate::display_text_window_row_lifecycle::{
 };
 use crate::font::metrics::FontMetricsService;
 use crate::frame_face_arena::FrameFaceAttempt;
-use crate::neovm_bridge::{FaceResolver, LayoutBufferView, RustBufferAccess};
+#[cfg(test)]
+use crate::neovm_bridge::FaceResolver;
+use crate::neovm_bridge::{LayoutBufferView, RustBufferAccess};
 use crate::types::{LineWrapMode, WindowParams, WindowSourceExtent};
 use crate::window_output::{
     TextWindowOutputTarget, TextWindowRedisplayPositions, WindowOutputEmitter,
 };
+use neovm_core::buffer::CharLen;
 use neovm_core::emacs_core::image_catalog::ImageScaleEnvironment;
 
 /// Owned by one exclusively borrowed window-render attempt. This result
@@ -112,17 +115,20 @@ pub(crate) struct BufferSourceWalkSetup {
         Option<crate::buffer_source::end_of_buffer_rows::BeyondAccessibleEndLinePrefix>,
 }
 
-struct BufferSourceWalkRenderState<'emit> {
-    source_render: TextRowSourceRenderState<'emit>,
+struct BufferSourceWalkRenderState<
+    'emit,
+    FS: crate::neovm_bridge::FaceServices = crate::neovm_bridge::FaceResolver,
+> {
+    source_render: TextRowSourceRenderState<'emit, FS>,
     line_numbers: &'emit mut LineNumberRenderState,
     face_scan: &'emit mut FaceScanCheckpoint,
     active_face_state: &'emit mut DisplayRowActiveFaceState,
     face_ids: &'emit mut FrameFaceAttempt,
 }
 
-impl<'emit> BufferSourceWalkRenderState<'emit> {
+impl<'emit, FS: crate::neovm_bridge::FaceServices> BufferSourceWalkRenderState<'emit, FS> {
     fn new(
-        source_render: TextRowSourceRenderState<'emit>,
+        source_render: TextRowSourceRenderState<'emit, FS>,
         line_numbers: &'emit mut LineNumberRenderState,
         face_scan: &'emit mut FaceScanCheckpoint,
         active_face_state: &'emit mut DisplayRowActiveFaceState,
@@ -348,9 +354,13 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
 
 impl BufferSourceWalkSetup {
     #[allow(clippy::too_many_arguments)]
-    fn render_visible_steps<'request, B: LayoutBufferView>(
+    fn render_visible_steps<
+        'request,
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         &mut self,
-        state: &mut BufferSourceWalkRenderState<'_>,
+        state: &mut BufferSourceWalkRenderState<'_, FS>,
         row_prelude_context: BufferSourceRowPreludeRequestContext,
         loop_context: BufferSourceLoopRequestContext,
         face_resolution_context: BufferSourceFaceResolutionContext<'request, B>,
@@ -375,7 +385,18 @@ impl BufferSourceWalkSetup {
                 self.charpos,
                 loop_context.text_start_byte(),
             ),
-        };
+        }
+        // The two bounds are orthogonal and both numeric: the acquisition
+        // horizon limits the COPIED source, while this allowance limits each
+        // row's run scan so every row's run production, slicing and
+        // measurement stays proportional to the row (the GNU display-line
+        // bound, `move_it_in_display_line_to` stopping against
+        // `it->last_visible_x`, src/xdisp.c:10422-10451). Splitting a run is
+        // pure re-chunking of the same stream and progress never depends on
+        // the bound, so the acquisition-bounded walk needs it exactly as much
+        // as the unbounded one: without it a bounded newline-less tail makes
+        // every visible row re-scan and re-measure up to the horizon.
+        .with_ordinary_run_scan_budget(CharLen::new(params.display_line_scan_budget_chars()));
 
         BufferSourceLoopMutableState::new(
             &mut self.invisible_text_checkpoint,
@@ -421,9 +442,14 @@ impl BufferSourceWalkSetup {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_tail_and_decide_retry<'request, 'buf, B: LayoutBufferView>(
+    fn render_tail_and_decide_retry<
+        'request,
+        'buf,
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         &mut self,
-        source_render: TextRowSourceRenderState<'_>,
+        source_render: TextRowSourceRenderState<'_, FS>,
         face_ids: &mut FrameFaceAttempt,
         line_numbers: &mut LineNumberRenderState,
         face_scan: &mut FaceScanCheckpoint,
@@ -476,9 +502,14 @@ impl BufferSourceWalkSetup {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_body_and_tail<'request, 'buf, B: LayoutBufferView>(
+    fn render_body_and_tail<
+        'request,
+        'buf,
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         &mut self,
-        state: &mut BufferSourceWalkRenderState<'_>,
+        state: &mut BufferSourceWalkRenderState<'_, FS>,
         row_prelude_context: BufferSourceRowPreludeRequestContext,
         loop_context: BufferSourceLoopRequestContext,
         face_resolution_context: BufferSourceFaceResolutionContext<'request, B>,
@@ -525,12 +556,17 @@ impl BufferSourceWalkSetup {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn begin_render_body_and_tail<'request, 'buf, B: LayoutBufferView>(
+    pub(crate) fn begin_render_body_and_tail<
+        'request,
+        'buf,
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         &mut self,
         begin_request: TextWindowBeginRequest,
         output: &mut BufferSourceOutputState<'_>,
         font_metrics: &mut Option<FontMetricsService>,
-        face_resolver: &FaceResolver,
+        face_resolver: &FS,
         face_ids: &mut FrameFaceAttempt,
         line_numbers: &mut LineNumberRenderState,
         face_scan: &mut FaceScanCheckpoint,

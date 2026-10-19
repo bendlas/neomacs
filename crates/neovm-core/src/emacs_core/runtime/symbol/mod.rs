@@ -28,6 +28,7 @@
 mod canonical_access;
 mod cell;
 mod fn_stamps;
+pub(crate) mod parallel;
 mod projection;
 mod property_revision;
 pub use canonical_access::CanonicalAccess;
@@ -70,7 +71,7 @@ use crate::emacs_core::error::Flow;
 use crate::emacs_core::forward::FwdDescriptor;
 use crate::gc_trace::GcTrace;
 use crate::heap_types::LispString;
-use crate::tagged::header::{load_value_atomic, store_value_atomic};
+use crate::tagged::header::AtomicTaggedValue;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 #[cfg(test)]
 use std::cell::Cell;
@@ -290,8 +291,8 @@ impl SymbolInterned {
 /// Per-symbol buffer-local cache. Mirrors GNU `struct
 /// Lisp_Buffer_Local_Value` at `src/lisp.h:3116-3137`.
 ///
-/// Phase 1 only declares the type; allocation and dispatch through it
-/// land in Phases 4-6.
+/// Cached roots use interior-mutable words: owner reads remain plain, while
+/// root tracing acquires publications through the actual cells.
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct LispBufferLocalValue {
@@ -304,13 +305,13 @@ pub struct LispBufferLocalValue {
     /// Optional forwarder for variables that have BOTH a per-buffer
     /// binding *and* a static C slot (e.g. `case-fold-search`). Must not
     /// be a `BufferObj` or `KboardObj`.
-    pub fwd: Option<&'static crate::emacs_core::forward::LispFwd>,
+    pub fwd: Option<crate::emacs_core::forward::FwdRef>,
     /// Buffer for which `valcell` was loaded, or `Value::NIL` for the
     /// global default. GNU `where`.
     ///
     /// Written only through [`LispBufferLocalValue::set_where`], which keeps
     /// [`Self::where_buf_id`] in step.
-    pub where_buf: Value,
+    pub where_buf: AtomicTaggedValue,
     /// The raw [`BufferId`](crate::buffer::BufferId) of `where_buf`, or
     /// [`NO_WHERE_BUF`] when it is not a buffer: the read fast path's
     /// where-buffer test as one integer compare. Comparing the object meant
@@ -318,10 +319,10 @@ pub struct LispBufferLocalValue {
     /// buffer-local variable -- a third of the read.
     pub where_buf_id: u64,
     /// `(SYMBOL . DEFAULT-VALUE)` cons. GNU `defcell`.
-    pub defcell: Value,
+    pub defcell: AtomicTaggedValue,
     /// `(SYMBOL . CURRENT-VALUE)` cons. Equal to `defcell` when no
     /// per-buffer binding is loaded. GNU `valcell`.
-    pub valcell: Value,
+    pub valcell: AtomicTaggedValue,
     /// [`blv_alist_epoch`] value at the last `where_buf`/`valcell`
     /// refresh. The read fast path trusts `valcell` only while this
     /// matches the global epoch AND `where_buf` is the current buffer —
@@ -341,7 +342,7 @@ impl LispBufferLocalValue {
     /// for the read fast path. The one writer of both.
     #[inline]
     pub(crate) fn set_where(&mut self, buf: Value) {
-        store_value_atomic(&mut self.where_buf, buf);
+        self.where_buf.store_atomic(buf);
         self.where_buf_id = buf.as_buffer_id().map_or(NO_WHERE_BUF, |id| id.0);
     }
 }
@@ -421,7 +422,7 @@ pub(crate) struct BlvCacheHit {
     /// GNU `local_if_set`: a `set` with no binding creates one.
     pub(crate) local_if_set: bool,
     /// The forwarder whose type rule the value obeys (`make_blv` keeps it).
-    pub(crate) fwd: Option<&'static crate::emacs_core::forward::LispFwd>,
+    pub(crate) fwd: Option<crate::emacs_core::forward::FwdRef>,
 }
 
 /// A `Localized` symbol's cells as `set_default_internal` sees them
@@ -432,7 +433,7 @@ pub(crate) struct BlvDefaultCells {
     /// default is what is loaded, so one store reaches both.
     pub(crate) defcell: Value,
     /// The forwarder whose type rule the value obeys.
-    pub(crate) fwd: Option<&'static crate::emacs_core::forward::LispFwd>,
+    pub(crate) fwd: Option<crate::emacs_core::forward::FwdRef>,
 }
 
 /// Mirrors GNU `swap_in_symval_forwarding` (`src/data.c:1539-1571`).
@@ -465,8 +466,12 @@ fn swap_in_blv(
     let found_cell = assq(key, local_var_alist);
     blv.set_where(current_buffer);
     blv.found = !found_cell.is_nil();
-    let new_valcell = if blv.found { found_cell } else { blv.defcell };
-    store_value_atomic(&mut blv.valcell, new_valcell);
+    let new_valcell = if blv.found {
+        found_cell
+    } else {
+        blv.defcell.get()
+    };
+    blv.valcell.store_atomic(new_valcell);
     blv.alist_epoch = epoch;
 }
 
@@ -606,13 +611,16 @@ impl LispSymbol {
             return None;
         }
         debug_assert_eq!(
-            blv.where_buf.as_buffer_id().map_or(NO_WHERE_BUF, |b| b.0),
+            blv.where_buf
+                .get()
+                .as_buffer_id()
+                .map_or(NO_WHERE_BUF, |b| b.0),
             blv.where_buf_id,
             "a BLV writer bypassed set_where"
         );
         Some(BlvCacheHit {
-            valcell: blv.valcell,
-            defcell: blv.defcell,
+            valcell: blv.valcell.get(),
+            defcell: blv.defcell.get(),
             found: blv.found,
             local_if_set: blv.local_if_set,
             fwd: blv.fwd,
@@ -629,7 +637,7 @@ impl LispSymbol {
         // SAFETY: as in `blv_cache_hit`.
         let blv = unsafe { &*blv.as_ptr() };
         Some(BlvDefaultCells {
-            defcell: blv.defcell,
+            defcell: blv.defcell.get(),
             fwd: blv.fwd,
         })
     }
@@ -897,7 +905,7 @@ pub struct Obarray {
     /// Append-only and leaked, exactly like GNU's static `DEFVAR_*` slots,
     /// which `staticpro` and `mark_kboards` root for the same reason.
     /// Membership is decided by `LispFwd::owned_value`, not by the caller.
-    value_fwds: Vec<&'static crate::emacs_core::forward::LispFwd>,
+    value_fwds: Vec<crate::emacs_core::forward::FwdRef>,
     /// Whether `max-lisp-eval-depth` has EVER been made buffer-local in this
     /// obarray. The eval-depth guard on every function call has to know
     /// whether a buffer-local value could undercut the global limit; asking
@@ -1489,13 +1497,11 @@ impl Clone for Obarray {
         // Duplicate the forwarders that OWN a value. Sharing them would make
         // `(setq gc-cons-threshold ...)` in one obarray visible in the other,
         // which is the very desync the per-context descriptor exists to avoid.
-        let mut fwd_map: rustc_hash::FxHashMap<
-            usize,
-            &'static crate::emacs_core::forward::LispFwd,
-        > = rustc_hash::FxHashMap::default();
+        let mut fwd_map: rustc_hash::FxHashMap<usize, crate::emacs_core::forward::FwdRef> =
+            rustc_hash::FxHashMap::default();
         let mut value_fwds = Vec::with_capacity(self.value_fwds.len());
-        let mut clone_stateful = |orig: &'static crate::emacs_core::forward::LispFwd| {
-            let key = std::ptr::from_ref(orig) as usize;
+        let mut clone_stateful = |orig: crate::emacs_core::forward::FwdRef| {
+            let key = orig.address();
             if let Some(&existing) = fwd_map.get(&key) {
                 return Some(existing);
             }
@@ -1556,8 +1562,7 @@ impl Clone for Obarray {
             // SAFETY: a record this clone just leaked and alone owns.
             let blv = unsafe { &mut *blv_ptr.as_ptr() };
             if let Some(fwd) = blv.fwd
-                && let Some(&copy) =
-                    fwd_map.get(&(fwd as *const crate::emacs_core::forward::LispFwd as usize))
+                && let Some(&copy) = fwd_map.get(&fwd.address())
             {
                 blv.fwd = Some(copy);
             }
@@ -1740,8 +1745,8 @@ impl Obarray {
                 }
                 ValueCell::Alias(_) | ValueCell::Forwarded(_) | ValueCell::Localized(_) => {}
             }
-            push(load_value_atomic(&sym.function));
-            push(load_value_atomic(&sym.plist));
+            push(sym.function.load_atomic());
+            push(sym.plist.load_atomic());
         }
     }
 
@@ -2297,7 +2302,7 @@ impl Obarray {
             }
             ValueCell::Alias(current) => self.symbol_value_id_copied_slow(current, 49),
             ValueCell::Localized(_) => {
-                let value = self.blv(id)?.defcell.cons_cdr();
+                let value = self.blv(id)?.defcell.get().cons_cdr();
                 if value.is_unbound() {
                     None
                 } else {
@@ -2337,7 +2342,7 @@ impl Obarray {
             // a call in the hot arms, as in `canonical_value`.
             ValueCell::Alias(current) => self.alias_value_with(id, current, projected),
             ValueCell::Localized(_) => {
-                let value = self.blv(id)?.defcell.cons_cdr();
+                let value = self.blv(id)?.defcell.get().cons_cdr();
                 if value.is_unbound() {
                     None
                 } else {
@@ -2397,7 +2402,7 @@ impl Obarray {
                     current = target;
                 }
                 ValueCell::Localized(_) => {
-                    let value = self.blv(current)?.defcell.cons_cdr();
+                    let value = self.blv(current)?.defcell.get().cons_cdr();
                     if value.is_unbound() {
                         return None;
                     }
@@ -2475,9 +2480,9 @@ impl Obarray {
         // Safety: a `Localized` cell names a record owned by self.blvs.
         unsafe {
             let blv = &mut *blv.as_ptr();
-            blv.defcell.set_cdr(value);
-            if super::value::eq_value(&blv.valcell, &blv.defcell) {
-                blv.valcell.set_cdr(value);
+            blv.defcell.get().set_cdr(value);
+            if super::value::eq_value(&blv.valcell.get(), &blv.defcell.get()) {
+                blv.valcell.get().set_cdr(value);
             }
         }
         CanonicalWrite::Done
@@ -2697,10 +2702,10 @@ impl Obarray {
             local_if_set: false,
             found: false,
             fwd: forwarder,
-            where_buf: Value::NIL,
+            where_buf: Value::NIL.into(),
             where_buf_id: NO_WHERE_BUF,
-            defcell,
-            valcell: defcell,
+            defcell: defcell.into(),
+            valcell: defcell.into(),
             // 0 < the global epoch's initial 1: a fresh BLV never
             // fast-path-hits before its first swap_in records reality.
             alist_epoch: 0,
@@ -2724,7 +2729,7 @@ impl Obarray {
 
     /// The forward descriptor installed on `id`, if the symbol is
     /// `SYMBOL_FORWARDED`. Mirrors GNU `SYMBOL_FWD` (`src/lisp.h:1082`).
-    pub fn forwarder(&self, id: SymId) -> Option<&'static crate::emacs_core::forward::LispFwd> {
+    pub fn forwarder(&self, id: SymId) -> Option<crate::emacs_core::forward::FwdRef> {
         self.slot(id)?.forwarded_descriptor()
     }
 
@@ -2974,12 +2979,13 @@ impl Obarray {
                 debug_assert_eq!(
                     (*blv_ptr)
                         .where_buf
+                        .get()
                         .as_buffer_id()
                         .map_or(NO_WHERE_BUF, |b| b.0),
                     (*blv_ptr).where_buf_id,
                     "a BLV writer bypassed set_where"
                 );
-                return Some((*blv_ptr).valcell.cons_cdr());
+                return Some((*blv_ptr).valcell.get().cons_cdr());
             }
         }
         self.read_localized(id, Value::make_buffer(target_buf_id), target_alist)
@@ -3050,9 +3056,9 @@ impl Obarray {
             // updates that shared cons's cdr in place, so an epoch-valid cell
             // carries the identical live value.
             if (*blv_ptr).alist_epoch == epoch
-                && crate::emacs_core::value::eq_value(&(*blv_ptr).where_buf, &target_buf)
+                && crate::emacs_core::value::eq_value(&(*blv_ptr).where_buf.get(), &target_buf)
             {
-                return (*blv_ptr).valcell.cons_cdr();
+                return (*blv_ptr).valcell.get().cons_cdr();
             }
             // Miss: GNU `find_symbol_value` swaps the binding in
             // (`swap_in_symval_forwarding`) so the NEXT read is a cell read.
@@ -3066,11 +3072,11 @@ impl Obarray {
             let valcell = if found {
                 found_cell
             } else {
-                (*blv_ptr).defcell
+                (*blv_ptr).defcell.get()
             };
             (*blv_ptr).set_where(target_buf);
             (*blv_ptr).found = found;
-            store_value_atomic(&mut (*blv_ptr).valcell, valcell);
+            (*blv_ptr).valcell.store_atomic(valcell);
             (*blv_ptr).alist_epoch = epoch;
             valcell.cons_cdr()
         }
@@ -3100,7 +3106,7 @@ impl Obarray {
         // asked this right after `find_symbol_value` had swapped the cache
         // in, so every buffer-local `let` paid a second whole-alist assq.
         if blv.alist_epoch == blv_alist_epoch()
-            && crate::emacs_core::value::eq_value(&blv.where_buf, &target_buf)
+            && crate::emacs_core::value::eq_value(&blv.where_buf.get(), &target_buf)
         {
             return blv.found;
         }
@@ -3118,7 +3124,7 @@ impl Obarray {
         if let Some(blv) = self.blv_mut(id) {
             blv.set_where(Value::NIL);
             blv.found = false;
-            blv.valcell = blv.defcell;
+            blv.valcell.store_atomic(blv.defcell.get());
         }
     }
 
@@ -3126,11 +3132,11 @@ impl Obarray {
     #[inline]
     pub fn reset_blv_cache_for_buffer(&mut self, id: SymId, buffer: Value) {
         if let Some(blv) = self.blv_mut(id)
-            && crate::emacs_core::value::eq_value(&blv.where_buf, &buffer)
+            && crate::emacs_core::value::eq_value(&blv.where_buf.get(), &buffer)
         {
             blv.set_where(Value::NIL);
             blv.found = false;
-            blv.valcell = blv.defcell;
+            blv.valcell.store_atomic(blv.defcell.get());
         }
     }
 
@@ -3171,11 +3177,7 @@ impl Obarray {
     /// (`false`): a late declaration of a localized variable goes through
     /// [`Self::reattach_localized_forwarder`] instead, and replacing the arm
     /// would orphan the alias edge or the buffer-local record.
-    fn forward_cell(
-        &mut self,
-        id: SymId,
-        fwd: &'static crate::emacs_core::forward::LispFwd,
-    ) -> bool {
+    fn forward_cell(&mut self, id: SymId, fwd: crate::emacs_core::forward::FwdRef) -> bool {
         let mut write = self.cell_write_ensure(id);
         let installed = match write.arm() {
             ArmMut::Plain(plain) => {
@@ -3320,7 +3322,7 @@ impl Obarray {
         if blv.fwd.is_some() {
             return;
         }
-        let restored = blv.defcell.cons_cdr();
+        let restored = blv.defcell.get().cons_cdr();
         let (fwd, canonical) = match kind {
             Kind::Bool => {
                 let flag = restored.is_truthy();
@@ -3347,9 +3349,9 @@ impl Obarray {
             }
         };
         blv.fwd = Some(fwd);
-        blv.defcell.set_cdr(canonical);
-        if super::value::eq_value(&blv.valcell, &blv.defcell) {
-            blv.valcell.set_cdr(canonical);
+        blv.defcell.get().set_cdr(canonical);
+        if super::value::eq_value(&blv.valcell.get(), &blv.defcell.get()) {
+            blv.valcell.get().set_cdr(canonical);
         }
         // The BLV's new descriptor is the variable's cell now; the memoized
         // pointer follows it (see `install_boolfwd`).
@@ -3383,7 +3385,7 @@ impl Obarray {
     /// The predicate lives in `LispFwd::owned_value`, so a new forward variant
     /// cannot be added and silently left untraced by a registry that forgot
     /// about it.
-    fn register_value_fwd(&mut self, fwd: &'static crate::emacs_core::forward::LispFwd) {
+    fn register_value_fwd(&mut self, fwd: crate::emacs_core::forward::FwdRef) {
         if fwd.owned_value().is_some() {
             self.value_fwds.push(fwd);
         }
@@ -3504,7 +3506,7 @@ impl Obarray {
                     //
                     // Use the safe `Obarray::blv` accessor so this code
                     // path stays out of `unsafe` blocks.
-                    return self.blv(current).map(|blv| blv.defcell.cons_cdr());
+                    return self.blv(current).map(|blv| blv.defcell.get().cons_cdr());
                 }
                 ValueCell::Forwarded(fwd) => {
                     // Phase 10D: bare-obarray reads of FORWARDED
@@ -3578,9 +3580,12 @@ impl Obarray {
                     // session VarRefs, 60.8ns -> ~cons_cdr).
                     if let Some(blv) = self.blv(current)
                         && blv.alist_epoch == blv_alist_epoch()
-                        && crate::emacs_core::value::eq_value(&blv.where_buf, &current_buffer_value)
+                        && crate::emacs_core::value::eq_value(
+                            &blv.where_buf.get(),
+                            &current_buffer_value,
+                        )
                     {
-                        return Some(blv.valcell.cons_cdr());
+                        return Some(blv.valcell.get().cons_cdr());
                     }
                     // Swap-in: if `where_buf` doesn't match the
                     // current buffer, scan the new buffer's
@@ -3589,7 +3594,7 @@ impl Obarray {
                     // `swap_in_symval_forwarding`.
                     swap_in_blv(self, current, current_buffer_value, local_var_alist);
                     let blv = self.blv(current)?;
-                    return Some(blv.valcell.cons_cdr());
+                    return Some(blv.valcell.get().cons_cdr());
                 }
                 ValueCell::Forwarded(fwd) => {
                     // Phase 8a: read through the forwarder descriptor.
@@ -3716,9 +3721,13 @@ impl Obarray {
         // when `found` is false, so the auto-create decision below is the
         // same one the scan would reach).
         let mut cell = if blv.alist_epoch == epoch
-            && crate::emacs_core::value::eq_value(&blv.where_buf, &target_buf)
+            && crate::emacs_core::value::eq_value(&blv.where_buf.get(), &target_buf)
         {
-            if blv.found { blv.valcell } else { Value::NIL }
+            if blv.found {
+                blv.valcell.get()
+            } else {
+                Value::NIL
+            }
         } else {
             assq(key, new_alist)
         };
@@ -3733,24 +3742,24 @@ impl Obarray {
             if !auto_create {
                 // Fall through to writing the default.
                 blv.found = false;
-                cell = blv.defcell;
+                cell = blv.defcell.get();
             } else {
                 // Cons up `(sym . current-default-cdr)` and prepend it
                 // to the buffer's local_var_alist.
-                let default_cdr = blv.defcell.cons_cdr();
+                let default_cdr = blv.defcell.get().cons_cdr();
                 cell = Value::cons(key, default_cdr);
                 new_alist = Value::cons(cell, new_alist);
             }
         }
-        store_value_atomic(&mut blv.valcell, cell);
+        blv.valcell.store_atomic(cell);
 
         // Step 2: actually write the new value into valcell's cdr.
         // The BLV's valcell is a shared cons whose cdr lives in the
         // tagged heap; mutate it via Value::set_cdr. Capture
         // valcell + defcell first so the BLV borrow ends before we
         // touch the cons cell.
-        let valcell = blv.valcell;
-        let defcell = blv.defcell;
+        let valcell = blv.valcell.get();
+        let defcell = blv.defcell.get();
         let _writing_default = super::value::eq_value(&valcell, &defcell);
         let _ = blv;
         valcell.set_cdr(value);
@@ -3812,13 +3821,13 @@ impl Obarray {
         // Safety: a `Localized` cell names a record owned by self.blvs.
         unsafe {
             let blv = &mut *blv.as_ptr();
-            blv.defcell.set_cdr(value);
+            blv.defcell.get().set_cdr(value);
             // If the BLV cache is currently swapped to defcell
             // (no per-buffer entry loaded), mirror the new value
             // through valcell as well so subsequent reads
             // observe it without re-swapping.
-            if super::value::eq_value(&blv.valcell, &blv.defcell) {
-                blv.valcell.set_cdr(value);
+            if super::value::eq_value(&blv.valcell.get(), &blv.defcell.get()) {
+                blv.valcell.get().set_cdr(value);
             }
         }
     }
@@ -3850,10 +3859,10 @@ impl Obarray {
                     // Safety: a `Localized` cell names a record self.blvs owns.
                     unsafe {
                         let blv = &mut *local.blv().as_ptr();
-                        let mut cdr = blv.defcell.cons_cdr();
+                        let mut cdr = blv.defcell.get().cons_cdr();
                         if cdr != Value::UNBOUND {
                             f(&mut cdr);
-                            blv.defcell.set_cdr(cdr);
+                            blv.defcell.get().set_cdr(cdr);
                         }
                     }
                 }
@@ -3901,10 +3910,10 @@ impl Obarray {
         };
         if symbol.function_unbound {
             FunctionCellSnapshot::ExplicitlyUnbound
-        } else if symbol.function.is_nil() {
+        } else if symbol.function.get().is_nil() {
             FunctionCellSnapshot::Empty
         } else {
-            FunctionCellSnapshot::Bound(symbol.function)
+            FunctionCellSnapshot::Bound(symbol.function.get())
         }
     }
 
@@ -3927,11 +3936,11 @@ impl Obarray {
         self.mark_global_member(id);
         let sym = self.ensure_symbol_id(id);
         // See `set_symbol_function_id': the same value redefines nothing.
-        let unchanged = !sym.function_unbound && sym.function.bits() == function.bits();
-        let previous = sym.function;
+        let unchanged = !sym.function_unbound && sym.function.get().bits() == function.bits();
+        let previous = sym.function.get();
         // SATB: retain the function cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.function);
-        store_value_atomic(&mut sym.function, function);
+        crate::tagged::gc::note_root_overwrite(sym.function.get());
+        sym.function.store_atomic(function);
         sym.function_unbound = false;
         if !unchanged {
             self.note_function_redefined(id, FunctionEpochBump::InternalCellWrite, previous);
@@ -4055,11 +4064,11 @@ impl Obarray {
         // Storing the value the cell already holds changes no call's
         // behavior, so it redefines nothing: no epoch move, no JIT eviction
         // (a `defalias' re-run while a file reloads, an `fset' in a loop).
-        let unchanged = !sym.function_unbound && sym.function.bits() == function.bits();
-        let previous = sym.function;
+        let unchanged = !sym.function_unbound && sym.function.get().bits() == function.bits();
+        let previous = sym.function.get();
         // SATB: retain the function cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.function);
-        store_value_atomic(&mut sym.function, function);
+        crate::tagged::gc::note_root_overwrite(sym.function.get());
+        sym.function.store_atomic(function);
         sym.function_unbound = false;
         if !unchanged {
             self.note_function_redefined(id, why, previous);
@@ -4078,12 +4087,12 @@ impl Obarray {
         self.ensure_global_member_if_canonical(id);
         let sym = self.ensure_symbol_id(id);
         let was_unbound = sym.function_unbound;
-        let was_bound_function = !sym.function.is_nil();
-        let previous = sym.function;
+        let was_bound_function = !sym.function.get().is_nil();
+        let previous = sym.function.get();
         sym.function_unbound = true;
         // SATB: retain the function cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.function);
-        store_value_atomic(&mut sym.function, Value::NIL);
+        crate::tagged::gc::note_root_overwrite(sym.function.get());
+        sym.function.store_atomic(Value::NIL);
         if !was_unbound || was_bound_function {
             self.note_function_redefined(id, FunctionEpochBump::Fmakunbound, previous);
         }
@@ -4099,12 +4108,12 @@ impl Obarray {
     pub fn clear_function_silent_id(&mut self, id: SymId) {
         let mut redefined = None;
         if let Some(sym) = self.slot_mut(id)
-            && !sym.function.is_nil()
+            && !sym.function.get().is_nil()
         {
-            let previous = sym.function;
+            let previous = sym.function.get();
             // SATB: retain the function cell's pre-image during a concurrent mark.
-            crate::tagged::gc::note_root_overwrite(sym.function);
-            store_value_atomic(&mut sym.function, Value::NIL);
+            crate::tagged::gc::note_root_overwrite(sym.function.get());
+            sym.function.store_atomic(Value::NIL);
             redefined = Some(previous);
         }
         if let Some(previous) = redefined {
@@ -4160,9 +4169,9 @@ impl Obarray {
         if blv.fwd.is_some() {
             return;
         }
-        blv.defcell.set_cdr(Value::UNBOUND);
-        if super::value::eq_value(&blv.valcell, &blv.defcell) {
-            blv.valcell.set_cdr(Value::UNBOUND);
+        blv.defcell.get().set_cdr(Value::UNBOUND);
+        if super::value::eq_value(&blv.valcell.get(), &blv.defcell.get()) {
+            blv.valcell.get().set_cdr(Value::UNBOUND);
         }
     }
 
@@ -4205,9 +4214,9 @@ impl Obarray {
         if blv.fwd.is_some() {
             return CanonicalWrite::Done;
         }
-        blv.defcell.set_cdr(Value::UNBOUND);
-        if super::value::eq_value(&blv.valcell, &blv.defcell) {
-            blv.valcell.set_cdr(Value::UNBOUND);
+        blv.defcell.get().set_cdr(Value::UNBOUND);
+        if super::value::eq_value(&blv.valcell.get(), &blv.defcell.get()) {
+            blv.valcell.get().set_cdr(Value::UNBOUND);
         }
         CanonicalWrite::Done
     }
@@ -4238,7 +4247,7 @@ impl Obarray {
     pub(crate) fn boundp_id_with(
         &self,
         id: SymId,
-        projected: impl FnOnce(&'static crate::emacs_core::forward::LispFwd) -> bool,
+        projected: impl FnOnce(crate::emacs_core::forward::FwdRef) -> bool,
     ) -> bool {
         let mut current = id;
         for _ in 0..50 {
@@ -4256,7 +4265,7 @@ impl Obarray {
                     // Bound if the BLV defcell has a non-UNBOUND default.
                     return self
                         .blv(current)
-                        .is_some_and(|blv| blv.defcell.cons_cdr() != Value::UNBOUND);
+                        .is_some_and(|blv| blv.defcell.get().cons_cdr() != Value::UNBOUND);
                 }
                 ValueCell::Forwarded(fwd) => {
                     // A forwarded slot is never unbound, whatever it forwards
@@ -4287,7 +4296,7 @@ impl Obarray {
     /// projection is bound as the variable it projects is by default.
     #[cold]
     #[inline(never)]
-    fn host_projected_forwarded_boundp(&self, fwd: &crate::emacs_core::forward::LispFwd) -> bool {
+    fn host_projected_forwarded_boundp(&self, fwd: crate::emacs_core::forward::FwdRef) -> bool {
         match fwd.thread_projection() {
             None => true,
             Some(projection) => self.projected_default_value(projection).is_some(),
@@ -4302,7 +4311,7 @@ impl Obarray {
     /// Check if a symbol has a function cell by identity.
     pub fn fboundp_id(&self, id: SymId) -> bool {
         self.slot(id)
-            .is_some_and(|s| !s.function_unbound && !s.function.is_nil())
+            .is_some_and(|s| !s.function_unbound && !s.function.get().is_nil())
     }
 
     /// Get a property from the symbol's plist.
@@ -4329,13 +4338,13 @@ impl Obarray {
         self.mark_global_member(symbol);
         let sym = self.ensure_symbol_id(symbol);
         let (new_plist, _changed) = crate::emacs_core::plist::plist_put(
-            sym.plist,
+            sym.plist.get(),
             Value::from_sym_id(intern(prop)),
             value,
         )?;
         // SATB: retain the plist cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.plist);
-        store_value_atomic(&mut sym.plist, new_plist);
+        crate::tagged::gc::note_root_overwrite(sym.plist.get());
+        sym.plist.store_atomic(new_plist);
         SymbolPropertyRevision::changed(symbol);
         Ok(())
     }
@@ -4353,10 +4362,10 @@ impl Obarray {
         self.ensure_global_member_if_canonical(symbol);
         let sym = self.ensure_symbol_id(symbol);
         let (new_plist, _changed) =
-            crate::emacs_core::plist::plist_put(sym.plist, Value::from_sym_id(prop), value)?;
+            crate::emacs_core::plist::plist_put(sym.plist.get(), Value::from_sym_id(prop), value)?;
         // SATB: retain the plist cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.plist);
-        store_value_atomic(&mut sym.plist, new_plist);
+        crate::tagged::gc::note_root_overwrite(sym.plist.get());
+        sym.plist.store_atomic(new_plist);
         SymbolPropertyRevision::changed(symbol);
         Ok(())
     }
@@ -4379,8 +4388,8 @@ impl Obarray {
         };
         let sym = self.ensure_symbol_id(symbol);
         // SATB: retain the plist cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.plist);
-        store_value_atomic(&mut sym.plist, new_plist);
+        crate::tagged::gc::note_root_overwrite(sym.plist.get());
+        sym.plist.store_atomic(new_plist);
         SymbolPropertyRevision::changed(symbol);
     }
 
@@ -4391,8 +4400,8 @@ impl Obarray {
         self.ensure_global_member_if_canonical(symbol);
         let sym = self.ensure_symbol_id(symbol);
         // SATB: retain the plist cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.plist);
-        store_value_atomic(&mut sym.plist, plist);
+        crate::tagged::gc::note_root_overwrite(sym.plist.get());
+        sym.plist.store_atomic(plist);
         SymbolPropertyRevision::changed(symbol);
     }
 
@@ -4403,7 +4412,7 @@ impl Obarray {
 
     /// Get the symbol's full plist as a flat list by identity.
     pub fn symbol_plist_id(&self, id: SymId) -> Value {
-        self.slot(id).map(|s| s.plist).unwrap_or(Value::NIL)
+        self.slot(id).map(|s| s.plist.get()).unwrap_or(Value::NIL)
     }
 
     /// Snapshot the states relevant to property lookup in one symbol-slot read.
@@ -4412,7 +4421,7 @@ impl Obarray {
     /// means the same thing as nil to GNU's `plist_get`, even though
     /// [`Self::symbol_plist_id`] must continue returning it verbatim.
     pub(crate) fn symbol_plist_snapshot_id(&self, id: SymId) -> SymbolPlistSnapshot {
-        match self.slot(id).map(|symbol| symbol.plist) {
+        match self.slot(id).map(|symbol| symbol.plist.get()) {
             Some(plist) if plist.is_cons() => SymbolPlistSnapshot::Entries(plist),
             _ => SymbolPlistSnapshot::NoEntries,
         }
@@ -4773,13 +4782,13 @@ impl Obarray {
                 ValueCell::Plain(value) => return (!value.is_unbound()).then_some(value),
                 ValueCell::Alias(target) => current = target,
                 ValueCell::Localized(_) => {
-                    let value = self.blv(current)?.defcell.cons_cdr();
+                    let value = self.blv(current)?.defcell.get().cons_cdr();
                     return (!value.is_unbound()).then_some(value);
                 }
                 ValueCell::Forwarded(fwd) => {
                     return fwd.load().or_else(|| {
                         let buf_fwd = fwd.as_buffer_obj_fwd()?;
-                        match buf_fwd.thread_projection() {
+                        match fwd.thread_projection() {
                             None => Some(buf_fwd.default),
                             Some(projection) => projected(projection),
                         }
@@ -4802,10 +4811,10 @@ impl Obarray {
         let mut current_id = id;
         loop {
             let sym = self.slot(current_id)?;
-            if sym.function.is_nil() {
+            if sym.function.get().is_nil() {
                 return None;
             }
-            let func = sym.function;
+            let func = sym.function.get();
             match func.kind() {
                 ValueKind::Symbol(id) => {
                     current_id = id;
@@ -4852,9 +4861,9 @@ impl Obarray {
                 sym.is_present()
                     && sym.interned_global
                     && !sym.function_unbound
-                    && !sym.function.is_nil()
+                    && !sym.function.get().is_nil()
             })
-            .map(|sym| (sym.name(), sym.function))
+            .map(|sym| (sym.name(), sym.function.get()))
     }
 
     /// Remove a symbol from the obarray.  Returns `true` if it was present.
@@ -5082,16 +5091,16 @@ impl GcTrace for Obarray {
                 // Localized: BLV contents traced via self.blvs below.
                 ValueCell::Alias(_) | ValueCell::Forwarded(_) | ValueCell::Localized(_) => {}
             }
-            roots.push(load_value_atomic(&sym.function));
-            roots.push(load_value_atomic(&sym.plist));
+            roots.push(sym.function.load_atomic());
+            roots.push(sym.plist.load_atomic());
         }
         // BLV contents for LOCALIZED symbols. Unchanged.
         for &blv_ptr in &self.blvs {
             // SAFETY: the pool's records live as long as `self`.
             let blv = unsafe { &*blv_ptr.as_ptr() };
-            roots.push(load_value_atomic(&blv.defcell));
-            roots.push(load_value_atomic(&blv.valcell));
-            roots.push(load_value_atomic(&blv.where_buf));
+            roots.push(blv.defcell.load_atomic());
+            roots.push(blv.valcell.load_atomic());
+            roots.push(blv.where_buf.load_atomic());
         }
         // Value-owning forwarder slots. GNU's `DEFVAR_INT` slot is an
         // `intmax_t` and needs no marking, but Neomacs stores the Lisp integer

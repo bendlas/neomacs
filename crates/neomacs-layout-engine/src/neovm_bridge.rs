@@ -13,6 +13,7 @@
 //! and creates no buffer-specific or Lisp-state cache.
 
 use neovm_core::emacs_core::eval::VariableView;
+use neovm_core::face::realization::BasicFace;
 use std::cmp::Ordering;
 
 mod borrowed_buffer;
@@ -37,7 +38,9 @@ mod property_keys;
 use property_keys::PropertyKeyOrder;
 
 mod face_colors;
-use face_colors::{FaceColorAttributes, FaceColorState};
+use face_colors::{FaceColorAttributes, FaceColorState, TtyPaint, TtyPaintKey};
+mod face_sources;
+use face_sources::{FaceTableRoots, RootedFace};
 
 use neovm_core::buffer::{
     Buffer, CharPos0, CharRange, EmacsByteLen, EmacsBytePos, EmacsByteRange, LispCharPos1,
@@ -54,8 +57,8 @@ use neovm_core::emacs_core::textprop::{DirectCharProperties, resolve_effective_c
 use neovm_core::emacs_core::value::{ValueKind, eq_value, list_to_vec};
 use neovm_core::emacs_core::{Context, Value};
 use neovm_core::face::{
-    BoxStyle as NeoBoxStyle, Color as NeoColor, Face as NeoFace, FaceDecoration, FaceHeight,
-    FaceTable, FontWeight, UnderlinePosition as NeoUnderlinePosition,
+    BoxBorder as NeoBoxBorder, BoxStyle as NeoBoxStyle, Color as NeoColor, Face as NeoFace,
+    FaceDecoration, FaceHeight, FaceTable, FontWeight, UnderlinePosition as NeoUnderlinePosition,
     UnderlineStyle as NeoUnderlineStyle,
 };
 pub(crate) use neovm_core::window::WindowLayoutVariable as LayoutVar;
@@ -246,6 +249,11 @@ impl BufferFaceRemapping {
     pub(crate) fn empty() -> Self {
         Self { alist: None }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_alist(alist: Option<Value>) -> Self {
+        Self { alist }
+    }
 }
 
 /// ADMITTED-WORK counters, read and reset once per accepted frame into
@@ -401,7 +409,9 @@ impl LayoutBufferView for Buffer {
     }
 
     fn layout_indexed_newline_count(&self, range: EmacsByteRange) -> Option<usize> {
-        self.indexed_newline_count(range)
+        // The layout's counts are the line-number gutter's, repeated for
+        // every redisplay: large enough ranges may build the index.
+        self.indexed_newline_count(range, neovm_core::buffer::LineIndexBuild::IfLarge)
     }
 
     fn layout_text_prop_at_emacs_byte_pos(&self, pos: EmacsBytePos, name: Value) -> Option<Value> {
@@ -1458,6 +1468,15 @@ pub fn window_params_from_neovm_with_font_sizing(
         mode_line_active,
         is_minibuffer,
     } = display_role;
+    // GNU uses the same activity predicate for mode, header and tab lines:
+    // selected/minibuffer-caller windows, or every window when this option is
+    // nil (dispextern.h:1541-1558,1582-1599,1617-1633).
+    let mode_line_active = mode_line_active
+        || (neovm_core::face::realization::enabled()
+            && neovm_core::face::realization::frame_is_tty_target(frame)
+            && vars
+                .value_by_name("mode-line-in-non-selected-windows")
+                .is_some_and(Value::is_nil));
     // Only leaf windows can be laid out.
     let effective_window_system = frame.effective_window_system();
     let is_window_system = effective_window_system.is_some();
@@ -1680,7 +1699,10 @@ pub fn window_params_from_neovm_with_font_sizing(
 
     let tab_line_height = if wants_tab_line {
         chrome_face_pixel_height(
-            &resolve_window_chrome_face(DisplayOrigin::TabLine),
+            &face_resolver.resolve_buffer_tab_line_face(
+                buffer,
+                crate::display_face_policy::TabLineFaceRole::from(mode_line_active),
+            ),
             char_height,
             device_scale,
         )
@@ -2203,13 +2225,30 @@ impl<'a, B: LayoutBufferView> RustBufferAccess<'a, B> {
     }
 
     /// Find a read boundary after N source newlines that cannot be consumed by
-    /// a display/invisible property. Inserted strings and wrapping only add
-    /// rows. Conservatively ignore every newline covered by either property,
-    /// including inactive values and overlays belonging to another window.
-    /// Skip hazardous extents directly, so a large fold needs no per-line
-    /// property queries. The returned offset always follows a real newline.
-    pub fn find_nth_preserved_newline_after(&self, byte_from: i64, n: usize) -> Option<i64> {
-        let bounds = clamped_layout_emacs_byte_range(self.buffer, byte_from, self.zv())?;
+    /// a display/invisible property, scanning only `[byte_from, byte_limit)`.
+    /// Inserted strings and wrapping only add rows. Conservatively ignore every
+    /// newline covered by either property, including inactive values and
+    /// overlays belonging to another window. Skip hazardous extents directly,
+    /// so a large fold needs no per-line property queries. The returned offset
+    /// always follows a real newline.
+    ///
+    /// This is a line-EXISTENCE query: `None` says the bounded region holds
+    /// fewer than `n` preserved newlines, never that the buffer ended. GNU
+    /// asks the same question of `find_newline` (src/search.c:675), which
+    /// answers it from the newline cache's newline-free region records
+    /// (src/search.c:595-644 `region_cache_forward`), and it bounds its own
+    /// continued-line search by the window's cell count
+    /// (`WINDOW_TOTAL_LINES (w) * WINDOW_TOTAL_COLS (w)`, src/xdisp.c:19763).
+    /// A caller that only needs a screenful of lines must pass such a bound,
+    /// or a newline-less tail walks (and is then copied) to ZV.
+    pub fn find_nth_preserved_newline_within(
+        &self,
+        byte_from: i64,
+        byte_limit: i64,
+        n: usize,
+    ) -> Option<i64> {
+        let bounds =
+            clamped_layout_emacs_byte_range(self.buffer, byte_from, byte_limit.min(self.zv()))?;
         if n == 0 {
             return Some(bounds.start().get() as i64);
         }
@@ -2223,10 +2262,15 @@ impl<'a, B: LayoutBufferView> RustBufferAccess<'a, B> {
             let result = self.buffer.layout_try_for_each_emacs_byte_range_chunk(
                 EmacsByteRange::new(start, bounds.end()),
                 |chunk| {
-                    for (index, byte) in chunk.iter().enumerate() {
-                        if *byte != b'\n' {
-                            continue;
-                        }
+                    // memchr, not a scalar byte loop: on a newline-free region
+                    // this query is a scan for the first newline, which GNU
+                    // answers from the newline cache without reading the bytes
+                    // at all (src/search.c:595-644); the vectorized search is
+                    // the closest bounded equivalent.
+                    let mut searched = 0;
+                    while let Some(found) = memchr::memchr(b'\n', &chunk[searched..]) {
+                        let index = searched + found;
+                        searched = index + 1;
                         let pos = EmacsBytePos::new(offset + index);
                         let after = EmacsBytePos::new(pos.get() + 1);
                         let mut skip_to = pos;
@@ -2922,11 +2966,12 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
                     .layout_text_prop_at_emacs_byte_pos(bytepos, Value::symbol("display"))
             })
             .is_some_and(|value| {
-                crate::display_property::classify_display_property(
+                crate::display_property::classify_display_property_at(
                     value,
                     &self.buffer.layout_display_when_conditions(),
                     crate::display_property::DisplayPropertyObject::Buffer,
                     self.buffer.layout_display_target(),
+                    crate::display_when::DisplayWhenLookup::buffer_at_char_pos(charpos),
                 )
                 .replacement()
                 .is_some()
@@ -3395,7 +3440,7 @@ fn stipple_file_search_paths(name: &str) -> Vec<std::path::PathBuf> {
 ///
 /// This is the neovm-core equivalent of `FaceDataFFI`.  All attributes are
 /// fully realized (no `Option`s) so the layout engine can use them directly.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ResolvedFace {
     /// Foreground color (sRGB pixel: 0x00RRGGBB).
     pub fg: u32,
@@ -3463,6 +3508,13 @@ pub struct ResolvedFace {
     /// Original color attributes retained across merges; paint colors are
     /// intentionally not reversible (inverse defaults and distant colors).
     color_state: FaceColorState,
+    /// Fully merged logical attributes, before terminal color callbacks.
+    /// The owning frame/layout attempt confines this immutable snapshot to its
+    /// mutator; Arc shares strings and attributes without sharing Lisp mutation.
+    source_attributes: Option<std::sync::Arc<RootedFace>>,
+    /// Canonical forced basic realization, distinct even when its logical
+    /// attributes equal another basic role's. Every logical merge clears it.
+    canonical_tty_role: Option<BasicFace>,
     /// Per-face measured character advance width (from FontMetricsService, 0.0 = use default).
     font_char_width: f32,
     /// Per-face font ascent (from FontMetricsService, 0.0 = use default).
@@ -3510,6 +3562,8 @@ impl Default for ResolvedFace {
             overstrike: false,
             terminal_inverse_video: false,
             color_state: FaceColorState::Seed,
+            source_attributes: None,
+            canonical_tty_role: None,
             font_char_width: 0.0,
             font_ascent: 0.0,
             font_line_height: 0.0,
@@ -3520,9 +3574,149 @@ impl Default for ResolvedFace {
     }
 }
 
+/// GNU compares lface attributes `EQ` first and only falls back to `equal`
+/// per slot (`face_attr_equal_p`, src/xfaces.c:4483-4497), because a
+/// re-derived face re-reads the same definition objects and identical slots
+/// are the overwhelmingly common verdict. [`ResolvedFace`] carries the same
+/// shortcut structurally: `source_attributes` is the interned merged source,
+/// and every consumer of one composition shares one `Arc`, so allocation
+/// identity proves content identity and skips the whole `Face`/`Value` walk.
+/// Distinct allocations still compare by content -- a face id must stay
+/// stable for content-equal sources across transactions, and those re-fold
+/// into fresh allocations whenever a definition change retired the cache.
+impl PartialEq for ResolvedFace {
+    fn eq(&self, other: &Self) -> bool {
+        let shared_source = match (&self.source_attributes, &other.source_attributes) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => return false,
+        };
+        self.fg == other.fg
+            && self.bg == other.bg
+            && self.terminal_fg == other.terminal_fg
+            && self.terminal_bg == other.terminal_bg
+            && self.use_default_foreground == other.use_default_foreground
+            && self.use_default_background == other.use_default_background
+            && self.font_family == other.font_family
+            && self.font_weight == other.font_weight
+            && self.italic == other.italic
+            && self.font_size == other.font_size
+            && self.underline_style == other.underline_style
+            && self.underline_position == other.underline_position
+            && self.underline_color == other.underline_color
+            && self.terminal_underline_color == other.terminal_underline_color
+            && self.strike_through == other.strike_through
+            && self.strike_through_color == other.strike_through_color
+            && self.overline == other.overline
+            && self.overline_color == other.overline_color
+            && self.box_type == other.box_type
+            && self.box_color == other.box_color
+            && self.box_line_width == other.box_line_width
+            && self.extend == other.extend
+            && self.overstrike == other.overstrike
+            && self.terminal_inverse_video == other.terminal_inverse_video
+            && self.color_state == other.color_state
+            && self.canonical_tty_role == other.canonical_tty_role
+            && self.font_char_width == other.font_char_width
+            && self.font_ascent == other.font_ascent
+            && self.font_line_height == other.font_line_height
+            && self.face_id == other.face_id
+            && self.lisp_name == other.lisp_name
+            && self.stipple == other.stipple
+            && (shared_source || self.source_attributes == other.source_attributes)
+    }
+}
+
 impl ResolvedFace {
+    fn install_realized_tty_colors(&mut self, realized: &NeoFace) {
+        // Read the retained pre-inverse channel state, never reverse-engineer
+        // source colors from this face's already-inverted paint.
+        FaceColorAttributes::from_base(self)
+            .merge_terminal_realization(realized)
+            .realize()
+            .install(self);
+        self.terminal_underline_color = realized
+            .underline
+            .enabled()
+            .and_then(|underline| underline.color.as_ref())
+            .and_then(|color| color.terminal);
+        if let Some(underline) = realized.underline.enabled() {
+            self.underline_color = underline
+                .color
+                .as_ref()
+                .map(color_to_pixel)
+                .unwrap_or(self.fg);
+        }
+    }
+
+    fn retain_source_over(
+        &mut self,
+        resolver: &FaceResolver,
+        base: &ResolvedFace,
+        overlay: &NeoFace,
+        overlay_identity: Option<&std::sync::Arc<NeoFace>>,
+    ) {
+        self.canonical_tty_role = None;
+        let Some(source) = base.source_attributes.clone() else {
+            return;
+        };
+        if let Some(identity) = overlay_identity
+            && let Some(shared) = resolver.cached_composed_identity_over(&source, identity)
+        {
+            self.source_attributes = Some(shared);
+            return;
+        }
+        if let Some(shared) = resolver.cached_composed_over(&source, overlay) {
+            if let Some(identity) = overlay_identity {
+                resolver.record_composed_identity_over(source, identity.clone(), shared.clone());
+            }
+            self.source_attributes = Some(shared);
+            return;
+        }
+        let mut merged = source.attributes().merge(overlay);
+        merged.inherit = None;
+        merged.doc = None;
+        let Some(shared) = resolver.shared_composed_source(merged, Some(&source)) else {
+            self.source_attributes = None;
+            return;
+        };
+        resolver.record_composed_over(source.clone(), overlay.clone(), shared.clone());
+        if let Some(identity) = overlay_identity {
+            resolver.record_composed_identity_over(source, identity.clone(), shared.clone());
+        }
+        self.source_attributes = Some(shared);
+    }
+
     pub(crate) fn has_same_color_source(&self, other: &Self) -> bool {
         FaceColorAttributes::from_base(self) == FaceColorAttributes::from_base(other)
+    }
+
+    /// Identity fast path for repeated checkpoint probes: one interned
+    /// composed source shared by allocation, plus the entry state that
+    /// realization reads.
+    ///
+    /// GNU's frame face cache keys a realized face by its merged lface
+    /// vector — `lookup_face` hashes and compares the lface, never the
+    /// realized `struct face` (src/xfaces.c:5064-5075) — because every
+    /// realized field is a deterministic function of that merged lface.
+    /// Allocation identity of an interned source is the strict refinement of
+    /// the same key: the source IS the merged content. Two fields escape
+    /// that implication and carry their own comparison — `font_size` may
+    /// fold a relative `:height` against different base faces, and
+    /// `lisp_name` is assigned by the named-face resolver after interning.
+    /// Faces without a retained source answer `false`; callers fall back to
+    /// full equality.
+    pub(crate) fn shares_resolved_identity(&self, other: &Self) -> bool {
+        let (Some(left), Some(right)) = (&self.source_attributes, &other.source_attributes) else {
+            return false;
+        };
+        std::sync::Arc::ptr_eq(left, right)
+            && self.font_size == other.font_size
+            && self.lisp_name == other.lisp_name
+            && self.canonical_tty_role == other.canonical_tty_role
+            && self.color_state == other.color_state
+            && self.underline_color == other.underline_color
+            && self.terminal_underline_color == other.terminal_underline_color
     }
 
     /// Typed view of this bridge-side face id. `ResolvedFace.face_id` stays a
@@ -3552,6 +3746,7 @@ impl ResolvedFace {
     /// together and never separately -- a site that set one and forgot the
     /// other would put the writer back to guessing an index from RGB.
     fn set_foreground(&mut self, color: &NeoColor) {
+        self.canonical_tty_role = None;
         self.fg = color_to_pixel(color);
         self.terminal_fg = color.terminal;
         self.use_default_foreground = false;
@@ -3559,6 +3754,7 @@ impl ResolvedFace {
 
     /// Assign GNU's whole realized background from one realized colour.
     fn set_background(&mut self, color: &NeoColor) {
+        self.canonical_tty_role = None;
         self.bg = color_to_pixel(color);
         self.terminal_bg = color.terminal;
         self.use_default_background = false;
@@ -3569,6 +3765,7 @@ impl ResolvedFace {
     /// colour: GNU's `FACE_TTY_DEFAULT_FG_COLOR`, which `turn_on_face` emits
     /// no colour for at all.
     fn set_frame_default_foreground(&mut self, pixel: u32) {
+        self.canonical_tty_role = None;
         self.fg = pixel;
         self.terminal_fg = None;
         self.use_default_foreground = true;
@@ -3577,6 +3774,7 @@ impl ResolvedFace {
     /// The frame's fallback background; see
     /// [`Self::set_frame_default_foreground`].
     fn set_frame_default_background(&mut self, pixel: u32) {
+        self.canonical_tty_role = None;
         self.bg = pixel;
         self.terminal_bg = None;
         self.use_default_background = true;
@@ -3663,6 +3861,24 @@ impl OrderedFaceSources {
     }
 }
 
+/// One resolved face source: its logical attributes plus, when the source is
+/// a single named face folded in this resolver, the shared specification it
+/// was folded into. The identity lets a repeated composition be recognized by
+/// pointer equality instead of re-digesting the content.
+struct FaceSpecContribution {
+    face: NeoFace,
+    identity: Option<std::sync::Arc<NeoFace>>,
+}
+
+impl FaceSpecContribution {
+    fn anonymous(face: NeoFace) -> Self {
+        Self {
+            face,
+            identity: None,
+        }
+    }
+}
+
 /// Accumulates GNU lface attributes without realizing colors or decorations.
 ///
 /// `ResolvedFace` is deliberately absent from the stored state.  Consequently
@@ -3671,6 +3887,7 @@ impl OrderedFaceSources {
 #[derive(Default)]
 struct UnresolvedFaceComposition {
     attributes: Option<NeoFace>,
+    identity: Option<std::sync::Arc<NeoFace>>,
 }
 
 /// GNU's face merger reports invalid references only at the display-property
@@ -3683,22 +3900,127 @@ enum FaceReferenceDiagnostics {
 }
 
 impl UnresolvedFaceComposition {
-    fn merge(&mut self, contribution: NeoFace) {
-        self.attributes = Some(match self.attributes.take() {
-            Some(attributes) => attributes.merge(&contribution),
-            None => contribution,
-        });
+    /// The identity survives only a single-source composition; once a second
+    /// source merges in, the accumulated attributes no longer equal any one
+    /// shared specification.
+    fn merge_ided(&mut self, contribution: FaceSpecContribution) {
+        match self.attributes.take() {
+            Some(attributes) => {
+                self.attributes = Some(attributes.merge(&contribution.face));
+                self.identity = None;
+            }
+            None => {
+                self.attributes = Some(contribution.face);
+                self.identity = contribution.identity;
+            }
+        }
     }
 
-    fn merge_optional(&mut self, contribution: Option<NeoFace>) {
+    fn merge_optional(&mut self, contribution: Option<FaceSpecContribution>) {
         if let Some(contribution) = contribution {
-            self.merge(contribution);
+            self.merge_ided(contribution);
         }
     }
 
     fn realize(self, resolver: &FaceResolver, base: &ResolvedFace) -> Option<ResolvedFace> {
-        self.attributes
-            .map(|attributes| resolver.apply_specified_face_over(base, &attributes))
+        self.attributes.map(|attributes| {
+            resolver.apply_specified_face_over(base, &attributes, self.identity.as_ref())
+        })
+    }
+}
+
+/// One real-TTY source snapshot, captured only after core initialized its
+/// frame cache. Every face-source invalidation advances the global counter;
+/// equal generations therefore need no frame-table identity lookup. A change
+/// on another frame may retag this source without invalidating its identity.
+/// This immutable token belongs to the resolver's exclusive owning mutator.
+#[derive(Clone, Copy)]
+struct BoundTtyFaceSource {
+    frame_id: FrameId,
+    generation: u64,
+}
+
+impl BoundTtyFaceSource {
+    #[inline]
+    fn is_current(self, evaluator: &Context, table: &FaceTable) -> bool {
+        self.generation == evaluator.face_change_count()
+            || evaluator.display_face_source_table_is_current(self.frame_id, table)
+    }
+}
+
+enum FaceRealizationSource {
+    MergeOverDefault,
+    Complete(std::sync::Arc<RootedFace>),
+}
+
+/// A render-local capability for pure resolution plus optional cold-entry
+/// observation. Ordinary rendering uses FaceResolver itself, so its existing
+/// one-pointer services borrow and empty observation specialize unchanged.
+pub(crate) trait FaceServices {
+    fn resolver(&self) -> &FaceResolver;
+    fn realize_for_display(&self, face: &mut ResolvedFace, evaluator: &mut Context);
+}
+
+trait ColdFaceEntryObserver {
+    fn before_entry(&self);
+}
+
+struct NoColdFaceEntryObserver;
+impl ColdFaceEntryObserver for NoColdFaceEntryObserver {
+    #[inline]
+    fn before_entry(&self) {}
+}
+
+impl ColdFaceEntryObserver for std::cell::Cell<bool> {
+    #[inline]
+    fn before_entry(&self) {
+        self.set(true);
+    }
+}
+
+/// This borrowed capability is created only for an actual synchronous Rows
+/// producer. The sticky Cell outlives every physical retry of that producer.
+pub(crate) struct ObservedFaceServices<'a> {
+    resolver: &'a FaceResolver,
+    cold_entry: &'a std::cell::Cell<bool>,
+}
+
+impl<'a> ObservedFaceServices<'a> {
+    pub(crate) fn new(resolver: &'a FaceResolver, cold_entry: &'a std::cell::Cell<bool>) -> Self {
+        Self {
+            resolver,
+            cold_entry,
+        }
+    }
+}
+
+impl FaceServices for ObservedFaceServices<'_> {
+    fn resolver(&self) -> &FaceResolver {
+        self.resolver
+    }
+
+    fn realize_for_display(&self, face: &mut ResolvedFace, evaluator: &mut Context) {
+        // Pending hook flow must keep the original placeholder behavior. In
+        // the quiescent case a native warm lookup cannot enter user Lisp.
+        if !evaluator.redisplay_hook_flow_pending()
+            && self.resolver.realize_cached_for_display(face, evaluator)
+        {
+            return;
+        }
+        self.resolver
+            .realize_with_cold_observer(face, evaluator, self.cold_entry);
+    }
+}
+
+impl FaceServices for FaceResolver {
+    #[inline]
+    fn resolver(&self) -> &FaceResolver {
+        self
+    }
+
+    #[inline]
+    fn realize_for_display(&self, face: &mut ResolvedFace, evaluator: &mut Context) {
+        FaceResolver::realize_for_display(self, face, evaluator);
     }
 }
 
@@ -3709,7 +4031,17 @@ impl UnresolvedFaceComposition {
 /// backend.
 pub struct FaceResolver {
     face_table: FaceTable,
+    /// The bound TTY snapshot may inspect any definition after a color callback
+    /// replaces the live table and collects. Root the whole snapshot once.
+    face_table_roots: Option<FaceTableRoots>,
     default_face: ResolvedFace,
+    /// Frame ownership is supplied by production layout. Unit resolvers have
+    /// no evaluator capability and remain pure. No evaluator or Lisp state is
+    /// retained here or in thread-local storage.
+    tty_face_source: Option<BoundTtyFaceSource>,
+    /// Only real TTY bindings need the large enum-indexed basic projection.
+    /// Unbound/default-off/GUI resolvers retain one empty pointer-sized option.
+    realized_basic_faces: Option<Box<enum_map::EnumMap<BasicFace, Option<ResolvedFace>>>>,
     /// Window system in use: `None` for TTY, `Some("x")` for X11,
     /// `Some("wayland")` for Wayland, etc.  Used to evaluate
     /// `:filtered` face spec predicates.
@@ -3735,8 +4067,279 @@ pub struct FaceResolver {
     /// retry speculatively, so the resolver records them without mutating the
     /// evaluator; the engine logs only the accepted attempt.
     invalid_face_references: std::cell::RefCell<Vec<String>>,
+    /// One shared [`RootedFace`] per distinct composed source, so repeated
+    /// compositions of the same logical face compare by `Arc` identity in
+    /// every downstream probe, the way GNU's merged lface vectors compare by
+    /// EQ on shared slots (src/xfaces.c:4483-4497). Content-keyed: an entry
+    /// is a function of its merged attributes, never of their provenance, so
+    /// the cache cannot go stale against this resolver's immutable table
+    /// snapshot; the cap bounds churning inline-plist faces.
+    ///
+    /// Held behind an `Rc` shared with the engine: a resolver lives for one
+    /// redisplay transaction, but its folded named specifications and merged
+    /// sources stay valid for as long as the face table snapshot does — GNU
+    /// keeps a frame's whole face cache across redisplays and frees it only
+    /// when a definition changes (`face_change`, src/xfaces.c:3098-3105).
+    composed_sources: std::rc::Rc<std::cell::RefCell<ComposedSourceCache>>,
     font_sizing: FontSizing,
     frame_font_domain: FrameFontDomain,
+}
+
+/// Shared-source interning for face compositions, mirroring GNU's face cache
+/// keyed by the merged lface vector (`lookup_face`, src/xfaces.c:5064-5093).
+#[derive(Default)]
+struct ComposedSourceCache {
+    /// Distinct merged sources by content digest.
+    entries: rustc_hash::FxHashMap<u64, Vec<std::sync::Arc<RootedFace>>>,
+    /// `base + overlay` compositions, so a repeated composition reuses its
+    /// merged source without rebuilding it. The base is pinned by a weak
+    /// reference: a freed base cannot match, and a live allocation cannot be
+    /// confused with another face that later reuses its address.
+    compositions: rustc_hash::FxHashMap<(usize, u64), Vec<ComposedOverlayEntry>>,
+    /// `base + overlay` compositions keyed by allocation identity, GNU's
+    /// `EQ`-first bucket verification (src/xfaces.c:4483-4497): both keys are
+    /// pinned by weak references, so a hit is two pointer comparisons.
+    identity_compositions: rustc_hash::FxHashMap<(usize, usize), Vec<IdentityComposedEntry>>,
+    /// Fully folded overlay specifications per named face — GNU resolves a
+    /// named face through the immutable `face_face` frame table every time
+    /// (`get_lface_attributes`), which this resolver snapshots once, so the
+    /// folded result is a function of the name. Buffer folds carry the
+    /// identity of the `face-remapping-alist` object they ran against; see
+    /// [`NamedSpecEntry`].
+    named_specs: rustc_hash::FxHashMap<Box<str>, NamedSpecEntry>,
+    len: usize,
+    /// Routed-row speculation depth: insert methods journal their undo
+    /// records while this is non-zero (see [`FaceCacheRewind`]). The route
+    /// arms before its first face probe and rewinds on any refusal, so a
+    /// refused row leaves the caches exactly as it found them.
+    speculation_depth: u32,
+    speculation_journal: Vec<FaceCacheRewind>,
+}
+
+/// One folded named-face specification plus the buffer-local
+/// `face-remapping-alist` object it was folded against.
+///
+/// GNU re-runs its live remapping check on every lookup
+/// (`merge_named_face`, src/xfaces.c:3269-3295): an `assq` for the face name
+/// against the current alist, then the cached definition fold. The memo
+/// keeps exactly that shape — the fold path re-runs the name's `assq` miss
+/// check per lookup (a hit takes the remapping branch before the memo is
+/// consulted), so the entry only has to record which alist OBJECT the fold
+/// saw. Top-level lookups may instead consult the memo before the `assq`
+/// (`resolve_buffer_named_face_overlay_spec_inner`): every recorded fold ran
+/// with an empty remap stack, so its own `assq` miss is part of what the
+/// entry encodes for that alist object. `setq`-replacing the alist (the only
+/// mutation `face-remap.el` and
+/// friends perform) produces a new list object, misses the recorded bits,
+/// and re-folds. In-place splicing an entry for one of the fold's
+/// *inherited* names is the one change an identity key cannot observe; the
+/// pin's table snapshot has the same identity-implies-content trust for
+/// `Rc::make_mut` storage. Pure table folds (`resolve_named_face_overlay_spec`)
+/// never read the alist and are recorded under [`ALIST_INDEPENDENT`].
+#[derive(Clone)]
+struct NamedSpecEntry {
+    shared: std::sync::Arc<NeoFace>,
+    alist_bits: usize,
+}
+
+/// Recorded for folds that never consulted a buffer-local remapping alist.
+const ALIST_INDEPENDENT: usize = usize::MAX;
+
+struct ComposedOverlayEntry {
+    base: std::sync::Weak<RootedFace>,
+    overlay: NeoFace,
+    merged: std::sync::Arc<RootedFace>,
+}
+
+struct IdentityComposedEntry {
+    base: std::sync::Weak<RootedFace>,
+    overlay: std::sync::Weak<NeoFace>,
+    merged: std::sync::Arc<RootedFace>,
+}
+
+impl ComposedSourceCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.compositions.clear();
+        self.identity_compositions.clear();
+        self.named_specs.clear();
+        self.len = 0;
+        // The wholesale reset only runs at speculation depth 0 (see the
+        // insert methods), where the journal is already empty; clearing it
+        // here keeps that invariant explicit rather than accidental.
+        self.speculation_journal.clear();
+    }
+}
+
+/// One undo record of a face-cache insert performed inside a speculative
+/// routed-row attempt. GNU lets a retried display keep the faces it
+/// realized — the frame face cache empties only on `face_change`
+/// (src/xfaces.c:3098-3105) — but a routed row here must be INVISIBLE when
+/// refused: the buffer pipeline re-renders it, and the attempt's cache
+/// entries would otherwise change which later insert trips the wholesale
+/// [`COMPOSED_SOURCE_CACHE_LIMIT`] reset or which paint a one-slot memo
+/// still answers for. Records apply in reverse insertion order, so a
+/// pushed entry is still the last of its bucket when its undo runs.
+enum FaceCacheRewind {
+    /// A realized terminal paint recorded beside its source; the previous
+    /// slot contents are restored wholesale (the slot is one deep).
+    TtyPaint {
+        source: std::sync::Arc<RootedFace>,
+        previous: Option<face_colors::TtyPaintMemo>,
+    },
+    /// An interned composed source appended to a digest bucket.
+    ComposedEntry {
+        hash: u64,
+        pushed: std::sync::Arc<RootedFace>,
+    },
+    /// A content-keyed `base + overlay` composition.
+    Composition {
+        key: (usize, u64),
+        pushed: std::sync::Arc<RootedFace>,
+    },
+    /// An identity-keyed `base + overlay` composition.
+    IdentityComposition {
+        key: (usize, usize),
+        pushed: std::sync::Arc<RootedFace>,
+    },
+    /// A folded named-face specification; `previous` restores a replaced
+    /// fold, or removes a fresh one.
+    NamedSpec {
+        name: Box<str>,
+        previous: Option<NamedSpecEntry>,
+    },
+}
+
+impl FaceCacheRewind {
+    /// Undo the insert this record was journaled for. Bucket entries are
+    /// matched by allocation identity, never by content: an equal-content
+    /// entry from before the attempt must survive the rewind.
+    fn apply(self, cache: &mut ComposedSourceCache) {
+        let removed = match self {
+            FaceCacheRewind::TtyPaint { source, previous } => {
+                source.rewind_tty_paint(previous);
+                return;
+            }
+            FaceCacheRewind::ComposedEntry { hash, pushed } => cache
+                .entries
+                .get_mut(&hash)
+                .is_some_and(|bucket| remove_by_identity(bucket, &pushed, |entry| entry)),
+            FaceCacheRewind::Composition { key, pushed } => cache
+                .compositions
+                .get_mut(&key)
+                .is_some_and(|bucket| remove_by_identity(bucket, &pushed, |entry| &entry.merged)),
+            FaceCacheRewind::IdentityComposition { key, pushed } => cache
+                .identity_compositions
+                .get_mut(&key)
+                .is_some_and(|bucket| remove_by_identity(bucket, &pushed, |entry| &entry.merged)),
+            FaceCacheRewind::NamedSpec { name, previous } => {
+                match previous {
+                    Some(entry) => cache.named_specs.insert(name, entry),
+                    None => cache.named_specs.remove(&name),
+                };
+                // The insert always counted one entry, even when it replaced
+                // a fold; the undo owes the same one back.
+                true
+            }
+        };
+        if removed {
+            cache.len = cache.len.saturating_sub(1);
+        }
+    }
+}
+
+/// Drop `pushed` from `bucket` by allocation identity. Bucket order carries
+/// no meaning (probes scan linearly), so a swap-remove is exact.
+fn remove_by_identity<E>(
+    bucket: &mut Vec<E>,
+    pushed: &std::sync::Arc<RootedFace>,
+    merged_of: impl Fn(&E) -> &std::sync::Arc<RootedFace>,
+) -> bool {
+    bucket
+        .iter()
+        .position(|entry| std::sync::Arc::ptr_eq(merged_of(entry), pushed))
+        .is_some_and(|position| {
+            bucket.swap_remove(position);
+            true
+        })
+}
+
+/// Marker of a face-cache speculation window handed back by
+/// [`FaceResolver::arm_face_cache_speculation`]. Opaque by design: only the
+/// resolver's accept/rewind pair consumes it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FaceCacheSpeculationMark {
+    journal_len: usize,
+}
+
+/// Beyond this many distinct composed sources the cache resets wholesale: a
+/// session composing thousands of distinct inline-plist faces keeps bounded
+/// memory, and steady workloads stay far under the cap.
+const COMPOSED_SOURCE_CACHE_LIMIT: usize = 4096;
+
+/// Engine-side carry of one resolver's [`ComposedSourceCache`] across redisplay
+/// transactions.
+///
+/// A resolver is rebuilt per transaction (twice when a TTY color callback
+/// forces a mid-transaction refresh), and with it every folded named-face
+/// specification and interned composed source used to be refolded from the
+/// table on every keystroke. GNU instead keeps each frame's face cache across
+/// redisplays and discards it only when a definition changes: `face_change` /
+/// `f->face_change` (src/xfaces.c:349, src/xfaces.c:746), set by the
+/// definition writers (src/xfaces.c:3098-3105). Entries are keyed by merged
+/// content or by allocation identity, so only the folded named specifications
+/// can go stale: [`ComposedSourcePin::apply_to`] adopts the cache across a
+/// changed-table refresh after dropping those folds. A changed table is a
+/// different snapshot by construction — evaluation mutates through
+/// `Rc::make_mut`, which reallocates rather than disturb this pin.
+pub(crate) struct ComposedSourcePin {
+    table: FaceTable,
+    cache: std::rc::Rc<std::cell::RefCell<ComposedSourceCache>>,
+}
+
+impl ComposedSourcePin {
+    /// Hand the cache to `resolver`: wholesale when its table snapshot still
+    /// matches the one this pin was folded against, otherwise with the folded
+    /// named specifications dropped (see below).
+    pub(crate) fn apply_to(&self, resolver: &mut FaceResolver) {
+        if resolver.face_table.same_snapshot(&self.table) {
+            resolver.composed_sources = std::rc::Rc::clone(&self.cache);
+            return;
+        }
+        // A definitions refresh re-derived at least one face, so this pin's
+        // table snapshot is stale — but staleness is scoped. The folded named
+        // specifications are functions of the OLD table's definitions and must
+        // re-fold. The composition and identity entries are functions of their
+        // inputs: their keys name the base allocation and the overlay content
+        // or allocation, and an input the new table no longer produces simply
+        // never probes again — a definition change cannot corrupt a hit,
+        // because equal content realizes equal paint and unequal content
+        // misses by key. Keeping them preserves the merged-source allocations,
+        // so unchanged faces keep their source identity across the refresh,
+        // GNU's lface vectors surviving a `face_change` that re-realizes only
+        // what changed (src/xfaces.c:349, src/xfaces.c:3098-3105). Realized
+        // terminal paint stays retirement-stamped by `face_change_count`.
+        let mut cache = self.cache.borrow_mut();
+        cache.len = cache.len.saturating_sub(cache.named_specs.len());
+        cache.named_specs.clear();
+        resolver.composed_sources = std::rc::Rc::clone(&self.cache);
+    }
+}
+
+/// Engine-side carry of one resolver's realized terminal faces.
+///
+/// `prepare_tty_realization` re-derives the default and every basic face from
+/// core's per-frame display cache, roots each source, and installs its
+/// realized colors. A redisplay where no face definition changed needs none of
+/// that work: GNU's realized faces survive on the frame until `face_change`
+/// invalidates them (src/xfaces.c:3098-3105), and the binding generation —
+/// the `face_change_count` at realization time — is that stamp here.
+pub(crate) struct TtyRealizationPin {
+    frame_id: FrameId,
+    generation: u64,
+    table: FaceTable,
+    default_face: ResolvedFace,
+    basic_faces: Box<enum_map::EnumMap<BasicFace, Option<ResolvedFace>>>,
 }
 
 /// GNU basic-face lookup has two realization outcomes.  A canonical lookup
@@ -3868,41 +4471,280 @@ impl FaceResolver {
         if neo_default.strike_through == Some(true) {
             df.strike_through = true;
         }
-        // Box
-        if let Some(bb) = neo_default.box_border.enabled() {
-            df.box_type = box_style_to_u8(&bb.style);
-            df.box_color = bb.color.as_ref().map(color_to_pixel).unwrap_or(0);
-            df.box_line_width = BoxLineWidth::from_gnu(bb.width);
-        }
-
         FaceColorAttributes::from_base(&df)
             .merge(&neo_default)
             .realize()
             .install(&mut df);
+        apply_box_border(&mut df, &neo_default.box_border);
 
         Self {
             face_table: face_table.clone(),
+            face_table_roots: None,
             default_face: df,
+            tty_face_source: None,
+            realized_basic_faces: None,
             window_system,
             current_window_parameters: std::cell::RefCell::new(Vec::new()),
             current_window_id: std::cell::Cell::new(None),
             invalid_face_references: std::cell::RefCell::new(Vec::new()),
+            composed_sources: std::rc::Rc::new(std::cell::RefCell::default()),
             font_sizing,
             frame_font_domain,
         }
     }
 
-    /// The terminal palette an ANONYMOUS attribute plist realizes against, or
-    /// `None` on a GUI frame.
+    /// Bind the pure resolver to the real terminal frame. Basic-face colors
+    /// were realized by core's GNU lifecycle; importing them is read-only and
+    /// must not demand synthetic or missing basic names (notably tab-line).
     ///
-    /// Named faces are realized in neovm-core, which calls `tty-color-desc`
-    /// itself, as GNU does.  A plist -- a `face` text property, an overlay, a
-    /// `face-remapping-alist` entry -- is realized HERE, and this crate calls no
-    /// Lisp function anywhere, so it runs GNU's own search over the terminal's
-    /// own palette instead.  It comes off the face table so it cannot be a
-    /// different palette from the one the named faces used.
+    /// `previous` carries the last bound resolver's realized faces: when the
+    /// frame, the `face_change_count` stamp, and the table snapshot all match,
+    /// the realization is reused instead of re-derived — GNU keeps a frame's
+    /// realized faces until a definition change invalidates them
+    /// (src/xfaces.c:3098-3105).
+    pub(crate) fn prepare_tty_realization(
+        &mut self,
+        frame_id: FrameId,
+        evaluator: &mut Context,
+        previous: Option<TtyRealizationPin>,
+    ) {
+        if !neovm_core::face::realization::enabled()
+            || self.window_system.is_some()
+            || !evaluator.frame_is_tty_face_target(frame_id)
+        {
+            return;
+        }
+        if self.face_table_roots.is_none() {
+            match evaluator.display_face_table_root_lease(frame_id, &self.face_table) {
+                Ok(roots) => self.face_table_roots = Some(FaceTableRoots::from(roots)),
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        "terminal face definitions require an installed mutator heap"
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(pin) = previous
+            && pin.frame_id == frame_id
+            && pin.generation == evaluator.face_change_count()
+            && self.face_table.same_snapshot(&pin.table)
+            && pin.basic_faces[BasicFace::Default].is_some()
+        {
+            self.default_face = pin.default_face;
+            self.tty_face_source = Some(BoundTtyFaceSource {
+                frame_id,
+                generation: pin.generation,
+            });
+            self.realized_basic_faces = Some(pin.basic_faces);
+            return;
+        }
+        let Some((default_source, default_paint)) =
+            evaluator.cached_basic_display_face_for_frame(frame_id, BasicFace::Default.name())
+        else {
+            return;
+        };
+        let rooted_default = match RootedFace::new(default_source.clone()) {
+            Ok(source) => std::sync::Arc::new(source),
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    "terminal face binding requires an installed mutator heap"
+                );
+                return;
+            }
+        };
+        let mut default = self.realize_face_with_source(
+            &default_source,
+            FaceRealizationSource::Complete(rooted_default),
+        );
+        default.install_realized_tty_colors(&default_paint);
+        default.canonical_tty_role = Some(BasicFace::Default);
+        self.default_face = default;
+        self.tty_face_source = Some(BoundTtyFaceSource {
+            frame_id,
+            generation: evaluator.face_change_count(),
+        });
+        let mut named_default = self.default_face.clone();
+        named_default.lisp_name = Some(BasicFace::Default.name().to_owned());
+        let mut basic_faces = Box::new(enum_map::EnumMap::default());
+        basic_faces[BasicFace::Default] = Some(named_default);
+        for name in neovm_core::face::realization::basic_face_names() {
+            let Some(role) = BasicFace::from_name(name) else {
+                continue;
+            };
+            if role == BasicFace::Default {
+                continue;
+            }
+            let Some((source, paint)) =
+                evaluator.cached_basic_display_face_for_frame(frame_id, name)
+            else {
+                continue;
+            };
+            let rooted_source = match RootedFace::with_base(
+                source.clone(),
+                self.default_face.source_attributes.as_deref(),
+            ) {
+                Ok(source) => std::sync::Arc::new(source),
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        "basic face source requires an installed mutator heap"
+                    );
+                    continue;
+                }
+            };
+            let mut resolved = self
+                .realize_face_with_source(&source, FaceRealizationSource::Complete(rooted_source));
+            resolved.install_realized_tty_colors(&paint);
+            resolved.canonical_tty_role = Some(role);
+            resolved.lisp_name = Some(name.to_owned());
+            resolved.face_id =
+                BasicFaceId::from_name(name).map_or(BasicFaceId::SENTINEL, u32::from);
+            basic_faces[role] = Some(resolved);
+        }
+        self.realized_basic_faces = Some(basic_faces);
+    }
+
+    pub(crate) fn has_tty_realization(&self) -> bool {
+        self.tty_face_source.is_some()
+    }
+
+    /// The realized terminal faces and their binding stamp, for the engine to
+    /// carry into the next redisplay's resolver (see [`TtyRealizationPin`]).
+    pub(crate) fn tty_realization_pin(&self) -> Option<TtyRealizationPin> {
+        let bound = self.tty_face_source?;
+        let basic_faces = self.realized_basic_faces.as_ref()?;
+        Some(TtyRealizationPin {
+            frame_id: bound.frame_id,
+            generation: bound.generation,
+            table: self.face_table.clone(),
+            default_face: self.default_face.clone(),
+            basic_faces: basic_faces.clone(),
+        })
+    }
+
+    /// The composed-source cache together with the face table snapshot it was
+    /// folded against, so the engine can carry it to the next redisplay's
+    /// resolver (see [`ComposedSourcePin`]).
+    pub(crate) fn composed_source_pin(&self) -> ComposedSourcePin {
+        ComposedSourcePin {
+            table: self.face_table.clone(),
+            cache: std::rc::Rc::clone(&self.composed_sources),
+        }
+    }
+
+    /// A speculative row probe may consume an existing realization, but must
+    /// never enter Lisp for a face the iterator has not reached yet.
+    pub(crate) fn realize_cached_for_display(
+        &self,
+        face: &mut ResolvedFace,
+        evaluator: &Context,
+    ) -> bool {
+        let Some(source) = self.tty_face_source else {
+            return true;
+        };
+        if !source.is_current(evaluator, &self.face_table) {
+            return false;
+        }
+        if face.canonical_tty_role.is_some() {
+            return true;
+        }
+        let frame_id = source.frame_id;
+        let Some(attributes) = face.source_attributes.clone() else {
+            return true;
+        };
+        if let Some(paint) =
+            self.cached_tty_paint(face, &attributes, frame_id, evaluator.face_change_count())
+        {
+            paint.install(face);
+            return true;
+        }
+        let Some(realized) =
+            evaluator.cached_display_face_for_frame(frame_id, attributes.attributes())
+        else {
+            return false;
+        };
+        // The memo must answer probes of the UNREALIZED entry state, so the
+        // key is read before the install writes realized colors into `face`.
+        let probe_key = TtyPaintKey::of(face);
+        face.install_realized_tty_colors(&realized);
+        self.record_tty_paint(
+            probe_key,
+            face,
+            attributes,
+            frame_id,
+            evaluator.face_change_count(),
+        );
+        true
+    }
+
+    pub(crate) fn realize_for_display(&self, face: &mut ResolvedFace, evaluator: &mut Context) {
+        self.realize_with_cold_observer(face, evaluator, &NoColdFaceEntryObserver);
+    }
+
+    #[inline]
+    fn realize_with_cold_observer<O: ColdFaceEntryObserver>(
+        &self,
+        face: &mut ResolvedFace,
+        evaluator: &mut Context,
+        observer: &O,
+    ) {
+        if let Some(source) = self.tty_face_source
+            && source.is_current(evaluator, &self.face_table)
+        {
+            if face.canonical_tty_role.is_some() {
+                return;
+            }
+            // A prior color callback may have replaced this frame's source
+            // definitions, including through nested redisplay. Leave temporary
+            // paint alone until the transaction rejects/restarts; entering Lisp
+            // here would realize a later glyph from obsolete source attributes.
+            let Some(attributes) = face.source_attributes.clone() else {
+                return;
+            };
+            if let Some(paint) = self.cached_tty_paint(
+                face,
+                &attributes,
+                source.frame_id,
+                evaluator.face_change_count(),
+            ) {
+                paint.install(face);
+                return;
+            }
+            // Observe the actual demand entry, including pending/error/no-
+            // insertion returns. Cache journals record only later successes.
+            observer.before_entry();
+            let realized =
+                evaluator.realize_display_face_for_frame(source.frame_id, attributes.attributes());
+            // See realize_cached_for_display: the memo key is the
+            // pre-realization entry state the next probe arrives in.
+            let probe_key = TtyPaintKey::of(face);
+            face.install_realized_tty_colors(&realized);
+            // A deferred or in-flight hook flow realized against a placeholder
+            // (`realize_display_face_for_frame` returns the source unchanged);
+            // such paint is transactional and must not seed the memo.
+            if !evaluator.redisplay_hook_flow_pending() {
+                self.record_tty_paint(
+                    probe_key,
+                    face,
+                    attributes,
+                    source.frame_id,
+                    evaluator.face_change_count(),
+                );
+            }
+        }
+    }
+
+    /// A bound TTY lifecycle retains plist strings until the complete lface
+    /// reaches the evaluator; no palette approximation can replace a callback.
     fn plist_palette(&self) -> Option<&neomacs_display_protocol::TtyPalette> {
-        self.face_table.tty_palette()
+        if self.has_tty_realization() {
+            None
+        } else {
+            self.face_table.tty_palette()
+        }
     }
 
     /// Discard diagnostics from a speculative frame-layout attempt.
@@ -3913,6 +4755,47 @@ impl FaceResolver {
     /// Drain invalid named face references from the accepted layout attempt.
     pub(crate) fn take_invalid_face_references(&self) -> Vec<String> {
         self.invalid_face_references.take()
+    }
+
+    /// Begin journaling this resolver's face-cache inserts for a speculative
+    /// routed-row attempt. While the window is open every insert appends an
+    /// undo record; [`Self::rewind_face_cache_speculation`] restores the
+    /// caches to this point so a refused row leaves no face-cache side
+    /// effects visible, and [`Self::accept_face_cache_speculation`] keeps
+    /// what a routed row earned. The journal rides the shared composed-source
+    /// cache, so it survives a mid-attempt resolver refresh unchanged. A Lisp
+    /// color callback that runs a nested layout inside the window journals
+    /// those inserts too; undoing them is safe because every cache here is a
+    /// pure function of its inputs — the nested layout's published state
+    /// never reads the memo back through this journal.
+    pub(crate) fn arm_face_cache_speculation(&self) -> FaceCacheSpeculationMark {
+        let mut cache = self.composed_sources.borrow_mut();
+        cache.speculation_depth += 1;
+        FaceCacheSpeculationMark {
+            journal_len: cache.speculation_journal.len(),
+        }
+    }
+
+    /// Close a speculation window whose row routed: the inserts stay, their
+    /// undo records go.
+    pub(crate) fn accept_face_cache_speculation(&self, mark: FaceCacheSpeculationMark) {
+        let mut cache = self.composed_sources.borrow_mut();
+        cache.speculation_depth = cache.speculation_depth.saturating_sub(1);
+        cache.speculation_journal.truncate(mark.journal_len);
+    }
+
+    /// Close a speculation window whose row was refused: undo its inserts in
+    /// reverse order. Records apply newest-first, so a pushed bucket entry is
+    /// still the last of its bucket when its undo runs.
+    pub(crate) fn rewind_face_cache_speculation(&self, mark: FaceCacheSpeculationMark) {
+        let mut cache = self.composed_sources.borrow_mut();
+        cache.speculation_depth = cache.speculation_depth.saturating_sub(1);
+        while cache.speculation_journal.len() > mark.journal_len {
+            let Some(undo) = cache.speculation_journal.pop() else {
+                break;
+            };
+            undo.apply(&mut cache);
+        }
     }
 
     /// Point the resolver at the window whose faces are about to be resolved,
@@ -3954,6 +4837,12 @@ impl FaceResolver {
     /// [`BasicFaceId::SENTINEL`] (20).
     pub fn resolve_named_face(&self, name: &str) -> ResolvedFace {
         use neomacs_display_protocol::face::BasicFaceId;
+        if let Some(role) = BasicFace::from_name(name)
+            && let Some(faces) = &self.realized_basic_faces
+            && let Some(face) = &faces[role]
+        {
+            return face.clone();
+        }
         let face = self.face_table.resolve(name);
         let mut resolved = self.realize_face(&face);
         resolved.lisp_name = Some(name.to_string());
@@ -3995,8 +4884,328 @@ impl FaceResolver {
         resolved
     }
 
-    fn apply_specified_face_over(&self, base: &ResolvedFace, face: &NeoFace) -> ResolvedFace {
+    /// One `Arc<RootedFace>` per distinct composed source.
+    ///
+    /// Every glyph-run composition of the same logical face reuses the shared
+    /// source, so memo probes (`face_id_for_resolved`, `remember_face`) and
+    /// frame-realization lookups compare by pointer identity instead of
+    /// walking merged attributes again — GNU's merged lface vectors get the
+    /// same effect by sharing slot objects, making `lface_equal_p`'s EQ
+    /// fast path the common case (src/xfaces.c:4483-4497).
+    fn shared_composed_source(
+        &self,
+        merged: neovm_core::face::Face,
+        base: Option<&RootedFace>,
+    ) -> Option<std::sync::Arc<RootedFace>> {
+        let hash = merged.content_hash();
+        {
+            let cache = self.composed_sources.borrow();
+            if let Some(bucket) = cache.entries.get(&hash)
+                && let Some(shared) = bucket.iter().find(|shared| *shared.attributes() == merged)
+            {
+                return Some(std::sync::Arc::clone(shared));
+            }
+        }
+        // Rooting allocates leases; run it without the cache borrowed.
+        let rooted = match RootedFace::with_base(merged, base) {
+            Ok(rooted) => std::sync::Arc::new(rooted),
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    "bound face composition lost its installed mutator heap"
+                );
+                return None;
+            }
+        };
+        let mut cache = self.composed_sources.borrow_mut();
+        if cache.len >= COMPOSED_SOURCE_CACHE_LIMIT {
+            if cache.speculation_depth > 0 {
+                // A speculative insert must not trip the wholesale reset
+                // (undoing one would mean snapshotting the whole cache);
+                // leave this source uncached and let the next plain insert
+                // take the reset.
+                return Some(rooted);
+            }
+            cache.clear();
+        }
+        let speculative = cache.speculation_depth > 0;
+        cache.entries.entry(hash).or_default().push(rooted.clone());
+        cache.len += 1;
+        if speculative {
+            cache
+                .speculation_journal
+                .push(FaceCacheRewind::ComposedEntry {
+                    hash,
+                    pushed: rooted.clone(),
+                });
+        }
+        Some(rooted)
+    }
+
+    /// The folded overlay specification for `name`, when it was already folded
+    /// in this resolver. Folding resolves the table entry plus its `:inherit`
+    /// graph, a pure function of the immutable snapshot, so one fold per name
+    /// per resolver is enough; GNU keeps the same economy by reusing the
+    /// frame's cached lface for a named face (`get_lface_attributes`,
+    /// src/xfaces.c:2124-2163).
+    fn cached_named_overlay_spec(&self, name: &str) -> Option<std::sync::Arc<NeoFace>> {
+        self.composed_sources
+            .borrow()
+            .named_specs
+            .get(name)
+            .filter(|entry| entry.alist_bits == ALIST_INDEPENDENT)
+            .map(|entry| std::sync::Arc::clone(&entry.shared))
+    }
+
+    fn record_named_overlay_spec(&self, name: &str, folded: NeoFace) -> std::sync::Arc<NeoFace> {
+        self.record_named_overlay_spec_for_alist(name, folded, ALIST_INDEPENDENT)
+    }
+
+    /// The fold for `name` under this buffer's remapping alist object, when
+    /// already folded against that same object (see [`NamedSpecEntry`]). A
+    /// buffer with no alist accepts pure table folds too: without an alist
+    /// there is nothing for the fold to consult, so the two coincide.
+    fn cached_buffer_named_overlay_spec(
+        &self,
+        name: &str,
+        alist_bits: usize,
+    ) -> Option<std::sync::Arc<NeoFace>> {
+        self.composed_sources
+            .borrow()
+            .named_specs
+            .get(name)
+            .filter(|entry| {
+                entry.alist_bits == alist_bits
+                    || (alist_bits == 0 && entry.alist_bits == ALIST_INDEPENDENT)
+            })
+            .map(|entry| std::sync::Arc::clone(&entry.shared))
+    }
+
+    fn record_named_overlay_spec_for_alist(
+        &self,
+        name: &str,
+        folded: NeoFace,
+        alist_bits: usize,
+    ) -> std::sync::Arc<NeoFace> {
+        let shared = std::sync::Arc::new(folded);
+        let mut cache = self.composed_sources.borrow_mut();
+        if cache.len >= COMPOSED_SOURCE_CACHE_LIMIT {
+            if cache.speculation_depth > 0 {
+                // See `shared_composed_source`: a speculative fold stays out
+                // of the cache rather than trip the wholesale reset.
+                return shared;
+            }
+            cache.clear();
+        }
+        let previous = (cache.speculation_depth > 0)
+            .then(|| cache.named_specs.get(name).cloned())
+            .flatten();
+        cache.named_specs.insert(
+            name.into(),
+            NamedSpecEntry {
+                shared: std::sync::Arc::clone(&shared),
+                alist_bits,
+            },
+        );
+        cache.len += 1;
+        if cache.speculation_depth > 0 {
+            cache.speculation_journal.push(FaceCacheRewind::NamedSpec {
+                name: name.into(),
+                previous,
+            });
+        }
+        shared
+    }
+
+    /// The previously realized terminal paint for `face`'s composed source,
+    /// when this exact realization ran against the same frame definitions.
+    ///
+    /// Paint is a pure function of the entry color state, the underline slot
+    /// the install preserves, and the rooted source — whose realization is
+    /// stamped by the binding `face_change_count`. A hit is GNU serving a
+    /// repeated merged-lface lookup from the frame face cache
+    /// (`lookup_face`, src/xfaces.c:5064-5093) without re-running
+    /// `realize_tty_face`.
+    fn cached_tty_paint(
+        &self,
+        face: &ResolvedFace,
+        source: &std::sync::Arc<RootedFace>,
+        frame: FrameId,
+        face_change_count: u64,
+    ) -> Option<TtyPaint> {
+        source.cached_tty_paint(frame, face_change_count, face)
+    }
+
+    /// Retain one realized terminal paint for reuse beside its source; the
+    /// allocation holds the memo, so its address cannot be recycled under an
+    /// entry and a retired source releases its paint with everything else.
+    /// `probe_key` is the face's PRE-realization entry state — see
+    /// [`RootedFace::record_tty_paint`].
+    fn record_tty_paint(
+        &self,
+        probe_key: TtyPaintKey,
+        face: &ResolvedFace,
+        source: std::sync::Arc<RootedFace>,
+        frame: FrameId,
+        face_change_count: u64,
+    ) {
+        // The slot is one deep, so a speculative record would evict whatever
+        // paint the source carried into this attempt; journal the previous
+        // contents for the rewind (see `FaceCacheRewind::TtyPaint`).
+        let previous =
+            (self.composed_sources.borrow().speculation_depth > 0).then(|| source.tty_paint_slot());
+        source.record_tty_paint(frame, face_change_count, probe_key, face);
+        if let Some(previous) = previous {
+            self.composed_sources
+                .borrow_mut()
+                .speculation_journal
+                .push(FaceCacheRewind::TtyPaint { source, previous });
+        }
+    }
+
+    /// The previously merged source for `overlay` over `base`, when this exact
+    /// composition was already built. Composition is a pure function of the
+    /// base's source identity and the overlay's content, so a hit is exact.
+    fn cached_composed_over(
+        &self,
+        base: &std::sync::Arc<RootedFace>,
+        overlay: &NeoFace,
+    ) -> Option<std::sync::Arc<RootedFace>> {
+        let key = (
+            std::sync::Arc::as_ptr(base) as usize,
+            overlay.content_hash(),
+        );
+        let cache = self.composed_sources.borrow();
+        let bucket = cache.compositions.get(&key)?;
+        bucket
+            .iter()
+            .find(|entry| {
+                entry
+                    .base
+                    .upgrade()
+                    .is_some_and(|pinned| std::sync::Arc::ptr_eq(&pinned, base))
+                    && &entry.overlay == overlay
+            })
+            .map(|entry| std::sync::Arc::clone(&entry.merged))
+    }
+
+    /// Identity-keyed composition reuse: both the base's rooted source and the
+    /// overlay's folded specification are shared allocations, so the probe is
+    /// pointer equality on both, GNU's `EQ` fast path for shared lface slots
+    /// (src/xfaces.c:4483-4497). Weak pins on both sides keep address reuse
+    /// from aliasing a different face.
+    fn cached_composed_identity_over(
+        &self,
+        base: &std::sync::Arc<RootedFace>,
+        overlay: &std::sync::Arc<NeoFace>,
+    ) -> Option<std::sync::Arc<RootedFace>> {
+        let key = (
+            std::sync::Arc::as_ptr(base) as usize,
+            std::sync::Arc::as_ptr(overlay) as usize,
+        );
+        let cache = self.composed_sources.borrow();
+        let bucket = cache.identity_compositions.get(&key)?;
+        bucket
+            .iter()
+            .find(|entry| {
+                entry
+                    .base
+                    .upgrade()
+                    .is_some_and(|pinned| std::sync::Arc::ptr_eq(&pinned, base))
+                    && entry
+                        .overlay
+                        .upgrade()
+                        .is_some_and(|pinned| std::sync::Arc::ptr_eq(&pinned, overlay))
+            })
+            .map(|entry| std::sync::Arc::clone(&entry.merged))
+    }
+
+    fn record_composed_identity_over(
+        &self,
+        base: std::sync::Arc<RootedFace>,
+        overlay: std::sync::Arc<NeoFace>,
+        merged: std::sync::Arc<RootedFace>,
+    ) {
+        let key = (
+            std::sync::Arc::as_ptr(&base) as usize,
+            std::sync::Arc::as_ptr(&overlay) as usize,
+        );
+        let mut cache = self.composed_sources.borrow_mut();
+        if cache.len >= COMPOSED_SOURCE_CACHE_LIMIT {
+            if cache.speculation_depth > 0 {
+                // See `shared_composed_source`.
+                return;
+            }
+            cache.clear();
+        }
+        let speculative = cache.speculation_depth > 0;
+        cache
+            .identity_compositions
+            .entry(key)
+            .or_default()
+            .push(IdentityComposedEntry {
+                base: std::sync::Arc::downgrade(&base),
+                overlay: std::sync::Arc::downgrade(&overlay),
+                merged: std::sync::Arc::clone(&merged),
+            });
+        cache.len += 1;
+        if speculative {
+            cache
+                .speculation_journal
+                .push(FaceCacheRewind::IdentityComposition {
+                    key,
+                    pushed: merged,
+                });
+        }
+    }
+
+    fn record_composed_over(
+        &self,
+        base: std::sync::Arc<RootedFace>,
+        overlay: NeoFace,
+        merged: std::sync::Arc<RootedFace>,
+    ) {
+        let key = (
+            std::sync::Arc::as_ptr(&base) as usize,
+            overlay.content_hash(),
+        );
+        let mut cache = self.composed_sources.borrow_mut();
+        if cache.len >= COMPOSED_SOURCE_CACHE_LIMIT {
+            if cache.speculation_depth > 0 {
+                // See `shared_composed_source`.
+                return;
+            }
+            cache.clear();
+        }
+        let speculative = cache.speculation_depth > 0;
+        cache
+            .compositions
+            .entry(key)
+            .or_default()
+            .push(ComposedOverlayEntry {
+                base: std::sync::Arc::downgrade(&base),
+                overlay,
+                merged: std::sync::Arc::clone(&merged),
+            });
+        cache.len += 1;
+        if speculative {
+            cache
+                .speculation_journal
+                .push(FaceCacheRewind::Composition {
+                    key,
+                    pushed: merged,
+                });
+        }
+    }
+
+    fn apply_specified_face_over(
+        &self,
+        base: &ResolvedFace,
+        face: &NeoFace,
+        face_identity: Option<&std::sync::Arc<NeoFace>>,
+    ) -> ResolvedFace {
         let mut rf = base.clone();
+        rf.retain_source_over(self, base, face, face_identity);
         FaceColorAttributes::from_base(base)
             .merge(face)
             .realize()
@@ -4069,22 +5278,7 @@ impl FaceResolver {
         if let Some(color) = &face.strike_through_color {
             rf.strike_through_color = color_to_pixel(color);
         }
-        match &face.box_border {
-            FaceDecoration::Unspecified => {}
-            FaceDecoration::Disabled => {
-                rf.box_type = 0;
-                rf.box_line_width = BoxLineWidth::default();
-            }
-            FaceDecoration::Enabled(box_border) => {
-                rf.box_type = box_style_to_u8(&box_border.style);
-                rf.box_color = box_border
-                    .color
-                    .as_ref()
-                    .map(color_to_pixel)
-                    .unwrap_or(rf.fg);
-                rf.box_line_width = BoxLineWidth::from_gnu(box_border.width);
-            }
-        }
+        apply_box_border(&mut rf, &face.box_border);
         if let Some(extend) = face.extend {
             rf.extend = extend;
         }
@@ -4108,12 +5302,20 @@ impl FaceResolver {
         name: &str,
         depth: usize,
         diagnostics: FaceReferenceDiagnostics,
-    ) -> NeoFace {
+    ) -> std::sync::Arc<NeoFace> {
         if depth > 40 {
-            return NeoFace::default();
+            return std::sync::Arc::new(NeoFace::default());
         }
         if name == "default" && depth > 0 {
-            return NeoFace::default();
+            return std::sync::Arc::new(NeoFace::default());
+        }
+        // `default` folds differently per depth, so only ordinary names are
+        // shared; invalid names stay unmemoized to keep per-lookup
+        // diagnostics.
+        if name != "default"
+            && let Some(shared) = self.cached_named_overlay_spec(name)
+        {
+            return shared;
         }
 
         let Some(face) = self.face_table.get(name).cloned() else {
@@ -4122,9 +5324,15 @@ impl FaceResolver {
                     .borrow_mut()
                     .push(name.to_owned());
             }
-            return NeoFace::default();
+            return std::sync::Arc::new(NeoFace::default());
         };
-        self.resolve_face_overlay_spec(face, depth, FaceReferenceDiagnostics::Suppress)
+        let folded =
+            self.resolve_face_overlay_spec(face, depth, FaceReferenceDiagnostics::Suppress);
+        if name != "default" {
+            self.record_named_overlay_spec(name, folded)
+        } else {
+            std::sync::Arc::new(folded)
+        }
     }
 
     fn resolve_face_overlay_spec(
@@ -4153,6 +5361,7 @@ impl FaceResolver {
         diagnostics: FaceReferenceDiagnostics,
     ) -> NeoFace {
         self.resolve_face_value_overlay_spec(face_ref, depth, diagnostics)
+            .map(|contribution| contribution.face)
             .unwrap_or_default()
     }
 
@@ -4163,13 +5372,17 @@ impl FaceResolver {
         face_ref: Value,
         depth: usize,
         diagnostics: FaceReferenceDiagnostics,
-    ) -> Option<NeoFace> {
+    ) -> Option<FaceSpecContribution> {
         if depth > 40 || face_ref.is_nil() || face_ref.is_bare_symbol_named("nil") {
             return None;
         }
 
         if let Some(name) = Self::face_name_from_value(&face_ref) {
-            return Some(self.resolve_named_face_overlay_spec(name, depth, diagnostics));
+            let shared = self.resolve_named_face_overlay_spec(name, depth, diagnostics);
+            return Some(FaceSpecContribution {
+                face: (*shared).clone(),
+                identity: Some(shared),
+            });
         }
 
         let items = list_to_vec(&face_ref)?;
@@ -4191,7 +5404,8 @@ impl FaceResolver {
         }
         if Self::face_spec_is_plist(&items) {
             let face = NeoFace::from_plist_realized("--inline--", &items, self.plist_palette());
-            return Some(self.resolve_face_overlay_spec(face, depth + 1, diagnostics));
+            let face = self.resolve_face_overlay_spec(face, depth + 1, diagnostics);
+            return Some(FaceSpecContribution::anonymous(face));
         }
 
         let mut composition = UnresolvedFaceComposition::default();
@@ -4202,7 +5416,10 @@ impl FaceResolver {
                 diagnostics,
             ));
         }
-        composition.attributes
+        composition.attributes.map(|face| FaceSpecContribution {
+            face,
+            identity: composition.identity,
+        })
     }
 
     fn face_name_from_value(value: &Value) -> Option<&str> {
@@ -4391,6 +5608,7 @@ impl FaceResolver {
                 // dynamic slot; a remapped basic face cannot occupy its fixed
                 // frame slot.
                 resolved.face_id = 0;
+                resolved.canonical_tty_role = None;
                 resolved.lisp_name = Some(face_id.name().to_string());
                 resolved
             }
@@ -4404,9 +5622,25 @@ impl FaceResolver {
         remap_stack: &mut Vec<String>,
         depth: usize,
         diagnostics: FaceReferenceDiagnostics,
-    ) -> Option<NeoFace> {
+    ) -> Option<FaceSpecContribution> {
         if depth > 40 || name == "nil" {
             return None;
+        }
+
+        let alist_bits = remapping.alist().map_or(0, Value::bits);
+
+        // A fold recorded for this exact alist object already encodes that
+        // alist's remapping decision for `name`, so a top-level lookup can
+        // consult it before walking the alist at all. Recursive resolutions
+        // keep the full order below: inside an active remap cycle the plain
+        // definition is what the guard must reach, not the completed fold.
+        if remap_stack.is_empty()
+            && let Some(shared) = self.cached_buffer_named_overlay_spec(name, alist_bits)
+        {
+            return Some(FaceSpecContribution {
+                face: (*shared).clone(),
+                identity: Some(shared),
+            });
         }
 
         // GNU face remapping is non-recursive for the face being remapped:
@@ -4435,7 +5669,20 @@ impl FaceResolver {
         // let a higher-priority `italic` overlay erase a lower-priority
         // `bold` text face.
         if name == "default" {
-            return Some(NeoFace::default());
+            return Some(FaceSpecContribution::anonymous(NeoFace::default()));
+        }
+
+        // Reaching here means the name's own remapping `assq` missed above,
+        // exactly GNU's per-lookup liveness check (merge_named_face,
+        // src/xfaces.c:3269-3295). The fold below is then shared per name and
+        // alist object identity; see [`NamedSpecEntry`] for the invalidation
+        // contract. This second probe still serves recursive resolutions,
+        // which skip the hoisted lookup above.
+        if let Some(shared) = self.cached_buffer_named_overlay_spec(name, alist_bits) {
+            return Some(FaceSpecContribution {
+                face: (*shared).clone(),
+                identity: Some(shared),
+            });
         }
 
         let Some(mut face) = self.face_table.get(name).cloned() else {
@@ -4444,7 +5691,7 @@ impl FaceResolver {
                     .borrow_mut()
                     .push(name.to_owned());
             }
-            return Some(NeoFace::default());
+            return Some(FaceSpecContribution::anonymous(NeoFace::default()));
         };
         let parent = face.inherit.take().and_then(|inherit_ref| {
             self.resolve_buffer_face_value_overlay_spec_inner(
@@ -4455,9 +5702,22 @@ impl FaceResolver {
                 FaceReferenceDiagnostics::Suppress,
             )
         });
-        Some(match parent {
-            Some(parent) => parent.merge(&face),
+        let folded = match parent {
+            Some(parent) => parent.face.merge(&face),
             None => face,
+        };
+        // Only top-level folds enter the memo: one recorded inside an active
+        // remap cycle skipped this name's remapping by the guard, and the
+        // hoisted lookup above must never answer a remapped name with that
+        // plain fold. Cycle folds simply re-fold on their rare revisits.
+        let shared = if remap_stack.is_empty() {
+            self.record_named_overlay_spec_for_alist(name, folded, alist_bits)
+        } else {
+            std::sync::Arc::new(folded)
+        };
+        Some(FaceSpecContribution {
+            face: (*shared).clone(),
+            identity: Some(shared),
         })
     }
 
@@ -4468,7 +5728,7 @@ impl FaceResolver {
         remap_stack: &mut Vec<String>,
         depth: usize,
         diagnostics: FaceReferenceDiagnostics,
-    ) -> Option<NeoFace> {
+    ) -> Option<FaceSpecContribution> {
         if depth > 40 {
             return None;
         }
@@ -4520,8 +5780,8 @@ impl FaceResolver {
                         )
                     });
                     return Some(match parent {
-                        Some(parent) => parent.merge(&inline),
-                        None => inline,
+                        Some(parent) => FaceSpecContribution::anonymous(parent.face.merge(&inline)),
+                        None => FaceSpecContribution::anonymous(inline),
                     });
                 }
 
@@ -4535,7 +5795,10 @@ impl FaceResolver {
                         diagnostics,
                     ));
                 }
-                composition.attributes
+                composition.attributes.map(|face| FaceSpecContribution {
+                    face,
+                    identity: composition.identity,
+                })
             }
             _ => None,
         }
@@ -4564,7 +5827,9 @@ impl FaceResolver {
             0,
             FaceReferenceDiagnostics::Report,
         )
-        .map(|attributes| self.apply_specified_face_over(base, &attributes))
+        .map(|contribution| {
+            self.apply_specified_face_over(base, &contribution.face, contribution.identity.as_ref())
+        })
     }
 
     /// Resolve NAME in a captured displayed-window face environment.
@@ -4591,7 +5856,30 @@ impl FaceResolver {
             .resolve_remapped_face_value_over(remapping, &base, &Value::symbol(name))
             .unwrap_or(base);
         resolved.face_id = BasicFaceId::SENTINEL;
+        resolved.canonical_tty_role = None;
         resolved.lisp_name = Some(name.to_string());
+        resolved
+    }
+
+    /// GNU display_mode_line initializes its iterator with the selected
+    /// active/inactive tab-line basic source, then lookup_basic_face applies
+    /// buffer remapping (xdisp.c:3257-3290,28145; xfaces.c:5198-5199).
+    pub(crate) fn resolve_buffer_tab_line_face<B: LayoutBufferView>(
+        &self,
+        buffer: &B,
+        role: crate::display_face_policy::TabLineFaceRole,
+    ) -> ResolvedFace {
+        let remapping = BufferFaceRemapping::capture(buffer);
+        if !self.has_tty_realization() {
+            return self.resolve_remapped_basic_face(remapping, BasicFaceId::TabLine);
+        }
+        let mut resolved = self.resolve_remapped_named_face(remapping, role.name());
+        // Keep every protocol basic ID unchanged. Both GNU tab-line roles can
+        // coexist in one frame, so they cannot share the renderer's old slot
+        // 19. The row request API explicitly uses zero to allocate a content-
+        // addressed ID (display_row/mod.rs DisplayRowSourceRenderRequest::from_base_face);
+        // its ordinary nonbasic SENTINEL would be treated as an assigned ID.
+        resolved.face_id = 0;
         resolved
     }
 
@@ -4636,6 +5924,16 @@ impl FaceResolver {
         &self,
         remapping: BufferFaceRemapping,
     ) -> ResolvedFace {
+        // With no buffer-local remapping entry for `default`, the merged
+        // result IS the frame default face: the fold below would apply an
+        // all-unspecified overlay (`FaceSpecContribution::anonymous`) over
+        // `self.default_face` — GNU's `merge_face_ref` over an un-remapped
+        // `default` returns the definition unchanged (`merge_named_face`
+        // assq miss, src/xfaces.c:3269-3295). Answer the common case with the
+        // assq alone and skip the anonymous composition probe entirely.
+        if Self::buffer_face_remapping_specs(remapping, "default").is_none() {
+            return self.default_face.clone();
+        }
         let mut remap_stack = Vec::new();
         self.resolve_buffer_face_value_overlay_spec_inner(
             remapping,
@@ -4644,7 +5942,13 @@ impl FaceResolver {
             0,
             FaceReferenceDiagnostics::Report,
         )
-        .map(|attributes| self.apply_specified_face_over(&self.default_face, &attributes))
+        .map(|contribution| {
+            self.apply_specified_face_over(
+                &self.default_face,
+                &contribution.face,
+                contribution.identity.as_ref(),
+            )
+        })
         .unwrap_or_else(|| self.default_face.clone())
     }
 
@@ -4654,7 +5958,13 @@ impl FaceResolver {
         val: &Value,
     ) -> Option<ResolvedFace> {
         self.resolve_face_value_overlay_spec(*val, 0, FaceReferenceDiagnostics::Report)
-            .map(|attributes| self.apply_specified_face_over(base, &attributes))
+            .map(|contribution| {
+                self.apply_specified_face_over(
+                    base,
+                    &contribution.face,
+                    contribution.identity.as_ref(),
+                )
+            })
     }
 
     /// Merge a frame-local GNU Lisp face over `base` without converting the
@@ -4666,7 +5976,13 @@ impl FaceResolver {
     ) -> Option<ResolvedFace> {
         let face_ref = self.face_table.lisp_face_ref(lisp_face_id)?;
         self.resolve_face_value_overlay_spec(face_ref, 0, FaceReferenceDiagnostics::Suppress)
-            .map(|attributes| self.apply_specified_face_over(base, &attributes))
+            .map(|contribution| {
+                self.apply_specified_face_over(
+                    base,
+                    &contribution.face,
+                    contribution.identity.as_ref(),
+                )
+            })
     }
 
     pub(crate) fn lisp_face_ref(
@@ -4916,11 +6232,29 @@ impl FaceResolver {
     /// Unset fields fall back to the default face.  Handles `inverse_video`,
     /// `FaceHeight` (absolute/relative), underline, overline, strike-through,
     /// box, overstrike, and extend.
+    #[inline]
     pub fn realize_face(&self, face: &NeoFace) -> ResolvedFace {
+        self.realize_face_with_source(face, FaceRealizationSource::MergeOverDefault)
+    }
+
+    fn realize_face_with_source(
+        &self,
+        face: &NeoFace,
+        source: FaceRealizationSource,
+    ) -> ResolvedFace {
         let mut rf = self.default_face.clone();
         // The clone starts from the default face; an anonymous face must not
         // inherit its *name*. Named resolvers overwrite this after realizing.
         rf.lisp_name = None;
+        match source {
+            FaceRealizationSource::MergeOverDefault => {
+                rf.retain_source_over(self, &self.default_face, face, None)
+            }
+            FaceRealizationSource::Complete(source) => {
+                rf.source_attributes = Some(source);
+                rf.canonical_tty_role = None;
+            }
+        }
 
         FaceColorAttributes::from_base(&self.default_face)
             .merge(face)
@@ -5002,18 +6336,7 @@ impl FaceResolver {
             rf.strike_through_color = color_to_pixel(c);
         }
         // Box border
-        match &face.box_border {
-            FaceDecoration::Unspecified => {}
-            FaceDecoration::Disabled => {
-                rf.box_type = 0;
-                rf.box_line_width = BoxLineWidth::default();
-            }
-            FaceDecoration::Enabled(bb) => {
-                rf.box_type = box_style_to_u8(&bb.style);
-                rf.box_color = bb.color.as_ref().map(color_to_pixel).unwrap_or(rf.fg);
-                rf.box_line_width = BoxLineWidth::from_gnu(bb.width);
-            }
-        }
+        apply_box_border(&mut rf, &face.box_border);
         // Extend
         if let Some(ext) = face.extend {
             rf.extend = ext;
@@ -5076,8 +6399,30 @@ fn underline_style_to_u8(style: &NeoUnderlineStyle) -> u8 {
     style.gnu_code()
 }
 
-fn box_style_to_u8(style: &NeoBoxStyle) -> u8 {
-    style.gnu_code()
+fn apply_box_border(face: &mut ResolvedFace, border: &FaceDecoration<NeoBoxBorder>) {
+    match border {
+        FaceDecoration::Unspecified => {}
+        FaceDecoration::Disabled => {
+            face.box_type = 0;
+            face.box_line_width = BoxLineWidth::default();
+        }
+        FaceDecoration::Enabled(border) => {
+            face.box_type = border.style.gnu_code();
+            face.box_color = border
+                .color
+                .as_ref()
+                .map(color_to_pixel)
+                .unwrap_or_else(|| {
+                    match border.style {
+                        NeoBoxStyle::Simple => face.fg,
+                        // GNU flat-button uses the face background directly;
+                        // 3D relief uses it as the base of the shadow colors.
+                        NeoBoxStyle::Flat | NeoBoxStyle::Raised | NeoBoxStyle::Pressed => face.bg,
+                    }
+                });
+            face.box_line_width = BoxLineWidth::from_gnu(border.width);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5085,5 +6430,25 @@ fn box_style_to_u8(style: &NeoBoxStyle) -> u8 {
 mod tests;
 
 #[cfg(test)]
+#[path = "neovm_bridge/tests/tty_paint_memo_test.rs"]
+mod tty_paint_memo_test;
+
+#[cfg(test)]
+#[path = "neovm_bridge/tests/face_cache_speculation_test.rs"]
+mod face_cache_speculation_test;
+
+#[cfg(test)]
+#[path = "neovm_bridge/tests/resolved_identity_test.rs"]
+mod resolved_identity_test;
+
+#[cfg(test)]
+#[path = "neovm_bridge/tests/composed_source_pin_test.rs"]
+mod composed_source_pin_test;
+
+#[cfg(test)]
 #[path = "neovm_bridge/tests/line_count_test.rs"]
 mod line_count_test;
+
+#[cfg(test)]
+#[path = "neovm_bridge/tests/rows_face_witness_test.rs"]
+mod rows_face_witness_test;

@@ -1,7 +1,7 @@
 //! Centralized tagged-heap mutation helpers.
 //!
-//! These functions are the single place to hook future generational or
-//! incremental write barriers into the tagged runtime.
+//! These functions apply generational and concurrent write barriers in the
+//! tagged runtime.
 
 use crate::buffer::text_props::TextPropertyTable;
 #[cfg(test)]
@@ -109,7 +109,9 @@ pub(crate) fn debug_assert_no_heap_mut_closure() {
     });
 }
 
-#[inline]
+// Keep the recorder and barrier rejects in the caller as the generation-only
+// arm grows: a rejected store must not gain a setter call under either mode.
+#[inline(always)]
 pub fn set_cons_car(cell: TaggedValue, value: TaggedValue) -> bool {
     if !record_projected_write(cell, WriteProjection::Cons) {
         return false;
@@ -124,7 +126,7 @@ pub fn set_cons_car(cell: TaggedValue, value: TaggedValue) -> bool {
     true
 }
 
-#[inline]
+#[inline(always)]
 pub fn set_cons_cdr(cell: TaggedValue, value: TaggedValue) -> bool {
     if !record_projected_write(cell, WriteProjection::Cons) {
         return false;
@@ -200,7 +202,7 @@ pub fn with_vector_data_mut<R>(
     let ptr = value.as_veclike_ptr().unwrap() as *mut VectorObj;
     #[cfg(debug_assertions)]
     let _guard = HeapMutClosureGuard::enter();
-    Some(f(unsafe { (*ptr).data.ensure_owned() }))
+    Some(unsafe { f(&mut (*ptr).data.ensure_owned()) })
 }
 
 /// Bulk slot mutation without retaining a Rust reference to the Vec header
@@ -239,7 +241,7 @@ pub fn set_vector_slot(value: TaggedValue, index: usize, item: TaggedValue) -> b
         return false;
     }
     let ptr = header as *mut VectorObj;
-    let data = unsafe { (*ptr).data.ensure_owned() };
+    let data = unsafe { &(*ptr).data };
     if index >= data.len() {
         return false;
     }
@@ -262,7 +264,7 @@ pub fn with_record_data_mut<R>(
     let ptr = value.as_veclike_ptr().unwrap() as *mut RecordObj;
     #[cfg(debug_assertions)]
     let _guard = HeapMutClosureGuard::enter();
-    Some(f(unsafe { (*ptr).data.ensure_owned() }))
+    Some(unsafe { f(&mut (*ptr).data.ensure_owned()) })
 }
 
 #[inline]
@@ -280,7 +282,7 @@ pub fn set_record_slot(value: TaggedValue, index: usize, item: TaggedValue) -> b
         return false;
     }
     let ptr = header as *mut RecordObj;
-    let data = unsafe { (*ptr).data.ensure_owned() };
+    let data = unsafe { &(*ptr).data };
     if index >= data.len() {
         return false;
     }
@@ -306,7 +308,7 @@ pub fn with_closure_slots_mut<R>(
                 let _ = obj.parsed_params.take();
                 #[cfg(debug_assertions)]
                 let _guard = HeapMutClosureGuard::enter();
-                Some(f(obj.data.ensure_owned()))
+                Some(f(&mut obj.data.ensure_owned()))
             }
         }
         VecLikeType::Macro => {
@@ -316,7 +318,7 @@ pub fn with_closure_slots_mut<R>(
                 let _ = obj.parsed_params.take();
                 #[cfg(debug_assertions)]
                 let _guard = HeapMutClosureGuard::enter();
-                Some(f(obj.data.ensure_owned()))
+                Some(f(&mut obj.data.ensure_owned()))
             }
         }
         _ => None,
@@ -338,7 +340,7 @@ pub fn set_closure_slot(value: TaggedValue, index: usize, item: TaggedValue) -> 
             let ptr = value.as_veclike_ptr().unwrap() as *mut LambdaObj;
             let obj = &mut *ptr;
             let _ = obj.parsed_params.take();
-            if index >= obj.data.ensure_owned().len() {
+            if index >= obj.data.len() {
                 return false;
             }
             note_heap_slot_write(value, HeapWriteKind::ClosureSlot, index, item);
@@ -349,7 +351,7 @@ pub fn set_closure_slot(value: TaggedValue, index: usize, item: TaggedValue) -> 
             let ptr = value.as_veclike_ptr().unwrap() as *mut MacroObj;
             let obj = &mut *ptr;
             let _ = obj.parsed_params.take();
-            if index >= obj.data.ensure_owned().len() {
+            if index >= obj.data.len() {
                 return false;
             }
             note_heap_slot_write(value, HeapWriteKind::ClosureSlot, index, item);

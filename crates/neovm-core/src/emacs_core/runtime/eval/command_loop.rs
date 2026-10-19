@@ -1697,8 +1697,10 @@ impl Context {
         // triggered by a window-change hook is a no-op. Without this check
         // a hook that indirectly calls `redisplay` infinitely recurses.
         let inhibit_redisplay = self.variable_value_by_name("inhibit-redisplay");
-        if (!force || crate::emacs_core::xdisp::mode_line_flow_enabled())
-            && inhibit_redisplay.as_ref().is_some_and(|v| v.is_truthy())
+        if inhibit_redisplay.as_ref().is_some_and(|v| v.is_truthy())
+            && (!force
+                || crate::emacs_core::xdisp::mode_line_flow_enabled()
+                || crate::face::realization::enabled())
         {
             tracing::debug!(
                 "redisplay inhibited by inhibit-redisplay={}",
@@ -1798,6 +1800,20 @@ impl Context {
             return Ok(());
         }
         self.resize_minibuffer_only_frames();
+        // GNU `redisplay_internal` lifts labeled restrictions first
+        // (`reset_outermost_restrictions`, src/xdisp.c:17415) and runs the
+        // window change functions next (`run_window_change_functions`,
+        // xdisp.c:17563), BEFORE any window is hscrolled or laid out
+        // (`redisplay_windows`, then `hscroll_windows` at xdisp.c:17942).
+        // A `window-size-change-functions` member therefore observes the
+        // window as the previous redisplay left it: a fresh buffer in a
+        // `truncate-lines` window with point past the right edge reads
+        // `window-hscroll' 0 there, and the ttykey `truncate' scene recorded
+        // exactly that from GNU while this path ran the hooks after layout
+        // and read the auto-hscroll of 85 it had just computed. Same hook
+        // pass per redisplay as before; only its position moved.
+        let saved = self.buffers.reset_outermost_restrictions();
+        let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
         // GNU `redisplay_internal` calls `hscroll_window_tree` (src/xdisp.c)
         // before laying out windows so each window's `hscroll` follows point;
         // for a truncated line whose point has moved off the right edge (the
@@ -1808,7 +1824,6 @@ impl Context {
         let has_fn = self.redisplay_fn.is_some();
         tracing::debug!("redisplay called (has_fn={})", has_fn);
         if let Some(mut f) = self.redisplay_fn.take() {
-            let saved = self.buffers.reset_outermost_restrictions();
             f(self);
             // The layout pass inside `f` consumes any pending exact echo-area
             // resize (GNU `resize_echo_area_exactly`). Clear it now, once per
@@ -1821,12 +1836,21 @@ impl Context {
                 self.redisplay_fn = Some(f);
                 return Err(flow);
             }
-            let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
+            // Face realization also runs with the legacy hook policy. Its
+            // callback flow belongs to this restored transaction boundary,
+            // otherwise one failed lookup poisons subsequent redisplays.
+            if crate::face::realization::enabled()
+                && let Some(flow) = self.take_deferred_redisplay_layout_flow()
+            {
+                self.buffers.restore_outermost_restrictions(saved);
+                self.redisplay_fn = Some(f);
+                return Err(flow);
+            }
             self.buffers.restore_outermost_restrictions(saved);
             self.redisplay_fn = Some(f);
         } else {
             self.echo_area_resize_exact_pending = false;
-            let _ = super::super::builtins::run_redisplay_window_change_hooks(self);
+            self.buffers.restore_outermost_restrictions(saved);
         }
         *self.last_redisplay_signature = Some(self.redisplay_signature());
         Ok(())
@@ -2016,7 +2040,7 @@ impl Context {
     ) -> Option<RedisplayBufferSignature> {
         let buffer = self.buffers.get(id)?;
         Some(RedisplayBufferSignature {
-            layout: self.buffer_layout_inputs(id)?,
+            layout: self.redisplay_buffer_layout_inputs(id)?,
             save_modified_tick: buffer.save_modified_tick(),
             autosave_modified_tick: buffer.autosave_modified_tick,
             point: buffer.point_char_pos(),
@@ -2157,7 +2181,7 @@ impl Context {
         // Per-slice sweep budget in cons blocks (each ~4096 cells); the slice
         // reclaims proportionally more non-cons objects internally.
         const INCREMENTAL_SWEEP_BUDGET: usize = 8;
-        let heap_ptr: *mut crate::tagged::gc::TaggedHeap = &mut *self.tagged_heap;
+        let heap_ptr: *mut crate::tagged::gc::TaggedHeap = self.tagged_heap.heap_root().as_ptr();
         // True only when a whole mark+sweep cycle finishes in this call, gating
         // the once-per-collection bookkeeping below.
         let cycle_completed;
@@ -2415,7 +2439,17 @@ impl Context {
         // Share the count with the group recorder, but capture the stable heap
         // pointer by value so each root does not reload it through a reference.
         let root_count = &cur_count;
+        let heap_identity = unsafe { (*heap_ptr).identity() };
         self.trace_roots(
+            heap_identity,
+            |roots| {
+                // SAFETY: borrow only from the live collector loan, and end
+                // this read before the root visitor writes through heap_ptr.
+                crate::tagged::transport::collect_shared_root_gc_roots(
+                    unsafe { &*heap_ptr },
+                    roots,
+                );
+            },
             &mut |name| {
                 close_group();
                 cur_name.set(Some(name));
@@ -2442,7 +2476,6 @@ impl Context {
         );
         close_group();
         let mut groups = groups.into_inner();
-        let heap_identity = unsafe { (*heap_ptr).identity() };
         let mut thread_local_roots = Vec::new();
         // A JIT leaf may keep addresses inside the obarray it was compiled
         // against; drop the cache before its roots are walked if this

@@ -1,0 +1,43 @@
+42
+7
+t
+nil
+t
+nil
+2
+1
+15
+((42) 1 2 3 4 5 6 7)
+((42) 1000001 1000002 1000003 1000004 1000005 1000006 1000007)
+((42) 2000001 2000002 2000003 2000004 2000005 2000006 2000007)
+((42) 3000001 3000002 3000003 3000004 3000005 3000006 3000007)
+(t 100 nil nil 2)
+(((20 . 22)) ((10 . 8)))
+(t 1 nil nil 2)
+(2 (("a6-symA" . 1) ("a6-symB" . 2)))
+(t 1000 1)
+(t 5 1)
+((((1 . 2) . 18)))
+(t nil 1)
+(((2 . 0)))
+(65 128)
+((1 . 65))
+(t 8 nil nil 2)
+(((7 . 7)) ((8 . 8)))
+(nil nil 1)
+"hash table test modifies table"
+(t nil 1)
+t
+nil
+((("a6-alpha" . 66048837)))
+22
+12
+(130 387 128)
+(2 1 t (77) t 99 0 1 t (77))
+(2 1 t (77) t 99 0 1 t (77))
+(2 1 t (77) t 99 0 1 t (77))
+((hash 1 (t t t t t 2 (error "hash table test modifies table" t)) 1 2 1 absent) (compare 1 (t t t t t 2 (error "hash table test modifies table" t)) 1 2 1 absent))
+(key-and-value key value key-or-value nil (1 key-and-value) (2 weak-val stable-val))
+((2 0) (2 0) (3 0) (1 0))
+((2 2) 0 0)
+(((3 t gone) (3 t gone)) 0)

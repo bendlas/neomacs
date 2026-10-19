@@ -57,6 +57,10 @@ impl FakeCapabilityDatabase {
         Self::bare()
             .with_string("cm", "\x1b[%i%d;%dH")
             .with_string("cs", "\x1b[%i%d;%dr")
+            .with_string("DL", "\x1b[%dM")
+            .with_string("AL", "\x1b[%dL")
+            .with_string("dl", "\x1b[M")
+            .with_string("al", "\x1b[L")
             .with_string("SF", "\x1b[%dS")
             .with_string("SR", "\x1b[%dT")
             .with_string("sf", "\n")
@@ -68,8 +72,9 @@ impl FakeCapabilityDatabase {
             .with_flag("xn")
     }
 
-    /// vt220 shape: DECSTBM + cursor addressing but NO indn/rin — CSI S/T
-    /// is not implemented by this terminal class.
+    /// Bare vt100 shape: DECSTBM + cursor addressing + sf/sr, but no
+    /// DL/AL, dl/al or indn/rin -- the entry GNU can only scroll with its
+    /// region plus IND/RI.
     fn vt220_like() -> Self {
         Self::bare()
             .with_string("cm", "\x1b[%i%d;%dH")
@@ -418,11 +423,47 @@ use neomacs_display_runtime::backend::tty::rif::{
     BlankTailMethod, RegionScrollMethod, RightMarginBehavior,
 };
 
+/// GNU `init_tty` reads `vi`, `ve` and `vs` (src/term.c:4572-4574) and
+/// `tty_show_cursor` emits `ve` then `vs` (src/term.c:362-372): the entry's
+/// own strings, carried as bytes, present or absent exactly as the entry
+/// has them.  screen-256color: `vi=\E[?25l`, `ve=\E[34h\E[?25h`,
+/// `vs=\E[34l`.
+#[test]
+fn cursor_visibility_strings_are_the_entrys_own_vi_ve_vs() {
+    let mut database = FakeCapabilityDatabase::screen_256color()
+        .with_string("vi", "\x1b[?25l")
+        .with_string("ve", "\x1b[34h\x1b[?25h")
+        .with_string("vs", "\x1b[34l");
+    let caps = resolve_tty_attribute_capabilities(&mut database, "");
+    assert_eq!(
+        caps.cursor_invisible.as_deref(),
+        Some(b"\x1b[?25l".as_slice())
+    );
+    assert_eq!(
+        caps.cursor_normal.as_deref(),
+        Some(b"\x1b[34h\x1b[?25h".as_slice())
+    );
+    assert_eq!(caps.cursor_visible.as_deref(), Some(b"\x1b[34l".as_slice()));
+
+    // An entry without them has none: GNU's `OUTPUT_IF` emits nothing, and
+    // so must the writer -- no hardcoded `ESC[?25h` stands in.
+    let mut bare = FakeCapabilityDatabase::screen_256color();
+    let caps = resolve_tty_attribute_capabilities(&mut bare, "");
+    assert!(caps.cursor_invisible.is_none());
+    assert!(caps.cursor_normal.is_none());
+    assert!(caps.cursor_visible.is_none());
+}
+
 #[test]
 fn xterm_shaped_entry_resolves_every_planner_capability() {
     let mut database = FakeCapabilityDatabase::xterm_like().with_flag("ut");
     let caps = resolve_term_caps(&mut database);
-    assert_eq!(caps.scroll_region, Some(RegionScrollMethod::SuSd));
+    // GNU tty_ins_del_lines' first choice: parameterized DL/AL, even though
+    // the entry also attests SU/SD, which GNU never scrolls with.
+    assert_eq!(
+        caps.scroll_region,
+        Some(RegionScrollMethod::DeleteInsertLines)
+    );
     assert_eq!(caps.right_margin, RightMarginBehavior::MagicWrap);
     assert!(caps.insert_delete_char);
     assert_eq!(
@@ -457,12 +498,42 @@ fn right_margin_behavior_is_one_exhaustive_capability() {
 }
 
 #[test]
-fn vt220_shaped_entry_scrolls_by_index_never_su_sd() {
-    // The SU/SD-on-vt220 trap: cs attests DECSTBM, but CSI S/T is VT420+.
-    // The entry's own sf/sr (LF and ESC M) attest the index form instead.
+fn vt100_shaped_entry_scrolls_by_index_never_delete_insert() {
+    // cs attests DECSTBM but the entry has no DL/AL or dl/al: GNU
+    // tty_ins_del_lines falls through `multi` and `single` to the scroll
+    // region plus its own sf/sr (LF and ESC M), which attest the index form.
     let mut database = FakeCapabilityDatabase::vt220_like();
     let caps = resolve_term_caps(&mut database);
     assert_eq!(caps.scroll_region, Some(RegionScrollMethod::Index));
+}
+
+#[test]
+fn single_line_delete_insert_outranks_the_index_form_like_gnu() {
+    // GNU's `single` branch (TS_del_line/TS_ins_line, src/term.c:1066-1074)
+    // comes before the scroll-region fallback; only the parameterized pair
+    // outranks it.
+    let mut database = FakeCapabilityDatabase::vt220_like()
+        .with_string("dl", "\x1b[M")
+        .with_string("al", "\x1b[L");
+    let caps = resolve_term_caps(&mut database);
+    assert_eq!(
+        caps.scroll_region,
+        Some(RegionScrollMethod::DeleteInsertLine)
+    );
+
+    // One half of a pair is not a method: GNU's `line_ins_del_ok` needs
+    // both an insert and a delete (src/term.c:4913-4918).
+    let mut database = FakeCapabilityDatabase::vt220_like().with_string("dl", "\x1b[M");
+    let caps = resolve_term_caps(&mut database);
+    assert_eq!(caps.scroll_region, Some(RegionScrollMethod::Index));
+
+    // SU/SD alone never qualifies: GNU does not scroll with indn/rin.
+    let mut database = FakeCapabilityDatabase::vt220_like()
+        .without_string("sr")
+        .with_string("SF", "\x1b[%dS")
+        .with_string("SR", "\x1b[%dT");
+    let caps = resolve_term_caps(&mut database);
+    assert_eq!(caps.scroll_region, None);
 }
 
 #[test]
@@ -528,9 +599,14 @@ fn padding_and_parameter_markers_do_not_defeat_recognition() {
     // %p markers survive in some spellings; both canonicalize away.
     let mut database = FakeCapabilityDatabase::xterm_like()
         .with_string("cs", "\x1b[%i%p1%d;%p2%dr$<5>")
-        .with_string("cm", "\x1b[%i%p1%d;%p2%dH");
+        .with_string("cm", "\x1b[%i%p1%d;%p2%dH")
+        .with_string("DL", "\x1b[%p1%dM$<2*>")
+        .with_string("AL", "\x1b[%p1%dL$<2*>");
     let caps = resolve_term_caps(&mut database);
-    assert_eq!(caps.scroll_region, Some(RegionScrollMethod::SuSd));
+    assert_eq!(
+        caps.scroll_region,
+        Some(RegionScrollMethod::DeleteInsertLines)
+    );
 }
 
 /// Run native fixtures in a child process so TERMINFO is selected before
@@ -1128,3 +1204,7 @@ fn standout_requires_an_exit_and_falls_back_after_cookie_checks() {
     assert_eq!(caps.standout_sequence.as_deref(), Some(b"SO".as_slice()));
     assert_eq!(caps.exit_standout_mode.as_deref(), Some(b"ME".as_slice()));
 }
+
+#[cfg(test)]
+#[path = "terminal_capabilities_program_test.rs"]
+mod numeric_program_tests;

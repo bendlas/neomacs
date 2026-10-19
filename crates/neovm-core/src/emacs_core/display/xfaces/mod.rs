@@ -10,6 +10,7 @@
 //! `crate::face`; font.c matching stays in `super::font`.
 
 pub(crate) mod height;
+pub(crate) mod realization;
 
 use crate::emacs_core::error::EvalResult;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
@@ -363,7 +364,6 @@ use crate::emacs_core::SymId;
 use crate::face::{
     BoxStyle, Face as RuntimeFace, FontSlant, FontWeight, FontWidth, LFACE_ATTRS, UnderlineStyle,
 };
-use crate::tagged::header::store_value_atomic;
 use crate::window::{FrameId, FrameManager, FrameParam};
 use neomacs_display_protocol::TerminalColor;
 
@@ -1538,6 +1538,22 @@ fn unspecified_face_symbol() -> Value {
     Value::from_sym_id(*ID.get_or_init(|| intern("unspecified")))
 }
 
+/// Present a stored lface slot the way `internal-get-lisp-face-attribute` does.
+///
+/// `:ignore-defface` stays in the defaults vector. `Finternal_set_lisp_face_attribute`
+/// writes it only when FRAME is t and the caller passed `unspecified`
+/// (`src/xfaces.c:3256-3263`). `Finternal_copy_lisp_face` copies that slot
+/// unchanged (`src/xfaces.c:3183`). The getter is what turns the sentinel
+/// back into `unspecified` (`src/xfaces.c:4288-4289`). Merge still sees the
+/// stored sentinel (`src/xfaces.c:4340-4343`). `reset` is not rewritten.
+fn present_stored_lisp_face_attribute(value: Value) -> Value {
+    if value.is_bare_symbol_named(":ignore-defface") {
+        unspecified_face_symbol()
+    } else {
+        value
+    }
+}
+
 /// The leading `face' tag symbol stored in slot 0 of a Lisp face vector.
 fn face_tag_symbol() -> Value {
     static ID: OnceLock<SymId> = OnceLock::new();
@@ -1558,9 +1574,11 @@ fn reset_lisp_face_vector(vector: Value) {
         if slots.len() != LISP_FACE_VECTOR_LEN {
             *slots = vec![unspecified; LISP_FACE_VECTOR_LEN];
         }
-        store_value_atomic(&mut slots[0], face_tag_symbol());
+        // The bulk seam retired any captured backing before this exclusive
+        // view; no marker can read these plain temporary owner words.
+        slots[0] = face_tag_symbol();
         for slot in slots.iter_mut().take(LISP_FACE_VECTOR_LEN).skip(1) {
-            store_value_atomic(slot, unspecified);
+            *slot = unspecified;
         }
     });
 }
@@ -2032,11 +2050,21 @@ pub(crate) fn runtime_face_from_lisp_face_vector_resolved(
         let Some(value) = lisp_face_vector_attr(vector, attr) else {
             continue;
         };
-        if runtime_unspecified_lisp_face_attr(attr, value) {
+        let terminal_default = crate::face::realization::enabled()
+            && matches!(attr, LFaceAttr::Foreground | LFaceAttr::Background)
+            && matches!(
+                value.as_utf8_str(),
+                Some("unspecified-fg" | "unspecified-bg")
+            );
+        if !terminal_default && runtime_unspecified_lisp_face_attr(attr, value) {
             continue;
         }
         if let Some(face_attr) = lisp_value_to_face_attr_resolved(attr, value, resolver) {
             face.set_attribute(attr, face_attr);
+            if attr == LFaceAttr::Underline {
+                face.color_specifications.underline_operations =
+                    crate::face::underline_color_operations(&value);
+            }
         }
     }
     face
@@ -2080,6 +2108,43 @@ pub(crate) fn runtime_face_table_from_frame_lisp_faces_resolved(
         }
         let runtime_face =
             runtime_face_from_lisp_face_vector_resolved(&face_name, vector, resolver);
+        if let Some(lisp_face_id) = lisp_face_id {
+            table.define_lisp_face(lisp_face_id, &face_name, runtime_face);
+        } else {
+            table.define(&face_name, runtime_face);
+        }
+    }
+    table
+}
+
+/// Refresh the runtime table by re-deriving only the names marked dirty,
+/// reusing every untouched entry from `previous` through shared copy-on-write
+/// storage. GNU never re-derives an unchanged definition: a set writes one
+/// vector slot (xfaces.c:3767-3773) and definitions live on as the frame's
+/// face vectors; realization is content-keyed (lookup_face, xfaces.c:5064).
+///
+/// `default` is always re-derived: `realize_default_lisp_face_for_frame`
+/// refreshes its vector from live frame parameters right before a refresh,
+/// outside any named change record.
+pub(crate) fn runtime_face_table_from_frame_lisp_faces_incremental(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    previous: &crate::face::FaceTable,
+    dirty: &rustc_hash::FxHashSet<Box<str>>,
+) -> crate::face::FaceTable {
+    let mut table = previous.clone();
+    for (face_name, lisp_face_id, vector) in frame_lisp_face_table_entries(eval, frame_id) {
+        if face_name != "default"
+            && !dirty.contains(face_name.as_str())
+            && previous.get(&face_name).is_some()
+        {
+            continue;
+        }
+        let runtime_face = runtime_face_from_lisp_face_vector_resolved(
+            &face_name,
+            vector,
+            FaceColorResolver::Standard,
+        );
         if let Some(lisp_face_id) = lisp_face_id {
             table.define_lisp_face(lisp_face_id, &face_name, runtime_face);
         } else {
@@ -3043,7 +3108,17 @@ pub(crate) fn builtin_internal_make_lisp_face(
         vector
     };
     eval.face_table.ensure_face(&face_name);
-    eval.face_change_count += 1;
+    let local_frame = args
+        .get(1)
+        .filter(|frame| !frame.is_nil())
+        .and_then(frame_id_from_designator);
+    let frames: Vec<FrameId> = local_frame.into_iter().collect();
+    let scope = if frames.is_empty() {
+        realization::FaceChangeScope::AllFrames
+    } else {
+        realization::FaceChangeScope::Frames(&frames)
+    };
+    realization::record_named_face_change(eval, &face_name, scope);
     Ok(result)
 }
 
@@ -3110,12 +3185,26 @@ pub(crate) fn builtin_internal_copy_lisp_face(
                 .unwrap_or_else(make_lisp_face_vector);
         (src_vector, dst_vector, false)
     };
+    // GNU vcopy (`src/xfaces.c:3183`) keeps `:ignore-defface` in the defaults
+    // vector. The public getter, not the copy, presents that slot as
+    // `unspecified` (`src/xfaces.c:4288-4289`).
     copy_lisp_face_vector_slots(src_vector, dst_vector);
     sync_face_overrides_from_lisp_face_vector(&to_name, dst_vector, defaults_frame);
 
     let result = args[1];
 
-    eval.face_change_count += 1;
+    let local_frame = if copy_defaults_domain {
+        None
+    } else {
+        frame_id_from_designator(if args[3].is_nil() { &args[2] } else { &args[3] })
+    };
+    let frames: Vec<FrameId> = local_frame.into_iter().collect();
+    let scope = if copy_defaults_domain {
+        realization::FaceChangeScope::AllFrames
+    } else {
+        realization::FaceChangeScope::Frames(&frames)
+    };
+    realization::record_named_face_change(eval, &to_name, scope);
 
     Ok(result)
 }
@@ -3376,7 +3465,13 @@ pub(crate) fn builtin_internal_set_lisp_face_attribute(
         }
     }
 
-    eval.face_change_count += 1;
+    // GNU xfaces.c:3774-3780 marks only the live frames whose attribute
+    // changed. FRAME=t mutates new-frame defaults and affects no live cache.
+    realization::record_named_face_change(
+        eval,
+        &face_name,
+        realization::FaceChangeScope::Frames(&changed_live_frames),
+    );
 
     Ok(result)
 }
@@ -3407,9 +3502,12 @@ fn lisp_value_to_face_attr_resolved(
             // Parse the lface string to a spec exactly once; realization —
             // the only spec-to-pixel bridge — happens here, at the boundary
             // where the runtime face table is built for a known frame class.
-            Some(FaceAttrValue::Color(
-                resolver.realize(&SpecifiedColor::parse(s))?,
-            ))
+            let specification = SpecifiedColor::parse(s);
+            let realized = resolver.realize(&specification);
+            Some(FaceAttrValue::SpecifiedColor {
+                specification,
+                realized,
+            })
         }
         LFaceAttr::Weight => {
             let name = value.as_bare_symbol_name()?;
@@ -3443,18 +3541,23 @@ fn lisp_value_to_face_attr_resolved(
                 return Some(FaceAttrValue::Bool(true));
             }
             if let Some(s) = value.as_utf8_str() {
-                let color = resolver.realize(&SpecifiedColor::parse(s));
-                return Some(FaceAttrValue::Underline(Underline {
-                    style: UnderlineStyle::Line,
-                    color,
-                    position: UnderlinePosition::FontMetric,
-                }));
+                let specification = SpecifiedColor::parse(s);
+                let color = resolver.realize(&specification);
+                return Some(FaceAttrValue::SpecifiedUnderline {
+                    underline: Underline {
+                        style: UnderlineStyle::Line,
+                        color,
+                        position: UnderlinePosition::FontMetric,
+                    },
+                    color: Some(specification),
+                });
             }
             // Plist form: (:style STYLE :color COLOR :position POS)
             if let Some(plist) = super::value::list_to_vec(&value) {
                 let mut style = UnderlineStyle::Line;
                 let mut color = None;
                 let mut position = UnderlinePosition::FontMetric;
+                let mut specification = None;
                 let mut i = 0;
                 while i + 1 < plist.len() {
                     let key = plist[i].as_bare_symbol_name().unwrap_or("");
@@ -3467,9 +3570,16 @@ fn lisp_value_to_face_attr_resolved(
                                 .unwrap_or(UnderlineStyle::Line);
                         }
                         ":color" => {
-                            if let Some(s) = val.as_utf8_str().or_else(|| val.as_bare_symbol_name())
-                            {
-                                color = resolver.realize(&SpecifiedColor::parse(s));
+                            if val.is_bare_symbol_named("foreground-color") {
+                                // GNU xfaces.c:6771-6773 leaves the terminal
+                                // underline slot at zero; this is not a color
+                                // name and must never call tty-color-desc.
+                                color = None;
+                                specification = None;
+                            } else if let Some(s) = val.as_utf8_str() {
+                                let spec = SpecifiedColor::parse(s);
+                                color = resolver.realize(&spec);
+                                specification = Some(spec);
                             }
                         }
                         ":position" => {
@@ -3479,11 +3589,14 @@ fn lisp_value_to_face_attr_resolved(
                     }
                     i += 2;
                 }
-                return Some(FaceAttrValue::Underline(Underline {
-                    style,
-                    color,
-                    position,
-                }));
+                return Some(FaceAttrValue::SpecifiedUnderline {
+                    underline: Underline {
+                        style,
+                        color,
+                        position,
+                    },
+                    color: specification,
+                });
             }
             Some(FaceAttrValue::Bool(true))
         }
@@ -3510,14 +3623,14 @@ fn lisp_value_to_face_attr_resolved(
                 return Some(FaceAttrValue::Box(BoxBorder {
                     color: None,
                     width: 1,
-                    style: BoxStyle::Flat,
+                    style: BoxStyle::Simple,
                 }));
             }
             if let Some(n) = value.as_fixnum() {
                 return Some(FaceAttrValue::Box(BoxBorder {
                     color: None,
                     width: n as i32,
-                    style: BoxStyle::Flat,
+                    style: BoxStyle::Simple,
                 }));
             }
             // Color string shorthand. Box colors are not tty-mapped in GNU
@@ -3527,7 +3640,7 @@ fn lisp_value_to_face_attr_resolved(
                 return Some(FaceAttrValue::Box(BoxBorder {
                     color,
                     width: 1,
-                    style: BoxStyle::Flat,
+                    style: BoxStyle::Simple,
                 }));
             }
             // Plist form: (:line-width WIDTH :color COLOR :style STYLE)
@@ -3535,7 +3648,7 @@ fn lisp_value_to_face_attr_resolved(
                 let mut border = BoxBorder {
                     color: None,
                     width: 1,
-                    style: BoxStyle::Flat,
+                    style: BoxStyle::Simple,
                 };
                 let mut i = 0;
                 while i + 1 < plist.len() {
@@ -3555,10 +3668,12 @@ fn lisp_value_to_face_attr_resolved(
                             }
                         }
                         ":style" => {
-                            border.style = val
-                                .as_bare_symbol_name()
-                                .and_then(BoxStyle::from_symbol)
-                                .unwrap_or(BoxStyle::Flat);
+                            if !val.is_nil()
+                                && let Some(style) =
+                                    val.as_bare_symbol_name().and_then(BoxStyle::from_symbol)
+                            {
+                                border.style = style;
+                            }
                         }
                         _ => {}
                     }
@@ -3569,7 +3684,7 @@ fn lisp_value_to_face_attr_resolved(
             Some(FaceAttrValue::Box(BoxBorder {
                 color: None,
                 width: 1,
-                style: BoxStyle::Flat,
+                style: BoxStyle::Simple,
             }))
         }
         LFaceAttr::InverseVideo | LFaceAttr::Extend => Some(FaceAttrValue::Bool(value.is_truthy())),
@@ -3626,9 +3741,11 @@ pub(crate) fn builtin_internal_get_lisp_face_attribute(
         if let Some(vector) = ensure_global_lisp_face_vector(eval, &face_name)
             && let Some(value) = lisp_face_vector_attr(vector, attr_name)
         {
-            return Ok(value);
+            return Ok(present_stored_lisp_face_attribute(value));
         }
-        return Ok(lisp_face_attribute_value(&face_name, attr_name, true));
+        return Ok(present_stored_lisp_face_attribute(
+            lisp_face_attribute_value(&face_name, attr_name, true),
+        ));
     }
 
     let frame_id = match args.get(2) {
@@ -3669,16 +3786,17 @@ pub(crate) fn builtin_internal_get_lisp_face_attribute(
         })
         .and_then(|vector| lisp_face_vector_attr(vector, attr_name))
         .unwrap_or_else(|| lisp_face_attribute_value(&face_name, attr_name, false));
-    // GNU `internal-get-lisp-face-attribute` (xfaces.c) returns the LISP face
-    // attribute (`LFACE_*` of `lface_from_face_name`), never the *realized*
-    // face. Do NOT fall back to the runtime realized face here: the realized
-    // face on this batch/mono frame still carries colors realized for a
-    // color-capable display during the bootstrap image build (e.g. `error`
+    // GNU `internal-get-lisp-face-attribute` (xfaces.c:4230-4291) returns the
+    // LISP face attribute (`LFACE_*` of `lface_from_face_name`), never the
+    // *realized* face. Do NOT fall back to the runtime realized face here: the
+    // realized face on this batch/mono frame still carries colors realized for
+    // a color-capable display during the bootstrap image build (e.g. `error`
     // :foreground "#ff0000"), whereas GNU returns `unspecified` because no
     // display clause of the defface spec matched a mono terminal. The lisp face
     // value above (frame lisp vector slot, falling back to the base/override
-    // value) is the GNU-faithful answer.
-    Ok(lisp_value)
+    // value) is the GNU-faithful answer. A stored `:ignore-defface` is
+    // presented as `unspecified` (`src/xfaces.c:4288-4289`).
+    Ok(present_stored_lisp_face_attribute(lisp_value))
 }
 
 /// `(internal-lisp-face-attribute-values ATTR)` -- return valid discrete values
@@ -3755,6 +3873,7 @@ pub(crate) fn builtin_internal_merge_in_global_face(
     merge_defaults_overrides_into_selected(&face_name);
     let frame_id = frame_id_from_designator(&args[1])
         .expect("validated frame designator should decode to frame id");
+    let local_existed = lookup_frame_lisp_face_vector(eval, frame_id, &face_name).is_some();
     if let (Some(global_vector), Some(local_vector)) = (
         ensure_global_lisp_face_vector(eval, &face_name),
         ensure_frame_lisp_face_vector(eval, frame_id, &face_name, FrameFaceInitial::Empty),
@@ -3770,9 +3889,29 @@ pub(crate) fn builtin_internal_merge_in_global_face(
             }
         }
         sync_face_overrides_from_lisp_face_vector(&face_name, local_vector, false);
+        if crate::face::realization::enabled()
+            && face_name == "default"
+            && eval.frame_is_tty_face_target(frame_id)
+        {
+            realization::realize_default_after_global_merge(
+                eval,
+                frame_id,
+                global_vector,
+                local_vector,
+            )?;
+            return Ok(Value::NIL);
+        }
     }
 
-    eval.face_change_count += 1;
+    let affected = [frame_id];
+    let scope = if crate::face::realization::enabled() && local_existed && face_name != "default" {
+        // GNU xfaces.c:4336-4351 merges existing nondefault definitions without
+        // freeing realizations. New demands must still read the new lface.
+        realization::FaceChangeScope::DefinitionsOnly(&affected)
+    } else {
+        realization::FaceChangeScope::Frames(&affected)
+    };
+    realization::record_named_face_change(eval, &face_name, scope);
     Ok(Value::NIL)
 }
 

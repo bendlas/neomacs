@@ -2652,10 +2652,97 @@ fn face_resolver_underline_styles_use_gnu_codes() {
 }
 
 #[test]
+fn flat_button_box_uses_background_without_changing_simple_box_foreground() {
+    let mut evaluator = neovm_core::emacs_core::Context::new();
+    let table = FaceTable::new();
+    let resolver = FaceResolver::new(&table, 0x00112233, 0x00445566, 14.0, None);
+
+    // GNU xfaces.c realize_gui_face selects the background only for an
+    // explicit flat-button style. Both styles still draw FACE_SIMPLE_BOX.
+    for (box_form, expected_type, expected_color) in [
+        ("t", 1, 0x00112233),
+        ("2", 1, 0x00112233),
+        ("(:line-width 2)", 1, 0x00112233),
+        ("(:style nil)", 1, 0x00112233),
+        ("(:style flat-button)", 1, 0x00445566),
+        ("(:style flat-button :style nil)", 1, 0x00445566),
+        ("(:style released-button)", 2, 0x00445566),
+        ("(:style pressed-button)", 3, 0x00445566),
+        ("(:style flat-button :color \"#778899\")", 1, 0x00778899),
+        ("(:color \"#778899\" :style flat-button)", 1, 0x00778899),
+    ] {
+        let face = eval_lisp(&mut evaluator, &format!("'(:box {box_form})"));
+        let mut buffer = test_buffer(583, "*flat-button*");
+        set_buffer_text(&mut buffer, "x");
+        buffer.put_text_property(0, 1, Value::symbol("face"), face);
+
+        let mut next_check = buffer.point_max_char_pos().get();
+        let resolved = resolver.face_at_pos(&buffer, 0, &mut next_check);
+        assert_eq!(resolved.box_type, expected_type, "{box_form}");
+        assert_eq!(resolved.box_color, expected_color, "{box_form}");
+    }
+}
+
+#[test]
+fn lisp_named_flat_button_style_survives_nil_plist_entries() {
+    let mut evaluator = neovm_core::emacs_core::Context::new();
+    eval_lisp(
+        &mut evaluator,
+        r##"(progn
+             (selected-frame)
+             (internal-set-lisp-face-attribute 'mode-line :foreground "#112233" nil)
+             (internal-set-lisp-face-attribute 'mode-line :background "#445566" nil)
+             (internal-set-lisp-face-attribute 'mode-line :inverse-video nil nil)
+             (internal-set-lisp-face-attribute 'mode-line :box
+                                              '(:style flat-button :style nil) nil))"##,
+    );
+    let frame = evaluator.frame_manager().selected_frame().unwrap().id;
+    evaluator.sync_runtime_faces_for_frame(frame);
+    let source = evaluator.face_table().resolve("mode-line");
+    assert_eq!(
+        source.box_border.enabled().unwrap().style,
+        NeoBoxStyle::Flat,
+        "{source:?}"
+    );
+
+    let resolver = FaceResolver::new(evaluator.face_table(), 0x00ffffff, 0x00000000, 14.0, None);
+    let resolved = resolver.resolve_named_face("mode-line");
+    assert_eq!(resolved.box_type, 1);
+    assert_eq!(resolved.box_color, 0x00445566);
+}
+
+#[test]
+fn flat_button_box_realizes_named_and_default_face_backgrounds() {
+    let mut evaluator = neovm_core::emacs_core::Context::new();
+    let mut table = FaceTable::new();
+    for name in ["default", "flat-button"] {
+        let specification = eval_lisp(
+            &mut evaluator,
+            "'(:foreground \"#112233\" :background \"#445566\" :box (:style flat-button))",
+        );
+        let items = list_to_vec(&specification).expect("face plist");
+        table.define(name, NeoFace::from_plist(name, &items));
+    }
+    let resolver = FaceResolver::new(&table, 0x00ffffff, 0x00000000, 14.0, None);
+    assert_eq!(resolver.default_face().box_type, 1);
+    assert_eq!(resolver.default_face().box_color, 0x00445566);
+    assert_eq!(
+        resolver.resolve_named_face("flat-button").box_color,
+        0x00445566
+    );
+
+    let face = resolver
+        .face_from_plist(&eval_lisp(&mut evaluator, "'(:box (:style flat-button))"))
+        .expect("anonymous face");
+    assert_eq!(resolver.realize_face(&face).box_color, 0x00445566);
+}
+
+#[test]
 fn face_resolver_box_styles_use_gnu_codes() {
     let _evaluator = neovm_core::emacs_core::Context::new();
     let mut table = FaceTable::new();
-    let styles: [(&str, NeoBoxStyle, u8); 3] = [
+    let styles: [(&str, NeoBoxStyle, u8); 4] = [
+        ("simple-box-face", NeoBoxStyle::Simple, 1),
         ("flat-box-face", NeoBoxStyle::Flat, 1),
         ("raised-box-face", NeoBoxStyle::Raised, 2),
         ("pressed-box-face", NeoBoxStyle::Pressed, 3),
@@ -3958,5 +4045,198 @@ fn distant_foreground_is_reconsidered_after_every_merge() {
     assert_eq!(
         contrasted.fg, 0x333333,
         "recover the source foreground, not substituted paint"
+    );
+}
+
+#[test]
+fn composed_face_sources_are_interned_by_content() {
+    let _runtime = neovm_core::emacs_core::Context::new();
+    let table = FaceTable::new();
+    let resolver = FaceResolver::new(&table, 0xFFFFFF, 0, 14.0, None);
+
+    let overlay = || {
+        let mut face = NeoFace::new("--composed-overlay--");
+        face.foreground = Some(NeoColor::rgb(255, 0, 0));
+        face
+    };
+    let first = resolver
+        .shared_composed_source(overlay(), None)
+        .expect("installed mutator heap");
+    let second = resolver
+        .shared_composed_source(overlay(), None)
+        .expect("installed mutator heap");
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "repeated compositions of one logical face share one rooted source"
+    );
+
+    let mut other = overlay();
+    other.foreground = Some(NeoColor::rgb(0, 255, 0));
+    let distinct = resolver
+        .shared_composed_source(other, None)
+        .expect("installed mutator heap");
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &distinct),
+        "a different face must not share the first face's source"
+    );
+}
+
+#[test]
+fn repeated_face_compositions_reuse_their_merged_source() {
+    let _runtime = neovm_core::emacs_core::Context::new();
+    let table = FaceTable::new();
+    let resolver = FaceResolver::new(&table, 0xFFFFFF, 0, 14.0, None);
+
+    let mut base_attributes = NeoFace::new("--composition-base--");
+    base_attributes.family = Some(Value::string("retained-family"));
+    let base_source =
+        std::sync::Arc::new(RootedFace::new(base_attributes).expect("installed mutator heap"));
+    let mut base = ResolvedFace::default();
+    base.source_attributes = Some(std::sync::Arc::clone(&base_source));
+
+    let overlay = || {
+        let mut face = NeoFace::new("--composition-overlay--");
+        face.foreground = Some(NeoColor::rgb(255, 0, 0));
+        face
+    };
+    let mut first = base.clone();
+    first.retain_source_over(&resolver, &base, &overlay(), None);
+    let mut second = base.clone();
+    second.retain_source_over(&resolver, &base, &overlay(), None);
+    assert!(
+        std::sync::Arc::ptr_eq(
+            first.source_attributes.as_ref().unwrap(),
+            second.source_attributes.as_ref().unwrap()
+        ),
+        "the same overlay over the same base must not rebuild its merged source"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(base.source_attributes.as_ref().unwrap(), &base_source),
+        "composing must not disturb the base's own source"
+    );
+}
+
+#[test]
+fn named_overlay_specs_are_shared_by_identity() {
+    let _runtime = neovm_core::emacs_core::Context::new();
+    let mut table = FaceTable::new();
+    let mut face = NeoFace::new("identity-named-face");
+    face.foreground = Some(NeoColor::rgb(12, 34, 56));
+    table.define("identity-named-face", face);
+    let resolver = FaceResolver::new(&table, 0xFFFFFF, 0, 14.0, None);
+
+    // Composing the same named face over the same base twice must reuse the
+    // same merged source Arc, keyed by the shared specification identity.
+    let mut base_attributes = NeoFace::new("--identity-base--");
+    base_attributes.family = Some(Value::string("identity-family"));
+    let base_source =
+        std::sync::Arc::new(RootedFace::new(base_attributes).expect("installed mutator heap"));
+    let mut base = ResolvedFace::default();
+    base.source_attributes = Some(std::sync::Arc::clone(&base_source));
+
+    let shared_overlay = resolver.resolve_named_face_overlay_spec(
+        "identity-named-face",
+        0,
+        FaceReferenceDiagnostics::Suppress,
+    );
+    assert!(
+        resolver
+            .cached_named_overlay_spec("identity-named-face")
+            .is_some_and(|memo| std::sync::Arc::ptr_eq(&memo, &shared_overlay)),
+        "the first fold must populate the named-spec memo"
+    );
+    let overlay = (*shared_overlay).clone();
+    let mut first = base.clone();
+    first.retain_source_over(
+        &resolver,
+        &base,
+        &overlay,
+        Some(&std::sync::Arc::clone(&shared_overlay)),
+    );
+    let mut second = base.clone();
+    second.retain_source_over(
+        &resolver,
+        &base,
+        &overlay,
+        Some(&std::sync::Arc::clone(&shared_overlay)),
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(
+            first.source_attributes.as_ref().unwrap(),
+            second.source_attributes.as_ref().unwrap()
+        ),
+        "the same named overlay identity over the same base must reuse the merged source"
+    );
+}
+
+#[test]
+fn unmatched_remapping_still_shares_named_specs() {
+    let _runtime = neovm_core::emacs_core::Context::new();
+    let mut table = FaceTable::new();
+    let mut face = NeoFace::new("unmatched-remap-face");
+    face.foreground = Some(NeoColor::rgb(10, 20, 30));
+    table.define("unmatched-remap-face", face);
+    let resolver = FaceResolver::new(&table, 0xFFFFFF, 0, 14.0, None);
+
+    // The buffer remaps a DIFFERENT face. GNU re-runs its live `assq` miss
+    // check per lookup (merge_named_face, src/xfaces.c:3269-3295) and then
+    // reuses the folded definition; the miss must still share one fold per
+    // alist object.
+    let alist = Value::list(vec![Value::cons(
+        Value::symbol("some-other-face"),
+        Value::list(vec![Value::symbol(":weight"), Value::symbol("bold")]),
+    )]);
+    let remapping = BufferFaceRemapping::for_alist(Some(alist));
+    let fold = |resolver: &FaceResolver| {
+        resolver
+            .resolve_buffer_named_face_overlay_spec_inner(
+                remapping,
+                "unmatched-remap-face",
+                &mut Vec::new(),
+                0,
+                FaceReferenceDiagnostics::Suppress,
+            )
+            .expect("named face resolves")
+    };
+    let first = fold(&resolver);
+    let second = fold(&resolver);
+    let (Some(first_id), Some(second_id)) = (first.identity.clone(), second.identity.clone())
+    else {
+        panic!("folds under an unmatched remapping alist must share one specification");
+    };
+    assert!(
+        std::sync::Arc::ptr_eq(&first_id, &second_id),
+        "repeated folds under the same alist object reuse the shared spec"
+    );
+
+    // Once the alist DOES map the face -- even as the same list object grown
+    // a new head entry -- the remapping branch must win over any memo.
+    let grown = Value::cons(
+        Value::cons(
+            Value::symbol("unmatched-remap-face"),
+            Value::list(vec![Value::symbol(":weight"), Value::symbol("bold")]),
+        ),
+        alist,
+    );
+    let remapped = resolver
+        .resolve_buffer_named_face_overlay_spec_inner(
+            BufferFaceRemapping::for_alist(Some(grown)),
+            "unmatched-remap-face",
+            &mut Vec::new(),
+            0,
+            FaceReferenceDiagnostics::Suppress,
+        )
+        .expect("named face resolves");
+    assert!(
+        remapped.face.weight.is_some_and(|weight| weight.is_bold()),
+        "a direct remapping entry applies its spec, got {:?}",
+        remapped.face.weight
+    );
+    assert!(
+        remapped
+            .identity
+            .as_ref()
+            .is_none_or(|identity| !std::sync::Arc::ptr_eq(identity, &first_id)),
+        "a remapped fold never serves the unmatched memo entry"
     );
 }

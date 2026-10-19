@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use strum::{EnumString, IntoStaticStr};
 
 mod dump_codes;
+pub mod realization;
 mod remapping;
 pub use remapping::{FaceRemapEntry, FaceRemapping};
 
@@ -441,18 +442,22 @@ pub struct BoxBorder {
     pub style: BoxStyle,
 }
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, EnumString, IntoPrimitive, IntoStaticStr, TryFromPrimitive,
-)]
-#[repr(u8)]
+/// Logical box styles, before choosing the face-relative default color.
+///
+/// GNU draws both a plain box and `flat-button` as FACE_SIMPLE_BOX, but
+/// defaults their colors to foreground and background respectively. Keep
+/// that distinction until realization instead of storing the drawing code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum BoxStyle {
+    #[strum(to_string = "nil")]
+    Simple,
     #[strum(to_string = "flat-button")]
-    Flat = 1,
+    Flat,
     #[strum(to_string = "released-button")]
-    Raised = 2,
+    Raised,
     #[strum(to_string = "pressed-button")]
-    Pressed = 3,
+    Pressed,
 }
 
 impl BoxStyle {
@@ -465,11 +470,22 @@ impl BoxStyle {
     }
 
     pub fn gnu_code(self) -> u8 {
-        self.into()
+        match self {
+            Self::Simple | Self::Flat => 1,
+            Self::Raised => 2,
+            Self::Pressed => 3,
+        }
     }
 
+    /// Decode a drawing kind, which cannot recover an explicit `flat-button`.
+    /// Lisp parsing and dump storage retain the logical style independently.
     pub fn from_gnu_code(code: u8) -> Option<Self> {
-        Self::try_from(code).ok()
+        match code {
+            1 => Some(Self::Simple),
+            2 => Some(Self::Raised),
+            3 => Some(Self::Pressed),
+            _ => None,
+        }
     }
 }
 
@@ -795,6 +811,17 @@ impl FontWidth {
 #[derive(Clone, Debug)]
 pub enum FaceAttrValue {
     Color(Color),
+    /// Preserve an lface color string together with its current realization.
+    /// Failed realization retains the specification for a later retry.
+    SpecifiedColor {
+        specification: SpecifiedColor,
+        realized: Option<Color>,
+    },
+    /// An underline whose original color specification must survive realization.
+    SpecifiedUnderline {
+        underline: Underline,
+        color: Option<SpecifiedColor>,
+    },
     Weight(FontWeight),
     Slant(FontSlant),
     Height(FaceHeight),
@@ -818,13 +845,98 @@ pub enum FaceAttrValue {
 // Face
 // ---------------------------------------------------------------------------
 
+/// One color operation in an underline attribute plist, in Lisp order.
+///
+/// GNU realizes every string-valued `:color` even when a later occurrence
+/// replaces it; the `foreground-color` symbol resets the slot without lookup
+/// (xfaces.c:6763-6780). Owned immutable data can cross mutator boundaries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum UnderlineColorOperation {
+    Lookup(SpecifiedColor),
+    Foreground,
+}
+
+/// Original lface colors retained alongside their current renderable values.
+///
+/// Immutable specifications contain only owned Rust data and can be shared
+/// across mutators through `Arc`. Each face owner mutates its own slots; there
+/// is no thread-local or shared mutable Lisp state. Sharing makes cloning a
+/// face retain its strings without allocating on the glyph-resolution path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FaceColorSpecifications {
+    pub foreground: Option<std::sync::Arc<SpecifiedColor>>,
+    pub background: Option<std::sync::Arc<SpecifiedColor>>,
+    pub underline: Option<std::sync::Arc<SpecifiedColor>>,
+    /// `Some` preserves an underline plist's ordered operations, including an
+    /// empty plist. `None` denotes a non-plist underline value.
+    pub underline_operations: Option<std::sync::Arc<[UnderlineColorOperation]>>,
+    pub distant_foreground: Option<std::sync::Arc<SpecifiedColor>>,
+}
+
+static_assertions::assert_impl_all!(FaceColorSpecifications: Send, Sync);
+
+impl FaceColorSpecifications {
+    /// Digest the retained specifications by shared allocation identity.
+    ///
+    /// Merges clone specification `Arc`s from face-table entries, so one
+    /// logical face carries the same pointers through every composition.
+    /// Content-equal specifications that were parsed into distinct allocations
+    /// digest differently; the caller's `PartialEq` check remains the
+    /// authority.
+    pub fn hash_shared_identity(&self, state: &mut impl std::hash::Hasher) {
+        fn hash_arc<T: ?Sized>(
+            state: &mut impl std::hash::Hasher,
+            spec: &Option<std::sync::Arc<T>>,
+        ) {
+            match spec {
+                Some(specification) => {
+                    state.write_u8(1);
+                    let pointer = std::sync::Arc::as_ptr(specification) as *const u8;
+                    state.write_usize(pointer as usize);
+                }
+                None => state.write_u8(0),
+            }
+        }
+
+        hash_arc(state, &self.foreground);
+        hash_arc(state, &self.background);
+        hash_arc(state, &self.underline);
+        hash_arc(state, &self.underline_operations);
+        hash_arc(state, &self.distant_foreground);
+    }
+}
+
+fn retained_color_specification(
+    specification: SpecifiedColor,
+) -> Option<std::sync::Arc<SpecifiedColor>> {
+    match specification {
+        SpecifiedColor::Unspecified => None,
+        specification => Some(std::sync::Arc::new(specification)),
+    }
+}
+
+fn merged_color_specification(
+    base: &Option<std::sync::Arc<SpecifiedColor>>,
+    overlay: &Option<std::sync::Arc<SpecifiedColor>>,
+    overlay_realized: Option<Color>,
+) -> Option<std::sync::Arc<SpecifiedColor>> {
+    if overlay.is_some() || overlay_realized.is_some() {
+        overlay.clone()
+    } else {
+        base.clone()
+    }
+}
+
 /// A face definition. Fields are `Option` to support partial specification
 /// (inheriting unset attributes from the default face).
 ///
 /// The face name is owned by the surrounding registry key, matching GNU
 /// Emacs's frame-local face hash table design.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Face {
+    /// The source specifications for colors that came from Lisp strings.
+    /// A failed lookup must not erase the input needed after invalidation.
+    pub color_specifications: FaceColorSpecifications,
     /// Foreground color.
     pub foreground: Option<Color>,
     /// Background color.
@@ -922,7 +1034,89 @@ fn normalized_face_name_value(value: &Value) -> Option<Value> {
     }
 }
 
+/// Fx-style hashing for the per-composition cache digests.
+///
+/// `DefaultHasher` (SipHash-1-3) pays a keyed round setup per digest, and
+/// `content_hash` runs on every composition probe; digesting the same face
+/// with fold-multiply rounds instead removes that setup without changing the
+/// contract: the digest is only a bucket hint, `PartialEq` remains the
+/// equality verdict.
+struct FastFaceHasher {
+    hash: u64,
+}
+
+impl FastFaceHasher {
+    #[inline]
+    fn add(&mut self, bits: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ bits).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for FastFaceHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.add(byte as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
 impl Face {
+    /// Cheap digest for content-addressed caches of composed faces.
+    ///
+    /// GNU hashes eight lface slots and only then verifies a bucket with
+    /// `lface_equal_p` (src/xfaces.c:4602-4612, 5064-5093); this is the same
+    /// shape. The digest is a bucket hint, never an equality verdict: callers
+    /// must confirm with `PartialEq`, the authority. Lisp references hash by
+    /// object identity and retained specifications by `Arc` allocation
+    /// identity, so the same logical face composed from shared table entries
+    /// digests identically while content-equal-but-distinct inputs may fall
+    /// into different buckets — that costs an extra cache entry, never a wrong
+    /// sharing decision.
+    pub fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use std::mem::discriminant;
+
+        let mut state = FastFaceHasher { hash: 0 };
+        self.color_specifications.hash_shared_identity(&mut state);
+        self.foreground.hash(&mut state);
+        self.background.hash(&mut state);
+        self.distant_foreground.hash(&mut state);
+        state.write_usize(self.family.map_or(0, Value::bits));
+        state.write_usize(self.foundry.map_or(0, Value::bits));
+        state.write_usize(self.stipple.map_or(0, Value::bits));
+        state.write_u16(self.weight.map_or(0, FontWeight::css_weight));
+        state.write_u8(u8::from(self.slant.is_some_and(|slant| slant.is_italic())));
+        discriminant(&self.height).hash(&mut state);
+        discriminant(&self.underline).hash(&mut state);
+        discriminant(&self.box_border).hash(&mut state);
+        state.finish()
+    }
+
     pub fn family_runtime_string_owned(&self) -> Option<String> {
         self.family.and_then(|value| {
             value
@@ -963,10 +1157,40 @@ impl Face {
             };
         }
 
+        macro_rules! set_color {
+            ($field:expr, $source:expr) => {
+                match value {
+                    FaceAttrValue::Color(color) => {
+                        $field = Some(color);
+                        $source = None;
+                    }
+                    FaceAttrValue::SpecifiedColor {
+                        specification,
+                        realized,
+                    } => {
+                        $field = realized;
+                        $source = retained_color_specification(specification);
+                    }
+                    FaceAttrValue::Unspecified => {
+                        $field = None;
+                        $source = None;
+                    }
+                    _ => return false,
+                }
+            };
+        }
+
         match attr {
-            LFaceAttr::Foreground => set_option!(self.foreground, Color),
-            LFaceAttr::Background => set_option!(self.background, Color),
-            LFaceAttr::DistantForeground => set_option!(self.distant_foreground, Color),
+            LFaceAttr::Foreground => {
+                set_color!(self.foreground, self.color_specifications.foreground)
+            }
+            LFaceAttr::Background => {
+                set_color!(self.background, self.color_specifications.background)
+            }
+            LFaceAttr::DistantForeground => set_color!(
+                self.distant_foreground,
+                self.color_specifications.distant_foreground
+            ),
             LFaceAttr::Weight => set_option!(self.weight, Weight),
             LFaceAttr::Slant => set_option!(self.slant, Slant),
             LFaceAttr::Width => set_option!(self.width, Width),
@@ -981,19 +1205,31 @@ impl Face {
                 FaceAttrValue::Unspecified => self.foundry = None,
                 _ => return false,
             },
-            LFaceAttr::Underline => match value {
-                FaceAttrValue::Underline(u) => self.underline = FaceDecoration::Enabled(u),
-                FaceAttrValue::Bool(true) => {
-                    self.underline = FaceDecoration::Enabled(Underline {
-                        style: UnderlineStyle::Line,
-                        color: None,
-                        position: UnderlinePosition::FontMetric,
-                    });
-                }
-                FaceAttrValue::Bool(false) => self.underline = FaceDecoration::Disabled,
-                FaceAttrValue::Unspecified => self.underline = FaceDecoration::Unspecified,
-                _ => return false,
-            },
+            LFaceAttr::Underline => {
+                let (underline, specification) = match value {
+                    FaceAttrValue::SpecifiedUnderline { underline, color } => (
+                        FaceDecoration::Enabled(underline),
+                        color.and_then(retained_color_specification),
+                    ),
+                    FaceAttrValue::Underline(underline) => {
+                        (FaceDecoration::Enabled(underline), None)
+                    }
+                    FaceAttrValue::Bool(true) => (
+                        FaceDecoration::Enabled(Underline {
+                            style: UnderlineStyle::Line,
+                            color: None,
+                            position: UnderlinePosition::FontMetric,
+                        }),
+                        None,
+                    ),
+                    FaceAttrValue::Bool(false) => (FaceDecoration::Disabled, None),
+                    FaceAttrValue::Unspecified => (FaceDecoration::Unspecified, None),
+                    _ => return false,
+                };
+                self.underline = underline;
+                self.color_specifications.underline = specification;
+                self.color_specifications.underline_operations = None;
+            }
             LFaceAttr::Overline => match value {
                 FaceAttrValue::Bool(b) => self.overline = Some(b),
                 FaceAttrValue::Color(c) => {
@@ -1045,6 +1281,37 @@ impl Face {
     /// override those in `self`.
     pub fn merge(&self, overlay: &Face) -> Face {
         Face {
+            color_specifications: FaceColorSpecifications {
+                foreground: merged_color_specification(
+                    &self.color_specifications.foreground,
+                    &overlay.color_specifications.foreground,
+                    overlay.foreground,
+                ),
+                background: merged_color_specification(
+                    &self.color_specifications.background,
+                    &overlay.color_specifications.background,
+                    overlay.background,
+                ),
+                distant_foreground: merged_color_specification(
+                    &self.color_specifications.distant_foreground,
+                    &overlay.color_specifications.distant_foreground,
+                    overlay.distant_foreground,
+                ),
+                underline: match &overlay.underline {
+                    FaceDecoration::Unspecified => self.color_specifications.underline.clone(),
+                    FaceDecoration::Disabled | FaceDecoration::Enabled(_) => {
+                        overlay.color_specifications.underline.clone()
+                    }
+                },
+                underline_operations: match &overlay.underline {
+                    FaceDecoration::Unspecified => {
+                        self.color_specifications.underline_operations.clone()
+                    }
+                    FaceDecoration::Disabled | FaceDecoration::Enabled(_) => {
+                        overlay.color_specifications.underline_operations.clone()
+                    }
+                },
+            },
             foreground: overlay.foreground.or(self.foreground),
             background: overlay.background.or(self.background),
             family: overlay.family.or(self.family),
@@ -1155,11 +1422,15 @@ impl Face {
                 "foreground" | "foreground-color" => {
                     if let Some(s) = val.as_utf8_str() {
                         face.foreground = realize_color_spec(s, palette);
+                        face.color_specifications.foreground =
+                            retained_color_specification(SpecifiedColor::parse(s));
                     }
                 }
                 "background" | "background-color" => {
                     if let Some(s) = val.as_utf8_str() {
                         face.background = realize_color_spec(s, palette);
+                        face.color_specifications.background =
+                            retained_color_specification(SpecifiedColor::parse(s));
                     }
                 }
                 "weight" => {
@@ -1182,7 +1453,14 @@ impl Face {
                         face.family = Some(*val);
                     }
                 }
-                "underline" => face.underline = parse_underline_value(val, palette),
+                "underline" => {
+                    face.underline = parse_underline_value(val, palette);
+                    let operations = underline_color_operations(val);
+                    face.color_specifications.underline =
+                        underline_color_specification(val, operations.as_deref())
+                            .and_then(retained_color_specification);
+                    face.color_specifications.underline_operations = operations;
+                }
                 "overline" => {
                     if let Some(s) = val.as_utf8_str() {
                         face.overline = Some(true);
@@ -1222,6 +1500,8 @@ impl Face {
                 "distant-foreground" => {
                     if let Some(s) = val.as_utf8_str() {
                         face.distant_foreground = realize_color_spec(s, palette);
+                        face.color_specifications.distant_foreground =
+                            retained_color_specification(SpecifiedColor::parse(s));
                     }
                 }
                 "foundry" => {
@@ -1283,6 +1563,47 @@ impl DecorationProperty {
     }
 }
 
+/// Capture the effectful portion of an underline plist without resolving any
+/// colors. The sequence is shared by face clones and contains no Lisp Values.
+pub(crate) fn underline_color_operations(
+    value: &Value,
+) -> Option<std::sync::Arc<[UnderlineColorOperation]>> {
+    if !value.is_cons() {
+        return None;
+    }
+    let items = crate::emacs_core::value::list_to_vec(value)?;
+    Some(
+        items
+            .chunks_exact(2)
+            .filter_map(|pair| {
+                if DecorationProperty::from_value(pair[0]) != Some(DecorationProperty::Color) {
+                    return None;
+                }
+                if pair[1].is_bare_symbol_named("foreground-color") {
+                    Some(UnderlineColorOperation::Foreground)
+                } else {
+                    face_runtime_string(&pair[1])
+                        .map(|text| UnderlineColorOperation::Lookup(SpecifiedColor::parse(&text)))
+                }
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    )
+}
+
+fn underline_color_specification(
+    value: &Value,
+    operations: Option<&[UnderlineColorOperation]>,
+) -> Option<SpecifiedColor> {
+    if let Some(text) = face_runtime_string(value) {
+        return Some(SpecifiedColor::parse(&text));
+    }
+    match operations?.last()? {
+        UnderlineColorOperation::Lookup(specification) => Some(specification.clone()),
+        UnderlineColorOperation::Foreground => None,
+    }
+}
+
 /// Parse one `:underline` value from an anonymous attribute plist.
 ///
 /// The colour is realized through the terminal palette, exactly as this
@@ -1326,9 +1647,11 @@ fn parse_underline_value(
                 let item = &items[i + 1];
                 match key {
                     Some(DecorationProperty::Color) => {
-                        color = face_runtime_string(item)
-                            .as_deref()
-                            .and_then(|spec| realize_color_spec(spec, palette));
+                        if item.is_bare_symbol_named("foreground-color") {
+                            color = None;
+                        } else if let Some(text) = face_runtime_string(item) {
+                            color = realize_color_spec(&text, palette);
+                        }
                     }
                     Some(DecorationProperty::Style) => {
                         if let Some(name) = item.as_bare_symbol_name() {
@@ -1363,13 +1686,13 @@ fn parse_box_value(value: &Value) -> FaceDecoration<BoxBorder> {
         ValueKind::T => FaceDecoration::Enabled(BoxBorder {
             color: None,
             width: 1,
-            style: BoxStyle::Flat,
+            style: BoxStyle::Simple,
         }),
         ValueKind::Nil => FaceDecoration::Disabled,
         ValueKind::Fixnum(n) => FaceDecoration::Enabled(BoxBorder {
             color: None,
             width: n as i32,
-            style: BoxStyle::Flat,
+            style: BoxStyle::Simple,
         }),
         _ if value.is_string() => {
             let Some(text) = face_runtime_string(value) else {
@@ -1378,7 +1701,7 @@ fn parse_box_value(value: &Value) -> FaceDecoration<BoxBorder> {
             FaceDecoration::Enabled(BoxBorder {
                 color: Color::parse(&text),
                 width: 1,
-                style: BoxStyle::Flat,
+                style: BoxStyle::Simple,
             })
         }
         ValueKind::Cons => {
@@ -1387,7 +1710,7 @@ fn parse_box_value(value: &Value) -> FaceDecoration<BoxBorder> {
             };
             let mut color = None;
             let mut width = 1i32;
-            let mut style = BoxStyle::Flat;
+            let mut style = BoxStyle::Simple;
             let mut i = 0;
             while i + 1 < items.len() {
                 let key = DecorationProperty::from_value(items[i]);
@@ -1408,8 +1731,11 @@ fn parse_box_value(value: &Value) -> FaceDecoration<BoxBorder> {
                         color = parse_color_value(item);
                     }
                     Some(DecorationProperty::Style) => {
-                        if let Some(name) = item.as_bare_symbol_name() {
-                            style = BoxStyle::from_symbol(name).unwrap_or(BoxStyle::Flat);
+                        if !item.is_nil()
+                            && let Some(specified) =
+                                item.as_bare_symbol_name().and_then(BoxStyle::from_symbol)
+                        {
+                            style = specified;
                         }
                     }
                     _ => {}
@@ -1458,7 +1784,7 @@ pub struct FaceTable {
     /// `collect_gc_roots` on the CONTEXT's handle, and a resolver's shared
     /// handle aliases the same allocation for the duration of one redisplay
     /// -- exactly the lifetime the old bitwise deep copy had.
-    faces: std::rc::Rc<HashMap<Value, Face>>,
+    faces: std::rc::Rc<FaceStorage>,
     /// Frame lface identity to the symbol naming that face.
     ///
     /// GNU display vectors carry the numeric lface index, not a name.  Keep
@@ -1477,15 +1803,116 @@ pub struct FaceTable {
     tty_palette: std::rc::Rc<neomacs_display_protocol::TtyPalette>,
 }
 
+/// Native palette identity for an eligible Rows attempt.
+///
+/// Existing exact global face count and realization epoch cover definition
+/// refreshes through the sealed recorded-writer seam. The palette additionally
+/// rejects a reentrant full refresh captured after its count was recorded but
+/// before its replacement table was installed. Its Weak control block prevents
+/// address ABA without retaining Lisp-valued definitions. Unlike Weak handles
+/// to those definitions, retaining this handle cannot make their Rc::make_mut
+/// operations dissociate storage during later ordinary face mutations.
+/// Palette replacement always assigns a fresh Rc, never Rc::make_mut.
+#[derive(Debug)]
+pub(crate) struct FaceTableIdentity {
+    tty_palette: std::rc::Weak<neomacs_display_protocol::TtyPalette>,
+}
+
+static_assertions::assert_not_impl_any!(FaceTableIdentity: Send, Sync);
+
+impl FaceTableIdentity {
+    pub(crate) fn matches(&self, table: &FaceTable) -> bool {
+        // The retained Weak pins this control block, so allocator address
+        // reuse cannot make a replacement palette compare equal. No palette
+        // or Lisp-object header is dereferenced here.
+        std::ptr::eq(
+            self.tty_palette.as_ptr(),
+            std::rc::Rc::as_ptr(&table.tty_palette),
+        )
+    }
+}
+
+/// Copy-on-write definition storage: the map plus the traced-root memo for
+/// exactly this snapshot. `update_faces` mutates through `Rc::make_mut`:
+/// in place while unshared, one reallocation when a resolver still pins the
+/// previous snapshot — so the memo beside a map can only ever be read
+/// alongside the content it was derived from (an in-place edit resets the
+/// cell first), and keeping it beside the map leaves `FaceTable`'s inline
+/// footprint (and the Context layout after it) untouched. GNU pays no
+/// equivalent walk — lface definitions live on symbol plists the obarray
+/// already roots (`Finternal_set_lisp_face_plist`, src/xfaces.c:1262-1280).
+#[derive(Clone)]
+struct FaceStorage {
+    map: HashMap<Value, Face>,
+    roots: std::cell::OnceCell<std::rc::Rc<[Value]>>,
+}
+
 impl FaceTable {
     pub fn new() -> Self {
         let mut table = Self {
-            faces: std::rc::Rc::new(HashMap::new()),
+            faces: std::rc::Rc::new(FaceStorage {
+                map: HashMap::new(),
+                roots: std::cell::OnceCell::new(),
+            }),
             lisp_face_refs: std::rc::Rc::new(HashMap::new()),
             tty_palette: std::rc::Rc::new(neomacs_display_protocol::TtyPalette::default()),
         };
         table.register_standard_faces();
         table
+    }
+
+    /// Capture existing native palette identity for an eligible Rows attempt.
+    /// The consumer must also retain exact face count and realization epoch.
+    /// No definition-storage Weak, source contents, roots or new stamp is kept.
+    pub(crate) fn rows_snapshot_identity(&self) -> FaceTableIdentity {
+        FaceTableIdentity {
+            tty_palette: std::rc::Rc::downgrade(&self.tty_palette),
+        }
+    }
+
+    /// Whether both immutable snapshots still refer to the same definitions.
+    /// Used across Lisp callbacks to distinguish harmless changes in another
+    /// frame from replacement of this frame's authoritative derived snapshot.
+    pub(crate) fn shares_definitions_with(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.faces, &other.faces)
+            && std::rc::Rc::ptr_eq(&self.lisp_face_refs, &other.lisp_face_refs)
+    }
+
+    /// Whether both tables alias the same immutable copy-on-write storage, so
+    /// every pure fold of one (a named face's merged specification, a composed
+    /// source) is valid for the other.
+    ///
+    /// Mutations replace storage through `Rc::make_mut`, which reallocates as
+    /// soon as a resolver pins the previous snapshot, so identity equality
+    /// implies content equality. GNU fills the same role with the `face_change`
+    /// stamps: a frame's face cache is reused across redisplays and freed only
+    /// when a definition changes (`bool face_change`, src/xfaces.c:349;
+    /// `f->face_change`, src/xfaces.c:746; the invalidation comment,
+    /// src/xfaces.c:3098-3105; the cache-empty rebuild in `init_iterator`,
+    /// src/xfaces.c:6958-6962).
+    pub fn same_snapshot(&self, other: &Self) -> bool {
+        self.shares_definitions_with(other)
+            && std::rc::Rc::ptr_eq(&self.tty_palette, &other.tty_palette)
+    }
+
+    /// The root list for the current immutable `faces` snapshot, derived on
+    /// first trace and served from the storage's memo thereafter. A
+    /// definition write can never change a shared allocation in place
+    /// (`update_faces` reallocates as soon as the storage is shared, and an
+    /// unshared edit resets the cell), so an entry beside the map it was
+    /// derived from can never go stale.
+    fn traced_roots(&self) -> std::rc::Rc<[Value]> {
+        self.faces
+            .roots
+            .get_or_init(|| {
+                let mut roots = Vec::new();
+                roots.extend(self.faces.map.keys().copied());
+                for face in self.faces.map.values() {
+                    face.trace_roots(&mut roots);
+                }
+                roots.into()
+            })
+            .clone()
     }
 
     /// The palette this table's faces were realized against, or `None` on a
@@ -1815,15 +2242,38 @@ impl FaceTable {
         self.define(name, face);
     }
 
+    /// Apply `edit` to a private copy of the definitions and publish it as
+    /// fresh immutable storage. Every write reallocates rather than mutating
+    /// shared cells in place: holders of the previous snapshot keep their
+    /// content, and storage identity (`same_snapshot`, the roots memo) stays
+    /// a proof of content equality unconditionally, not only while a
+    /// resolver pins the old table. Definition writes are one slot each,
+    /// like GNU's per-attribute ASET (`Finternal_set_lisp_face_plist`,
+    /// src/xfaces.c:1262-1280; the attribute write, xfaces.c:3767-3773):
+    /// `Rc::make_mut` edits in place while the storage is unshared and
+    /// reallocates only when a resolver still pins the previous snapshot,
+    /// so a font-lock burst of sets stays O(1) per set instead of paying
+    /// a full-map copy each time. Either way the memo restarts from the
+    /// edited content.
+    fn update_faces(&mut self, edit: impl FnOnce(&mut HashMap<Value, Face>)) {
+        let storage = std::rc::Rc::make_mut(&mut self.faces);
+        storage.roots = std::cell::OnceCell::new();
+        edit(&mut storage.map);
+    }
+
     /// Define or update a face.
     pub fn define(&mut self, name: &str, face: Face) {
-        std::rc::Rc::make_mut(&mut self.faces).insert(face_symbol_value(name), face);
+        self.update_faces(|faces| {
+            faces.insert(face_symbol_value(name), face);
+        });
     }
 
     /// Define a runtime face together with its frame-local GNU Lisp face id.
     pub fn define_lisp_face(&mut self, id: LispFaceId, name: &str, face: Face) {
         let face_ref = face_symbol_value(name);
-        std::rc::Rc::make_mut(&mut self.faces).insert(face_ref, face);
+        self.update_faces(|faces| {
+            faces.insert(face_ref, face);
+        });
         std::rc::Rc::make_mut(&mut self.lisp_face_refs).insert(id, face_ref);
     }
 
@@ -1834,10 +2284,11 @@ impl FaceTable {
 
     /// Ensure a face exists (create empty if not present).
     pub fn ensure_face(&mut self, name: &str) {
-        let key = face_symbol_value(name);
-        std::rc::Rc::make_mut(&mut self.faces)
-            .entry(key)
-            .or_insert_with(|| Face::new(name));
+        self.update_faces(|faces| {
+            faces
+                .entry(face_symbol_value(name))
+                .or_insert_with(|| Face::new(name));
+        });
     }
 
     /// Update a single attribute on a face.
@@ -1846,15 +2297,16 @@ impl FaceTable {
     pub fn set_attribute(&mut self, name: &str, attr: LFaceAttr, value: FaceAttrValue) -> bool {
         self.ensure_face(name);
         let key = face_symbol_value(name);
-        let face = std::rc::Rc::make_mut(&mut self.faces)
-            .get_mut(&key)
-            .unwrap();
-        face.set_attribute(attr, value)
+        let mut modified = false;
+        self.update_faces(|faces| {
+            modified = faces.get_mut(&key).unwrap().set_attribute(attr, value);
+        });
+        modified
     }
 
     /// Look up a face by name.
     pub fn get(&self, name: &str) -> Option<&Face> {
-        self.faces.get(&face_symbol_value(name))
+        self.faces.map.get(&face_symbol_value(name))
     }
 
     /// Resolve a face name, merging inherited faces.
@@ -1890,7 +2342,7 @@ impl FaceTable {
         }
 
         let key = face_symbol_value(name);
-        let Some(face) = self.faces.get(&key) else {
+        let Some(face) = self.faces.map.get(&key) else {
             return Face::new(name);
         };
 
@@ -1975,7 +2427,7 @@ impl FaceTable {
         for name in face_names {
             // Use the raw face definition (not resolved), so inherited
             // attributes from the parent don't override prior merges.
-            if let Some(face) = self.faces.get(&face_symbol_value(name)) {
+            if let Some(face) = self.faces.map.get(&face_symbol_value(name)) {
                 result = result.merge(face);
             }
         }
@@ -1986,6 +2438,7 @@ impl FaceTable {
     /// List all defined face names.
     pub fn face_list(&self) -> Vec<String> {
         self.faces
+            .map
             .keys()
             .filter_map(|value| value.as_bare_symbol_name().map(str::to_string))
             .collect()
@@ -1993,16 +2446,17 @@ impl FaceTable {
 
     /// Number of defined faces.
     pub fn len(&self) -> usize {
-        self.faces.len()
+        self.faces.map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.faces.is_empty()
+        self.faces.map.is_empty()
     }
 
     // pdump accessors
     pub(crate) fn dump_faces_by_sym_id(&self) -> Vec<(SymId, Face)> {
         self.faces
+            .map
             .iter()
             .filter_map(|(name, face)| name.as_bare_symbol_id().map(|id| (id, face.clone())))
             .collect()
@@ -2014,12 +2468,13 @@ impl FaceTable {
             // the first TTY frame's face sync installs one.
             tty_palette: std::rc::Rc::new(neomacs_display_protocol::TtyPalette::default()),
             lisp_face_refs: std::rc::Rc::new(HashMap::new()),
-            faces: std::rc::Rc::new(
-                faces
+            faces: std::rc::Rc::new(FaceStorage {
+                map: faces
                     .into_iter()
                     .map(|(name, face)| (face_symbol_value(&name), face))
                     .collect(),
-            ),
+                roots: std::cell::OnceCell::new(),
+            }),
         }
     }
 
@@ -2027,12 +2482,13 @@ impl FaceTable {
         Self {
             tty_palette: std::rc::Rc::new(neomacs_display_protocol::TtyPalette::default()),
             lisp_face_refs: std::rc::Rc::new(HashMap::new()),
-            faces: std::rc::Rc::new(
-                faces
+            faces: std::rc::Rc::new(FaceStorage {
+                map: faces
                     .into_iter()
                     .map(|(name, face)| (Value::from_sym_id(name), face))
                     .collect(),
-            ),
+                roots: std::cell::OnceCell::new(),
+            }),
         }
     }
 }
@@ -2057,27 +2513,31 @@ fn trace_face_ref_roots(value: Value, roots: &mut Vec<Value>) {
     }
 }
 
+impl GcTrace for Face {
+    fn trace_roots(&self, roots: &mut Vec<Value>) {
+        roots.extend(
+            [self.family, self.foundry, self.stipple, self.doc]
+                .into_iter()
+                .flatten(),
+        );
+        // `:inherit` can be an arbitrary face_ref — walk it so any
+        // cons cells in list/plist forms stay rooted across GC.
+        if let Some(inherit) = self.inherit {
+            trace_face_ref_roots(inherit, roots);
+        }
+    }
+}
+
 impl GcTrace for FaceTable {
     fn trace_roots(&self, roots: &mut Vec<Value>) {
-        roots.extend(self.faces.keys().copied());
-        for face in self.faces.values() {
-            if let Some(family) = face.family {
-                roots.push(family);
-            }
-            if let Some(foundry) = face.foundry {
-                roots.push(foundry);
-            }
-            if let Some(stipple) = face.stipple {
-                roots.push(stipple);
-            }
-            if let Some(doc) = face.doc {
-                roots.push(doc);
-            }
-            // `:inherit` can be an arbitrary face_ref — walk it so any
-            // cons cells in list/plist forms stay rooted across GC.
-            if let Some(inherit) = face.inherit {
-                trace_face_ref_roots(inherit, roots);
-            }
+        roots.extend_from_slice(&self.traced_roots());
+    }
+
+    /// Serve the collector directly from the memo; the derived default would
+    /// materialize a throwaway vector for the same values every collection.
+    fn trace_roots_with(&self, visit: &mut dyn FnMut(Value)) {
+        for root in self.traced_roots().iter() {
+            visit(*root);
         }
     }
 }
@@ -2089,3 +2549,7 @@ impl GcTrace for FaceTable {
 #[cfg(test)]
 #[path = "face/tests/face_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "face/tests/color_specifications_test.rs"]
+mod color_specifications_tests;

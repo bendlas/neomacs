@@ -17,11 +17,11 @@
 //! are exactly what they were: no switch sees a new value, and none is
 //! lowered differently. A header is neither `Copy` nor `Clone` and real
 //! per-buffer forwarders take a typed `BufferSlot`, so the marker only ever
-//! heads a descriptor ([`LispBufferObjFwd::thread_projection`]).
+//! heads a descriptor ([`FwdRef::thread_projection`]).
 //!
 //! Every hot reader refuses such a cell with a check it already makes for
 //! per-buffer slots, before touching any storage:
-//! - `LispFwd::load` answers `None` (the per-buffer arm), so the VM's
+//! - `FwdRef::load` answers `None` (the per-buffer arm), so the VM's
 //!   forwarded varref and the interpreter fall back to their general walks;
 //! - `LispBufferObjFwd::value_in` fails its `off < slots.len()` test and
 //!   answers `default`, which is UNBOUND, so the cached read tier refuses on
@@ -46,7 +46,9 @@
 //! are compiled for tests only, so production code reaches the routing only
 //! through a projected cell, which it cannot create.
 
-use super::{LispBufferObjFwd, LispFwd, LispObjFwd};
+mod parallel;
+
+use super::{FwdRef, LispBufferObjFwd, LispObjFwd};
 use crate::buffer::buffer::BUFFER_SLOT_COUNT;
 use crate::emacs_core::symbol::BlvPtr;
 use crate::emacs_core::value::Value;
@@ -106,27 +108,27 @@ impl CanonicalBlv {
 /// storage: never a projection's own header, so a projection never wraps a
 /// projection.
 #[derive(Clone, Copy, Debug)]
-pub struct BuiltinForwarder(&'static LispFwd);
+pub struct BuiltinForwarder(FwdRef);
 
 static_assertions::assert_not_impl_any!(BuiltinForwarder: Send, Sync);
 
 impl BuiltinForwarder {
     /// FWD as a canonical backing, or `None` for a projection's header.
     #[inline]
-    pub fn new(fwd: &'static LispFwd) -> Option<Self> {
+    pub fn new(fwd: FwdRef) -> Option<Self> {
         fwd.thread_projection().is_none().then_some(Self(fwd))
     }
 
     /// The GNU descriptor.
     #[inline]
-    pub fn descriptor(self) -> &'static LispFwd {
+    pub fn descriptor(self) -> FwdRef {
         self.0
     }
 }
 
 impl PartialEq for BuiltinForwarder {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.0, other.0)
+        self.0 == other.0
     }
 }
 
@@ -183,6 +185,19 @@ const _: () = {
     assert!(offset_of!(ThreadProjectionDescriptor, header) == 0);
 };
 
+// This body's first header is a BufferObj forwarder, but a projection handle
+// must retain the full descriptor's provenance, including its trailing cells.
+impl super::sealed::Sealed for ThreadProjectionDescriptor {}
+
+impl super::FwdDescriptor for ThreadProjectionDescriptor {
+    const TYPE: super::LispFwdType = super::LispFwdType::BufferObj;
+
+    #[inline(always)]
+    fn header(&self) -> FwdRef {
+        FwdRef::of_body(self)
+    }
+}
+
 impl ThreadProjectionDescriptor {
     /// The variable's slot in every owner's binding vector.
     #[inline]
@@ -218,7 +233,7 @@ impl ThreadProjectionDescriptor {
 
     /// The forwarder whose slot is the plain word.
     #[cfg(test)]
-    pub(crate) fn plain_root(&'static self) -> &'static LispFwd {
+    pub(crate) fn plain_root(&'static self) -> FwdRef {
         use super::FwdDescriptor;
         self.plain.header()
     }
@@ -242,7 +257,7 @@ impl ThreadProjectionDescriptor {
     /// cell, the BLV's (if any) for a localized one, the builtin itself for a
     /// forwarded one.
     #[inline]
-    pub(crate) fn logical_forwarder(&self) -> Option<&'static LispFwd> {
+    pub(crate) fn logical_forwarder(&self) -> Option<FwdRef> {
         match self.arm() {
             CanonicalArm::Plain => None,
             // SAFETY: a projection's localized arm names a live record of
@@ -254,39 +269,23 @@ impl ThreadProjectionDescriptor {
 
     /// The per-buffer header a symbol cell stores.
     #[inline]
-    pub fn header(&self) -> &LispFwd {
-        use super::FwdDescriptor;
-        self.header.header()
+    pub fn header(&self) -> FwdRef {
+        <Self as super::FwdDescriptor>::header(self)
     }
 }
 
-impl LispBufferObjFwd {
-    /// The thread projection this per-buffer header heads, if it carries the
-    /// marker. Called only where a real per-buffer forwarder cannot be:
-    /// after a slot access that the marker made fail.
-    #[inline]
-    pub fn thread_projection(&self) -> Option<&ThreadProjectionDescriptor> {
-        if self.offset != THREAD_PROJECTION_OFFSET {
-            return None;
-        }
-        // SAFETY: a `LispBufferObjFwd` carrying THREAD_PROJECTION_OFFSET is
-        // only ever built by `ThreadProjectionTable`, as the first `repr(C)`
-        // field (offset 0, pinned above) of a leaked, never-freed
-        // `ThreadProjectionDescriptor`: `alloc_buffer_objfwd` takes a typed
-        // `BufferSlot` (below BUFFER_SLOT_COUNT, pinned below the marker),
-        // the struct's `ty` and `offset` are private to this module, and it
-        // is neither `Copy` nor `Clone`, so no header with the marker exists
-        // apart from its descriptor. The cast therefore names that
-        // descriptor, which outlives `self`'s borrow.
-        Some(unsafe { &*std::ptr::from_ref(self).cast::<ThreadProjectionDescriptor>() })
-    }
-}
-
-impl LispFwd {
+impl FwdRef {
     /// The thread projection this header heads, if it is one.
     #[inline]
-    pub fn thread_projection(&self) -> Option<&ThreadProjectionDescriptor> {
-        self.as_buffer_obj_fwd()?.thread_projection()
+    pub fn thread_projection(self) -> Option<&'static ThreadProjectionDescriptor> {
+        if self.as_buffer_obj_fwd()?.offset != THREAD_PROJECTION_OFFSET {
+            return None;
+        }
+        // SAFETY: only ThreadProjectionTable constructs BufferObj headers with
+        // this marker. Its leaked repr(C) descriptor starts with that header,
+        // and FwdDescriptor::header retains the whole body's provenance. Resolve
+        // through the original handle, never a narrowed BufferObj field borrow.
+        Some(unsafe { &*self.as_ptr().cast::<ThreadProjectionDescriptor>() })
     }
 }
 
@@ -304,8 +303,8 @@ impl std::fmt::Debug for ThreadProjectionDescriptor {
 /// The World's registry of thread projections: slot allocation, and the one
 /// authority that maps a cell's header back to its descriptor.
 ///
-/// Descriptors live in leaked arena pages (symbol cells hold
-/// `&'static LispFwd`, and compiled code may hold one), never freed and
+/// Descriptors live in leaked arena pages (symbol cells and compiled code
+/// hold [`FwdRef`] handles), never freed and
 /// never moved. Indices are dense and monotonic: SymIds are never reused, so
 /// neither are indices. Index 1 is [`TlsIndex::VOID`].
 ///
@@ -355,7 +354,7 @@ impl ThreadProjectionTable {
     /// matched against this table's, so a header copied out of a projection
     /// is never mistaken for one.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn projection(&self, fwd: &LispFwd) -> Option<&'static ThreadProjectionDescriptor> {
+    pub(crate) fn projection(&self, fwd: FwdRef) -> Option<&'static ThreadProjectionDescriptor> {
         if fwd.as_buffer_obj_fwd()?.offset != THREAD_PROJECTION_OFFSET {
             return None;
         }
@@ -365,7 +364,7 @@ impl ThreadProjectionTable {
         } else {
             self.get(candidate.index)?
         };
-        std::ptr::eq(issued.header(), fwd).then_some(issued)
+        (issued.header() == fwd).then_some(issued)
     }
 
     /// Visit the canonical plain word of every descriptor issued: the table

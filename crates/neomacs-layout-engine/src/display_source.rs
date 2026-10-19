@@ -10,7 +10,7 @@ use crate::display_item::{
 use crate::display_origin::{DisplayOrigin, DisplayPropertySource, OverlayStringKind};
 use crate::display_property::{
     DisplayMarginContent, DisplayMarginSide, DisplayPropertyClassification, DisplayPropertyObject,
-    DisplayReplacementProperty, classify_display_property,
+    DisplayReplacementProperty, classify_display_property_at,
     classify_display_property_modifiers_only,
 };
 use crate::display_row::append_context::DisplayRowAppendKind;
@@ -528,10 +528,6 @@ impl DisplaySourceTextOrigin {
         Self { buffer_byte }
     }
 
-    pub(crate) const fn buffer_byte(self) -> usize {
-        self.buffer_byte
-    }
-
     pub(crate) fn position_from_buffer(
         self,
         byte_pos: EmacsBytePos,
@@ -717,6 +713,37 @@ pub(crate) struct DisplaySourceStepItem {
     is_explicit_line_break: bool,
 }
 
+/// The text of a `TextRun` the buffer walk renders in ONE whole-run append:
+/// multi-character, not an automatic composition, and free of any character
+/// that needs a precluster Special substitute.
+///
+/// This is the text-shape half of the single-pass admission
+/// ([`DisplaySourceStepItem`]'s `text_run`); the whole-run append additionally
+/// needs known source ends. Prepared worker rows use the same predicate to
+/// decide whether a clipped run keeps its own (shaped) run measurement or
+/// falls back to scalar character elements, so the two paths stay identical.
+pub(crate) fn whole_run_text(item: &DisplayItem) -> Option<&str> {
+    let DisplayItemKind::TextRun(run) = &item.kind else {
+        return None;
+    };
+    if matches!(&run.composition, DisplayTextComposition::Automatic(_)) {
+        return None;
+    }
+    let text = &*run.text;
+    let mut chars = text.chars();
+    chars.next()?;
+    chars.next()?;
+    // Exclude any char that needs a precluster Special substitute (newline,
+    // CR, tab, and every nobreak space/hyphen GNU highlights). Such chars
+    // must break the multi-char fast path so they get their own single-char
+    // item -- their nobreak face is keyed on the per-item source char.
+    text.chars()
+        .all(|ch| {
+            !matches!(ch, '\n' | '\r' | '\t') && !nonascii_space_p(ch) && !nonascii_hyphen_p(ch)
+        })
+        .then_some(text)
+}
+
 impl DisplaySourceStepItem {
     pub(crate) fn new(source_item: DisplaySourceItem, text_start_byte: usize) -> Option<Self> {
         let is_explicit_line_break = source_item.is_explicit_line_break();
@@ -775,25 +802,7 @@ impl DisplaySourceStepItem {
     }
 
     pub(crate) fn text_run(&self) -> Option<&str> {
-        let DisplayItemKind::TextRun(run) = &self.item.kind else {
-            return None;
-        };
-        if matches!(&run.composition, DisplayTextComposition::Automatic(_)) {
-            return None;
-        }
-        let text = &*run.text;
-        let mut chars = text.chars();
-        chars.next()?;
-        chars.next()?;
-        // Exclude any char that needs a precluster Special substitute (newline,
-        // CR, tab, and every nobreak space/hyphen GNU highlights). Such chars
-        // must break the multi-char fast path so they get their own single-char
-        // item -- their nobreak face is keyed on the per-item source char.
-        text.chars()
-            .all(|ch| {
-                !matches!(ch, '\n' | '\r' | '\t') && !nonascii_space_p(ch) && !nonascii_hyphen_p(ch)
-            })
-            .then_some(text)
+        whole_run_text(&self.item)
     }
 
     pub(crate) fn raw_text_run(&self) -> Option<&str> {
@@ -881,6 +890,7 @@ impl DisplaySourceStepItem {
         Some((first, pending))
     }
 
+    #[cfg(test)]
     pub(crate) fn split_text_run_at_charpos(
         self,
         split_charpos: i64,
@@ -1050,6 +1060,7 @@ impl DisplaySourceItem {
         display_item_buffer_end_byte_idx(&self.item, text_start_byte)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_multi_char_text_run(&self) -> bool {
         let DisplayItemKind::TextRun(run) = &self.item.kind else {
             return false;
@@ -1176,6 +1187,7 @@ impl DisplaySourceItem {
         Some((first, pending))
     }
 
+    #[cfg(test)]
     pub(crate) fn split_text_run_at_charpos(
         self,
         split_charpos: i64,
@@ -3075,6 +3087,8 @@ struct LispStringSourceFrame {
     /// The walk's evaluated `(when FORM . SPEC)` results for this string's
     /// own `display` properties.
     display_when: DisplayWhenConditions,
+    /// The string object itself: GNU `object` of its `display` sites.
+    object: Value,
 }
 
 /// Select once per string object, then retain only owned character ranges.
@@ -3173,12 +3187,26 @@ impl LispStringSourceFrame {
             pointer_occurrence,
             box_boundaries,
             display_when: DisplayWhenConditions::structural(),
+            object: value,
         })
     }
 
     fn with_display_when(mut self, display_when: DisplayWhenConditions) -> Self {
         self.display_when = display_when;
         self
+    }
+
+    /// The site of this string's `display` property at character `index`.
+    /// A string reached through a buffer `display` property knows the buffer
+    /// position it is displayed at: GNU's `buffer-position` there.
+    fn display_when_lookup(&self, index: usize) -> crate::display_when::DisplayWhenLookup {
+        crate::display_when::DisplayWhenLookup::String {
+            string: self.object,
+            index: index as i64,
+            anchor: self
+                .replacement_source
+                .map(|source| source.anchor_charpos().get() as i64 + 1),
+        }
     }
 
     fn next_action(
@@ -3241,13 +3269,15 @@ impl LispStringSourceFrame {
                     display_prop,
                     &self.display_when,
                     context.display_target(),
+                    self.display_when_lookup(start),
                 );
             } else {
-                let display_property = DisplayPropertySourcePlan::new(
+                let display_property = DisplayPropertySourcePlan::new_at(
                     display_prop,
                     &self.display_when,
                     DisplayPropertyObject::LispString,
                     context.display_target(),
+                    self.display_when_lookup(start),
                 );
                 let display_end = if display_property.replacement().is_some() {
                     self.display_value_extent(display_prop, property_end)
@@ -3737,16 +3767,34 @@ impl DisplayPropertySourceFaces {
 }
 
 impl DisplayPropertySourcePlan {
+    pub(crate) fn new_at(
+        value: Value,
+        conditions: &DisplayWhenConditions,
+        object: DisplayPropertyObject,
+        target: crate::display_property::DisplayPropertyTarget,
+        at: crate::display_when::DisplayWhenLookup,
+    ) -> Self {
+        Self {
+            value,
+            classification: classify_display_property_at(value, conditions, object, target, at),
+        }
+    }
+
+    /// [`Self::new_at`] for a spec shape with no walk behind it.
+    #[cfg(test)]
     pub(crate) fn new(
         value: Value,
         conditions: &DisplayWhenConditions,
         object: DisplayPropertyObject,
         target: crate::display_property::DisplayPropertyTarget,
     ) -> Self {
-        Self {
+        Self::new_at(
             value,
-            classification: classify_display_property(value, conditions, object, target),
-        }
+            conditions,
+            object,
+            target,
+            crate::display_when::DisplayWhenLookup::AnyOccurrence,
+        )
     }
 
     pub(crate) fn replacement(&self) -> Option<&DisplayReplacementProperty> {

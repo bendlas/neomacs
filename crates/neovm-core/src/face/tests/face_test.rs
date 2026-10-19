@@ -139,6 +139,7 @@ fn underline_style_codes_match_gnu_face_underline_type() {
 fn box_style_codes_match_gnu_face_box_type() {
     crate::test_utils::init_test_tracing();
     let styles = [
+        (BoxStyle::Simple, 1, "nil"),
         (BoxStyle::Flat, 1, "flat-button"),
         (BoxStyle::Raised, 2, "released-button"),
         (BoxStyle::Pressed, 3, "pressed-button"),
@@ -146,7 +147,14 @@ fn box_style_codes_match_gnu_face_box_type() {
 
     for (style, code, symbol) in styles {
         assert_eq!(style.gnu_code(), code);
-        assert_eq!(BoxStyle::from_gnu_code(code), Some(style));
+        assert_eq!(
+            BoxStyle::from_gnu_code(code),
+            Some(if style == BoxStyle::Flat {
+                BoxStyle::Simple
+            } else {
+                style
+            })
+        );
         assert_eq!(style.symbol_name(), symbol);
         assert_eq!(BoxStyle::from_symbol(symbol), Some(style));
     }
@@ -155,6 +163,30 @@ fn box_style_codes_match_gnu_face_box_type() {
     assert_eq!(BoxStyle::from_gnu_code(4), None);
     assert_eq!(BoxStyle::from_symbol("flat"), None);
     assert_eq!(BoxStyle::from_symbol("raised"), None);
+}
+
+#[test]
+fn face_plist_distinguishes_plain_boxes_from_flat_button() {
+    let mut context = crate::emacs_core::Context::new();
+    for (form, expected_style) in [
+        ("t", BoxStyle::Simple),
+        ("2", BoxStyle::Simple),
+        ("(:line-width 2)", BoxStyle::Simple),
+        ("(:style nil)", BoxStyle::Simple),
+        ("(:style flat-button)", BoxStyle::Flat),
+        ("(:style flat-button :style nil)", BoxStyle::Flat),
+    ] {
+        let specification = context
+            .eval_str(&format!("'(:box {form})"))
+            .expect("face plist");
+        let items = crate::emacs_core::value::list_to_vec(&specification).unwrap();
+        let face = Face::from_plist("box", &items);
+        assert_eq!(
+            face.box_border.enabled().unwrap().style,
+            expected_style,
+            "{form}"
+        );
+    }
 }
 
 #[test]
@@ -1008,4 +1040,84 @@ fn an_anonymous_plist_realizes_its_underline_color_through_the_palette() {
     );
     let underline = face.underline.enabled().expect("underline enabled");
     assert_eq!(underline.color.and_then(|color| color.terminal), None);
+}
+
+// --- FaceTable root memo ---
+
+#[test]
+fn face_table_trace_roots_serve_stable_and_follow_definition_writes() {
+    crate::test_utils::init_test_tracing();
+    use crate::gc_trace::GcTrace;
+    let mut table = FaceTable::new();
+    let mut rooted = Face::new("memo-face");
+    rooted.family = Some(Value::string("memo-family"));
+    table.define("memo-face", rooted);
+    let mut first = Vec::new();
+    table.trace_roots(&mut first); // builds the memo
+    let mut second = Vec::new();
+    table.trace_roots(&mut second); // serves from the memo
+    assert_eq!(first, second);
+    assert!(first.iter().any(|v| *v == Value::string("memo-family")));
+
+    // A definition write publishes new storage; the memo must not keep
+    // serving the retired snapshot's root list for it.
+    table.define("after-write", Face::new("after-write"));
+    let mut after = Vec::new();
+    table.trace_roots(&mut after);
+    let written = face_symbol_value("after-write");
+    assert!(after.iter().any(|v| *v == written));
+    assert!(!first.iter().any(|v| *v == written));
+}
+
+#[test]
+fn face_table_trace_roots_clone_keeps_the_previous_snapshot() {
+    crate::test_utils::init_test_tracing();
+    use crate::gc_trace::GcTrace;
+    let mut table = FaceTable::new();
+    let shared = table.clone();
+    table.define("clone-only", Face::new("clone-only"));
+    let mut stale = Vec::new();
+    shared.trace_roots(&mut stale);
+    let key = face_symbol_value("clone-only");
+    assert!(
+        !stale.iter().any(|v| *v == key),
+        "a clone keeps its immutable snapshot; writes never reach it in place"
+    );
+    assert!(!shared.same_snapshot(&table));
+    let mut fresh = Vec::new();
+    table.trace_roots(&mut fresh);
+    assert!(fresh.iter().any(|v| *v == key));
+}
+
+#[test]
+fn rows_palette_identity_does_not_add_definition_cow_weak_owners() {
+    use std::rc::Rc;
+
+    let mut table = FaceTable::new();
+    assert_eq!(Rc::strong_count(&table.faces), 1);
+    assert_eq!(Rc::strong_count(&table.lisp_face_refs), 1);
+    assert_eq!(Rc::weak_count(&table.faces), 0);
+    assert_eq!(Rc::weak_count(&table.lisp_face_refs), 0);
+    let identity = table.rows_snapshot_identity();
+    assert_eq!(Rc::weak_count(&table.faces), 0);
+    assert_eq!(Rc::weak_count(&table.lisp_face_refs), 0);
+    assert_eq!(Rc::weak_count(&table.tty_palette), 1);
+    let faces = Rc::as_ptr(&table.faces);
+    let references = Rc::as_ptr(&table.lisp_face_refs);
+    table.ensure_face("rows-unique-native-face");
+    table.define_lisp_face(
+        LispFaceId::new(37001).unwrap(),
+        "rows-unique-native-face",
+        Face::new("rows-unique-native-face"),
+    );
+    assert_eq!(Rc::as_ptr(&table.faces), faces);
+    assert_eq!(Rc::as_ptr(&table.lisp_face_refs), references);
+    assert_eq!(Rc::weak_count(&table.faces), 0);
+    assert_eq!(Rc::weak_count(&table.lisp_face_refs), 0);
+    assert!(identity.matches(&table));
+    // These assertions cover Rc control-block identity and Weak ownership;
+    // ordinary map growth/interning may still allocate. The identity is not
+    // itself a freshness proof for this deliberately mutated table.
+    table.set_tty_palette(neomacs_display_protocol::TtyPalette::default());
+    assert!(!identity.matches(&table));
 }

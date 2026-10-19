@@ -24,7 +24,18 @@ pub(crate) enum FrameRelayoutRequest {
     LogicalInputsChanged {
         window_id: DisplayWindowId,
     },
+    /// A `when` display clause the window's walk took by the structural rule
+    /// evaluated nil after the walk. Replay the frame once with the answer.
+    DisplayWhenAnswerChanged {
+        window_id: DisplayWindowId,
+    },
     WindowTopologyChanged {
+        before: u64,
+        after: u64,
+    },
+    /// A Lisp face callback changed the face definitions or terminal palette
+    /// represented by this speculative frame's immutable resolver.
+    FaceRealizationInputsChanged {
         before: u64,
         after: u64,
     },

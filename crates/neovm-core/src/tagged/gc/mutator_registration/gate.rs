@@ -14,6 +14,12 @@ fn current_thread() -> u64 {
 
 /// The owner tag describes only a held real mutex, never substitutes for it.
 /// Clearing precedes unlock; reacquisition restores it before inspecting state.
+///
+/// Every release path also publishes the phase word computed from the final
+/// gated state (`Release`, still under the mutex), so a mutation of the
+/// rendezvous phase or the catalog-transition flag can never become
+/// invisible to the lock-free admission polls: there is exactly one
+/// publication point per release, not one per mutation site.
 pub(super) struct RegistryGuard<'a> {
     registry: &'a Registry,
     guard: Option<MutexGuard<'a, RegistryState>>,
@@ -21,6 +27,7 @@ pub(super) struct RegistryGuard<'a> {
 impl<'a> RegistryGuard<'a> {
     fn new(registry: &'a Registry, guard: MutexGuard<'a, RegistryState>) -> Self {
         registry
+            .gate
             .gate_owner
             .store(current_thread(), Ordering::Release);
         Self {
@@ -29,7 +36,10 @@ impl<'a> RegistryGuard<'a> {
         }
     }
     fn take_for_wait(mut self) -> MutexGuard<'a, RegistryState> {
-        self.registry.gate_owner.store(0, Ordering::Release);
+        if let Some(state) = self.guard.as_ref() {
+            self.registry.phase.publish(state);
+        }
+        self.registry.gate.gate_owner.store(0, Ordering::Release);
         self.guard.take().expect("live registry guard")
     }
 }
@@ -46,26 +56,52 @@ impl DerefMut for RegistryGuard<'_> {
 }
 impl Drop for RegistryGuard<'_> {
     fn drop(&mut self) {
-        if self.guard.is_some() {
-            self.registry.gate_owner.store(0, Ordering::Release);
+        if let Some(state) = self.guard.take() {
+            self.registry.phase.publish(&state);
+            self.registry.gate.gate_owner.store(0, Ordering::Release);
+            drop(state);
         }
     }
 }
 
+/// Counts threads inside a predicate-wait episode. A run-slice drop reads it
+/// to decide whether the wake condvar can hold a waiter at all: the ticket is
+/// taken before an episode's first predicate check and held across the whole
+/// loop, so a waiter can only park while its ticket keeps the count nonzero.
+pub(super) struct ParkTicket<'a> {
+    registry: &'a Registry,
+}
+
 impl Registry {
+    pub(super) fn park_ticket(&self) -> ParkTicket<'_> {
+        self.park.parked.fetch_add(1, Ordering::SeqCst);
+        ParkTicket { registry: self }
+    }
+}
+impl Drop for ParkTicket<'_> {
+    fn drop(&mut self) {
+        self.registry.park.parked.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Registry {
+    pub(super) fn gate_is_held_by_current_thread(&self) -> bool {
+        self.gate.gate_owner.load(Ordering::Acquire) == current_thread()
+    }
+
     /// Internal stopped image prepare/commit only. Never wait while retaining a gate,
     /// entry/root-table/allocator guard, or a callback into owner code.
     pub(super) fn lock_blocking(&self) -> Result<RegistryGuard<'_>, RegistrationError> {
-        if self.poisoned.load(Ordering::Acquire) {
+        if self.park.poisoned.load(Ordering::Acquire) {
             return Err(RegistrationError::Poisoned);
         }
-        if self.gate_owner.load(Ordering::Acquire) == current_thread() {
+        if self.gate.gate_owner.load(Ordering::Acquire) == current_thread() {
             return Err(RegistrationError::Busy);
         }
-        match self.state.lock() {
+        match self.gate.state.lock() {
             Ok(guard) => {
                 let guard = RegistryGuard::new(self, guard);
-                if self.poisoned.load(Ordering::Acquire) {
+                if self.park.poisoned.load(Ordering::Acquire) {
                     Err(RegistrationError::Poisoned)
                 } else {
                     Ok(guard)
@@ -80,13 +116,13 @@ impl Registry {
     }
 
     pub(super) fn lock(&self) -> Result<RegistryGuard<'_>, RegistrationError> {
-        if self.poisoned.load(Ordering::Acquire) {
+        if self.park.poisoned.load(Ordering::Acquire) {
             return Err(RegistrationError::Poisoned);
         }
-        match self.state.try_lock() {
+        match self.gate.state.try_lock() {
             Ok(guard) => {
                 let guard = RegistryGuard::new(self, guard);
-                if self.poisoned.load(Ordering::Acquire) {
+                if self.park.poisoned.load(Ordering::Acquire) {
                     Err(RegistrationError::Poisoned)
                 } else {
                     Ok(guard)
@@ -104,19 +140,23 @@ impl Registry {
     }
 
     pub(super) fn poison(&self) {
-        if self.gate_owner.load(Ordering::Acquire) == current_thread() {
+        if self.gate.gate_owner.load(Ordering::Acquire) == current_thread() {
             self.publish_poison();
         } else {
             // No publication, collector callback or join holds the control
             // gate. Entry locks use try_lock, so they cannot reverse this edge.
-            let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let guard = self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let _guard = RegistryGuard::new(self, guard);
             self.publish_poison();
         }
     }
     fn publish_poison(&self) {
-        self.poisoned.store(true, Ordering::Release);
-        self.wake.notify_all();
+        self.park.poisoned.store(true, Ordering::Release);
+        self.park.wake.notify_all();
     }
 
     pub(super) fn wait<'a>(
@@ -127,13 +167,13 @@ impl Registry {
         // Includes same-thread poison after the caller's predicate check. An
         // external poisoner must obtain the mutex, so it cannot notify in the
         // following check->atomic-release/wait gap.
-        if self.poisoned.load(Ordering::Acquire) {
+        if self.park.poisoned.load(Ordering::Acquire) {
             return Err(RegistrationError::Poisoned);
         }
-        match self.wake.wait(guard.take_for_wait()) {
+        match self.park.wake.wait(guard.take_for_wait()) {
             Ok(guard) => {
                 let guard = RegistryGuard::new(self, guard);
-                if self.poisoned.load(Ordering::Acquire) {
+                if self.park.poisoned.load(Ordering::Acquire) {
                     Err(RegistrationError::Poisoned)
                 } else {
                     Ok(guard)

@@ -1,4 +1,6 @@
 //! Exact-root publication, then owner-side parking. No heap or World access.
+#[cfg(test)]
+use super::super::a8_probes;
 use super::*;
 use crate::tagged::transport::PreparedParallelRootBatch;
 
@@ -26,6 +28,7 @@ impl<'era> Mutator<'era> {
     /// StartingStopped cannot obtain a run slice until its bootstrap is opened.
     pub fn wait_started(&mut self) -> Result<(), RendezvousError> {
         self.check_thread()?;
+        let _park = self.registry.park_ticket();
         let mut gate = self.registry.lock()?;
         loop {
             let mode = entry_state(&self.entry)?.rendezvous.mode;
@@ -48,6 +51,7 @@ impl<'era> Mutator<'era> {
     }
     pub fn wait_request(&self) -> Result<NonZeroU64, RendezvousError> {
         self.check_thread()?;
+        let _park = self.registry.park_ticket();
         let mut gate = self.registry.lock()?;
         loop {
             let e = entry_state(&self.entry)?;
@@ -136,6 +140,12 @@ impl<'era> Mutator<'era> {
         roots: &[SharedRoot],
     ) -> Result<(), RendezvousError> {
         self.check_thread()?;
+        #[cfg(test)]
+        a8_probes::mark(
+            a8_probes::PUBLISH_ENTERED,
+            wanted.map(NonZeroU64::get).unwrap_or(0),
+            self.entry.key.owner,
+        );
         for root in roots {
             if root.heap_identity() != self.entry.key.heap {
                 return Err(RendezvousError::Identity);
@@ -153,7 +163,7 @@ impl<'era> Mutator<'era> {
             {
                 return Err(RendezvousError::Busy);
             }
-            if e.run_loan || e.worker_loan || self.entry.live_run_loan.load(Ordering::Acquire) {
+            if e.run_loan || e.worker_loan || self.entry.admitted() {
                 return Err(RendezvousError::Loan);
             }
             let epoch = match gate.rendezvous.phase {
@@ -179,11 +189,17 @@ impl<'era> Mutator<'era> {
                 .map_err(|_| RendezvousError::Capacity)?;
             (generation, epoch)
         };
+        // Held cons tails are owner-exclusive storage: every unhanded suffix
+        // returns under the catalog gate before this image can publish. The
+        // loan checks above prove no run borrow can hold a tail right now.
+        self.publish_cons_tails()?;
         self.local
             .as_ref()
             .ok_or(RendezvousError::Publication)?
             .validate_publication()
             .map_err(RegistrationError::from)?;
+        #[cfg(test)]
+        a8_probes::mark(a8_probes::REGION_CLOSED, epoch, self.entry.key.owner);
         let identity = ParallelRootIdentity::new(self.entry.key, generation, epoch);
         let retention = self
             .registry
@@ -209,7 +225,7 @@ impl<'era> Mutator<'era> {
             if matches!(gate.rendezvous.phase, Phase::Tracing(_)) {
                 return Err(RendezvousError::Busy);
             }
-            if e.run_loan || e.worker_loan || self.entry.live_run_loan.load(Ordering::Acquire) {
+            if e.run_loan || e.worker_loan || self.entry.admitted() {
                 return Err(RendezvousError::Loan);
             }
             e.rendezvous.mode = Mode::Publishing;
@@ -245,6 +261,8 @@ impl<'era> Mutator<'era> {
                 return Err(RegistrationError::from(error).into());
             }
         };
+        #[cfg(test)]
+        a8_probes::mark(a8_probes::HOSTALLOC_DONE, epoch, self.entry.key.owner);
         // From this point a failure must retain BOTH payloads. Their Drop cannot
         // release the root lease, but the GC image must be retained explicitly.
         let commit = loop {
@@ -299,9 +317,19 @@ impl<'era> Mutator<'era> {
             Mode::Stopped
         };
         self.protocol.participating = true;
+        #[cfg(test)]
+        a8_probes::mark(
+            if native {
+                a8_probes::NATIVE_ACK
+            } else {
+                a8_probes::ACK_COMMITTED
+            },
+            epoch,
+            self.entry.key.owner,
+        );
         drop(e);
         drop(gate);
-        self.registry.wake.notify_all();
+        self.registry.park.wake.notify_all();
         Ok(())
     }
 }

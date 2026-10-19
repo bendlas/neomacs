@@ -21,9 +21,11 @@ pub mod visited_file_modtime;
 
 pub use buffer::{
     Buffer, BufferId, BufferManager, BufferTextSnapshot, InsertionType, LabeledRestriction,
-    LabeledRestrictionLabel, SavedLabeledRestrictions, SavedRestrictionKind, SavedRestrictionState,
+    LabeledRestrictionLabel, LineIndexBuild, SavedLabeledRestrictions, SavedRestrictionKind,
+    SavedRestrictionState,
 };
 pub(crate) use buffer_text::BufferText;
+pub use buffer_text::{BufferSourceAuthority, BufferSourceReadLease};
 pub use edit_transaction::TranspositionAnchorPolicy;
 pub(crate) use edit_transaction::{PreparedBufferEdit, TextMeasurement};
 pub use overlay::{Overlay, OverlayList};

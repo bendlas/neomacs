@@ -81,7 +81,7 @@ pub fn collect_snapshot_states(
         }
         let prepared =
             layout_frame_display_state(evaluator, node.frame_id, FrameLayoutPurpose::Snapshot);
-        if evaluator.has_mode_line_display_flow() {
+        if evaluator.has_mode_line_display_flow() || evaluator.redisplay_hook_flow_pending() {
             // This callback carries String errors. Keep the original Flow in
             // Context for run_frame_snapshot to return after reinstalling it.
             return Err("frame snapshot: mode-line evaluation exited nonlocally".to_string());
@@ -99,7 +99,7 @@ pub fn collect_snapshot_states(
     {
         let prepared =
             layout_frame_display_state(evaluator, FrameId(*id), FrameLayoutPurpose::Snapshot);
-        if evaluator.has_mode_line_display_flow() {
+        if evaluator.has_mode_line_display_flow() || evaluator.redisplay_hook_flow_pending() {
             // The core drains the Context-owned Flow after this callback.
             return Err("frame snapshot: mode-line evaluation exited nonlocally".to_string());
         }
@@ -202,12 +202,42 @@ pub fn install_font_shape_driver(evaluator: &mut Context) {
 }
 
 pub fn install_window_layout_query_fn(evaluator: &mut Context) {
+    install_window_layout_query_with_policy(
+        evaluator,
+        neomacs_layout_engine::RowsQueryPolicy::disabled(),
+    );
+}
+
+fn install_window_layout_query_with_policy(
+    evaluator: &mut Context,
+    policy: neomacs_layout_engine::RowsQueryPolicy,
+) {
     evaluator.display_idle_maintenance_fn = Some(Box::new(|eval| {
         REDISPLAY_RUNTIME.with(|runtime| runtime.maintain_scroll_coverage(eval))
     }));
-    evaluator.install_window_layout_query(|eval, frame_id, window_id, scope| {
-        REDISPLAY_RUNTIME.with(|runtime| runtime.query_window(eval, frame_id, window_id, scope))
+    // The immutable native policy lives in this existing heap allocation.
+    // Context, LayoutEngine and the runtime's TLS representation do not grow.
+    evaluator.install_window_layout_query(move |eval, frame_id, window_id, scope| {
+        REDISPLAY_RUNTIME.with(|runtime| {
+            runtime.query_window_with_policy(eval, frame_id, window_id, scope, &policy)
+        })
     });
+}
+
+pub(crate) fn tty_rows_host_authority()
+-> neovm_core::emacs_core::display_host::InertRowsHostAuthority {
+    // SAFETY: TtyPopupDisplayHost stores only the popup redraw AtomicBool.
+    // In every instance state its geometry/image/font services are inherited
+    // inert defaults: image catalogs are absent and no external font geometry
+    // is supplied. Popup/clipboard/terminal I/O methods are not part of the
+    // certified Rows producer. Any change to these services requires revisiting
+    // this all-instances contract. Core checks the actual host's Any TypeId,
+    // current face lifetime, installed owner and collector on every use.
+    unsafe {
+        neovm_core::emacs_core::display_host::InertRowsHostAuthority::for_type::<
+            super::tty_frontend::TtyPopupDisplayHost,
+        >()
+    }
 }
 
 // ── TTY layout tree and redisplay ─────────────────────────────────────────
@@ -224,7 +254,9 @@ pub fn run_tty_layout_tree(
         .frame_manager()
         .frames_in_reverse_z_order(root_id, RenderFrameVisibility::VisibleOnly);
 
-    if neovm_core::emacs_core::xdisp::mode_line_flow_enabled() {
+    if neovm_core::emacs_core::xdisp::mode_line_flow_enabled()
+        || neovm_core::face::realization::enabled()
+    {
         return prepare_tty_tree_before_activation(evaluator, root_id, frame_order);
     }
 
@@ -239,7 +271,7 @@ pub fn run_tty_layout_tree(
         }
         let prepared =
             layout_frame_display_state(evaluator, frame_id, FrameLayoutPurpose::Redisplay);
-        if evaluator.has_mode_line_display_flow() {
+        if evaluator.has_mode_line_display_flow() || evaluator.redisplay_hook_flow_pending() {
             // The redisplay driver returns the Context-owned exit. Neither
             // primary nor auxiliary TTY may rasterize a partial frame tree.
             return None;
@@ -271,7 +303,7 @@ fn prepare_tty_tree_before_activation(
             continue;
         }
         let child = layout_frame_display_state(evaluator, frame_id, FrameLayoutPurpose::Redisplay);
-        if evaluator.has_mode_line_display_flow() {
+        if evaluator.has_mode_line_display_flow() || evaluator.redisplay_hook_flow_pending() {
             // Discard all tickets before the driver returns the original Flow.
             // Both primary and auxiliary TTYs use this tree producer.
             root.discard(evaluator);
@@ -303,12 +335,24 @@ fn prepare_tty_tree_before_activation(
     Some((root, children))
 }
 
+/// Lisp `visible-cursor' for this redisplay: GNU `tty_show_cursor` reads
+/// the C variable when it shows the cursor at `update_end`
+/// (src/term.c:362-372); its default is 1, so an unbound variable reads
+/// as non-nil here too.  One variable read per redisplay.
+pub(crate) fn very_visible_cursor(evaluator: &Context) -> bool {
+    evaluator
+        .variable_value_by_name("visible-cursor")
+        .is_none_or(|value| value.is_truthy())
+}
+
 /// Rasterize the display state into a `TtyRif` and write ANSI output to stdout.
 pub fn run_tty_rif_redisplay(
     tty_rif: &mut TtyRif,
     root: &SealedFramePresentation,
     children: &[SealedFramePresentation],
+    very_visible_cursor: bool,
 ) {
+    tty_rif.set_very_visible_cursor(very_visible_cursor);
     tty_rif.rasterize_presentations(root, children);
     #[cfg(windows)]
     let result = super::tty_output::windows::render(tty_rif);
@@ -327,7 +371,9 @@ pub fn run_tty_rif_redisplay_to(
     children: &[SealedFramePresentation],
     output: &mut impl std::io::Write,
     capabilities: &super::tty_output::Capabilities,
+    very_visible_cursor: bool,
 ) {
+    tty_rif.set_very_visible_cursor(very_visible_cursor);
     tty_rif.rasterize_presentations(root, children);
     if let Err(error) = super::tty_output::paint_to(tty_rif, output, capabilities) {
         tracing::error!(%error, "secondary TTY redisplay failed");
@@ -350,6 +396,29 @@ pub fn install_tty_redisplay_callback(evaluator: &mut Context, startup: &Startup
 
 pub(crate) type TryRenderSelectedTerminal = Box<dyn FnMut(&mut Context) -> bool>;
 
+/// Redisplay for a session that has no primary terminal.
+///
+/// GNU batch does not call `init_display`. A terminal exists only after
+/// `init_tty` (`src/frame.c:1811`). Constructing [`REDISPLAY_RUNTIME`] scans
+/// the system font database, which TTY frames do not use (`src/frame.c:1184-1185`).
+/// Call this only once a daemon is serving clients or an auxiliary TTY has opened.
+pub(crate) fn install_headless_tty_redisplay(
+    evaluator: &mut Context,
+    mut try_render_selected_auxiliary: Option<TryRenderSelectedTerminal>,
+) {
+    // No primary terminal exists. Explicit/attached TTYs own their renderers
+    // and are the only valid destination for this redisplay.
+    REDISPLAY_RUNTIME.with(RedisplayRuntime::disable_cosmic_metrics);
+    evaluator.redisplay_fn = Some(Box::new(move |eval: &mut Context| {
+        if let Some(render) = try_render_selected_auxiliary.as_mut() {
+            render(eval);
+        }
+    }));
+    install_frame_snapshot_fn(evaluator);
+    install_window_layout_query_fn(evaluator);
+    install_font_shape_driver(evaluator);
+}
+
 pub fn install_tty_redisplay_callback_with_popup_redraw(
     evaluator: &mut Context,
     startup: &StartupOptions,
@@ -357,17 +426,7 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
     mut try_render_selected_auxiliary: Option<TryRenderSelectedTerminal>,
 ) {
     if startup.daemon.is_some() {
-        // No primary terminal exists. Attached client TTYs own their renderers
-        // and are the only valid destination for daemon redisplay.
-        REDISPLAY_RUNTIME.with(RedisplayRuntime::disable_cosmic_metrics);
-        evaluator.redisplay_fn = Some(Box::new(move |eval: &mut Context| {
-            if let Some(render) = try_render_selected_auxiliary.as_mut() {
-                render(eval);
-            }
-        }));
-        install_frame_snapshot_fn(evaluator);
-        install_window_layout_query_fn(evaluator);
-        install_font_shape_driver(evaluator);
+        install_headless_tty_redisplay(evaluator, try_render_selected_auxiliary);
         return;
     }
     if !tty_init::should_enable_live_tty_io(startup) {
@@ -424,11 +483,18 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
             if full_redraw {
                 tty_rif.force_redraw();
             }
-            run_tty_rif_redisplay(&mut tty_rif, &root, &children);
+            let very_visible = very_visible_cursor(eval);
+            run_tty_rif_redisplay(&mut tty_rif, &root, &children, very_visible);
         }
     }));
     install_frame_snapshot_fn(evaluator);
-    install_window_layout_query_fn(evaluator);
+    install_window_layout_query_with_policy(
+        evaluator,
+        neomacs_layout_engine::RowsQueryPolicy::terminal(
+            startup.rows_query_admission,
+            tty_rows_host_authority(),
+        ),
+    );
     install_font_shape_driver(evaluator);
 }
 

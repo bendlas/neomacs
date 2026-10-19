@@ -3912,6 +3912,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
+ "static_assertions",
  "strum",
  "tracing",
 ]
@@ -4032,6 +4033,7 @@ version = "0.0.19"
 dependencies = [
  "cosmic-text",
  "dwrote",
+ "enum-map",
  "fontconfig",
  "fontdb",
  "freetype-rs",
@@ -4049,6 +4051,7 @@ dependencies = [
  "static_assertions",
  "strum",
  "sys-locale",
+ "thiserror 2.0.20",
  "tracing",
  "tracing-test",
  "ttf-parser",
@@ -4163,6 +4166,7 @@ dependencies = [
  "pkg-config",
  "regex",
  "rustix 1.1.4",
+ "static_assertions",
  "tempfile",
 ]
 
@@ -4287,6 +4291,7 @@ dependencies = [
  "dbus",
  "dns-lookup",
  "encoding_rs",
+ "enum-map",
  "enumflags2",
  "errno",
  "expect-test",

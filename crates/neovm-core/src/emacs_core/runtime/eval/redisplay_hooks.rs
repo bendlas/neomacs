@@ -555,6 +555,17 @@ impl Context {
         gnu_redisplay_hooks_enabled()
     }
 
+    /// GNU `try_cursor_movement` refuses while `windows_or_buffers_changed`
+    /// or `update_mode_lines` is set (src/xdisp.c:19866-19876).  Under the
+    /// GNU hook policy those are the pending window and mode-line scopes of
+    /// the redisplay in progress; the legacy policy keeps no such flags and
+    /// answers false (callers combine this with the chrome-dirty generation).
+    pub fn gnu_redisplay_refuses_cursor_movement(&self) -> bool {
+        gnu_redisplay_hooks_enabled()
+            && (self.gnu_redisplay_hooks.windows != PendingScope::None
+                || self.gnu_redisplay_hooks.mode_lines != PendingScope::None)
+    }
+
     /// True only while the complete GNU transaction owns mini preparation.
     /// A standalone committed-start callback also prevents recursive redisplay,
     /// but it does not own sizing for a later renderer-facing layout attempt.
@@ -760,6 +771,10 @@ impl Context {
         self.gnu_redisplay_hooks.layout_flow.is_some()
     }
 
+    pub(super) fn take_deferred_redisplay_layout_flow(&mut self) -> Option<Flow> {
+        self.gnu_redisplay_hooks.layout_flow.take()
+    }
+
     fn gnu_mini_geometry_request(&mut self) -> Option<RedisplayMiniGeometryRequest> {
         let selected = self.frames.selected_frame()?;
         let mini = selected.minibuffer_window?;
@@ -796,7 +811,7 @@ impl Context {
         let frame = self.frames.find_window_frame_id(window)?;
         let buffer = self.frames.get(frame)?.find_window(window)?.buffer_id()?;
         // GNU window_outdated compares source revisions, not point alone.
-        let current = self.buffer_layout_inputs(buffer)?;
+        let current = self.redisplay_buffer_layout_inputs(buffer)?;
         let old = self
             .last_redisplay_signature
             .as_ref()

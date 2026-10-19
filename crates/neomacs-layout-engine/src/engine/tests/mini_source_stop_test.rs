@@ -112,6 +112,8 @@ fn measure(
             &mut eval,
             frame,
             LayoutPurpose::MiniPreparation { window_id: window },
+            None,
+            None,
         )
         .expect("canonical ToEnd mini producer")
         .into_geometry()
@@ -141,6 +143,8 @@ fn measure(
                         count: std::num::NonZeroUsize::new(10).expect("positive rows"),
                     },
                 },
+                None,
+                None,
             )
             .expect("ordinary presentation query");
         eval.eval_str("d5-mini-condition-count")

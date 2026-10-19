@@ -7,6 +7,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+use super::super::a8_probes;
 use super::super::image::PublishedGcImage;
 use super::super::{
     MutatorEntry, MutatorKey, ParallelHeapEra, RegistrationError, Registry, RegistryState,
@@ -117,10 +119,11 @@ impl ParallelHeapEra<'_> {
         let registry = self.registry();
         keeper(registry)?;
         request(registry)?;
+        let _park = registry.park_ticket();
         let mut gate = registry.lock().map_err(registration_error)?;
         loop {
             gate.rendezvous.live()?;
-            if registry.poisoned.load(Ordering::Acquire) {
+            if registry.park.poisoned.load(Ordering::Acquire) {
                 return Err(RendezvousError::Poisoned);
             }
             match gate.rendezvous.phase {
@@ -179,6 +182,10 @@ impl ParallelHeapEra<'_> {
 }
 
 impl<'era> AllStopped<'era> {
+    pub fn symbols(&mut self) -> Result<super::super::KeeperSymbols<'_>, RendezvousError> {
+        let registry = self.registry;
+        super::super::symbol_authority::KeeperSymbols::mint(self, registry)
+    }
     pub(crate) fn check_world_roots(
         &self,
         heap: super::super::HeapIdentity,
@@ -189,6 +196,10 @@ impl<'era> AllStopped<'era> {
         }
         let gate = self.registry.lock()?;
         self.validate(&gate)
+    }
+
+    pub(in crate::tagged::gc) fn gate_is_held_by_current_thread(&self) -> bool {
+        self.registry.gate_is_held_by_current_thread()
     }
 
     pub(in crate::tagged::gc::mutator_registration) fn matches_registry(
@@ -203,7 +214,7 @@ impl<'era> AllStopped<'era> {
     }
 
     fn validate(&self, gate: &RegistryState) -> Result<(), RendezvousError> {
-        if self.registry.poisoned.load(Ordering::Acquire) {
+        if self.registry.park.poisoned.load(Ordering::Acquire) {
             return Err(RendezvousError::Poisoned);
         }
         if gate.rendezvous.phase != Phase::Tracing(self.epoch) {
@@ -236,7 +247,7 @@ impl<'era> AllStopped<'era> {
             let proof = ParallelStoppedMutatorsProof::from_all_stopped(self);
             body(self, &proof)?
         };
-        if self.registry.poisoned.load(Ordering::Acquire) {
+        if self.registry.park.poisoned.load(Ordering::Acquire) {
             return Err(RendezvousError::Poisoned);
         }
         self.traced = true;
@@ -278,7 +289,7 @@ impl<'era> AllStopped<'era> {
         };
         let result = body(reader);
         attempt.finished = true;
-        if self.registry.poisoned.load(Ordering::Acquire) {
+        if self.registry.park.poisoned.load(Ordering::Acquire) {
             return Err(RendezvousError::Poisoned);
         }
         Ok(result)
@@ -298,7 +309,7 @@ impl<'era> AllStopped<'era> {
         };
         let result = body(image);
         attempt.finished = true;
-        if self.registry.poisoned.load(Ordering::Acquire) {
+        if self.registry.park.poisoned.load(Ordering::Acquire) {
             return Err(RendezvousError::Poisoned);
         }
         Ok(result)
@@ -353,7 +364,11 @@ impl<'era> AllStopped<'era> {
             gate.rendezvous.poison();
             self.registry.poison();
         }
-        self.registry.wake.notify_all();
+        #[cfg(test)]
+        if completion.is_ok() {
+            a8_probes::mark(a8_probes::KEEPER_COMPLETED, gate.rendezvous.completed, 0);
+        }
+        self.registry.park.wake.notify_all();
         completion
     }
 
@@ -375,7 +390,7 @@ impl Drop for AllStopped<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.registry.poison();
-            self.registry.wake.notify_all();
+            self.registry.park.wake.notify_all();
         }
     }
 }

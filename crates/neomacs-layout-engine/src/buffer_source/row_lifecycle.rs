@@ -287,11 +287,14 @@ impl BufferSourceHscrollSkipAction {
         );
     }
 
-    pub(crate) fn append_left_truncation_marker_to_text_row_and_apply<'ctx>(
+    pub(crate) fn append_left_truncation_marker_to_text_row_and_apply<
+        'ctx,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         self,
         render_context: BufferSyntheticTextRenderContext<'ctx>,
         row_geometry: &'ctx DisplayRowGeometryState,
-        source_render: &mut TextRowSourceRenderState<'_>,
+        source_render: &mut TextRowSourceRenderState<'_, FS>,
         mut row_progress: DisplaySourceRowProgressState<'_>,
         content_x: f32,
     ) -> Option<DisplayRowPosition> {
@@ -493,10 +496,10 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn render_and_apply<B: LayoutBufferView>(
+    pub(crate) fn render_and_apply<B: LayoutBufferView, FS: crate::neovm_bridge::FaceServices>(
         self,
         buffer: &B,
-        source_render: TextRowSourceRenderState<'_>,
+        source_render: TextRowSourceRenderState<'_, FS>,
         row_progress: DisplaySourceRowProgressState<'_>,
         row_geometry: &mut DisplayRowGeometryState,
         cursor_info: &mut CursorCaptureState,
@@ -590,6 +593,8 @@ pub(crate) struct BufferSourceHscrollSkipRenderContext<'a> {
     active_face_state: &'a DisplayRowActiveFaceState,
     metrics: DisplayRowFallbackMetrics,
     point_charpos: i64,
+    /// See `BufferSourceLoopRequestContext::query_target`.
+    query_target: Option<i64>,
     has_prefix: bool,
     row_geometry_defaults: DisplayRowGeometryDefaults,
     display_text_row_base: usize,
@@ -700,10 +705,13 @@ fn hscroll_skip_column_width(
 }
 
 impl<'a> BufferSourceHscrollSkipRenderContext<'a> {
-    pub(crate) fn render_next_and_apply<B: LayoutBufferView>(
+    pub(crate) fn render_next_and_apply<
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         self,
         source_walk: &mut BufferSourceWalk<'_, B>,
-        state: BufferSourceLoopMutableState<'_, '_, '_>,
+        state: BufferSourceLoopMutableState<'_, '_, '_, FS>,
     ) -> DisplayRowTransitionContinuation {
         let BufferSourceLoopMutableState {
             progress,
@@ -720,6 +728,8 @@ impl<'a> BufferSourceHscrollSkipRenderContext<'a> {
         let mut source_render = source_render;
         let context = self;
 
+        let columns_before = row_carryover.hscroll_skip.consumed_columns();
+        let hscroll_columns = row_carryover.hscroll_skip.configured_columns();
         let Some(hscroll_action) = source_walk
             .consume_hscroll_skip(
                 context.text,
@@ -731,6 +741,34 @@ impl<'a> BufferSourceHscrollSkipRenderContext<'a> {
         else {
             return DisplayRowTransitionContinuation::Exhausted;
         };
+
+        // GNU `pos_visible_p` answers for a position the hscroll hides: its
+        // iterator keeps counting x from the line start while it skips
+        // (`move_it_in_display_line_to` up to `first_visible_x`), so the
+        // position is reported at its line x minus the hscroll, left of the
+        // text area, on its row (GNU 31.1: (-85 10) for column 0 under
+        // hscroll 85; `posn-at-point' then refuses x < -1).  Redisplay draws
+        // nothing for these characters and publishes nothing; a synchronous
+        // query that asks about one of them publishes exactly that one point,
+        // which is also the whole per-query cost.
+        if let Some(target) = context.query_target
+            && !hscroll_action.is_line_break()
+            && hscroll_action.hidden_prefix_end_charpos() == target
+        {
+            let char_width = context.metrics.char_width;
+            let hidden_col = i64::from(columns_before) - i64::from(hscroll_columns);
+            source_render
+                .output_emitter()
+                .push_text_hidden_display_point(
+                    LispCharPos1::new(target + 1),
+                    context.content_x + hidden_col as f32 * char_width,
+                    row_build.row_geometry.y(),
+                    char_width,
+                    row_build.row_geometry.height(),
+                    row_build.row_geometry.row(),
+                    hidden_col,
+                );
+        }
 
         // GNU records a row's start BEFORE it skips the hscrolled columns
         // (`row->start = it->start`, src/xdisp.c:25857; the skip is at
@@ -849,6 +887,7 @@ impl<'a> BufferSourceHscrollSkipRenderContext<'a> {
         active_face_state: &'a DisplayRowActiveFaceState,
         metrics: DisplayRowFallbackMetrics,
         point_charpos: i64,
+        query_target: Option<i64>,
         has_prefix: bool,
         row_geometry_defaults: DisplayRowGeometryDefaults,
         display_text_row_base: usize,
@@ -863,6 +902,7 @@ impl<'a> BufferSourceHscrollSkipRenderContext<'a> {
             active_face_state,
             metrics,
             point_charpos,
+            query_target,
             has_prefix,
             row_geometry_defaults,
             display_text_row_base,
@@ -1016,11 +1056,14 @@ impl<'a> BufferSourceSelectiveDisplayTailRenderRequest<'a> {
         }
     }
 
-    pub(crate) fn render_if_needed_and_apply<B: LayoutBufferView>(
+    pub(crate) fn render_if_needed_and_apply<
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         self,
         source_walk: &mut BufferSourceWalk<'_, B>,
         buffer: &B,
-        state: BufferSourceLoopMutableState<'_, '_, '_>,
+        state: BufferSourceLoopMutableState<'_, '_, '_, FS>,
     ) -> BufferSourceSelectiveDisplayTailRenderOutcome {
         let context = self.context;
         let selective_display = BufferSourceSelectiveDisplayContext::new(
@@ -1243,12 +1286,12 @@ impl BufferSourceInvisibleTextSkip {
         })
     }
 
-    pub(crate) fn append_to_text_row_and_apply<'ctx>(
+    pub(crate) fn append_to_text_row_and_apply<'ctx, FS: crate::neovm_bridge::FaceServices>(
         self,
         render_context: BufferSyntheticTextRenderContext<'ctx>,
         row_geometry: &'ctx DisplayRowGeometryState,
         cursor_info: &mut CursorCaptureState,
-        source_render: &mut TextRowSourceRenderState<'_>,
+        source_render: &mut TextRowSourceRenderState<'_, FS>,
         row_progress: &mut DisplaySourceRowProgressState<'_>,
         ellipsis_text: Option<&str>,
     ) {
@@ -1275,11 +1318,14 @@ impl BufferSourceInvisibleTextSkip {
 }
 
 impl<'a> BufferSourceInvisibleTextRenderContext<'a> {
-    pub(crate) fn render_at_checkpoint_and_apply<B: LayoutBufferView>(
+    pub(crate) fn render_at_checkpoint_and_apply<
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         self,
         source_walk: &mut BufferSourceWalk<'_, B>,
         buffer: &B,
-        state: BufferSourceLoopMutableState<'_, '_, '_>,
+        state: BufferSourceLoopMutableState<'_, '_, '_, FS>,
     ) -> BufferSourceInvisibleTextRenderOutcome {
         let BufferSourceLoopMutableState {
             invisible_text_checkpoint,
@@ -1493,11 +1539,11 @@ impl BufferSourceSelectiveDisplayLineTailMarker {
         )
     }
 
-    pub(crate) fn append_to_text_row_and_apply<'ctx>(
+    pub(crate) fn append_to_text_row_and_apply<'ctx, FS: crate::neovm_bridge::FaceServices>(
         self,
         render_context: BufferSyntheticTextRenderContext<'ctx>,
         row_geometry: &'ctx DisplayRowGeometryState,
-        source_render: &mut TextRowSourceRenderState<'_>,
+        source_render: &mut TextRowSourceRenderState<'_, FS>,
         mut row_progress: DisplaySourceRowProgressState<'_>,
         ellipsis_text: Option<&str>,
     ) {
@@ -1868,11 +1914,11 @@ impl<'a> BufferSourceLineBreakRenderRequest<'a> {
         self
     }
 
-    pub(crate) fn render_and_apply<B: LayoutBufferView>(
+    pub(crate) fn render_and_apply<B: LayoutBufferView, FS: crate::neovm_bridge::FaceServices>(
         self,
         source_walk: &mut BufferSourceWalk<'_, B>,
         buffer: &B,
-        state: BufferSourceLoopMutableState<'_, '_, '_>,
+        state: BufferSourceLoopMutableState<'_, '_, '_, FS>,
     ) -> DisplayRowTransitionContinuation {
         let BufferSourceLoopMutableState {
             mut progress,
@@ -2111,11 +2157,14 @@ impl<'a> BufferSourceLineBreakRenderRequest<'a> {
     /// row — starts on the freshly opened row. Mirrors GNU xdisp.c, where a
     /// display line "ends in a newline from a display string" and the buffer
     /// text after the display property resumes on the next glyph row.
-    pub(crate) fn render_display_string_break_and_apply<B: LayoutBufferView>(
+    pub(crate) fn render_display_string_break_and_apply<
+        B: LayoutBufferView,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         self,
         source_walk: &mut BufferSourceWalk<'_, B>,
         buffer: &B,
-        state: BufferSourceLoopMutableState<'_, '_, '_>,
+        state: BufferSourceLoopMutableState<'_, '_, '_, FS>,
         line_break_transition: DisplayRowLineBreakTransitionPlan,
     ) -> DisplayRowTransitionContinuation {
         let BufferSourceLoopMutableState {
@@ -2427,10 +2476,10 @@ impl BufferSourceLineBreakSourceAction {
     }
 }
 
-pub(crate) fn append_synthetic_request_to_text_row<'ctx>(
+pub(crate) fn append_synthetic_request_to_text_row<'ctx, FS: crate::neovm_bridge::FaceServices>(
     render_context: BufferSyntheticTextRenderContext<'ctx>,
     row_geometry: &'ctx DisplayRowGeometryState,
-    source_render: &mut TextRowSourceRenderState<'_>,
+    source_render: &mut TextRowSourceRenderState<'_, FS>,
     row_progress: &mut DisplaySourceRowProgressState<'_>,
     request: SyntheticTextAppendRequest,
 ) {
@@ -2442,10 +2491,13 @@ pub(crate) fn append_synthetic_request_to_text_row<'ctx>(
     row_progress.apply_position(progress.end());
 }
 
-pub(crate) fn append_hscroll_truncation_marker_to_text_row<'ctx>(
+pub(crate) fn append_hscroll_truncation_marker_to_text_row<
+    'ctx,
+    FS: crate::neovm_bridge::FaceServices,
+>(
     render_context: BufferSyntheticTextRenderContext<'ctx>,
     row_geometry: &'ctx DisplayRowGeometryState,
-    source_render: &mut TextRowSourceRenderState<'_>,
+    source_render: &mut TextRowSourceRenderState<'_, FS>,
     row_progress: &mut DisplaySourceRowProgressState<'_>,
     content_x: f32,
 ) {

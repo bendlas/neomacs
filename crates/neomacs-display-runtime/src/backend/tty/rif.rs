@@ -19,6 +19,9 @@ use neomacs_display_protocol::tty_capabilities::{
 };
 use neomacs_display_protocol::types::{DisplayWindowId, FaceId, Rect, ResolvedBidiDirection};
 
+#[path = "diagnostic_knobs.rs"]
+mod diagnostic_knobs;
+
 #[path = "painter.rs"]
 pub mod painter;
 
@@ -485,6 +488,14 @@ pub struct TtyRif {
     cursor_visible: bool,
     /// Visible terminal cursor shape when the hardware cursor is shown.
     cursor_shape: TerminalCursorShape,
+    /// Lisp `visible-cursor' as of this frame: GNU `tty_show_cursor` follows
+    /// the entry's `ve` with its `vs` only when it is non-nil
+    /// (src/term.c:362-372).  Its C default is 1.
+    very_visible_cursor: bool,
+    /// What this session has told the terminal about its cursor shape
+    /// (DECSCUSR), which is terminal state, not screen state: a redraw or a
+    /// resize does not undo it.
+    terminal_cursor_shape: TerminalCursorShapeMemory,
     /// Face lookup table (face_id -> Face).
     faces: FrameFaceMap,
     /// The default face's realized terminal background.
@@ -524,7 +535,8 @@ fn terminal_cursor_cell(x: f32, y: f32, char_width: f32, char_height: f32) -> (u
 /// encodes). Defaults are the capabilities of every modern terminal;
 /// synchronized output is additionally safe to over-claim (an unknown DEC
 /// private mode is ignored), while scroll regions are not (a terminal
-/// without DECSTBM would render SU as full-screen scroll), hence the split.
+/// without DECSTBM would delete lines down to the screen bottom), hence the
+/// split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermCaps {
     /// How output behaves at the physical right margin.  GNU keeps `am' and
@@ -561,7 +573,7 @@ impl Default for TermCaps {
     fn default() -> Self {
         Self {
             right_margin: RightMarginBehavior::MagicWrap,
-            scroll_region: Some(RegionScrollMethod::SuSd),
+            scroll_region: Some(RegionScrollMethod::DeleteInsertLines),
             insert_delete_char: true,
             blank_tail: BlankTailMethod::EraseToEol {
                 back_color_erase: true,
@@ -671,18 +683,32 @@ enum LogicalTailUpdate {
 }
 
 /// How a region scroll is put on the wire. Chosen at capability-resolution
-/// time from what the terminfo entry actually attests, and carried in the
-/// planned op — the encoder is total over this enum.
+/// time from what the terminfo entry actually attests, in the order GNU
+/// `tty_ins_del_lines` tries its capabilities (src/term.c:1041-1092), and
+/// carried in the planned op — the encoder is total over this enum.
+///
+/// GNU never scrolls with SU/SD (`indn`/`rin`): it deletes or inserts
+/// lines at the cursor row inside the scroll region.  Emitting CSI S/T
+/// instead was not a visible difference on a modern emulator, but it is a
+/// different control repertoire -- the pinned pyte 0.8.2 of the TTY
+/// differential harness implements DL/IL and not SU/SD, so every region
+/// scroll (the `invisible` scene's hidden lines) left the shifted rows
+/// stale in its legacy frames while GNU's deletes replayed exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionScrollMethod {
+    /// DECSTBM + cursor to the region's top row + one parameterized DL/IL
+    /// (`CSI n M` / `CSI n L`): GNU's first choice, termcap `DL`/`AL`
+    /// (`TS_del_multi_lines`/`TS_ins_multi_lines`, src/term.c:4524,4539).
+    DeleteInsertLines,
+    /// DECSTBM + cursor to the region's top row + n single-line DL/IL
+    /// (`CSI M` / `CSI L`): GNU's second choice, termcap `dl`/`al`
+    /// (`TS_del_line`/`TS_ins_line`, src/term.c:4523,4538).
+    DeleteInsertLine,
     /// DECSTBM + cursor to the region edge + n single-line index/reverse
     /// index controls (IND `ESC D` / RI `ESC M`) — GNU term.c's
-    /// `tty_ins_del_lines` fallback, the form every vt100-class entry
-    /// attests via `cs` + `sr`.
+    /// `tty_ins_del_lines` last fallback (`TS_fwd_scroll`/`TS_rev_scroll`),
+    /// the form every vt100-class entry attests via `cs` + `sr`.
     Index,
-    /// DECSTBM + parameterized SU/SD (`CSI n S` / `CSI n T`), attested by
-    /// terminfo `indn`/`rin`. One control regardless of distance.
-    SuSd,
 }
 
 /// Vertical scroll direction and magnitude. Zero is unrepresentable: a
@@ -851,6 +877,66 @@ pub enum TerminalCursorShape {
     Bar,
 }
 
+/// What the terminal's cursor shape is, as far as this session has set it.
+///
+/// GNU never sets a cursor shape on a text terminal -- term.c emits no
+/// DECSCUSR, and `cursor-type' is a window-system property there -- so the
+/// default `box' cursor must leave the terminal's own configured cursor
+/// alone (the ttykey differential scenes recorded GNU's cursor as the
+/// terminal default at every checkpoint while this port wrote `CSI 2 SP q`,
+/// a steady block, at session start and after every redraw).  A bar or
+/// underline cursor is a neomacs
+/// addition beyond GNU; once one has been set, going back to `box' restores
+/// the terminal's default with DECSCUSR 0 rather than imposing a steady block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TerminalCursorShapeMemory {
+    /// The shape last set, `None` when unknown (never set, or forgotten by a
+    /// redraw: the terminal may have been reset underneath).
+    last_set: Option<TerminalCursorShape>,
+    /// Whether this session ever set a shape other than the default: only
+    /// then can a `box' cursor have something to restore.
+    touched: bool,
+}
+
+impl TerminalCursorShapeMemory {
+    /// The DECSCUSR parameter a frame must write so the terminal shows
+    /// `wanted`, or `None` when nothing is to be written.  `resend` re-sends
+    /// a non-default shape even when it is already set (the non-silent
+    /// framing, which writes its cursor every frame).
+    pub(crate) fn control_for(self, wanted: TerminalCursorShape, resend: bool) -> Option<u8> {
+        match wanted {
+            TerminalCursorShape::Block => {
+                let set_elsewhere = match self.last_set {
+                    Some(TerminalCursorShape::Block) => false,
+                    Some(_) => true,
+                    None => self.touched,
+                };
+                set_elsewhere.then_some(0)
+            }
+            TerminalCursorShape::Underline => {
+                (resend || self.last_set != Some(wanted)).then_some(4)
+            }
+            TerminalCursorShape::Bar => (resend || self.last_set != Some(wanted)).then_some(6),
+        }
+    }
+
+    /// Record that `wanted` was written (as the control from
+    /// [`Self::control_for`]).
+    pub(crate) fn note_written(&mut self, wanted: TerminalCursorShape) {
+        if wanted != TerminalCursorShape::Block {
+            self.touched = true;
+        }
+        self.last_set = Some(wanted);
+    }
+
+    /// A redraw or resize repaints the screen, not the terminal's cursor
+    /// shape; but another program may have reset it meanwhile, so what is
+    /// set becomes unknown while the knowledge that something was set stays.
+    pub(crate) fn forget_after_redraw(&mut self) {
+        self.last_set = None;
+    }
+}
+
 impl TtyRif {
     /// Create a new TtyRif for a terminal of the given dimensions.
     pub fn new(width: usize, height: usize) -> Self {
@@ -862,6 +948,8 @@ impl TtyRif {
             cursor_col: 0,
             cursor_visible: false,
             cursor_shape: TerminalCursorShape::Block,
+            very_visible_cursor: true,
+            terminal_cursor_shape: TerminalCursorShapeMemory::default(),
             faces: rustc_hash::FxHashMap::default(),
             default_bg: None,
             default_fg: None,
@@ -882,6 +970,14 @@ impl TtyRif {
 
     /// Declare what the connected terminal can do. The planner consults this
     /// before proposing operations; see [`TermCaps`].
+    /// Publish Lisp `visible-cursor' for the next frame: whether showing the
+    /// cursor also emits the entry's `vs` (GNU `tty_show_cursor`,
+    /// src/term.c:362-372).  One bool per redisplay from the frontend; the
+    /// encoder never reads Lisp itself.
+    pub fn set_very_visible_cursor(&mut self, very_visible: bool) {
+        self.very_visible_cursor = very_visible;
+    }
+
     pub fn set_caps(&mut self, caps: TermCaps) {
         self.caps = caps;
     }
@@ -898,6 +994,7 @@ impl TtyRif {
         self.force_full_render = true;
         self.damage.forget_terminal();
         self.damage.forget_painters();
+        self.terminal_cursor_shape.forget_after_redraw();
     }
 
     /// Force the next [`diff_and_render`](Self::diff_and_render) call to emit
@@ -907,6 +1004,7 @@ impl TtyRif {
     pub fn force_redraw(&mut self) {
         self.force_full_render = true;
         self.damage.forget_terminal();
+        self.terminal_cursor_shape.forget_after_redraw();
     }
 
     /// Set the face table for resolving face_ids.
@@ -989,7 +1087,7 @@ impl TtyRif {
             .collect();
         if self.damage.mode != damage::TtyDamageMode::Off {
             self.rasterize_frame_tree_damaged(root, &children);
-            if std::env::var_os("NEOMACS_DUMP_TTY_GLYPHS").is_some() {
+            if diagnostic_knobs::dump_tty_glyphs_enabled() {
                 self.dump_tty_glyphs_to_log();
             }
             return;
@@ -1010,7 +1108,7 @@ impl TtyRif {
             self.rasterize_state_at(child, origin_col, origin_row, true);
         }
 
-        if std::env::var_os("NEOMACS_DUMP_TTY_GLYPHS").is_some() {
+        if diagnostic_knobs::dump_tty_glyphs_enabled() {
             self.dump_tty_glyphs_to_log();
         }
     }
@@ -1024,7 +1122,7 @@ impl TtyRif {
     ) {
         self.install_state_faces(state);
 
-        if std::env::var_os("NEOMACS_DUMP_TTY_GLYPHS").is_some() {
+        if diagnostic_knobs::dump_tty_glyphs_enabled() {
             self.dump_frame_display_state_to_log(state, origin_col, origin_row);
         }
 
@@ -1462,8 +1560,9 @@ impl TtyRif {
             // no equivalent.
             self.output.extend_from_slice(b"\x1b[?2026h");
         }
-        // Hide cursor during update to avoid flicker.
-        self.output.extend_from_slice(b"\x1b[?25l");
+        // Hide cursor during update to avoid flicker (GNU `tty_hide_cursor`
+        // before the frame's glyphs are written, src/term.c:763).
+        write_hide_cursor(&mut self.output);
 
         self.encode_ops(&ops);
 
@@ -1480,15 +1579,23 @@ impl TtyRif {
         // where GNU emits the entry's `me` and `op`, or nothing (ledger 188).
 
         // Position cursor and show it if visible.
-        let shape_written = self.cursor_visible && self.cursor_shape_due();
         if self.cursor_visible {
             write_cursor_goto(&mut self.output, self.cursor_row + 1, self.cursor_col + 1);
-            if shape_written {
-                write_cursor_shape(&mut self.output, self.cursor_shape);
+            // GNU writes no cursor shape on a terminal; see
+            // `TerminalCursorShapeMemory`.  The non-silent framing re-sends a
+            // non-default shape every frame, as it always did.
+            if let Some(ps) = self
+                .terminal_cursor_shape
+                .control_for(self.cursor_shape, !self.damage.silent)
+            {
+                write_cursor_shape_control(&mut self.output, ps);
+                self.terminal_cursor_shape.note_written(self.cursor_shape);
             }
-            self.output.extend_from_slice(b"\x1b[?25h");
+            // GNU `tty_update_end` -> `tty_show_cursor` (src/term.c:258):
+            // the entry's `ve`, then `vs` for a very visible cursor.
+            write_show_cursor(&mut self.output, self.very_visible_cursor);
         }
-        self.note_framed_cursor(shape_written);
+        self.note_framed_cursor();
 
         if self.caps.synchronized_output {
             // End synchronized update: present the frame atomically.
@@ -1963,12 +2070,34 @@ impl TtyRif {
                     // is what establishes.
                     write_face_off(&mut self.output, &mut last_attrs);
                     match (method, dir) {
-                        (RegionScrollMethod::SuSd, ScrollDir::Up(n)) => self
-                            .output
-                            .extend_from_slice(format!("\x1b[{n}S").as_bytes()),
-                        (RegionScrollMethod::SuSd, ScrollDir::Down(n)) => self
-                            .output
-                            .extend_from_slice(format!("\x1b[{n}T").as_bytes()),
+                        // GNU tty_ins_del_lines `multi`: cursor to the row
+                        // the lines leave from (`raw_cursor_to (f, vpos, 0)`),
+                        // then one parameterized delete/insert.  The lines
+                        // below move inside the region DECSTBM bounded, so
+                        // the rows past `bottom` stay where they are.
+                        (RegionScrollMethod::DeleteInsertLines, ScrollDir::Up(n)) => {
+                            write_cursor_goto(&mut self.output, top + 1, 1);
+                            self.output
+                                .extend_from_slice(format!("\x1b[{n}M").as_bytes());
+                        }
+                        (RegionScrollMethod::DeleteInsertLines, ScrollDir::Down(n)) => {
+                            write_cursor_goto(&mut self.output, top + 1, 1);
+                            self.output
+                                .extend_from_slice(format!("\x1b[{n}L").as_bytes());
+                        }
+                        // GNU tty_ins_del_lines `single`: the same, n times.
+                        (RegionScrollMethod::DeleteInsertLine, ScrollDir::Up(n)) => {
+                            write_cursor_goto(&mut self.output, top + 1, 1);
+                            for _ in 0..n.get() {
+                                self.output.extend_from_slice(b"\x1b[M");
+                            }
+                        }
+                        (RegionScrollMethod::DeleteInsertLine, ScrollDir::Down(n)) => {
+                            write_cursor_goto(&mut self.output, top + 1, 1);
+                            for _ in 0..n.get() {
+                                self.output.extend_from_slice(b"\x1b[L");
+                            }
+                        }
                         // GNU tty_ins_del_lines fallback: cursor to the
                         // region edge, then n single-line index controls.
                         // IND/RI are core VT100, attested by the
@@ -1986,7 +2115,13 @@ impl TtyRif {
                             }
                         }
                     }
-                    self.output.extend_from_slice(b"\x1b[r");
+                    // GNU `tty_set_terminal_window (f, 0)` restores the
+                    // region as the explicit whole screen
+                    // (`tty_set_scroll_region (f, 0, FRAME_TOTAL_LINES)`,
+                    // src/term.c:267-275), not DECSTBM's parameterless form.
+                    let rows = self.desired.height.clamp(1, usize::from(u16::MAX));
+                    self.output
+                        .extend_from_slice(format!("\x1b[1;{rows}r").as_bytes());
                     cursor = EncodedCursorState::Unknown;
                 }
                 TermOp::WriteRun { row, start, end } => {
@@ -2990,14 +3125,41 @@ fn write_cursor_goto(buf: &mut Vec<u8>, row: u16, col: u16) {
     let _ = write!(buf, "\x1b[{};{}H", row, col);
 }
 
-fn write_cursor_shape(buf: &mut Vec<u8>, shape: TerminalCursorShape) {
+/// GNU `tty_hide_cursor` (src/term.c:345-357): the entry's `vi`, or nothing
+/// for an entry without one (its cursor then stays where it is drawn, as on
+/// GNU).
+fn write_hide_cursor(buf: &mut Vec<u8>) {
+    with_capabilities(|caps| write_hide_cursor_with(buf, caps));
+}
+
+fn write_hide_cursor_with(buf: &mut Vec<u8>, caps: &TtyAttributeCapabilities) {
+    if let Some(vi) = caps.cursor_invisible.as_deref() {
+        buf.extend_from_slice(vi);
+    }
+}
+
+/// GNU `tty_show_cursor` (src/term.c:362-372): the entry's `ve`, then its
+/// `vs` when `visible-cursor' is non-nil.  Both are optional in the entry
+/// and emitted only when present (`OUTPUT_IF`).
+fn write_show_cursor(buf: &mut Vec<u8>, very_visible: bool) {
+    with_capabilities(|caps| write_show_cursor_with(buf, caps, very_visible));
+}
+
+fn write_show_cursor_with(buf: &mut Vec<u8>, caps: &TtyAttributeCapabilities, very_visible: bool) {
+    if let Some(ve) = caps.cursor_normal.as_deref() {
+        buf.extend_from_slice(ve);
+    }
+    if very_visible && let Some(vs) = caps.cursor_visible.as_deref() {
+        buf.extend_from_slice(vs);
+    }
+}
+
+/// DECSCUSR (`CSI Ps SP q`) with the parameter
+/// [`TerminalCursorShapeMemory::control_for`] chose: 0 restores the
+/// terminal's default cursor, 4 and 6 are the steady underline and bar.
+fn write_cursor_shape_control(buf: &mut Vec<u8>, ps: u8) {
     use std::io::Write;
-    let ps = match shape {
-        TerminalCursorShape::Block => 2,
-        TerminalCursorShape::Underline => 4,
-        TerminalCursorShape::Bar => 6,
-    };
-    let _ = write!(buf, "\x1b[{} q", ps);
+    let _ = write!(buf, "\x1b[{ps} q");
 }
 
 // --- Terminal color depth (issue #154) ------------------------------------

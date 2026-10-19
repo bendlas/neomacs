@@ -9,8 +9,10 @@
 //! - [`LispSymbol::value_cell`] reads the tag and then the word the tag
 //!   selects, as one [`ValueCell`]. No reader can take the word without the
 //!   tag, so none can read the wrong arm.
-//! - [`CellWrite`] is the only writer of either half, and
-//!   [`CellWrite::publish`] the one place a word or tag is stored. The moves
+//! - Serial transitions use [`CellWrite`]; sealed parallel Plain stores use
+//!   the private token-routed `parallel` child while all markers are excluded.
+//!   For serial code, [`CellWrite::publish`] is the one place a word or tag
+//!   is stored. The moves
 //!   it offers are typed by the arm the cell is in ([`ArmMut`]): a plain cell
 //!   can be stored, aliased, localized or forwarded; an alias re-aliased or
 //!   undone; a forwarded cell re-forwarded or localized; a localized cell
@@ -32,13 +34,16 @@
 //! own the writer side. Nothing here makes a symbol shareable between
 //! mutators, and no `Send`/`Sync` is claimed for any type in this module.
 
+mod parallel;
+
 use super::{
     LispBufferLocalValue, SYMBOL_NAME_SENTINEL, SymbolInterned, SymbolRedirect, SymbolTrappedWrite,
 };
-use crate::emacs_core::forward::LispFwd;
+use crate::emacs_core::forward::FwdRef;
 use crate::emacs_core::intern::{NameId, SymId, symbol_name_id};
 use crate::emacs_core::value::Value;
-use crate::tagged::header::load_value_atomic;
+use crate::tagged::header::AtomicTaggedValue;
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -62,8 +67,39 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 /// word they select ([`CellWrite::publish`]); a symbol's flags byte is not
 /// reachable mutably from outside it at all.
 #[repr(transparent)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct SymbolFlags(u8);
+pub struct SymbolFlags(UnsafeCell<u8>);
+
+// Interior mutability is load-bearing: the concurrent GC obarray scan reads
+// this byte while the mutator rewrites it, through `&self`-derived pointers.
+// The UnsafeCell gives every access the cell permission (a plain `u8` field
+// would make the scan's atomic access UB under Stacked Borrows).
+//
+// Only the *cross-thread* accesses are atomic: the GC scan
+// (`load_redirect`/`load_runtime_projected`) and the mutator's store. The
+// owner's own flag reads are plain loads through the cell, which LLVM can CSE
+// and fold -- an `AtomicU8` load cannot, and the extra reloads cost +13
+// instructions in `read_var_cached` (measured by census + callgrind). A plain
+// owner read races only the owner's own store (same thread, sequenced) and
+// the GC's atomic read (read/read).
+impl Default for SymbolFlags {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl Clone for SymbolFlags {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Self::new(self.load())
+    }
+}
+
+impl std::fmt::Debug for SymbolFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.load(), f)
+    }
+}
 
 /// `SymbolFlags::is_plain_untrapped_unprojected` reads the redirect and
 /// trapped-write fields as raw zero bits; that is only the (Plainval,
@@ -86,20 +122,64 @@ impl SymbolFlags {
     pub(super) const RUNTIME_PROJECTED_BIT: u8 = 0b1000_0000;
 
     #[inline(always)]
-    pub fn redirect(self) -> SymbolRedirect {
-        SymbolRedirect::try_from(self.0 & Self::REDIRECT_MASK)
-            .expect("symbol redirect flag contains valid GNU symbol_redirect code")
+    pub const fn new(bits: u8) -> Self {
+        Self(UnsafeCell::new(bits))
+    }
+
+    /// The whole byte, as one plain owner load (see the type's contract).
+    #[inline(always)]
+    fn load(&self) -> u8 {
+        // SAFETY: owner reads are sequenced with the owner's stores, and the
+        // GC only reads.
+        unsafe { *self.0.get() }
+    }
+
+    /// The whole byte, as one Relaxed atomic load for the GC scan.
+    #[inline(always)]
+    fn load_atomic(&self) -> u8 {
+        // SAFETY: the cell is live and aligned; `UnsafeCell` authorizes the
+        // atomic view, and concurrent access uses the atomic store below.
+        unsafe { AtomicU8::from_ptr(self.0.get()).load(Ordering::Relaxed) }
+    }
+
+    /// Decode the two-bit redirect field. The field is masked to two bits and
+    /// `SymbolRedirect` has exactly GNU's four codes in order, so this
+    /// mapping is total. Decoding must not go through a fallible conversion:
+    /// an `expect` on this path leaves a cold panic edge in every owner read
+    /// of the value cell, which changes inlining (measured by the b135
+    /// sustained-editing regression: the inliner stopped folding
+    /// `builtin_var_value`'s dispatch and added real call overhead per
+    /// builtin read).
+    #[inline(always)]
+    fn decode_redirect(bits: u8) -> SymbolRedirect {
+        const _: () = {
+            assert!(SymbolRedirect::Plainval as u8 == 0);
+            assert!(SymbolRedirect::Varalias as u8 == 1);
+            assert!(SymbolRedirect::Localized as u8 == 2);
+            assert!(SymbolRedirect::Forwarded as u8 == 3);
+        };
+        match bits & Self::REDIRECT_MASK {
+            0 => SymbolRedirect::Plainval,
+            1 => SymbolRedirect::Varalias,
+            2 => SymbolRedirect::Localized,
+            _ => SymbolRedirect::Forwarded,
+        }
+    }
+
+    #[inline(always)]
+    pub fn redirect(&self) -> SymbolRedirect {
+        Self::decode_redirect(self.load())
     }
 
     /// Private: the redirect moves only with its word ([`CellWrite`]).
     #[inline]
     fn set_redirect(&mut self, r: SymbolRedirect) {
-        self.store_byte((self.0 & !Self::REDIRECT_MASK) | r.gnu_code());
+        self.store_byte((self.load() & !Self::REDIRECT_MASK) | r.gnu_code());
     }
 
     #[inline]
-    pub fn trapped_write(self) -> SymbolTrappedWrite {
-        let raw = (self.0 & Self::TRAPPED_WRITE_MASK) >> Self::TRAPPED_WRITE_SHIFT;
+    pub fn trapped_write(&self) -> SymbolTrappedWrite {
+        let raw = (self.load() & Self::TRAPPED_WRITE_MASK) >> Self::TRAPPED_WRITE_SHIFT;
         SymbolTrappedWrite::try_from(raw)
             .expect("symbol trapped-write flag contains valid GNU symbol_trapped_write code")
     }
@@ -107,33 +187,35 @@ impl SymbolFlags {
     #[inline]
     fn set_trapped_write(&mut self, t: SymbolTrappedWrite) {
         self.store_byte(
-            (self.0 & !Self::TRAPPED_WRITE_MASK) | (t.gnu_code() << Self::TRAPPED_WRITE_SHIFT),
+            (self.load() & !Self::TRAPPED_WRITE_MASK) | (t.gnu_code() << Self::TRAPPED_WRITE_SHIFT),
         );
     }
 
     #[inline]
-    pub fn interned(self) -> SymbolInterned {
-        let raw = (self.0 & Self::INTERNED_MASK) >> Self::INTERNED_SHIFT;
+    pub fn interned(&self) -> SymbolInterned {
+        let raw = (self.load() & Self::INTERNED_MASK) >> Self::INTERNED_SHIFT;
         SymbolInterned::try_from(raw)
             .expect("symbol interned flag contains valid GNU symbol_interned code")
     }
 
     #[inline]
     fn set_interned(&mut self, i: SymbolInterned) {
-        self.store_byte((self.0 & !Self::INTERNED_MASK) | (i.gnu_code() << Self::INTERNED_SHIFT));
+        self.store_byte(
+            (self.load() & !Self::INTERNED_MASK) | (i.gnu_code() << Self::INTERNED_SHIFT),
+        );
     }
 
     #[inline]
-    pub fn runtime_projected(self) -> bool {
-        self.0 & Self::RUNTIME_PROJECTED_BIT != 0
+    pub fn runtime_projected(&self) -> bool {
+        self.load() & Self::RUNTIME_PROJECTED_BIT != 0
     }
 
     #[inline]
     fn set_runtime_projected(&mut self, v: bool) {
         let byte = if v {
-            self.0 | Self::RUNTIME_PROJECTED_BIT
+            self.load() | Self::RUNTIME_PROJECTED_BIT
         } else {
-            self.0 & !Self::RUNTIME_PROJECTED_BIT
+            self.load() & !Self::RUNTIME_PROJECTED_BIT
         };
         self.store_byte(byte);
     }
@@ -144,21 +226,22 @@ impl SymbolFlags {
     /// projection.  One byte test, since `Plainval` and `Untrapped` are both
     /// the zero encoding.
     #[inline(always)]
-    pub fn is_plain_untrapped_unprojected(self) -> bool {
-        self.0 & (Self::REDIRECT_MASK | Self::TRAPPED_WRITE_MASK | Self::RUNTIME_PROJECTED_BIT) == 0
+    pub fn is_plain_untrapped_unprojected(&self) -> bool {
+        self.load() & (Self::REDIRECT_MASK | Self::TRAPPED_WRITE_MASK | Self::RUNTIME_PROJECTED_BIT)
+            == 0
     }
 
     #[inline]
-    pub fn declared_special(self) -> bool {
-        self.0 & Self::DECLARED_SPECIAL_BIT != 0
+    pub fn declared_special(&self) -> bool {
+        self.load() & Self::DECLARED_SPECIAL_BIT != 0
     }
 
     #[inline]
     fn set_declared_special(&mut self, v: bool) {
         let byte = if v {
-            self.0 | Self::DECLARED_SPECIAL_BIT
+            self.load() | Self::DECLARED_SPECIAL_BIT
         } else {
-            self.0 & !Self::DECLARED_SPECIAL_BIT
+            self.load() & !Self::DECLARED_SPECIAL_BIT
         };
         self.store_byte(byte);
     }
@@ -166,21 +249,19 @@ impl SymbolFlags {
     /// The raw byte, for a caller that packs it into a wider word (the
     /// symbol's write window).
     #[inline(always)]
-    pub(super) fn bits(self) -> u8 {
-        self.0
+    pub(super) fn bits(&self) -> u8 {
+        self.load()
     }
 
     /// Atomic (relaxed) store of the whole flags byte so a concurrent GC reader
-    /// (`load_redirect`) never observes a torn byte. Mirrors `ConsCell::set_car`:
-    /// the field stays a plain `u8`, accessed atomically via a raw cast. There is
-    /// a single mutator, so the caller's plain read of `self.0` to compute `byte`
-    /// does not race (the GC thread only ever reads this byte).
+    /// (`load_redirect`) never observes a torn byte. Relaxed is enough: this
+    /// byte only selects which word to read, and the cell's own publication
+    /// ordering carries the payload.
     #[inline]
     fn store_byte(&mut self, byte: u8) {
-        let p = std::ptr::from_mut(&mut self.0).cast::<AtomicU8>();
-        // SAFETY: `AtomicU8` has the size and alignment of `u8`, and `&mut
-        // self` makes this the only access from this thread.
-        unsafe { (*p).store(byte, Ordering::Relaxed) };
+        // Atomic: the GC scan may read this byte concurrently.
+        // SAFETY: as `load_atomic`.
+        unsafe { AtomicU8::from_ptr(self.0.get()).store(byte, Ordering::Relaxed) };
     }
 
     /// Atomic (relaxed) read of [`Self::runtime_projected`], for a reader
@@ -188,11 +269,7 @@ impl SymbolFlags {
     /// byte read for the redirect dispatch is not kept live across it.
     #[inline(always)]
     fn load_runtime_projected(&self) -> bool {
-        let p = std::ptr::from_ref(&self.0).cast::<AtomicU8>();
-        // SAFETY: as in `store_byte`; a shared reference permits an atomic
-        // load.
-        let byte = unsafe { (*p).load(Ordering::Relaxed) };
-        byte & Self::RUNTIME_PROJECTED_BIT != 0
+        self.load_atomic() & Self::RUNTIME_PROJECTED_BIT != 0
     }
 
     /// Atomic (relaxed) read of the redirect tag, for the concurrent GC obarray
@@ -200,12 +277,7 @@ impl SymbolFlags {
     /// torn flags byte while the mutator changes a redirect/flag bit.
     #[inline]
     fn load_redirect(&self) -> SymbolRedirect {
-        let p = std::ptr::from_ref(&self.0).cast::<AtomicU8>();
-        // SAFETY: as in `store_byte`; a shared reference permits an atomic
-        // load.
-        let byte = unsafe { (*p).load(Ordering::Relaxed) };
-        SymbolRedirect::try_from(byte & Self::REDIRECT_MASK)
-            .expect("symbol redirect flag contains valid GNU symbol_redirect code")
+        Self::decode_redirect(self.load_atomic())
     }
 }
 
@@ -261,7 +333,7 @@ pub(crate) enum ValueCell {
     /// GNU `SYMBOL_LOCALIZED`: the buffer-local record.
     Localized(BlvPtr),
     /// GNU `SYMBOL_FORWARDED`: the descriptor whose slot holds the value.
-    Forwarded(&'static LispFwd),
+    Forwarded(FwdRef),
 }
 
 /// The one machine word behind a cell; what it means is the tag's business,
@@ -269,62 +341,102 @@ pub(crate) enum ValueCell {
 /// (an alias id is zero-extended), so a raw read of it never sees
 /// uninitialised bytes.
 #[repr(transparent)]
-#[derive(Clone, Copy)]
-struct CellWord(usize);
+struct CellWord(UnsafeCell<usize>);
+
+// The word is the concurrent GC obarray scan's read target while the mutator
+// publishes a new one, through `&self`-derived pointers. The UnsafeCell is
+// load-bearing (a plain `usize` field would make the scan's atomic access UB
+// under Stacked Borrows). As for `SymbolFlags`, only the cross-thread accesses
+// are atomic -- the scan's Acquire load and the publish seam's Release store;
+// owner reads are plain loads the optimizer can fold.
+impl Clone for CellWord {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Self::new(self.load())
+    }
+}
 
 impl CellWord {
     #[inline(always)]
+    fn new(bits: usize) -> Self {
+        Self(UnsafeCell::new(bits))
+    }
+
+    /// The whole word, as one plain owner load.
+    #[inline(always)]
+    fn load(&self) -> usize {
+        // SAFETY: owner reads are sequenced with the owner's stores, and the
+        // GC only reads.
+        unsafe { *self.0.get() }
+    }
+
+    /// The whole word, as one Acquire atomic load for the scan.
+    #[inline(always)]
+    fn load_acquire(&self) -> usize {
+        // SAFETY: the cell is live and aligned; `UnsafeCell` authorizes the
+        // atomic view, and the publish seam stores atomically.
+        unsafe { AtomicUsize::from_ptr(self.0.get()).load(Ordering::Acquire) }
+    }
+
+    /// Release atomic store at the one publish seam.
+    #[inline(always)]
+    fn store_release(&self, bits: usize) {
+        // SAFETY: as `load_acquire`.
+        unsafe { AtomicUsize::from_ptr(self.0.get()).store(bits, Ordering::Release) };
+    }
+
+    #[inline(always)]
     fn plain(value: Value) -> Self {
-        Self(value.bits())
+        Self::new(value.bits())
     }
 
     #[inline(always)]
     fn alias(target: SymId) -> Self {
-        Self(target.0 as usize)
+        Self::new(target.0 as usize)
     }
 
     #[inline(always)]
     fn localized(blv: BlvPtr) -> Self {
-        Self(blv.as_ptr() as usize)
+        Self::new(blv.as_ptr() as usize)
     }
 
     #[inline(always)]
-    fn forwarded(fwd: &'static LispFwd) -> Self {
-        Self(std::ptr::from_ref(fwd) as usize)
+    fn forwarded(fwd: FwdRef) -> Self {
+        Self::new(fwd.address())
     }
 
     /// The word stored under `Plainval` by [`Self::plain`].
     #[inline(always)]
-    fn read_plain(self) -> Value {
-        Value::from_bits(self.0)
+    fn read_plain(&self) -> Value {
+        Value::from_bits(self.load())
     }
 
     /// The word stored under `Varalias` by [`Self::alias`], which
     /// zero-extended it from a `u32`.
     #[inline(always)]
-    fn read_alias(self) -> SymId {
-        SymId(self.0 as u32)
+    fn read_alias(&self) -> SymId {
+        SymId(self.load() as u32)
     }
 
     /// The word stored under `Localized` by [`Self::localized`].
     #[inline(always)]
-    fn read_localized(self) -> BlvPtr {
+    fn read_localized(&self) -> BlvPtr {
         // SAFETY: only `CellWord::localized` stores under this tag, from a
         // `BlvPtr`, which is never null.
-        BlvPtr(unsafe { NonNull::new_unchecked(self.0 as *mut LispBufferLocalValue) })
+        BlvPtr(unsafe { NonNull::new_unchecked(self.load() as *mut LispBufferLocalValue) })
     }
 
     /// The word stored under `Forwarded` by [`Self::forwarded`].
     #[inline(always)]
-    fn read_forwarded(self) -> &'static LispFwd {
-        // SAFETY: only `CellWord::forwarded` stores under this tag, from a
-        // `&'static LispFwd`.
-        unsafe { &*(self.0 as *const LispFwd) }
+    fn read_forwarded(&self) -> FwdRef {
+        // Only `CellWord::forwarded` stores under this tag, and it stores a
+        // live descriptor's header address.
+        FwdRef::from_address(self.load())
     }
 
     /// Decode under the tag the word was stored with.
     #[inline(always)]
-    fn decode(self, redirect: SymbolRedirect) -> ValueCell {
+    fn decode(&self, redirect: SymbolRedirect) -> ValueCell {
         match redirect {
             SymbolRedirect::Plainval => ValueCell::Plain(self.read_plain()),
             SymbolRedirect::Varalias => ValueCell::Alias(self.read_alias()),
@@ -360,10 +472,10 @@ pub struct LispSymbol {
     val: CellWord,
     /// Function slot. `Value::NIL` is the unbound sentinel (GNU `Qnil` in
     /// `struct Lisp_Symbol::s.function`, `lisp.h:820`).
-    pub function: Value,
+    pub function: AtomicTaggedValue,
     /// Property list as a Lisp cons list (NIL = empty). Matches GNU
     /// `struct Lisp_Symbol::s.plist` (`lisp.h:820`).
-    pub plist: Value,
+    pub plist: AtomicTaggedValue,
     /// Whether this symbol is interned in the global obarray.
     pub(super) interned_global: bool,
     /// Whether `fmakunbound` explicitly masked the symbol's fallback function.
@@ -432,10 +544,10 @@ impl Clone for LispSymbol {
     fn clone(&self) -> Self {
         Self {
             name: AtomicU32::new(self.name.load(Ordering::Relaxed)),
-            flags: self.flags,
-            val: self.val,
-            function: self.function,
-            plist: self.plist,
+            flags: self.flags.clone(),
+            val: self.val.clone(),
+            function: self.function.clone(),
+            plist: self.plist.clone(),
             interned_global: self.interned_global,
             function_unbound: self.function_unbound,
         }
@@ -472,8 +584,8 @@ impl LispSymbol {
             name: AtomicU32::new(SYMBOL_NAME_SENTINEL.0),
             flags: SymbolFlags::default(),
             val: CellWord::plain(Value::UNBOUND),
-            function: Value::NIL,
-            plist: Value::NIL,
+            function: AtomicTaggedValue::new(Value::NIL),
+            plist: AtomicTaggedValue::new(Value::NIL),
             interned_global: false,
             function_unbound: false,
         }
@@ -494,7 +606,7 @@ impl LispSymbol {
     /// projected onto the World's VOID descriptor (`HEADER`), carrying the
     /// host-projection bit every checked writer refuses, as admission leaves
     /// every void cell.
-    pub(super) fn new_projected(id: SymId, header: &'static LispFwd) -> Self {
+    pub(super) fn new_projected(id: SymId, header: FwdRef) -> Self {
         let mut sym = Self::new(id);
         // A detached symbol: no other thread can see it, so the cell is
         // written without the seqlock or a pre-image note.
@@ -526,8 +638,8 @@ impl LispSymbol {
         };
         sym.flags.set_redirect(redirect);
         sym.val = word;
-        sym.function = function;
-        sym.plist = plist;
+        sym.function = function.into();
+        sym.plist = plist.into();
         sym
     }
 
@@ -561,8 +673,8 @@ impl LispSymbol {
     #[inline]
     pub(super) fn publish_fill(&mut self, src: LispSymbol) {
         let published_name = src.name.load(Ordering::Relaxed);
-        self.flags = src.flags;
-        self.val = src.val;
+        self.flags = src.flags.clone();
+        self.val = src.val.clone();
         self.function = src.function;
         self.plist = src.plist;
         self.interned_global = src.interned_global;
@@ -575,7 +687,7 @@ impl LispSymbol {
     /// The packed flags, by value.
     #[inline(always)]
     pub fn flags(&self) -> SymbolFlags {
-        self.flags
+        self.flags.clone()
     }
 
     /// [`SymbolFlags::runtime_projected`] read afresh from the cell, for a
@@ -652,16 +764,14 @@ impl LispSymbol {
     #[inline]
     pub(crate) fn value_cell_acquire(&self) -> ValueCell {
         let redirect = self.flags.load_redirect();
-        CellWord(self.load_word_acquire()).decode(redirect)
+        CellWord::new(self.load_word_acquire()).decode(redirect)
     }
 
     #[inline(always)]
     fn load_word_acquire(&self) -> usize {
-        let p = std::ptr::from_ref(&self.val.0).cast::<AtomicUsize>();
-        // SAFETY: `CellWord` is a `usize`, which `AtomicUsize` matches in
-        // size and alignment (asserted above); every store to it is atomic
-        // (`CellWrite::publish`) or happens before the slot is published.
-        unsafe { (*p).load(Ordering::Acquire) }
+        // The scan may race the mutator's publication store; both sides are
+        // atomic.
+        self.val.load_acquire()
     }
 
     /// The value of a `Plainval` cell ([`Value::UNBOUND`] when void);
@@ -698,7 +808,7 @@ impl LispSymbol {
 
     /// The descriptor of a `Forwarded` cell; `None` for every other redirect.
     #[inline(always)]
-    pub(crate) fn forwarded_descriptor(&self) -> Option<&'static LispFwd> {
+    pub(crate) fn forwarded_descriptor(&self) -> Option<FwdRef> {
         match self.flags.redirect() {
             SymbolRedirect::Forwarded => Some(self.val.read_forwarded()),
             SymbolRedirect::Plainval | SymbolRedirect::Varalias | SymbolRedirect::Localized => None,
@@ -920,10 +1030,7 @@ impl<'a> CellWrite<'a> {
         {
             crate::tagged::gc::note_root_overwrite_while_marking(old);
         }
-        let p = std::ptr::from_mut(&mut self.sym.val.0).cast::<AtomicUsize>();
-        // SAFETY: as in `LispSymbol::load_word_acquire`; `&mut` makes this
-        // the only writer.
-        unsafe { (*p).store(word.0, Ordering::Release) };
+        self.sym.val.store_release(word.load());
         match tag {
             NewTag::Keep => {}
             NewTag::Set(redirect) => self.sym.flags.set_redirect(redirect),
@@ -1002,7 +1109,7 @@ impl PlainArm<'_, '_> {
     /// GNU `defvar_int` / `defvar_bool` / `defvar_lisp` /
     /// `defvar_per_buffer` / `defvar_kboard` (`src/lread.c`,
     /// `src/buffer.c`).
-    pub(super) fn forward_to(self, fwd: &'static LispFwd) {
+    pub(super) fn forward_to(self, fwd: FwdRef) {
         self.write.publish(
             NewTag::Set(SymbolRedirect::Forwarded),
             CellWord::forwarded(fwd),
@@ -1055,18 +1162,18 @@ impl LocalizedArm<'_, '_> {
 /// A `Forwarded` cell being written.
 pub(super) struct ForwardedArm<'w, 'a> {
     write: &'w mut CellWrite<'a>,
-    fwd: &'static LispFwd,
+    fwd: FwdRef,
 }
 
 impl ForwardedArm<'_, '_> {
     #[inline]
-    pub(super) fn descriptor(&self) -> &'static LispFwd {
+    pub(super) fn descriptor(&self) -> FwdRef {
         self.fwd
     }
 
     /// Install FWD in place of the current descriptor (a re-registration,
     /// or `Obarray::clone` re-homing a stateful descriptor's copy).
-    pub(super) fn forward_to(self, fwd: &'static LispFwd) {
+    pub(super) fn forward_to(self, fwd: FwdRef) {
         self.write.publish(NewTag::Keep, CellWord::forwarded(fwd));
     }
 
@@ -1121,7 +1228,7 @@ impl LocalizedArm<'_, '_> {
 pub(super) enum RevealedCell {
     Plain(Value),
     Localized(BlvPtr),
-    Forwarded(&'static LispFwd),
+    Forwarded(FwdRef),
 }
 
 impl ForwardedArm<'_, '_> {
@@ -1199,8 +1306,8 @@ pub(super) fn read_symbol_children<const MAJOR: bool>(
         // Read the word regardless of arm; it is only INTERPRETED below when
         // the consistently-observed redirect is `Plainval`.
         let word = sym.load_word_acquire();
-        let function = load_value_atomic(&sym.function);
-        let plist = load_value_atomic(&sym.plist);
+        let function = sym.function.load_atomic();
+        let plist = sym.plist.load_atomic();
         // Boehm's reader half of `seqlock_enter`: a load above that saw a
         // store from a write window also sees, after this fence, the odd
         // count that opened it.
@@ -1211,7 +1318,7 @@ pub(super) fn read_symbol_children<const MAJOR: bool>(
         }
         // Consistent snapshot. `is_heap_object()` excludes fixnums, nil, symbol
         // ids and UNBOUND, so the Plainval gate never traces a non-heap word.
-        if let ValueCell::Plain(plain) = CellWord(word).decode(redirect)
+        if let ValueCell::Plain(plain) = CellWord::new(word).decode(redirect)
             && (plain.is_heap_object()
                 || (MAJOR && matches!(plain.kind(), crate::tagged::value::ValueKind::Symbol(_))))
         {

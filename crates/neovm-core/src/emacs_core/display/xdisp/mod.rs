@@ -19,6 +19,7 @@
 //!
 //! | Knob | Unset default | Values | Effect |
 //! | --- | --- | --- | --- |
+//! | `NEOMACS_FONTIFICATION_RAW_BOUNDARY` | `on` | `off`; `on`/`1`/`true`/`yes` | Reuse exact bounded raw fontified scans only when existing category/alias/default absence proofs hold |
 //! | `NEOMACS_POSN_BOUNDED_TEXT` | `on` | `off`; `on`/`1`/`true`/`yes` | Bound text copied by approximate window-position fallbacks |
 //! | `NEOMACS_MODE_LINE_PROP_SLICE` | `off` | `off`; `on`/`1`/`true`/`yes` | Clip and graft literal source intervals with one plist copy |
 //! | `NEOMACS_MODE_LINE_PROP_BORROW` | `off` | `off`; `on`/`1`/`true`/`yes` | Borrow source string intervals during synchronous mode-line property reads |
@@ -36,8 +37,10 @@ pub fn mode_line_flow_enabled() -> bool {
 mod text_measurement;
 use crate::emacs_core::eval::VariableView;
 use text_measurement::TextMeasurement;
+mod fontification_boundary;
 mod mode_line_gc;
 mod mode_line_numeric_padding;
+use fontification_boundary::{FontificationBoundaryAdmission, FontificationBoundaryMode};
 pub(crate) mod motion;
 
 use self::motion::MotionEngine;
@@ -7931,7 +7934,15 @@ fn live_position_visibility(
         }
     };
     if let Some(snapshot) = eval.fresh_window_display_snapshot(fid, wid, buffer_id) {
-        return Ok(Some(measure(snapshot)));
+        let visibility = measure(snapshot);
+        // A position the hscroll hides has no point in the snapshot; GNU
+        // still reports it (left of the text area), so re-walk for it below
+        // as GNU re-walks for every call.
+        let hidden = matches!(visibility, PositionVisibility::NotVisible)
+            && pos.is_some_and(|pos| snapshot.position_hidden_by_hscroll(pos));
+        if !hidden {
+            return Ok(Some(visibility));
+        }
     }
     let scope = pos.map_or(crate::window::WindowLayoutQueryScope::Viewport, |target| {
         crate::window::WindowLayoutQueryScope::Position { target }
@@ -8459,6 +8470,12 @@ fn validate_posn_pixel_coordinate(value: Value) -> Result<i64, Flow> {
 // Redisplay fontification
 // ---------------------------------------------------------------------------
 
+mod fontification_demand;
+use fontification_demand::{FontificationDemandObserver, NoFontificationDemand};
+pub use fontification_demand::{
+    RedisplayFontificationCoverage, RedisplayFontificationDemand, RedisplayFontificationWitness,
+};
+
 fn get_fontified_property(ctx: &mut super::eval::Context, pos: i64) -> EvalResult {
     super::textprop::builtin_get_char_property(
         ctx,
@@ -8470,7 +8487,15 @@ fn next_fontified_property_change(
     ctx: &mut super::eval::Context,
     pos: i64,
     limit: i64,
+    mode: FontificationBoundaryMode,
 ) -> EvalResult {
+    match fontification_boundary::admit(ctx, pos, limit, mode)? {
+        FontificationBoundaryAdmission::Raw(next)
+        | FontificationBoundaryAdmission::Resolved(next) => {
+            return Ok(Value::fixnum(next.as_i64()));
+        }
+        FontificationBoundaryAdmission::UseGeneric => {}
+    }
     super::textprop::builtin_next_single_property_change(
         ctx,
         vec![
@@ -8482,7 +8507,12 @@ fn next_fontified_property_change(
     )
 }
 
-fn call_fontification_functions_at(ctx: &mut super::eval::Context, hook_value: Value, pos: i64) {
+fn call_fontification_functions_at<O: FontificationDemandObserver>(
+    ctx: &mut super::eval::Context,
+    hook_value: Value,
+    pos: i64,
+    observer: &mut O,
+) {
     let hook_sym = intern("fontification-functions");
     let functions = hook_runtime::collect_hook_functions_in_state(ctx, hook_sym, hook_value, true);
     if functions.is_empty() {
@@ -8526,6 +8556,7 @@ fn call_fontification_functions_at(ctx: &mut super::eval::Context, hook_value: V
             );
             continue;
         }
+        observer.callback();
         let result = ctx.apply(function, vec![arg]);
         let result = ctx.unbind_to_with_result(call_count, result);
         if let Err(flow) = result {
@@ -8553,13 +8584,18 @@ fn call_fontification_functions_at(ctx: &mut super::eval::Context, hook_value: V
 /// into a fontified one.
 ///
 /// GNU's `handle_fontified_prop` recomputes iterator properties only for the
-/// second state.  Keeping that distinction typed lets the immutable layout
+/// successful transition. Keeping callback entry separate lets the immutable layout
 /// engine retry after a successful callback without looping forever when a
 /// fontification function declines to mark the requested position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RedisplayFontificationOutcome {
+    /// No fontification callback was entered. Native property inspection alone
+    /// cannot invalidate the caller's owned layout inputs.
     #[default]
     Unchanged,
+    /// A callback may have run without marking the requested position. This
+    /// includes an unsuccessful callback: it still requires fresh validation.
+    CallbacksUnchanged,
     Fontified,
 }
 
@@ -8567,12 +8603,19 @@ impl RedisplayFontificationOutcome {
     pub const fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Fontified, _) | (_, Self::Fontified) => Self::Fontified,
+            (Self::CallbacksUnchanged, _) | (_, Self::CallbacksUnchanged) => {
+                Self::CallbacksUnchanged
+            }
             (Self::Unchanged, Self::Unchanged) => Self::Unchanged,
         }
     }
 
     pub const fn requires_layout_retry(self) -> bool {
         matches!(self, Self::Fontified)
+    }
+
+    pub const fn entered_callbacks(self) -> bool {
+        !matches!(self, Self::Unchanged)
     }
 }
 
@@ -8589,18 +8632,88 @@ pub fn ensure_fontified_for_redisplay(
     from_char: i64,
     to_char: i64,
 ) -> Result<RedisplayFontificationOutcome, Flow> {
+    ensure_fontified_for_redisplay_with_mode(
+        ctx,
+        buf_id,
+        from_char,
+        to_char,
+        fontification_boundary::mode(),
+    )
+}
+
+// Explicit mode keeps tests independent of shared environment/TLS mutation.
+fn ensure_fontified_for_redisplay_with_mode(
+    ctx: &mut super::eval::Context,
+    buf_id: BufferId,
+    from_char: i64,
+    to_char: i64,
+    mode: FontificationBoundaryMode,
+) -> Result<RedisplayFontificationOutcome, Flow> {
+    ensure_fontified_for_redisplay_inner(
+        ctx,
+        buf_id,
+        from_char,
+        to_char,
+        mode,
+        &mut NoFontificationDemand,
+    )
+}
+
+/// Observe the canonical request without changing boundary mode, callbacks or scans.
+/// Producer evidence grants no reuse or source-lifetime authority.
+pub fn ensure_fontified_for_redisplay_with_demand(
+    ctx: &mut super::eval::Context,
+    buf_id: BufferId,
+    from_char: i64,
+    to_char: i64,
+    demand: &mut RedisplayFontificationDemand,
+) -> Result<RedisplayFontificationOutcome, Flow> {
+    let result = ensure_fontified_for_redisplay_inner(
+        ctx,
+        buf_id,
+        from_char,
+        to_char,
+        fontification_boundary::mode(),
+        demand,
+    );
+    if result.is_err() {
+        demand.abort();
+    }
+    result
+}
+
+fn ensure_fontified_for_redisplay_inner<O: FontificationDemandObserver>(
+    ctx: &mut super::eval::Context,
+    buf_id: BufferId,
+    from_char: i64,
+    to_char: i64,
+    mode: FontificationBoundaryMode,
+    observer: &mut O,
+) -> Result<RedisplayFontificationOutcome, Flow> {
     let Some((point_min, point_max)) = ctx.buffers.get(buf_id).map(|buffer| {
         (
             buffer.point_min_lisp_char_pos().as_i64(),
             buffer.point_max_lisp_char_pos().as_i64(),
         )
     }) else {
+        observer.unknown();
         return Ok(RedisplayFontificationOutcome::Unchanged);
     };
 
     let start = from_char.saturating_add(1).clamp(point_min, point_max);
     let end = to_char.saturating_add(1).clamp(start, point_max);
+    observer.begin(buf_id, LispCharPos1::new(start), LispCharPos1::new(end));
+    // The buffer interval proof does not certify effective overlay precedence.
+    if O::ENABLED
+        && ctx
+            .buffers
+            .get(buf_id)
+            .is_some_and(|buffer| !buffer.overlays().is_empty())
+    {
+        observer.unknown();
+    }
     if start >= end {
+        observer.complete();
         return Ok(RedisplayFontificationOutcome::Unchanged);
     }
 
@@ -8615,12 +8728,14 @@ pub fn ensure_fontified_for_redisplay(
             .unwrap_or(Value::NIL)
             .is_truthy()
         {
+            observer.unknown();
             return Ok(RedisplayFontificationOutcome::Unchanged);
         }
 
         let hook_sym = intern("fontification-functions");
         let hook_value = hook_runtime::hook_value_by_id(ctx, hook_sym).unwrap_or(Value::NIL);
         if hook_value.is_nil() {
+            observer.unknown();
             return Ok(RedisplayFontificationOutcome::Unchanged);
         }
 
@@ -8643,7 +8758,11 @@ pub fn ensure_fontified_for_redisplay(
 
             let before = get_fontified_property(ctx, pos)?;
             if before.is_nil() {
-                call_fontification_functions_at(ctx, hook_value, pos);
+                observer.unknown();
+                // Mark before entering Lisp, including callbacks which fail,
+                // decline to fontify, or remove the current buffer.
+                outcome = outcome.merge(RedisplayFontificationOutcome::CallbacksUnchanged);
+                call_fontification_functions_at(ctx, hook_value, pos, observer);
                 if ctx.buffers.current_buffer_id() != Some(buf_id) {
                     ctx.restore_current_buffer_if_live(buf_id);
                 }
@@ -8657,19 +8776,30 @@ pub fn ensure_fontified_for_redisplay(
                 // same unfontified position.
                 let after = get_fontified_property(ctx, pos)?;
                 if after.is_nil() {
+                    observer.advance(LispCharPos1::new(pos), LispCharPos1::new(pos + 1), false);
                     pos += 1;
                     continue;
                 }
                 outcome = RedisplayFontificationOutcome::Fontified;
             }
 
-            let next = next_fontified_property_change(ctx, pos, end)?;
+            let next = next_fontified_property_change(ctx, pos, end, mode)?;
             let Some(next_pos) = next.as_int() else {
                 break;
             };
             if next_pos <= pos {
+                observer.advance(
+                    LispCharPos1::new(pos),
+                    LispCharPos1::new(pos + 1),
+                    !before.is_nil(),
+                );
                 pos += 1;
             } else {
+                observer.advance(
+                    LispCharPos1::new(pos),
+                    LispCharPos1::new(next_pos.min(end)),
+                    !before.is_nil(),
+                );
                 pos = next_pos.min(end);
             }
         }
@@ -8677,6 +8807,7 @@ pub fn ensure_fontified_for_redisplay(
         Ok(outcome)
     })();
 
+    observer.complete();
     if let Some(saved) = saved_current {
         ctx.restore_current_buffer_if_live(saved);
     }
@@ -8765,6 +8896,26 @@ pub(crate) fn builtin_posn_at_point(
     else {
         return Ok(Value::NIL);
     };
+    // GNU `Fposn_at_point` (src/keyboard.c:13073-13097) builds the posn from
+    // `pos-visible-in-window-p's (X Y): "Point invisible due to hscrolling?
+    // X can be -1 when a newline in a R2L line overflows into the left
+    // fringe", so X < -1 answers nil, and X = -1 goes through
+    // `posn-at-x-y' like any other coordinate.
+    if metrics.x < -1 {
+        return Ok(Value::NIL);
+    }
+    if metrics.x == -1 {
+        let window = args.get(1).copied().unwrap_or(Value::NIL);
+        return builtin_posn_at_x_y(
+            eval,
+            vec![
+                Value::fixnum(metrics.x),
+                Value::fixnum(metrics.y),
+                window,
+                Value::NIL,
+            ],
+        );
+    }
     Ok(make_text_area_position(window_id, metrics))
 }
 
@@ -8828,7 +8979,17 @@ fn compute_live_window_geometry_scope(
     // GNU's coordinate queries walk from the live window start even on a
     // graphical frame. Using the renderer's older presentation during queued
     // pixel-scroll commands makes point correction undo part of the gesture.
-    if frame.initial || eval.noninteractive() {
+    //
+    // The only gate GNU has here is the initial frame: `pos_visible_p`
+    // returns false for FRAME_INITIAL_P (src/xdisp.c:1703) and runs its
+    // iterator for every other frame, batch or not.  Ledger 201 also refused
+    // batch, taking the `noninteractive` test of `window-end' with UPDATE
+    // (src/window.c:1861) and `window-line-height' for a gate of this path;
+    // it is not one, and `pos-visible-in-window-p' already walked here in
+    // batch while `posn-at-point' answered nil for every position before
+    // the first redisplay of a terminal frame made in batch (GNU 31.1:
+    // (10 . 10) for column 10).  Both now share this one walk.
+    if frame.initial {
         return Ok(None);
     }
     // A populated snapshot that is still FRESH already answered (or correctly
@@ -8857,10 +9018,26 @@ fn compute_live_window_geometry_scope(
     // `pos_visible_p` re-run the iterator on EVERY call (src/dispnew.c:6277-6286,
     // src/xdisp.c:1772-1774).  Recomputing when the rows are invalid is that
     // behaviour expressed as a cache.
+    //
+    // One exception: a position the hscroll hides on a visible row has no
+    // point in any snapshot redisplay produced (it drew nothing there), yet
+    // GNU reports it at its x left of the text area.  That is not a snapshot
+    // that answered "not visible"; it is a question only the walk can answer,
+    // so it recomputes, as GNU recomputes every time.
     let buffer_id = frame.find_window(wid).and_then(|window| window.buffer_id());
+    let hidden_target = match scope {
+        crate::window::WindowLayoutQueryScope::Position { target } => Some(target),
+        _ => None,
+    };
     if buffer_id
         .and_then(|buffer_id| eval.fresh_window_display_snapshot(fid, wid, buffer_id))
-        .is_some_and(|snapshot| snapshot.has_points())
+        .is_some_and(|snapshot| {
+            snapshot.has_points()
+                && !hidden_target.is_some_and(|target| {
+                    snapshot.point_for_buffer_pos(target).is_none()
+                        && snapshot.position_hidden_by_hscroll(target)
+                })
+        })
     {
         return Ok(None);
     }
@@ -10089,3 +10266,7 @@ mod mode_line_outer_flow;
 #[cfg(test)]
 #[path = "tests/mode_line_outer_handlers_test.rs"]
 mod mode_line_outer_handlers;
+
+#[cfg(test)]
+#[path = "tests/fontification_demand_test.rs"]
+mod fontification_demand_tests;

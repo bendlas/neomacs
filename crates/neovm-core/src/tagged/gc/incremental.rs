@@ -397,7 +397,7 @@ impl TaggedHeap {
                     self.all_objects = current;
                     self.sweep_noncons_live_bytes = self
                         .sweep_noncons_live_bytes
-                        .saturating_add(Self::object_bytes_from_header(current));
+                        .saturating_add(self.collector_object_bytes(current));
                 } else {
                     self.non_cons_object_addrs.remove(&(current as usize));
                     self.unregister_vector_object(current);
@@ -596,7 +596,7 @@ impl TaggedHeap {
     // about twenty instructions per cell even with generations disabled.
     #[inline(always)]
     pub(super) fn mark_or_push_child(&mut self, val: TaggedValue, origin: &str) {
-        match val.kind() {
+        match val.gc_kind() {
             crate::tagged::value::ValueKind::Symbol(id) => self.mark_symbol(id),
             _ if val.is_heap_object() => self.push_gray(val, origin),
             _ => {}
@@ -611,7 +611,7 @@ impl TaggedHeap {
 
         let (ptr, expected) = if val.is_string() {
             (
-                val.as_string_ptr().unwrap() as *const u8,
+                val.gc_string_ptr().unwrap() as *const u8,
                 HeapObjectKind::String,
             )
         } else if val.is_float() {
@@ -621,7 +621,7 @@ impl TaggedHeap {
             )
         } else if val.is_veclike() {
             (
-                val.as_veclike_ptr().unwrap() as *const u8,
+                val.gc_veclike_ptr().unwrap() as *const u8,
                 HeapObjectKind::VecLike,
             )
         } else {
@@ -651,27 +651,27 @@ impl TaggedHeap {
 
     /// Mark a single tagged value and push its children onto the gray queue.
     pub(super) fn mark_value<const MINOR: bool>(&mut self, val: TaggedValue) {
-        if let crate::tagged::value::ValueKind::Symbol(id) = val.kind() {
+        if let crate::tagged::value::ValueKind::Symbol(id) = val.gc_kind() {
             self.mark_symbol(id);
         } else if val.is_cons() {
             // GNU `mark_object`'s cdr-chasing loop: a list is marked along
             // its spine inline, without a gray-queue push + pop + re-dispatch
             // per cell — for a megacons list that round trip is a second
             // multi-megabyte buffer streamed through the cache.
-            let mut ptr = val.xcons_ptr();
+            let mut ptr = val.gc_cons_ptr();
             while self.mark_cons::<MINOR>(ptr) {
                 let car = unsafe { (*ptr).load_car() };
                 let cdr = unsafe { (*ptr).load_cdr() };
                 self.mark_or_push_child(car, "cons-car");
                 if cdr.is_cons() {
-                    ptr = cdr.xcons_ptr();
+                    ptr = cdr.gc_cons_ptr();
                     continue;
                 }
                 self.mark_or_push_child(cdr, "cons-cdr");
                 break;
             }
         } else if val.is_string() {
-            let ptr = val.as_string_ptr().unwrap() as *mut StringObj;
+            let ptr = val.gc_string_ptr().unwrap() as *mut StringObj;
             // Dump-span test first: a mapped string used to walk the string
             // arena and miss the residual addr-set before classification.
             let addr = ptr as usize;
@@ -734,7 +734,7 @@ impl TaggedHeap {
                 self.note_minor_survivor(ptr.cast());
             };
         } else if val.is_veclike() {
-            let ptr = val.as_veclike_ptr().unwrap() as *mut VecLikeHeader;
+            let ptr = val.gc_veclike_ptr().unwrap() as *mut VecLikeHeader;
             // Dump-span test first: mapped veclikes paid all six arena range
             // checks plus an FxHashSet miss per mark (~10.7M Ir in the
             // first-cycle window of the type sim) before being classified.
@@ -908,15 +908,15 @@ impl TaggedHeap {
             VecLikeType::CharTable => {
                 let obj = unsafe { &*(ptr as *const CharTableObj) };
                 for (value, origin) in [
-                    (load_value_atomic(&obj.defalt), "char-table-default"),
-                    (load_value_atomic(&obj.parent), "char-table-parent"),
-                    (load_value_atomic(&obj.purpose), "char-table-purpose"),
-                    (load_value_atomic(&obj.ascii), "char-table-ascii"),
+                    (obj.defalt.load_atomic(), "char-table-default"),
+                    (obj.parent.load_atomic(), "char-table-parent"),
+                    (obj.purpose.load_atomic(), "char-table-purpose"),
+                    (obj.ascii.load_atomic(), "char-table-ascii"),
                 ] {
                     self.mark_or_push_child(value, origin);
                 }
                 for slot in &obj.contents {
-                    let val = load_value_atomic(slot);
+                    let val = slot.load_atomic();
                     self.mark_or_push_child(val, "char-table-content");
                 }
                 for val in obj.extras.iter_atomic() {
@@ -940,65 +940,74 @@ impl TaggedHeap {
                 for val in font.fields.iter_atomic() {
                     self.mark_or_push_child(val, "font-property");
                 }
-                self.mark_or_push_child(load_value_atomic(&font.capability), "font-capability");
+                // Unsupported worker kinds defer their mutable payloads;
+                // this owner-side drain excludes Lisp writers.
+                self.mark_or_push_child(font.capability, "font-capability");
             }
             VecLikeType::HashTable => {
                 let obj = ptr as *const HashTableObj;
-                let ht = unsafe { &(*obj).table };
-                if ht.weakness.is_some() {
-                    // Weak table: DON'T trace its entries here — that would keep
-                    // every key/value alive and defeat weakness. Record it; the
-                    // per-entry survival decision happens in
-                    // `mark_and_sweep_weak_tables` at the stop-the-world
-                    // `complete_collection`, after the main mark drains (GNU
-                    // `mark_and_sweep_weak_table_contents`). The remembered-set /
-                    // SATB / permanent-scan paths now also defer weak entries
-                    // (`register_weak_hash_table_for_sweep` registers the table
-                    // and pushes only its non-weak closures), and a tenured/mapped
-                    // weak table is re-registered every cycle via
-                    // `permanent_weak_hash_tables`, so weak semantics hold for
-                    // young, tenured, and dumped tables alike. The weak sweep runs
-                    // before `verify_dump_partition`, so dead entries are removed
-                    // before the verifier enumerates — no UAF.
-                    let tptr = obj as *mut HashTableObj;
-                    if self.weak_hash_tables_set.insert(tptr) {
-                        self.weak_hash_tables.push(tptr);
-                    }
-                } else if let Some(pending) = ht.data.pending_entries() {
-                    // Un-hydrated dump table: its entries live in the parked
-                    // vec; trace exactly the set the hydrated arms below
-                    // would (values + key snapshots - HashKeys are not
-                    // walked in either form).
-                    for (_, value, snapshot) in pending {
-                        self.mark_or_push_child(*value, "hash-table-pending-value");
-                        if let Some(snapshot) = snapshot {
-                            self.mark_or_push_child(*snapshot, "hash-table-pending-key");
+                let tables = self.collector_tables();
+                // SAFETY: trace retains this live object and the current stop scope.
+                unsafe {
+                    tables.inspect(obj.cast_mut(), |ht| {
+                        if ht.weakness.is_some() {
+                            // Weak table: DON'T trace its entries here — that would keep
+                            // every key/value alive and defeat weakness. Record it; the
+                            // per-entry survival decision happens in
+                            // `mark_and_sweep_weak_tables` at the stop-the-world
+                            // `complete_collection`, after the main mark drains (GNU
+                            // `mark_and_sweep_weak_table_contents`). The remembered-set /
+                            // SATB / permanent-scan paths now also defer weak entries
+                            // (`register_weak_hash_table_for_sweep` registers the table
+                            // and pushes only its non-weak closures), and a tenured/mapped
+                            // weak table is re-registered every cycle via
+                            // `permanent_weak_hash_tables`, so weak semantics hold for
+                            // young, tenured, and dumped tables alike. The weak sweep runs
+                            // before `verify_dump_partition`, so dead entries are removed
+                            // before the verifier enumerates — no UAF.
+                            let tptr = obj as *mut HashTableObj;
+                            if self.weak_hash_tables_set.insert(tptr) {
+                                self.weak_hash_tables.push(tptr);
+                            }
+                        } else if let Some(pending) = ht.data.pending_entries() {
+                            // Un-hydrated dump table: its entries live in the parked
+                            // vec; trace exactly the set the hydrated arms below
+                            // would (values + key snapshots - HashKeys are not
+                            // walked in either form).
+                            for (_, value, snapshot) in pending {
+                                self.mark_or_push_child(*value, "hash-table-pending-value");
+                                if let Some(snapshot) = snapshot {
+                                    self.mark_or_push_child(*snapshot, "hash-table-pending-key");
+                                }
+                            }
+                        } else {
+                            // Owner-side tracing reads current entries while
+                            // Lisp writers are excluded. The worker separately
+                            // reads an immutable original under its hash lease.
+                            for slot in ht.data.values() {
+                                let val = *slot;
+                                self.mark_or_push_child(val, "hash-table-value");
+                            }
+                            // Trace key snapshots (original key objects)
+                            for slot in ht.key_snapshots() {
+                                let val = *slot;
+                                self.mark_or_push_child(val, "hash-table-key-snapshot");
+                            }
                         }
-                    }
-                } else {
-                    // Trace all values in the hash table
-                    for slot in ht.data.values() {
-                        let val = load_value_atomic(slot);
-                        self.mark_or_push_child(val, "hash-table-value");
-                    }
-                    // Trace key snapshots (original key objects)
-                    for slot in ht.key_snapshots() {
-                        let val = load_value_atomic(slot);
-                        self.mark_or_push_child(val, "hash-table-key-snapshot");
-                    }
-                }
-                // Custom test/hash closures (from `define-hash-table-test`) live
-                // ONLY in these fields. Without tracing them the closure is swept
-                // while the table is still live, and the next custom-test
-                // gethash/puthash calls a freed function (use-after-free). The
-                // fields are immutable after table creation, so a plain read is
-                // race-free during a concurrent mark.
-                if let Some(f) = ht.user_cmp_function {
-                    self.mark_or_push_child(f, "hash-table-user-cmp");
-                }
-                if let Some(f) = ht.user_hash_function {
-                    self.mark_or_push_child(f, "hash-table-user-hash");
-                }
+                        // Custom test/hash closures (from `define-hash-table-test`) live
+                        // ONLY in these fields. Without tracing them the closure is swept
+                        // while the table is still live, and the next custom-test
+                        // gethash/puthash calls a freed function (use-after-free). The
+                        // fields are immutable after table creation, so a plain read is
+                        // race-free during a concurrent mark.
+                        if let Some(f) = ht.user_cmp_function {
+                            self.mark_or_push_child(f, "hash-table-user-cmp");
+                        }
+                        if let Some(f) = ht.user_hash_function {
+                            self.mark_or_push_child(f, "hash-table-user-hash");
+                        }
+                    })
+                };
             }
             VecLikeType::Obarray => {
                 let obj = unsafe { &*(ptr as *const ObarrayObj) };
@@ -1063,8 +1072,9 @@ impl TaggedHeap {
             VecLikeType::Overlay => {
                 let obj = ptr as *const OverlayObj;
                 let data = unsafe { &(*obj).data };
-                // Trace the property list
-                let plist = load_value_atomic(&data.plist);
+                // Overlay payloads are deferred by the worker and traced
+                // here with Lisp writers excluded.
+                let plist = data.plist;
                 self.mark_or_push_child(plist, "overlay-plist");
             }
             VecLikeType::SymbolWithPos => {
@@ -1092,16 +1102,15 @@ impl TaggedHeap {
             }
             VecLikeType::Xwidget => {
                 let obj = ptr as *const XwidgetObj;
+                // The worker defers xwidget payloads; this owner-side
+                // drain reads them with Lisp writers excluded.
                 let fields = unsafe {
                     [
-                        (load_value_atomic(&(*obj).plist), "xwidget-plist"),
-                        (load_value_atomic(&(*obj).type_), "xwidget-type"),
-                        (load_value_atomic(&(*obj).buffer), "xwidget-buffer"),
-                        (load_value_atomic(&(*obj).title), "xwidget-title"),
-                        (
-                            load_value_atomic(&(*obj).script_callbacks),
-                            "xwidget-script-callbacks",
-                        ),
+                        ((*obj).plist, "xwidget-plist"),
+                        ((*obj).type_, "xwidget-type"),
+                        ((*obj).buffer, "xwidget-buffer"),
+                        ((*obj).title, "xwidget-title"),
+                        ((*obj).script_callbacks, "xwidget-script-callbacks"),
                     ]
                 };
                 for (value, label) in fields {
@@ -1588,8 +1597,12 @@ impl TaggedHeap {
         // cycle that just marked them (this eager sweep runs inside the same
         // collection, before any next flip).
         let parity = self.mark_parity;
-        let mut prev: *mut *mut GcHeader = &mut self.all_objects;
-        let mut current = self.all_objects;
+        // The unlink cursor must not borrow a field of `self`: promotion and
+        // reclamation below reborrow the whole heap. Keep the head local until
+        // those calls finish, just as the incremental sweep detaches its list.
+        let mut head = std::mem::replace(&mut self.all_objects, std::ptr::null_mut());
+        let mut prev = std::ptr::addr_of_mut!(head);
+        let mut current = head;
         let mut live_bytes = 0usize;
         while !current.is_null() {
             // SAFETY: sweeping is exclusive with every marker and mutator;
@@ -1606,8 +1619,8 @@ impl TaggedHeap {
                 debug_assert!(!(*current).tenured, "tenured object on the young list");
                 if (*current).is_marked_at(parity) {
                     // Keep it — advance prev
-                    live_bytes = live_bytes.saturating_add(Self::object_bytes_from_header(current));
-                    prev = &mut (*current).next;
+                    live_bytes = live_bytes.saturating_add(self.collector_object_bytes(current));
+                    prev = std::ptr::addr_of_mut!((*current).next);
                     current = next;
                 } else {
                     // Free it — unlink from list
@@ -1622,6 +1635,12 @@ impl TaggedHeap {
             }
         }
 
+        // Sweeping must not append young allocations while its list is detached.
+        debug_assert!(
+            self.all_objects.is_null(),
+            "the eager sweep must not allocate into the young list"
+        );
+        self.all_objects = head;
         live_bytes
     }
 
@@ -1946,7 +1965,9 @@ impl TaggedHeap {
                             if let Some(fin) = unsafe { (*up).finalizer.take() } {
                                 // SAFETY: module allocation supplied this pointer
                                 // and callback pair; explicit reclamation is its
-                                // ownership-ending invocation.
+                                // ownership-ending invocation. EmacsFinalizer's
+                                // GNU contract excludes heap/TLS/env reentry;
+                                // the collector's protected loan remains live.
                                 unsafe { fin((*up).ptr) };
                             }
                         }
@@ -1964,6 +1985,8 @@ impl TaggedHeap {
                             if let Some(fin) = unsafe { (*mf).finalizer.take() } {
                                 // SAFETY: the module registered the callback for
                                 // this closure data; explicit reclaim ends it.
+                                // Its EmacsFinalizer contract excludes heap/TLS/
+                                // env reentry while this sweep loan is live.
                                 unsafe { fin((*mf).data) };
                             }
                         }
@@ -2370,6 +2393,16 @@ impl TaggedHeap {
     #[cfg(test)]
     pub(crate) fn bytecode_arena_owns_for_test(&self, ptr: *const u8) -> bool {
         self.bytecode_arena.owns(ptr)
+    }
+
+    /// Whether this heap still lists VALUE, a vectorlike, in an arena or the
+    /// residual box set. Address membership only: a reclaimed box is absent
+    /// and is not dereferenced. Admission uses this to decide whether an
+    /// unrooted empty weak table survived a serial collection.
+    pub(crate) fn retains_veclike(&self, value: TaggedValue) -> bool {
+        value.is_veclike()
+            && Self::value_heap_addr(value)
+                .is_some_and(|addr| self.owns_veclike_object(addr as *const u8))
     }
 
     /// Test-only allocated ownership, including conses in a surviving block.

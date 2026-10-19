@@ -6893,7 +6893,6 @@ fn vm_case_table_builtins_use_shared_buffer_state() {
         vm_eval_str(
             r#"(let* ((buf (current-buffer))
                       (other (get-buffer-create "*case-other*"))
-                      (third (get-buffer-create "*case-third*"))
                       (standard (standard-case-table))
                       (custom (copy-sequence standard)))
                  (list
@@ -6903,7 +6902,7 @@ fn vm_case_table_builtins_use_shared_buffer_state() {
                   (progn (set-buffer other) (eq (current-case-table) standard))
                   (progn (set-buffer buf) (eq (current-case-table) custom))
                   (progn (set-standard-case-table custom) (eq (standard-case-table) custom))
-                  (progn (set-buffer third) (eq (current-case-table) custom))))"#
+                  (progn (set-buffer (get-buffer-create "*case-third*")) (eq (current-case-table) custom))))"#
         ),
         "OK (t t t t t t t)"
     );
@@ -7590,8 +7589,37 @@ fn vm_set_process_thread_builtin_uses_shared_runtime_state() {
 #[test]
 fn vm_non_child_process_creation_builtins_use_shared_runtime_state() {
     crate::test_utils::init_test_tracing();
+    // GNU's serial_configure reads the device with tcgetattr first and reports
+    // its failure (src/sysdep.c:3164-3166).  Linux initialises a pty master
+    // when it is opened, so /dev/ptmx configures there; Darwin initialises the
+    // tty only when its slave is first opened (measured by this tree's
+    // SerialTestPty fixture), so the same port signals
+    // (file-error "Failed tcgetattr" ...) under GNU and NeoVM alike on Darwin.
+    let serial_pty_probe = if cfg!(target_os = "macos") {
+        r#"(condition-case err
+                     (let ((p (make-serial-process :name "sp" :port "/dev/ptmx" :speed 9600)))
+                       (list (processp p)
+                             (eq (process-type p) 'serial)))
+                   (error err))"#
+    } else {
+        r#"(let ((p (make-serial-process :name "sp" :port "/dev/ptmx" :speed 9600)))
+                     (list (processp p)
+                           (eq (process-type p) 'serial)))"#
+    };
+    let serial_pty_row = if cfg!(target_os = "macos") {
+        // Darwin reports ENOTTY from tcgetattr on a pty master whose slave
+        // has never been opened.  GNU passes the host's strerror text through
+        // (report_file_errno, src/fileio.c:286-300), so build the row from the
+        // same host call rather than pinning one libc's words.
+        format!(
+            "(file-error \"Failed tcgetattr\" \"{}\")",
+            crate::emacs_core::errno::emacs_strerror(libc::ENOTTY)
+        )
+    } else {
+        "(t t)".to_owned()
+    };
     assert_eq!(
-        vm_eval_str(
+        vm_eval_str(&format!(
             r#"(list
                  (make-network-process)
                  (condition-case err (make-network-process :name "np") (error err))
@@ -7614,11 +7642,11 @@ fn vm_non_child_process_creation_builtins_use_shared_runtime_state() {
                  (condition-case err (make-serial-process :name "sp" :port 1 :speed 9600) (error err))
                  (condition-case err (make-serial-process :name "sp") (error err))
                  (condition-case err (make-serial-process :name "sp" :port "/tmp/no-port") (error err))
-                 (let ((p (make-serial-process :name "sp" :port "/dev/ptmx" :speed 9600)))
-                   (list (processp p)
-                         (eq (process-type p) 'serial))))"#
-        ),
-        "OK (nil (wrong-type-argument stringp nil) (error \":name value not a string\") (error \"Missing :name keyword parameter\") (t t t) nil (t t t t) (error \":name value not a string\") nil (wrong-type-argument stringp t) (wrong-type-argument stringp 1) (error \"No port specified\") (error \":speed not specified\") (t t))"
+                 {serial_pty_probe})"#
+        )),
+        format!(
+            "OK (nil (wrong-type-argument stringp nil) (error \":name value not a string\") (error \"Missing :name keyword parameter\") (t t t) nil (t t t t) (error \":name value not a string\") nil (wrong-type-argument stringp t) (wrong-type-argument stringp 1) (error \"No port specified\") (error \":speed not specified\") {serial_pty_row})"
+        )
     );
 }
 
@@ -8581,14 +8609,26 @@ fn vm_sqlite_preserves_i64_errors_and_result_set_lifetime() {
 #[test]
 fn vm_native_stub_clusters_use_direct_dispatch() {
     crate::test_utils::init_test_tracing();
-    assert_eq!(
-        vm_eval_str(
-            r##"(list
-                 (null (fboundp 'debug-timer-check))
-                 (let ((w (inotify-add-watch "/tmp" nil nil)))
+    // GNU compiles src/inotify.c only under HAVE_INOTIFY (src/Makefile.in:
+    // "inotify.o if HAVE_INOTIFY"), and its file-notify backend is kqueue on
+    // Darwin (src/kqueue.c:338,475,505).  NeoVM declares the same split when
+    // it registers these subrs (file_notify/subrs.rs), so the inotify cluster
+    // is three live calls on Linux and three absences elsewhere.
+    let file_notify_probe = if cfg!(target_os = "linux") {
+        r#"(let ((w (inotify-add-watch "/tmp" nil nil)))
                    (list (consp w)
                          (inotify-valid-p w)
-                         (inotify-rm-watch w)))
+                         (inotify-rm-watch w)))"#
+    } else {
+        r#"(list (null (fboundp 'inotify-add-watch))
+                   (null (fboundp 'inotify-rm-watch))
+                   (null (fboundp 'inotify-valid-p)))"#
+    };
+    assert_eq!(
+        vm_eval_str(&format!(
+            r##"(list
+                 (null (fboundp 'debug-timer-check))
+                 {file_notify_probe}
                  (null (fboundp 'inotify-watch-list))
                  (null (fboundp 'inotify-allocated-p))
                  (eq (condition-case err
@@ -8663,7 +8703,7 @@ fn vm_native_stub_clusters_use_direct_dispatch() {
                    (error t))
                  (condition-case nil (gnutls-symmetric-encrypt nil nil nil nil)
                    (error t)))"##
-        ),
+        )),
         r#"OK (t (t t t) t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t t (t wrong-type-argument wrong-type-argument t t t) t t t t t)"#
     );
 }
@@ -12561,3 +12601,346 @@ mod fillarray_identity;
 #[cfg(test)]
 #[path = "frame_bindings.rs"]
 mod frame_bindings;
+
+/// `(lambda (x) (switch x TABLE) ...)` as GNU bytes through the deferred
+/// decode, so the proof admits the switch and the function runs in the
+/// VERIFIED driver: `dup; constant table; switch; constant 10; return;
+/// constant 20; return; constant 30; return` -- a miss answers 10, byte
+/// offset 5 answers 20, byte offset 7 answers 30.
+fn deferred_switch_on_arg(table: Value) -> ByteCodeFunction {
+    let mut func = ByteCodeFunction::new(LambdaParams::simple(vec![intern("vm-vsw-x")]));
+    func.lexical = true;
+    func.constants = vec![
+        table,
+        Value::fixnum(10),
+        Value::fixnum(20),
+        Value::fixnum(30),
+    ]
+    .into();
+    func.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(3);
+    func.gnu_bytecode_bytes = Some(crate::tagged::header::LispByteVec::owned(vec![
+        137, 192, 183, 193, 135, 194, 135, 195, 135,
+    ]));
+    func.defer_gnu_decode();
+    func
+}
+
+#[test]
+fn vm_verified_switch_dispatches_through_its_proof() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new_minimal_vm_harness();
+    let (a, b, c) = (
+        Value::symbol("vm-vsw-a"),
+        Value::symbol("vm-vsw-b"),
+        Value::symbol("vm-vsw-c"),
+    );
+    let func = deferred_switch_on_arg(switch_table(HashTableTest::Eq, &[(a, 5), (b, 7)]));
+    assert!(
+        func.executes_verified_ops(),
+        "a switch whose table values are instruction starts at the switch depth is admitted"
+    );
+    // Several rounds: unplanned, plan-building, then planned dispatch.
+    for _ in 0..4 {
+        assert_eq!(run_switch(&mut eval, &func, a), 20);
+        assert_eq!(run_switch(&mut eval, &func, b), 30);
+        assert_eq!(run_switch(&mut eval, &func, c), 10);
+    }
+}
+
+/// The verified driver follows a jump table mutated after sealing exactly
+/// as far as the proof allows: onto an admitted target, onto any other
+/// instruction proven at the switch's depth (GNU follows it too), and never
+/// onto an instruction at another depth (GNU would corrupt its stack there;
+/// here it is invalid bytecode).
+#[test]
+fn vm_verified_switch_follows_a_mutation_only_onto_a_proven_depth() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new_minimal_vm_harness();
+    let (a, b, c) = (
+        Value::symbol("vm-vsw-mut-a"),
+        Value::symbol("vm-vsw-mut-b"),
+        Value::symbol("vm-vsw-mut-c"),
+    );
+    let table = switch_table(HashTableTest::Eq, &[(a, 5), (b, 7)]);
+    let func = deferred_switch_on_arg(table);
+    assert!(func.executes_verified_ops());
+    assert_eq!(run_switch(&mut eval, &func, a), 20);
+
+    let remap = |key: Value, offset: i64| {
+        let _ = table.with_hash_table_mut(|ht| {
+            ht.insert(key.to_hash_key(&ht.test), key, Value::fixnum(offset));
+        });
+    };
+    // Onto the other admitted target.
+    remap(a, 7);
+    assert_eq!(run_switch(&mut eval, &func, a), 30);
+    // Onto byte 3 (`constant 10`, the fall-through), proven at the switch's
+    // depth though never a table value at sealing: followed.
+    remap(c, 3);
+    assert_eq!(run_switch(&mut eval, &func, c), 10);
+    // Onto byte 4 (`return`), proven one deeper: refused as invalid bytecode,
+    // not executed with an unproven stack.
+    remap(c, 4);
+    assert!(
+        new_vm(&mut eval).execute(&func, vec![c]).is_err(),
+        "a target at another depth must not run in the verified driver"
+    );
+    // The function itself stays usable afterwards.
+    assert_eq!(run_switch(&mut eval, &func, b), 30);
+}
+
+/// `(lambda (a i) (aref a i))` and `(lambda (a i v) (aset a i v) a)` /
+/// `(lambda (a i v) (aset a i v))` as hand-built, sealed and stack-verified
+/// bytecode: the real `Aref`/`Aset` arms of the VERIFIED driver and their
+/// VM-only helpers.
+fn array_opcode_function(ops: Vec<Op>, nargs: usize, max_stack: usize) -> ByteCodeFunction {
+    let mut func = ByteCodeFunction::new(
+        crate::emacs_core::bytecode::decode::parse_arglist_descriptor(
+            (nargs | (nargs << 8)) as i64,
+        ),
+    );
+    func.ops = ops;
+    func.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(max_stack);
+    func.seal_hand_assembled_ops_for_test();
+    assert!(
+        func.executes_verified_ops(),
+        "the array probe runs verified"
+    );
+    func
+}
+
+/// The VM's answer in GNU's printed form: `OK VALUE`, or for a signal
+/// `ERR (SYMBOL DATA...)` exactly as GNU's `(condition-case err ... (error
+/// err))` prints it (the harness prints the data list in its own parens).
+fn run_array_opcode(eval: &mut Context, func: &ByteCodeFunction, args: Value) -> String {
+    let args = crate::emacs_core::value::list_to_vec(&args).expect("argument list");
+    let result = new_vm(eval).execute(func, args).map_err(map_flow);
+    let printed = crate::emacs_core::error::format_eval_result(&result);
+    match printed
+        .strip_prefix("ERR (")
+        .and_then(|rest| rest.strip_suffix("))"))
+        .and_then(|rest| rest.split_once(" ("))
+    {
+        Some((symbol, data)) => format!("ERR ({symbol} {data})"),
+        None => printed,
+    }
+}
+
+/// Every `aref`/`aset` shape and error a GNU 31.1 byte-compiled
+/// `(lambda (a i) (aref a i))` / `(lambda (a i v) (aset a i v) a)` answers,
+/// recorded from GNU (tmp/v10x/vmgap/array-oracle.el, 2026-10-22): decode
+/// order (CHECK_FIXNUM before the array check), negative and huge indices,
+/// every array kind, and every string-write refusal.
+#[test]
+fn vm_aref_aset_answer_and_signal_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new_vm_runtime_harness();
+    let aref = array_opcode_function(
+        vec![Op::StackRef(1), Op::StackRef(1), Op::Aref, Op::Return],
+        2,
+        4,
+    );
+    let aset_array = array_opcode_function(
+        vec![
+            Op::StackRef(2),
+            Op::StackRef(2),
+            Op::StackRef(2),
+            Op::Aset,
+            Op::Pop,
+            Op::StackRef(2),
+            Op::Return,
+        ],
+        3,
+        6,
+    );
+    let aset_value = array_opcode_function(
+        vec![
+            Op::StackRef(2),
+            Op::StackRef(2),
+            Op::StackRef(2),
+            Op::Aset,
+            Op::Return,
+        ],
+        3,
+        6,
+    );
+    let char_table_case = "(list (let ((ct (make-char-table 'test))) \
+                           (set-char-table-range ct ?a 7) ct) ?a)";
+    let aref_cases: &[(&str, &str)] = &[
+        ("(list (vector 10 20 30) 2)", "OK 30"),
+        ("(list (record 'r 1 2) 2)", "OK 2"),
+        ("(list \"abc\" 1)", "OK 98"),
+        ("(list (string-to-multibyte \"abc\") 2)", "OK 99"),
+        ("(list \"a\u{e9}c\" 1)", "OK 233"),
+        ("(list \"a\u{e9}c\" 2)", "OK 99"),
+        ("(list (make-bool-vector 3 t) 1)", "OK t"),
+        ("(list (vector 1 2) 2)", "ERR (args-out-of-range [1 2] 2)"),
+        ("(list \"abc\" 3)", "ERR (args-out-of-range \"abc\" 3)"),
+        ("(list \"abc\" -1)", "ERR (args-out-of-range \"abc\" -1)"),
+        (
+            "(list (vector 1 2) 'x)",
+            "ERR (wrong-type-argument fixnump x)",
+        ),
+        (
+            "(list (list 1 2) 0)",
+            "ERR (wrong-type-argument arrayp (1 2))",
+        ),
+        ("(list 5 0)", "ERR (wrong-type-argument arrayp 5)"),
+        (
+            "(list \"abc\" 1.0)",
+            "ERR (wrong-type-argument fixnump 1.0)",
+        ),
+        (char_table_case, "OK 7"),
+        (
+            "(list (make-char-table 'test) -1)",
+            "ERR (wrong-type-argument characterp -1)",
+        ),
+        (
+            "(list (vector 1 2) most-positive-fixnum)",
+            "ERR (args-out-of-range [1 2] 2305843009213693951)",
+        ),
+    ];
+    for (args, want) in aref_cases {
+        let args = eval.eval_str(args).expect("arguments evaluate");
+        assert_eq!(
+            run_array_opcode(&mut eval, &aref, args),
+            *want,
+            "aref {args:?}"
+        );
+    }
+    // (arguments, the array after `aset` or its error, aset's own value).
+    let aset_cases: &[(&str, Option<&str>, &str)] = &[
+        ("(list (make-vector 3 0) 2 9)", Some("OK [0 0 9]"), "OK 9"),
+        ("(list (record 'r 1 2) 1 7)", Some("OK #s(r 7 2)"), "OK 7"),
+        (
+            "(list (make-bool-vector 3 nil) 1 t)",
+            Some("OK #&3\"\u{2}\""),
+            "OK t",
+        ),
+        (
+            "(list (make-vector 2 0) 2 1)",
+            None,
+            "ERR (args-out-of-range [0 0] 2)",
+        ),
+        (
+            "(list (make-vector 2 0) -1 1)",
+            None,
+            "ERR (args-out-of-range [0 0] -1)",
+        ),
+        (
+            "(list (make-vector 2 0) 'x 1)",
+            None,
+            "ERR (wrong-type-argument fixnump x)",
+        ),
+        (
+            "(list (make-bool-vector 3 nil) 3 t)",
+            None,
+            "ERR (args-out-of-range #&3\"\u{0}\" 3)",
+        ),
+        (
+            "(list (list 1 2) 0 1)",
+            None,
+            "ERR (wrong-type-argument arrayp (1 2))",
+        ),
+        ("(list 5 'x 1)", None, "ERR (wrong-type-argument fixnump x)"),
+        (
+            "(list 'sym 0 1)",
+            None,
+            "ERR (wrong-type-argument arrayp sym)",
+        ),
+        (
+            "(list (copy-sequence \"abc\") 0 'x)",
+            None,
+            "ERR (wrong-type-argument characterp x)",
+        ),
+        (
+            "(list (copy-sequence \"abc\") 0 -1)",
+            None,
+            "ERR (wrong-type-argument characterp -1)",
+        ),
+        (
+            "(list (copy-sequence \"abc\") 0 #x400000)",
+            None,
+            "ERR (wrong-type-argument characterp 4194304)",
+        ),
+        (
+            "(list (string-to-unibyte \"abc\") 0 300)",
+            None,
+            "ERR (error \"Attempt to store non-byte value into unibyte string\")",
+        ),
+        (
+            "(list (copy-sequence \"a\u{e9}c\") 0 #xe9)",
+            None,
+            "ERR (error \"Attempt to store non-ASCII char into multibyte string\")",
+        ),
+        (
+            "(list (copy-sequence \"abc\") -1 ?x)",
+            None,
+            "ERR (args-out-of-range \"abc\" -1)",
+        ),
+        (
+            "(list (copy-sequence \"abc\") 3 ?x)",
+            None,
+            "ERR (args-out-of-range \"abc\" 3)",
+        ),
+        (
+            "(list (copy-sequence \"abc\") 1.0 ?x)",
+            None,
+            "ERR (wrong-type-argument fixnump 1.0)",
+        ),
+        ("(list (make-char-table 'test) #x3fffff 'z)", None, "OK z"),
+        (
+            "(list (make-char-table 'test) #x400000 1)",
+            None,
+            "ERR (wrong-type-argument characterp 4194304)",
+        ),
+        (
+            "(list (copy-sequence \"a\u{e9}c\") 2 ?z)",
+            Some("OK \"a\u{e9}z\""),
+            "OK 122",
+        ),
+        (
+            "(list (string-to-unibyte \"abc\") 0 255)",
+            Some("OK \"\\377bc\""),
+            "OK 255",
+        ),
+        (
+            "(list (copy-sequence \"a\u{e9}c\") 1 ?x)",
+            None,
+            "ERR (error \"Attempt to replace non-ASCII char in multibyte string\")",
+        ),
+        (
+            "(list (make-vector 2 0) 1.5 1)",
+            None,
+            "ERR (wrong-type-argument fixnump 1.5)",
+        ),
+        (
+            "(list (vector 1 2) most-positive-fixnum 0)",
+            None,
+            "ERR (args-out-of-range [1 2] 2305843009213693951)",
+        ),
+    ];
+    for (args_src, want_array, want_value) in aset_cases {
+        let args = eval.eval_str(args_src).expect("arguments evaluate");
+        let got_array = run_array_opcode(&mut eval, &aset_array, args);
+        match want_array {
+            Some(want) => assert_eq!(got_array, *want, "aset array {args_src}"),
+            // An error: the array form signals exactly what aset's value does.
+            None if want_value.starts_with("ERR") => {
+                assert_eq!(got_array, *want_value, "aset array {args_src}")
+            }
+            None => {}
+        }
+        let args = eval.eval_str(args_src).expect("arguments evaluate");
+        assert_eq!(
+            run_array_opcode(&mut eval, &aset_value, args),
+            *want_value,
+            "aset value {args_src}"
+        );
+    }
+    // The char-table store landed where `aref` reads it.
+    let args = eval
+        .eval_str("(let ((ct (make-char-table 'test))) (aset ct #x3fffff 'z) (list ct #x3fffff))")
+        .expect("arguments evaluate");
+    assert_eq!(run_array_opcode(&mut eval, &aref, args), "OK z");
+}

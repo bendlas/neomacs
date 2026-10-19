@@ -396,7 +396,7 @@ impl Drop for RestoreCleanup {
 
 /// Serialize the evaluator state to a pdump file.
 pub fn dump_to_file(eval: &Context, path: &Path) -> Result<(), DumpError> {
-    let mut state = dump_evaluator(eval);
+    let mut state = dump_evaluator_for_restart(eval);
     let symbol_table_payload = symbol_table_image::symbol_table_section_bytes(&state.symbol_table)?;
     let heap_payload = mapped_heap::extract_mapped_heap_payloads(&mut state);
     let object_starts_payload = object_starts::build_object_starts(&state.tagged_heap)?;
@@ -760,8 +760,8 @@ fn reconstruct_evaluator_after_symbol_table_with_decoder_and_value_fixups(
 ) -> Result<Context, DumpError> {
     // 2. Reconstruct the tagged heap before any heap-backed value/object loads
     // so tagged dump references can resolve directly to live tagged objects.
-    let mut tagged_heap = Box::new(crate::tagged::gc::TaggedHeap::new());
-    crate::tagged::gc::set_tagged_heap(&mut tagged_heap);
+    let tagged_heap = crate::tagged::gc::AliasableBox::new(crate::tagged::gc::TaggedHeap::new());
+    crate::tagged::gc::set_tagged_heap_root(tagged_heap.root());
     decoder.preload_tagged_heap_with_value_fixup_section(value_fixups_section)?;
 
     // 3. Reset thread-local runtime caches before replaying semantic state.
@@ -867,3 +867,7 @@ pub(crate) fn take_after_pdump_load_hook_pending(eval: &mut Context) -> bool {
 #[cfg(test)]
 #[path = "tests/pdump_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/deterministic_order_test.rs"]
+mod deterministic_order_tests;

@@ -533,6 +533,22 @@ impl crate::emacs_core::eval::Context {
         window_id: WindowId,
         source_buffer_id: BufferId,
     ) -> Option<crate::window::WindowLayoutAttemptFreshness> {
+        self.window_layout_attempt_freshness_with_capture(
+            frame_id,
+            window_id,
+            source_buffer_id,
+            Self::buffer_layout_inputs,
+        )
+    }
+
+    #[inline]
+    fn window_layout_attempt_freshness_with_capture(
+        &self,
+        frame_id: FrameId,
+        window_id: WindowId,
+        source_buffer_id: BufferId,
+        mut capture: impl FnMut(&Self, BufferId) -> Option<super::WindowBufferLayoutInputState>,
+    ) -> Option<crate::window::WindowLayoutAttemptFreshness> {
         use strum::VariantArray;
 
         let frame = self.frames.get(frame_id)?;
@@ -546,14 +562,44 @@ impl crate::emacs_core::eval::Context {
                 .variable_value_in_buffer(Some(source_buffer), variable.sym_id())
                 .map(crate::window::WindowLayoutValueIdentity::of);
         }
+        // Keep the original native-read order. The canonical projections own
+        // immutable snapshots and invoke no Lisp callbacks; cloning shares
+        // native payloads, never mutable Lisp source data.
+        let fontset_generation = crate::emacs_core::fontset::fontset_generation();
+        let context_instance_id = self.context_instance_id();
+        let window_topology_generation = self.frames.window_topology_generation();
+        let frame_inputs = frame.layout_inputs();
+        let window_inputs = frame.window_layout_inputs(window_id)?;
+        let namespace_before = (live_buffer_id == source_buffer_id)
+            .then(crate::emacs_core::intern::symbol_registry_epoch_value);
+        let live_buffer = capture(self, live_buffer_id)?;
+        let source_buffer = if let Some(namespace_before) = namespace_before {
+            let owned_source = live_buffer.clone();
+            let namespace_after = crate::emacs_core::intern::symbol_registry_epoch_value();
+            // Another World may unintern the fontifier's process-global name
+            // without borrowing this Context. Reuse requires the same observed
+            // namespace epoch across the actual read and clone. This relies on
+            // native intern retaining its positive entry until an observed
+            // epoch change (no eviction): an unpublished removal under the
+            // registry write lock also leaves the old second lookup a cache
+            // hit. A miss waits for that writer and observes its publication.
+            // Owner/buffer reads remain private and noncalling in this scope.
+            if namespace_before == namespace_after {
+                owned_source
+            } else {
+                capture(self, source_buffer_id)?
+            }
+        } else {
+            capture(self, source_buffer_id)?
+        };
         Some(crate::window::WindowLayoutAttemptFreshness {
-            fontset_generation: crate::emacs_core::fontset::fontset_generation(),
-            context_instance_id: self.context_instance_id(),
-            window_topology_generation: self.frames.window_topology_generation(),
-            frame: frame.layout_inputs(),
-            window: frame.window_layout_inputs(window_id)?,
-            live_buffer: self.buffer_layout_inputs(live_buffer_id)?,
-            source_buffer: self.buffer_layout_inputs(source_buffer_id)?,
+            fontset_generation,
+            context_instance_id,
+            window_topology_generation,
+            frame: frame_inputs,
+            window: window_inputs,
+            live_buffer,
+            source_buffer,
             source_layout_variables,
             selection: crate::window::WindowLayoutSelectionState {
                 selected_frame: self.frames.selected_frame().map(|frame| frame.id),
@@ -566,6 +612,51 @@ impl crate::emacs_core::eval::Context {
             body_redisplay: self.body_redisplay_revision(window_id, live_buffer_id),
             function_epoch: self.obarray.function_epoch(),
         })
+    }
+
+    /// Pass an owned token through native layout preparation/publication.
+    ///
+    /// Native admission is restricted to audited layout preparation/publication
+    /// that changes no logical input and restores temporary buffer/point
+    /// selection. Merely avoiding Lisp does not admit arbitrary native edits.
+    /// Possible Lisp always recaptures. This is an attempt-local borrow, not
+    /// retained state or a key-based cache. Each evaluator exclusively owns its
+    /// inputs; independently published fontsets/dispatch and lazy native
+    /// character-table initialization still require the checks below.
+    pub fn window_layout_attempt_freshness_after_span<'a>(
+        &self,
+        before: &'a crate::window::WindowLayoutAttemptFreshness,
+        admission: super::WindowLayoutLispAdmission,
+    ) -> Option<std::borrow::Cow<'a, crate::window::WindowLayoutAttemptFreshness>> {
+        use std::borrow::Cow;
+        // Enumerate the complete projection: adding an input requires auditing
+        // whether native preparation can change it without a Lisp boundary.
+        let crate::window::WindowLayoutAttemptFreshness {
+            fontset_generation,
+            context_instance_id,
+            window_topology_generation: _,
+            frame,
+            window,
+            live_buffer: _,
+            source_buffer,
+            source_layout_variables: _,
+            selection: _,
+            face_change_count: _,
+            media_generation: _,
+            body_redisplay: _,
+            function_epoch,
+        } = before;
+        if admission == super::WindowLayoutLispAdmission::NativeOnly
+            && *context_instance_id == self.context_instance_id()
+            && *fontset_generation == crate::emacs_core::fontset::fontset_generation()
+            && window.char_table_mutation_epoch == super::CharTableLayoutRevision::current()
+            && *function_epoch == self.obarray.function_epoch()
+        {
+            Some(Cow::Borrowed(before))
+        } else {
+            self.window_layout_attempt_freshness(frame.id, window.id, source_buffer.id)
+                .map(Cow::Owned)
+        }
     }
 
     /// Install the frontend half of the synchronous layout-query boundary.
@@ -763,11 +854,43 @@ impl crate::emacs_core::eval::Context {
         }
     }
 
-    /// Canonical buffer-layout projection shared with redisplay skipping.
+    /// Complete buffer projection for retained rows and speculative attempts.
+    /// Installing a hook can change canonical motion without changing text
+    /// ticks or the generic redisplay generation. Keep this effective identity
+    /// read and the attempt's namespace guard at their existing boundaries.
     pub(crate) fn buffer_layout_inputs(
         &self,
         buffer_id: BufferId,
+    ) -> Option<super::WindowBufferLayoutInputState> {
+        self.capture_buffer_layout_inputs(buffer_id, |buffer| {
+            super::FontificationHookIdentity(
+                self.variable_value_in_buffer_inline(
+                    Some(buffer),
+                    crate::emacs_core::intern::intern("fontification-functions"),
+                )
+                .map(super::WindowLayoutValueIdentity::of),
+            )
+        })
+    }
+
+    /// Redisplay scheduling projection. GNU does not make replacing the
+    /// fontification hook itself a repaint request. Fontification mutations
+    /// still participate through the shared text/property/overlay revisions.
+    /// Unit erases only that callback identity; full freshness consumers cannot
+    /// accept this type in place of their required fontification payload.
+    pub(crate) fn redisplay_buffer_layout_inputs(
+        &self,
+        buffer_id: BufferId,
     ) -> Option<BufferLayoutInputState> {
+        self.capture_buffer_layout_inputs(buffer_id, |_| ())
+    }
+
+    #[inline]
+    fn capture_buffer_layout_inputs<Fontification>(
+        &self,
+        buffer_id: BufferId,
+        capture_fontification: impl FnOnce(&crate::buffer::Buffer) -> Fontification,
+    ) -> Option<BufferLayoutInputState<Fontification>> {
         let buffer = self.buffers.get(buffer_id)?;
         Some(BufferLayoutInputState {
             id: buffer.id,
@@ -779,6 +902,7 @@ impl crate::emacs_core::eval::Context {
             accessible_bytes: buffer.accessible_emacs_byte_region().range(),
             total_chars: buffer.total_char_len(),
             total_emacs_bytes: buffer.total_emacs_byte_len(),
+            fontification_functions: capture_fontification(buffer),
             prefixes: self.layout_prefix_inputs(buffer_id)?,
             invisibility: self.layout_invisibility_input(buffer_id)?,
             display_table: self.layout_display_table_input(buffer_id)?,
@@ -834,8 +958,9 @@ impl crate::emacs_core::eval::Context {
     /// Capture the complete layout identity for one live window.
     ///
     /// This is the single freshness boundary for consumers of retained rows.
-    /// Its frame/window/buffer projections are also used by the redisplay skip
-    /// signature, so both cache policies evolve together.
+    /// Its frame/window/buffer projections share every geometry input with
+    /// redisplay scheduling. This full token additionally owns the effective
+    /// fontification callback identity, which is not a repaint request.
     pub fn window_display_snapshot_freshness(
         &self,
         frame_id: FrameId,
@@ -876,8 +1001,30 @@ impl crate::emacs_core::eval::Context {
         buffer_id: BufferId,
     ) -> Option<&WindowDisplaySnapshot> {
         let current = self.window_display_snapshot_freshness(frame_id, window_id, buffer_id)?;
-        let snapshot = self.frames.get(frame_id)?.redisplay_snapshot(window_id)?;
+        let Some(snapshot) = self.frames.get(frame_id)?.redisplay_snapshot(window_id) else {
+            tracing::trace!(target: "neovm_core::motion_geometry", ?frame_id, ?window_id,
+                "retained rows unavailable");
+            return None;
+        };
         if let Some(recorded) = &snapshot.layout_freshness {
+            tracing::trace!(target: "neovm_core::motion_geometry", ?frame_id, ?window_id,
+                ?recorded, ?current,
+                freshness_matches = recorded == &current,
+                fontset_matches = recorded.fontset_generation == current.fontset_generation,
+                context_matches = recorded.context_instance_id == current.context_instance_id,
+                topology_matches = recorded.window_topology_generation == current.window_topology_generation,
+                point_matches = recorded.window.point == current.window.point,
+                window_matches = recorded.window == current.window,
+                buffer_matches = recorded.buffer == current.buffer,
+                frame_matches = recorded.frame == current.frame,
+                presentation_matches = recorded.redisplay_generation == current.redisplay_generation,
+                body_matches = recorded.body_redisplay == current.body_redisplay,
+                faces_match = recorded.face_change_count == current.face_change_count,
+                display_vars_match = recorded.display_var_change_count == current.display_var_change_count,
+                media_match = recorded.media_generation == current.media_generation,
+                functions_match = recorded.function_epoch == current.function_epoch,
+                symbol_properties_match = recorded.symbol_property_revision == current.symbol_property_revision,
+                "retained row freshness");
             return (recorded == &current).then_some(snapshot);
         }
         if let Some(recorded_modiff) = snapshot.buffer_modiff
@@ -1226,6 +1373,7 @@ impl FrameManager {
             buffer_id: leaf_buffer_id,
             window_start: leaf_window_start,
             position_markers,
+            window_end,
             point: leaf_point,
             old_point,
             hscroll,
@@ -1242,6 +1390,17 @@ impl FrameManager {
             *leaf_buffer_id = buffer_id;
             *leaf_window_start = window_start.max(LispCharPos1::ONE);
             *position_markers = super::WindowPositionMarkerState::Detached;
+            // GNU `set_window_buffer` zeroes `w->window_end_pos` and
+            // `w->window_end_vpos` for every buffer install, same buffer or
+            // not (src/window.c:4360-4361): the recorded end is an offset
+            // from Z and describes rows of the buffer that produced it.  An
+            // unrecorded end reads back as Z, which is GNU's zero offset.
+            // Kept across a buffer switch, the old buffer's end was
+            // reinterpreted in the new one and told the viewport policy
+            // that point lay hundreds of lines below the window, so a
+            // `set-window-start` NOFORCE near EOB was recentered where
+            // GNU's "same window start" branch (src/xdisp.c:20972) keeps it.
+            *window_end = super::WindowEndState::Unrecorded;
             *leaf_point = point.max(LispCharPos1::ONE);
             if !preserve_display_state {
                 *old_point = point.max(LispCharPos1::ONE);
@@ -1302,3 +1461,11 @@ pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
     CHAR_TABLE_LAYOUT_MUTATION_EPOCH.with(|cell| slot.0 = cell.replace(slot.0));
     WINDOW_PARAMETERS_LAYOUT_GENERATION.with(|cell| slot.1 = cell.replace(slot.1));
 }
+
+#[cfg(test)]
+#[path = "tests/attempt_freshness_reuse_test.rs"]
+mod attempt_freshness_reuse_tests;
+
+#[cfg(test)]
+#[path = "tests/buffer_layout_projection_test.rs"]
+mod buffer_layout_projection_tests;

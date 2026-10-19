@@ -3121,6 +3121,50 @@ fn a_run_is_turned_off_with_the_terminals_own_me_and_op() {
 /// `masscomp` and the rest -- and thirty more have a `me` that is pure padding,
 /// for which `tputs` emits a DELAY and no bytes.
 #[test]
+fn cursor_visibility_follows_the_entrys_vi_ve_vs_and_visible_cursor() {
+    // GNU `tty_hide_cursor`/`tty_show_cursor` (src/term.c:345-372): `vi` to
+    // hide; `ve`, then `vs` only with `visible-cursor' non-nil, to show.
+    // The strings are the entry's own and absent ones emit nothing --
+    // screen's `vs=\E[34l` is what makes GNU's cursor "very visible"
+    // there, recorded at every GNU READY of the ttykey differential scenes
+    // where this port's hardcoded `ESC[?25h` left the cursor normal.
+    let screen = TtyAttributeCapabilities {
+        cursor_invisible: Some(b"\x1b[?25l".to_vec()),
+        cursor_normal: Some(b"\x1b[34h\x1b[?25h".to_vec()),
+        cursor_visible: Some(b"\x1b[34l".to_vec()),
+        ..TtyAttributeCapabilities::full()
+    };
+
+    let mut buf = Vec::new();
+    write_hide_cursor_with(&mut buf, &screen);
+    assert_eq!(buf, b"\x1b[?25l");
+
+    let mut buf = Vec::new();
+    write_show_cursor_with(&mut buf, &screen, true);
+    assert_eq!(buf, b"\x1b[34h\x1b[?25h\x1b[34l", "ve then vs");
+
+    let mut buf = Vec::new();
+    write_show_cursor_with(&mut buf, &screen, false);
+    assert_eq!(
+        buf, b"\x1b[34h\x1b[?25h",
+        "(setq visible-cursor nil) drops vs and nothing else"
+    );
+
+    // No entry strings (a dumb terminal): GNU's OUTPUT_IF emits nothing.
+    let dumb = TtyAttributeCapabilities::none();
+    let mut buf = Vec::new();
+    write_hide_cursor_with(&mut buf, &dumb);
+    write_show_cursor_with(&mut buf, &dumb, true);
+    assert!(buf.is_empty(), "no vi/ve/vs, no bytes: {buf:?}");
+
+    // The no-database fallback keeps the old normal cursor and claims no vs.
+    let fallback = TtyAttributeCapabilities::full();
+    let mut buf = Vec::new();
+    write_show_cursor_with(&mut buf, &fallback, true);
+    assert_eq!(buf, b"\x1b[?25h");
+}
+
+#[test]
 fn a_terminal_without_me_undoes_only_the_underline_like_gnu() {
     let no_me = TtyAttributeCapabilities {
         exit_attribute_mode: None,
@@ -3750,12 +3794,19 @@ fn scrolled_rows_emit_region_scroll_not_row_rewrites() {
     let out = render_output(&mut rif);
     let text = String::from_utf8_lossy(&out);
 
+    // GNU tty_ins_del_lines: the region's top row, then one DL (`DL`
+    // termcap, `CSI n M`) -- never SU, which GNU does not emit and the
+    // differential harness's pinned pyte does not implement.
     assert!(
-        text.contains("\x1b[1S"),
-        "one-line shift must emit a scroll-up, got: {text:?}"
+        text.contains("\x1b[1;1H\x1b[1M"),
+        "one-line shift must emit DL at the region top, got: {text:?}"
     );
     assert!(
-        text.contains(";10r") || text.contains("[1;10r"),
+        !text.contains("\x1b[1S"),
+        "GNU never scrolls with SU, got: {text:?}"
+    );
+    assert!(
+        text.contains("\x1b[1;10r"),
         "scroll must be bounded by a DECSTBM region, got: {text:?}"
     );
     // The shifted rows must NOT be retransmitted: their text moved, the
@@ -3815,7 +3866,7 @@ fn small_changes_do_not_trigger_scroll() {
     let out = render_output(&mut rif);
     let text = String::from_utf8_lossy(&out);
     assert!(
-        !text.contains("\x1b[1S"),
+        !text.contains("\x1b[1M") && !text.contains(";10r"),
         "an edit is not a scroll: {text:?}"
     );
     assert!(text.contains("edited-this-row!"));
@@ -3931,8 +3982,8 @@ fn caps_without_scroll_region_never_plan_scroll_ops() {
     let text = String::from_utf8_lossy(&out);
     assert!(!text.contains("\x1b[?2026"), "sync gated off: {text:?}");
     assert!(
-        !text.contains("S\x1b[r"),
-        "no region scroll on a dumb terminal"
+        !text.contains("\x1b[1M") && !text.contains(";10r"),
+        "no region scroll on a dumb terminal: {text:?}"
     );
     // Content still arrives, just via ordinary row diffs (which transmit
     // only the cells that changed, so assert on a changed fragment).
@@ -4277,10 +4328,10 @@ fn typing_echo_bytes_are_a_fraction_of_tail_rewrite() {
 }
 
 #[test]
-fn index_method_scrolls_with_ind_ri_and_never_su_sd() {
-    // vt220 / Linux-console shape: DECSTBM attested, CSI S/T not. The
+fn index_method_scrolls_with_ind_ri_and_never_delete_insert() {
+    // Bare vt100 shape: DECSTBM attested, no DL/AL or dl/al. The
     // capability carries the method, so the same plan encodes as cursor to
-    // the region edge plus IND/RI.
+    // the region edge plus IND/RI -- GNU tty_ins_del_lines' last fallback.
     let caps = TermCaps {
         scroll_region: Some(RegionScrollMethod::Index),
         ..TermCaps::default()
@@ -4301,8 +4352,8 @@ fn index_method_scrolls_with_ind_ri_and_never_su_sd() {
     let out = render_output(&mut rif);
     let text = String::from_utf8_lossy(&out);
     assert!(
-        !text.contains("\x1b[1S") && !text.contains("\x1b[1T"),
-        "index method must never emit SU/SD: {text:?}"
+        !text.contains("\x1b[1M") && !text.contains("\x1b[1L") && !text.contains("\x1b[1S"),
+        "index method must never emit DL/IL or SU: {text:?}"
     );
     assert!(
         text.contains("\x1b[1;10r") && text.contains("\x1bD"),
@@ -4320,8 +4371,8 @@ fn index_method_scrolls_with_ind_ri_and_never_su_sd() {
     let out = render_output(&mut rif);
     let text = String::from_utf8_lossy(&out);
     assert!(
-        text.contains("\x1bM") && !text.contains("\x1b[1T"),
-        "reverse scroll must be RI, not SD: {text:?}"
+        text.contains("\x1bM") && !text.contains("\x1b[1L") && !text.contains("\x1b[1T"),
+        "reverse scroll must be RI, not IL or SD: {text:?}"
     );
 }
 
@@ -4436,7 +4487,8 @@ fn zero_area_grids_plan_nothing_and_do_not_panic() {
 #[test]
 fn scrolling_backward_emits_region_scroll_down() {
     // Down-direction sibling of scrolled_rows_emit_region_scroll: content
-    // moves down (viewport scrolled up), encoded as SD inside the region.
+    // moves down (viewport scrolled up), encoded as IL at the region's top
+    // row inside the region (GNU tty_ins_del_lines with n > 0).
     let mut rif = TtyRif::new(20, 10);
     let full_row = |n: i32| format!("{:<20}", format!("line-number-{n:02}"));
     for r in 0..10i32 {
@@ -4449,8 +4501,12 @@ fn scrolling_backward_emits_region_scroll_down() {
     let out = render_output(&mut rif);
     let text = String::from_utf8_lossy(&out);
     assert!(
-        text.contains("\x1b[1T"),
-        "one-line backward shift must emit SD: {text:?}"
+        text.contains("\x1b[1;1H\x1b[1L"),
+        "one-line backward shift must emit IL at the region top: {text:?}"
+    );
+    assert!(
+        !text.contains("\x1b[1T"),
+        "GNU never scrolls with SD: {text:?}"
     );
     assert!(
         !text.contains("line-number-05"),
@@ -4469,7 +4525,7 @@ fn scrolling_backward_emits_region_scroll_down() {
     let text = String::from_utf8_lossy(&out);
     assert!(
         !text.contains("line-number"),
-        "model must match the terminal after SD: {text:?}"
+        "model must match the terminal after IL: {text:?}"
     );
 }
 

@@ -297,7 +297,7 @@ pub(crate) fn boundp_in(eval: &super::eval::Context, symbol: SymId) -> EvalResul
 fn host_projected_boundp(
     eval: &super::eval::Context,
     resolved: SymId,
-    fwd: &crate::emacs_core::forward::LispFwd,
+    fwd: crate::emacs_core::forward::FwdRef,
 ) -> bool {
     fwd.thread_projection().is_none()
         || matches!(
@@ -1080,7 +1080,7 @@ pub(super) fn builtin_register_code_conversion_map(
         let plist = eval
             .obarray()
             .get_by_id(sym_id)
-            .map(|s| s.plist)
+            .map(|s| s.plist.get())
             .unwrap_or(Value::NIL);
         crate::emacs_core::plist::plist_check(plist)?;
     }
@@ -4284,9 +4284,9 @@ pub(crate) fn builtin_variable_binding_locus(
                 }
                 if let Some(blv) = ctx.obarray.blv(resolved)
                     && blv.found
-                    && !blv.where_buf.is_nil()
+                    && !blv.where_buf.get().is_nil()
                 {
-                    return Ok(blv.where_buf);
+                    return Ok(blv.where_buf.get());
                 }
             }
             ValueCell::Forwarded(fwd) => {
@@ -4793,10 +4793,9 @@ pub(crate) fn builtin_local_variable_if_set_p(
             // symbols because setting them auto-localizes the per-buffer slot
             // (`data.c:2458-2460`). Other forwarder kinds are not
             // buffer-local variables.
-            let buf_fwd = sym
-                .forwarded_descriptor()
-                .and_then(|fwd| fwd.as_buffer_obj_fwd());
-            if buf_fwd.is_some_and(|buf_fwd| buf_fwd.thread_projection().is_some()) {
+            let fwd = sym.forwarded_descriptor();
+            let buf_fwd = fwd.and_then(|fwd| fwd.as_buffer_obj_fwd());
+            if fwd.is_some_and(|fwd| fwd.thread_projection().is_some()) {
                 return projected_local_variable_if_set_p(ctx, resolved_id, args);
             }
             Ok(Value::bool_val(buf_fwd.is_some()))

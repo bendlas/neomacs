@@ -30,7 +30,7 @@ use crate::display_source_walk::DisplaySourcePositionConsumption;
 use crate::frame_face_arena::FrameFaceAttempt;
 use crate::neovm_bridge::{LayoutBufferView, ResolvedFace};
 use neomacs_display_protocol::types::FaceId;
-use neovm_core::buffer::BufferId;
+use neovm_core::buffer::{BufferId, CharLen};
 
 pub(crate) struct BufferSourceWalk<'request, B: LayoutBufferView> {
     producer: BufferElementProducer<'request, B>,
@@ -54,11 +54,14 @@ pub(crate) enum BufferSourceRewind {
 /// step. Publishing a missing item's source position precedes face/emission
 /// installation; dispatch receives the item only after those side effects.
 #[allow(clippy::too_many_arguments)]
-fn apply_produced_step_to_render_progress<B: LayoutBufferView>(
+fn apply_produced_step_to_render_progress<
+    B: LayoutBufferView,
+    FS: crate::neovm_bridge::FaceServices,
+>(
     step: &mut ProducedStep,
     progress: &mut DisplaySourceProgressState<'_>,
     face_resolution_context: BufferSourceFaceResolutionContext<'_, B>,
-    source_render: &mut TextRowSourceRenderState<'_>,
+    source_render: &mut TextRowSourceRenderState<'_, FS>,
     row_geometry: &mut DisplayRowGeometryState,
     append_surface: &DisplayRowAppendSurface,
     active_face_state: &DisplayRowActiveFaceState,
@@ -152,6 +155,16 @@ impl<'request, B: LayoutBufferView> BufferSourceWalk<'request, B> {
         }
     }
 
+    /// Bound each ordinary text-run scan to `budget` characters past its own
+    /// start, the per-row allowance of GNU `get_narrowed_width`
+    /// (src/xdisp.c:3717-3735). Every window walk sets this so a newline-less
+    /// tail cannot make a visible row walk the remaining buffer; it composes
+    /// with (and is independent of) a walk's absolute acquisition horizon.
+    pub(crate) fn with_ordinary_run_scan_budget(mut self, budget: CharLen) -> Self {
+        self.producer.set_ordinary_run_scan_budget(budget);
+        self
+    }
+
     pub(crate) fn append_state(&mut self) -> &mut DisplaySourceRowAppendState {
         &mut self.append_state
     }
@@ -211,23 +224,34 @@ impl<'request, B: LayoutBufferView> BufferSourceWalk<'request, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn consume_source_item_for_render_into(
+    pub(crate) fn consume_source_item_for_render_into<FS: crate::neovm_bridge::FaceServices>(
         &mut self,
         progress: &mut DisplaySourceProgressState<'_>,
         face_resolution_context: BufferSourceFaceResolutionContext<'_, B>,
         face_ids: &mut FrameFaceAttempt,
-        source_render: &mut TextRowSourceRenderState<'_>,
+        source_render: &mut TextRowSourceRenderState<'_, FS>,
         row_geometry: &mut DisplayRowGeometryState,
         append_surface: &DisplayRowAppendSurface,
         active_face_state: &DisplayRowActiveFaceState,
         output: &mut ProducedStep,
     ) {
-        self.producer.produce_step_into(
-            progress.source_position(),
-            face_resolution_context,
-            face_ids,
-            output,
-        );
+        if source_render.has_tty_realization() {
+            source_render.with_face_realizer(|realize| {
+                self.producer.produce_step_into(
+                    progress.source_position(),
+                    face_resolution_context.with_face_realizer(realize),
+                    face_ids,
+                    output,
+                );
+            });
+        } else {
+            self.producer.produce_step_into(
+                progress.source_position(),
+                face_resolution_context,
+                face_ids,
+                output,
+            );
+        }
         apply_produced_step_to_render_progress(
             output,
             progress,

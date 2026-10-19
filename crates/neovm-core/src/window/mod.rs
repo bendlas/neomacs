@@ -646,8 +646,12 @@ pub struct WindowLayoutInputState {
 }
 
 /// Buffer inputs that can change display-row positions or geometry.
+///
+/// The shared projection is used by redisplay skipping. Retained rows and
+/// speculative attempts require the additional typed fontification identity.
+/// All other fields are captured by one monomorphized collector.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BufferLayoutInputState {
+pub struct BufferLayoutInputState<Fontification = ()> {
     pub(crate) id: BufferId,
     pub(crate) modified_tick: i64,
     pub(crate) chars_modified_tick: i64,
@@ -657,10 +661,22 @@ pub struct BufferLayoutInputState {
     pub(crate) accessible_bytes: EmacsByteRange,
     pub(crate) total_chars: CharLen,
     pub(crate) total_emacs_bytes: EmacsByteLen,
+    fontification_functions: Fontification,
     pub(crate) prefixes: LayoutPrefixInputs,
     pub(crate) invisibility: LayoutInvisibilityInput,
     pub(crate) display_table: LayoutDisplayTableInput,
 }
+
+/// Effective callback identity, captured on this Context's mutator. The
+/// numeric word owns no Lisp object and is never dereferenced from here.
+/// Hook replacement must invalidate retained rows and speculative attempts;
+/// mutable contents and callback visitation retain their existing conservative
+/// redisplay-generation boundary. A unit-valued redisplay projection cannot be
+/// substituted for this typed identity at either freshness boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FontificationHookIdentity(Option<WindowLayoutValueIdentity>);
+
+pub(crate) type WindowBufferLayoutInputState = BufferLayoutInputState<FontificationHookIdentity>;
 
 /// Owned prefix inputs shared by redisplay skipping, geometry freshness and
 /// row reuse. String contents can change without a buffer modification tick.
@@ -2975,7 +2991,7 @@ pub struct WindowDisplaySnapshotFreshness {
     pub(crate) window_topology_generation: u64,
     pub(crate) frame: FrameLayoutInputState,
     pub(crate) window: WindowLayoutInputState,
-    pub(crate) buffer: BufferLayoutInputState,
+    pub(crate) buffer: WindowBufferLayoutInputState,
     pub(crate) face_change_count: u64,
     pub(crate) display_var_change_count: u64,
     pub(crate) redisplay_generation: u64,
@@ -3042,8 +3058,8 @@ pub struct WindowLayoutAttemptFreshness {
     window_topology_generation: u64,
     frame: FrameLayoutInputState,
     window: WindowLayoutInputState,
-    live_buffer: BufferLayoutInputState,
-    source_buffer: BufferLayoutInputState,
+    live_buffer: WindowBufferLayoutInputState,
+    source_buffer: WindowBufferLayoutInputState,
     source_layout_variables: WindowLayoutVariableState,
     selection: WindowLayoutSelectionState,
     face_change_count: u64,
@@ -3069,6 +3085,21 @@ pub struct WindowLayoutAttemptFreshness {
 pub enum WindowLayoutLispBoundary {
     BufferBody,
     WindowChrome,
+}
+
+/// Actual callback admission at an attempt-local input boundary.
+///
+/// NativeOnly is restricted to audited layout preparation/publication that
+/// changes no logical input, restores temporary buffer/point selection, and
+/// evaluates no Lisp. Arbitrary native edits require MayHaveEntered too.
+/// A possible callback includes unsuccessful/unmarking
+/// callbacks and errors. The complete token is freshly captured in that case.
+/// This value belongs to one exclusively borrowed evaluator attempt; it is
+/// never retained or used as an invalidation key by another mutator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowLayoutLispAdmission {
+    NativeOnly,
+    MayHaveEntered,
 }
 
 impl WindowLayoutAttemptFreshness {
@@ -3261,24 +3292,96 @@ impl WindowDisplaySnapshot {
             .iter()
             .find_map(|row| row.start_buffer_pos)
             .or_else(|| self.iter_points().next().map(|point| point.buffer_pos))?;
+        // A right-truncated last row owns the tail it skipped (GNU's
+        // `row->end` lies past it, src/xdisp.c:26695,26736), so the span the
+        // window can answer for extends through that tail.
         let end = self
             .rows
             .iter()
             .rev()
-            .find_map(|row| row.end_buffer_pos)
+            .find_map(|row| row.truncated_end_buffer_pos.or(row.end_buffer_pos))
             .or_else(|| self.iter_points().last().map(|point| point.buffer_pos))?;
         Some(WindowVisibleBufferSpan::new(start, end))
     }
 
+    /// The row whose source span holds POS: through its last drawn glyph, or
+    /// through the tail a right-truncated row skipped (the line terminator, or
+    /// ZV when the truncated line ends the buffer), which GNU's
+    /// `pos_visible_p` still lands on that row (src/xdisp.c:11122-11146).
     fn row_for_buffer_pos(&self, pos: LispCharPos1) -> Option<&DisplayRowSnapshot> {
         self.rows.iter().find(|row| {
             let Some(start) = row.start_buffer_pos else {
                 return false;
             };
-            let Some(end) = row.end_buffer_pos else {
+            let Some(end) = row.truncated_end_buffer_pos.or(row.end_buffer_pos) else {
                 return false;
             };
             start <= pos && pos <= end
+        })
+    }
+
+    /// Whether POS is on one of this snapshot's rows but left of the first
+    /// glyph that row drew: hidden by the window's hscroll.  GNU `pos_visible_p`
+    /// still reports such a position, at its x left of the text area
+    /// (src/xdisp.c:1772-1830 with the iterator's line-relative x), so a
+    /// snapshot that has no point for it has not answered; the caller re-walks
+    /// as GNU does on every call.  A row's `start_buffer_pos` is its LINE
+    /// start even when hscrolled (`note_row_walk_start`), which is what
+    /// bounds the hidden prefix on the left; on the right it is the first
+    /// glyph the row DREW -- the left-truncation `$` is an overlaid marker
+    /// standing for the glyph that straddles the boundary, and GNU reports
+    /// that glyph's own position at its hidden x too (a tab at columns 2-7
+    /// under hscroll 3: (-1 1), `posn-point' nil; GNU 31.1).
+    pub fn position_hidden_by_hscroll(&self, pos: LispCharPos1) -> bool {
+        self.rows.iter().any(|row| {
+            row.start_buffer_pos.is_some_and(|start| start <= pos)
+                && self
+                    .iter_row_points(row.row)
+                    .find(|point| point.role.is_position())
+                    .is_some_and(|first_drawn| pos < first_drawn.buffer_pos)
+        })
+    }
+
+    /// Whether POS lies in the tail ROW skipped by right truncation: after its
+    /// last drawn glyph and no further than the terminator (or ZV).
+    fn pos_in_truncated_tail(row: &DisplayRowSnapshot, pos: LispCharPos1) -> bool {
+        row.end_buffer_pos.is_some_and(|end| pos > end)
+            && row.truncated_end_buffer_pos.is_some_and(|tail| pos <= tail)
+    }
+
+    /// The display point GNU reports for a position in ROW's truncated tail.
+    ///
+    /// `pos_visible_p` (src/xdisp.c:1772-1830) runs `move_it_to` to the
+    /// position; on a truncated line `move_it_in_display_line_to` stops at the
+    /// truncation column with MOVE_LINE_TRUNCATED, `move_it_to` reseats past
+    /// the line and, now at or past the position, returns with the iterator's
+    /// x still at that column and its y still on the row (xdisp.c:11122-11146,
+    /// `reached = 9` before the row advance).  So the position is visible at
+    /// the truncation marker's column of its row -- the `$` slot the walk
+    /// published as an overlaid marker point, whose own position (the first
+    /// character the row did not draw) is what `posn-at-point` then reports
+    /// as `posn-point` (GNU 31.1: 102938 for every point of a tail starting
+    /// there) -- and on a frame that shows no marker glyph, at the column the
+    /// row stopped drawing.
+    fn truncated_tail_point(&self, row: &DisplayRowSnapshot) -> Option<DisplayPointSnapshot> {
+        let marker = self
+            .iter_row_points(row.row)
+            .filter(|point| point.role == DisplayPointRole::OverlaidMarker)
+            .last();
+        marker.or_else(|| {
+            let first_hidden = row.end_buffer_pos?.as_i64().checked_add(1)?;
+            self.iter_row_points(row.row)
+                .last()
+                .map(|last| DisplayPointSnapshot {
+                    buffer_pos: LispCharPos1::new(first_hidden),
+                    role: DisplayPointRole::OverlaidMarker,
+                    x: row.end_x,
+                    y: last.y,
+                    width: last.width,
+                    height: last.height,
+                    row: row.row,
+                    col: row.end_col,
+                })
         })
     }
 
@@ -3322,6 +3425,9 @@ impl WindowDisplaySnapshot {
             return exact;
         }
         let row = self.row_for_buffer_pos(pos)?;
+        if Self::pos_in_truncated_tail(row, pos) {
+            return self.truncated_tail_point(row);
+        }
         let next = self
             .iter_row_points(row.row)
             .find(|point| point.buffer_pos > pos);
@@ -4302,6 +4408,8 @@ pub struct Frame {
     pub(crate) window_state_change: bool,
     /// Real frame-local Lisp face hash table, mirroring GNU `frame->face_hash_table`.
     pub face_hash_table: Value,
+    /// Derived realization state, owned by this frame's exclusive mutator.
+    pub(crate) face_realization: crate::face::realization::FrameFaceRealizationCache,
     /// Per-frame realized Lisp faces, mirroring GNU's `frame->face_hash_table`
     /// runtime surface for renderer-facing consumers.
     /// GNU `struct frame.z_order`: stacking order among sibling child frames.
@@ -4456,6 +4564,7 @@ impl Frame {
             window_hook_record: FrameWindowHookRecord::default(),
             window_state_change: false,
             face_hash_table: Value::hash_table(HashTableTest::Eq),
+            face_realization: Default::default(),
             z_order: 0,
             undecorated: false,
             no_accept_focus: false,
@@ -7106,6 +7215,13 @@ impl FrameManager {
         self.frames.keys().copied().collect()
     }
 
+    /// True when a live frame is absent from `affected`.
+    pub(crate) fn has_frame_outside(&self, affected: &[FrameId]) -> bool {
+        self.frames
+            .keys()
+            .any(|frame_id| !affected.contains(frame_id))
+    }
+
     /// Return FRAME's parent frame id, when FRAME is a child frame.
     pub fn frame_parent_id(&self, id: FrameId) -> Option<FrameId> {
         self.frames
@@ -8920,6 +9036,7 @@ impl GcTrace for FrameManager {
                 roots.push(*v);
             }
             roots.push(frame.face_hash_table);
+            frame.face_realization.trace_roots(roots);
             // Chrome string objects in published snapshots are rooted by
             // their own `SharedRoot` leases.
             frame.tree().trace_roots(roots);

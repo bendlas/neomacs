@@ -607,13 +607,27 @@ pub(super) struct LiveProcessIo {
 pub(super) enum ChildOutputReader {
     Stdout(std::fs::File),
     Shared(os_pipe::PipeReader),
+    #[cfg(all(test, unix))]
+    Injected(super::pipe_exit_tests::PipeReader),
 }
 
 impl std::io::Read for ChildOutputReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Stdout(stdout) => stdout.read(buffer),
-            Self::Shared(pipe) => pipe.read(buffer),
+        // GNU emacs_read never exposes EINTR (sysdep.c:2758-2789). Finish
+        // that interrupted operation before the caller can classify a failed
+        // read and retire the pipe, or status_notify can publish exit while
+        // unread bytes still belong to this descriptor.
+        loop {
+            let result = match self {
+                Self::Stdout(stdout) => stdout.read(buffer),
+                Self::Shared(pipe) => pipe.read(buffer),
+                #[cfg(all(test, unix))]
+                Self::Injected(pipe) => pipe.read(buffer),
+            };
+            match result {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
         }
     }
 }
@@ -665,6 +679,8 @@ impl std::os::fd::AsRawFd for ChildOutputReader {
         match self {
             Self::Stdout(stdout) => stdout.as_raw_fd(),
             Self::Shared(pipe) => pipe.as_raw_fd(),
+            #[cfg(test)]
+            Self::Injected(pipe) => pipe.as_raw_fd(),
         }
     }
 }
@@ -1113,7 +1129,14 @@ impl ProcessWaitBackendInterest {
 
 impl ProcessWaitBackend {
     pub(super) fn new() -> Self {
+        // Miri implements no `timerfd_create`, which `polling::Poller::new`
+        // uses on Linux. The backend already tolerates a missing poller (its
+        // wait loop falls back to sleep-polling), and interpreted tests do not
+        // spawn children, so interpreted runs start without one.
+        #[cfg(not(miri))]
         let poller = polling::Poller::new().ok().map(Arc::new);
+        #[cfg(miri)]
+        let poller: Option<Arc<polling::Poller>> = None;
         #[cfg(unix)]
         let signal_fd = poller.as_ref().and_then(|poller| {
             let fd = crate::emacs_core::os_signal::install().self_pipe_read_fd()?;

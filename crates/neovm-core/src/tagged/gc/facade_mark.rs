@@ -459,8 +459,10 @@ impl TaggedHeap {
     /// heap; it may only seed roots, with no Lisp execution, nested collection
     /// or allocation safepoint. Internal roots are reseeded here. The admission
     /// and heap lifetime remain valid until this returned loan is consumed.
-    /// The existing sweep may invoke native finalizers: the caller must also
-    /// exclude their reentry or mutation of this heap throughout this drain.
+    /// The existing sweep may invoke native finalizers. Their EmacsFinalizer
+    /// contract follows GNU: no interaction with Emacs, including heap/TLS/env
+    /// reentry. Such reentry is outside the module API contract, even when the
+    /// thread has a serial TLS heap installed.
     pub unsafe fn drain_to_quiescent(
         &mut self,
         reseed: impl FnOnce(&mut TaggedHeap),
@@ -579,6 +581,21 @@ impl TaggedHeap {
 mod tests {
     use super::*;
 
+    #[test]
+    fn heapborrow_r5_clear_tls_preserves_collector_loan() {
+        let heap = aliasable::AliasableBox::new(TaggedHeap::new());
+        let root = heap.root();
+        set_tagged_heap_root(root);
+        // SAFETY: sole stopped owner, no live mark or external roots. Clearing
+        // TLS must compare only the root address while this loan is retained.
+        let identity = heap.heap_identity();
+        let collector = unsafe { (*root.as_ptr()).drain_to_quiescent(|_| {}) }.unwrap();
+        clear_tagged_heap_root_if_installed(root);
+        assert!(!tagged_heap_is_installed());
+        assert_eq!(collector.heap_identity(), identity);
+        drop(collector);
+    }
+
     fn quiescent(heap: &mut TaggedHeap) -> QuiescentCollector<'_> {
         // SAFETY: each fixture owns its heap directly without obarray/TLS
         // aliases or callbacks; this helper is used only when it has no
@@ -610,10 +627,8 @@ mod tests {
         let mut heap = TaggedHeap::new();
         let image_child = heap.alloc_float(8.25);
         let image = Box::into_raw(Box::new(ConsCell {
-            car: image_child,
-            cdr_or_next: crate::tagged::header::ConsCdrOrNext {
-                cdr: TaggedValue::NIL,
-            },
+            car: crate::tagged::header::ConsWord::new(image_child),
+            cdr_or_next: crate::tagged::header::ConsCdrWord::new(TaggedValue::NIL),
         }));
         // SAFETY: the leaked aligned initialized cell acts as a writable
         // mapped image and remains live longer than this heap. The fixture is
@@ -916,3 +931,6 @@ mod tests {
         drop(exclusion);
     }
 }
+
+mod cons_suspend;
+pub(super) use cons_suspend::SuspendedConsCollector;

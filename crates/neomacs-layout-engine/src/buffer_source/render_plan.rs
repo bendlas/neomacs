@@ -106,18 +106,32 @@ fn render_or_retain_window_chrome(
     request: WindowChromeRowsRenderRequest<'_, '_>,
     render_services: ChromeRowRenderServices<'_, '_>,
     source: WindowChromeRowSource<'_>,
-) -> Result<WindowChromeMetrics, LogicalInputsChanged> {
+) -> Result<
+    (
+        WindowChromeMetrics,
+        crate::attempt_freshness::LayoutLispAdmission,
+    ),
+    LogicalInputsChanged,
+> {
     let memo = match source {
         WindowChromeRowSource::Recompute => None,
         WindowChromeRowSource::RecomputeWithMemo(memo) => Some(memo),
         WindowChromeRowSource::Retained(chrome) => {
-            return Ok(crate::window_output::install_retained_window_chrome(
-                output,
-                output_emitter,
-                chrome,
+            return Ok((
+                crate::window_output::install_retained_window_chrome(
+                    output,
+                    output_emitter,
+                    chrome,
+                ),
+                crate::attempt_freshness::LayoutLispAdmission::NativeOnly,
             ));
         }
-        WindowChromeRowSource::PreserveReservedMetrics(metrics) => return Ok(metrics),
+        WindowChromeRowSource::PreserveReservedMetrics(metrics) => {
+            return Ok((
+                metrics,
+                crate::attempt_freshness::LayoutLispAdmission::NativeOnly,
+            ));
+        }
     };
     match render_window_chrome_rows(
         output,
@@ -127,7 +141,10 @@ fn render_or_retain_window_chrome(
         render_services,
         memo,
     ) {
-        WindowChromeRowsRenderOutcome::Rendered(metrics) => Ok(metrics),
+        WindowChromeRowsRenderOutcome::Rendered {
+            metrics,
+            lisp_admission,
+        } => Ok((metrics, lisp_admission)),
         WindowChromeRowsRenderOutcome::SourceInvalidated => Err(LogicalInputsChanged),
     }
 }
@@ -615,6 +632,10 @@ impl BufferSourceDefaultFacePlan {
         &self.face
     }
 
+    pub(crate) fn face_mut(&mut self) -> &mut ResolvedFace {
+        &mut self.face
+    }
+
     /// Reserve the effective display identity of this buffer's default face.
     ///
     /// The basic `default` face owns the canonical frame ID only while buffer
@@ -677,10 +698,16 @@ impl BufferSourceOutputSetup {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn render_body_attempt<'a, 'surface, 'buf, B>(
+    pub(crate) fn render_body_attempt<
+        'a,
+        'surface,
+        'buf,
+        B,
+        FS: crate::neovm_bridge::FaceServices,
+    >(
         self,
         walk_setup: &mut BufferSourceWalkSetup,
-        state: BufferSourceRenderAttemptContext<'_, '_>,
+        state: BufferSourceRenderAttemptContext<'_, '_, FS>,
         chrome_request: WindowChromeRowsRenderRequest<'_, '_>,
         remaining_visibility_retries: usize,
         forward_viewport_measurement: Option<ForwardViewportMeasurement>,
@@ -710,7 +737,7 @@ impl BufferSourceOutputSetup {
             state.into_parts();
         let retry_checkpoint = output.capture_retry_checkpoint();
         let effective_default_face =
-            default_face.reserve_effective_face(face_resolver, &mut face_ids);
+            default_face.reserve_effective_face(face_resolver.resolver(), &mut face_ids);
         let default_face_id = effective_default_face.face_id();
         BufferWindowBackground::from_default_face(&effective_default_face).publish(
             &mut output.output_target(),
@@ -721,7 +748,7 @@ impl BufferSourceOutputSetup {
         let has_overlays = !buffer.layout_overlays().is_empty();
         let face_resolution = BufferSourceFaceResolutionContext::new(
             buffer,
-            face_resolver,
+            face_resolver.resolver(),
             default_face.measurement_policy(),
             default_face.face(),
             default_face_id,
@@ -878,7 +905,7 @@ impl BufferSourceOutputSetup {
             // allocation. This window can now install rows without mutating the
             // namespace behind glyphs emitted by an earlier sibling.
             let mut render_services =
-                ChromeRowRenderServices::new(font_metrics, face_resolver, &mut face_ids);
+                ChromeRowRenderServices::new(font_metrics, face_resolver.resolver(), &mut face_ids);
 
             // Install retained body rows verbatim (already bidi-finalized), with
             // the prior cursor decoration stripped — the new cursor is set below.
@@ -908,6 +935,7 @@ impl BufferSourceOutputSetup {
             let mut redisplay_positions = TextWindowRedisplayPositions::from_output_rows(
                 &output_emitter,
                 tail_context.window_start,
+                source.accessible_end(),
                 source.text_start_byte(),
                 0,
             );
@@ -1003,17 +1031,21 @@ impl BufferSourceOutputSetup {
                     Ok(freshness) => freshness,
                     Err(changed) => return changed.into(),
                 };
-            let measured_chrome_heights = match render_or_retain_window_chrome(
-                output.reborrow(),
-                &mut output_emitter,
-                evaluator,
-                chrome_request,
-                render_services.reborrow(),
-                WindowChromeRowSource::for_replay(retained_chrome.as_ref(), chrome_memo.as_ref()),
-            ) {
-                Ok(metrics) => metrics,
-                Err(changed) => return changed.into(),
-            };
+            let (measured_chrome_heights, chrome_lisp_admission) =
+                match render_or_retain_window_chrome(
+                    output.reborrow(),
+                    &mut output_emitter,
+                    evaluator,
+                    chrome_request,
+                    render_services.reborrow(),
+                    WindowChromeRowSource::for_replay(
+                        retained_chrome.as_ref(),
+                        chrome_memo.as_ref(),
+                    ),
+                ) {
+                    Ok(metrics) => metrics,
+                    Err(changed) => return changed.into(),
+                };
             tail_context.finish_and_install(
                 TextWindowFinishState::new(output, output_emitter, evaluator),
                 measured_chrome_heights,
@@ -1029,6 +1061,7 @@ impl BufferSourceOutputSetup {
                     && !params.word_wrap,
                 window_end_record: publish_request.window_end_record(redisplay_positions),
                 freshness_before_chrome,
+                chrome_lisp_admission,
                 effective_default_face,
                 cursor_only: true,
                 reused_matrix_rows: None,
@@ -1199,7 +1232,7 @@ impl BufferSourceOutputSetup {
             }
 
             let mut render_services =
-                ChromeRowRenderServices::new(font_metrics, face_resolver, &mut face_ids);
+                ChromeRowRenderServices::new(font_metrics, face_resolver.resolver(), &mut face_ids);
 
             // Redisplay positions: window_end is the LAST visible row.
             //  - SCROLL: reused rows sit ABOVE the exposed (bottom) rows, so the
@@ -1212,6 +1245,7 @@ impl BufferSourceOutputSetup {
                 TextWindowRedisplayPositions::from_output_rows(
                     &output_emitter,
                     scroll.new_window_start,
+                    source.accessible_end(),
                     source.text_start_byte(),
                     walk_setup.byte_idx,
                 )
@@ -1299,6 +1333,7 @@ impl BufferSourceOutputSetup {
                 TextWindowRedisplayPositions::from_output_rows(
                     &output_emitter,
                     scroll.new_window_start,
+                    source.accessible_end(),
                     source.text_start_byte(),
                     walk_setup.byte_idx,
                 )
@@ -1461,17 +1496,21 @@ impl BufferSourceOutputSetup {
                     Ok(freshness) => freshness,
                     Err(changed) => return changed.into(),
                 };
-            let measured_chrome_heights = match render_or_retain_window_chrome(
-                output.reborrow(),
-                &mut output_emitter,
-                evaluator,
-                chrome_request,
-                render_services.reborrow(),
-                WindowChromeRowSource::for_replay(retained_chrome.as_ref(), chrome_memo.as_ref()),
-            ) {
-                Ok(metrics) => metrics,
-                Err(changed) => return changed.into(),
-            };
+            let (measured_chrome_heights, chrome_lisp_admission) =
+                match render_or_retain_window_chrome(
+                    output.reborrow(),
+                    &mut output_emitter,
+                    evaluator,
+                    chrome_request,
+                    render_services.reborrow(),
+                    WindowChromeRowSource::for_replay(
+                        retained_chrome.as_ref(),
+                        chrome_memo.as_ref(),
+                    ),
+                ) {
+                    Ok(metrics) => metrics,
+                    Err(changed) => return changed.into(),
+                };
 
             tail_context.finish_and_install(
                 TextWindowFinishState::new(output, output_emitter, evaluator),
@@ -1494,6 +1533,7 @@ impl BufferSourceOutputSetup {
                     && !params.word_wrap,
                 window_end_record: publish_request.window_end_record(redisplay_positions),
                 freshness_before_chrome,
+                chrome_lisp_admission,
                 effective_default_face,
                 cursor_only: false,
                 reused_matrix_rows: Some(reused_matrix_rows),
@@ -1601,7 +1641,7 @@ impl BufferSourceOutputSetup {
         let (mut output, evaluator) = output.into_parts();
         let window_faces = FrameFaces::new(face_resolver).for_window(buffer);
         let mut render_services =
-            ChromeRowRenderServices::new(font_metrics, face_resolver, &mut face_ids);
+            ChromeRowRenderServices::new(font_metrics, face_resolver.resolver(), &mut face_ids);
         let mut output_emitter = output_emitter;
         let redisplay_positions = walk_setup.install_body(
             output.reborrow(),
@@ -1711,7 +1751,7 @@ impl BufferSourceOutputSetup {
                 Ok(freshness) => freshness,
                 Err(changed) => return changed.into(),
             };
-        let measured_chrome_heights = match render_or_retain_window_chrome(
+        let (measured_chrome_heights, chrome_lisp_admission) = match render_or_retain_window_chrome(
             output.reborrow(),
             &mut output_emitter,
             evaluator,
@@ -1741,6 +1781,7 @@ impl BufferSourceOutputSetup {
                 && !params.word_wrap,
             window_end_record: publish_request.window_end_record(redisplay_positions),
             freshness_before_chrome,
+            chrome_lisp_admission,
             effective_default_face,
             cursor_only: false,
             reused_matrix_rows: None,

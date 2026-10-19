@@ -1343,6 +1343,7 @@ fn buffer_hscroll_skip_render_request_appends_left_truncation_marker() {
         &active_face,
         DisplayRowFallbackMetrics::from_default_face_extents(8.0, 16.0, 12.0),
         99,
+        None,
         false,
         context.defaults,
         0,
@@ -8117,6 +8118,7 @@ fn buffer_text_window_body_install_request_records_positions_and_edge_markers() 
     let positions = TextWindowBodyInstallRequest::new(TextWindowBodyInstallRenderContext::new(
         41,
         3,
+        i64::MAX,
         100,
         4,
         true,
