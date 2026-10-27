@@ -1669,7 +1669,8 @@ fn first_emacs_char_code(value: Value) -> Option<i64> {
                 return Some(0);
             }
             let (ch, _) = if string.is_multibyte() {
-                super::emacs_char::string_char(string.as_bytes())
+                let (c, n) = super::emacs_char::string_char(string.as_bytes());
+                (c.code(), n)
             } else {
                 (string.as_bytes()[0] as u32, 1)
             };
@@ -2520,6 +2521,120 @@ fn builtin_coding_system_eol_type_uncached(
     Ok(Value::vector(vec))
 }
 
+/// The classification GNU's write path gives a selected coding system.
+///
+/// `choose_write_coding_system` (src/fileio.c) distinguishes exactly two
+/// worlds for the *selected* coding: a `raw_text` type is byte-faithful and
+/// skips `select-safe-coding-system-function`, while everything else is
+/// handed to that selector.  Naming the two outcomes makes the rule a type
+/// instead of a boolean flag, and gives `write-region` and
+/// `unencodable-char-position` one definition to share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteCodingClass {
+    /// GNU `CODING_ATTR_TYPE == Qraw_text`: every byte is written verbatim.
+    RawText,
+    /// Any other coding type: the text must be checked for safe encoding.
+    Selectable,
+}
+
+/// `true` when NAME has the `raw_text` coding type GNU's write path tests.
+///
+/// The resolved runtime name is reduced to its base (the `-unix`/`-dos`/
+/// `-mac` variants share their base's type), then compared with the
+/// `raw-text` type GNU gives `raw-text`, `no-conversion` and `binary`.
+fn coding_name_is_raw_text(mgr: &CodingSystemManager, name: &str) -> bool {
+    let resolved = resolve_runtime_name(mgr, name).unwrap_or_else(|| name.to_string());
+    coding_type_for_base(strip_eol_suffix(&resolved)) == Some("raw-text")
+}
+
+/// Classify NAME by the rule GNU's write path uses.
+pub(crate) fn classify_write_coding(mgr: &CodingSystemManager, name: &str) -> WriteCodingClass {
+    if coding_name_is_raw_text(mgr, name) {
+        WriteCodingClass::RawText
+    } else {
+        WriteCodingClass::Selectable
+    }
+}
+
+/// The concrete end-of-line type a coding system definition fixes, if any.
+///
+/// GNU reads `AREF (spec, 2)`: a vector there means undecided.  Names carry
+/// the EOL suffix, and dynamic definitions can fix it through
+/// `coding-system-put`, so both sources are consulted.
+fn concrete_eol(mgr: &CodingSystemManager, resolved_name: &str) -> Option<EolType> {
+    if let Some(eol) = EolType::from_suffix(resolved_name) {
+        return Some(eol);
+    }
+    let bucket = runtime_bucket_name(mgr, resolved_name)?;
+    let info = mgr.get(&bucket)?;
+    match info.eol_type {
+        EolType::Undecided => None,
+        eol => Some(eol),
+    }
+}
+
+/// GNU `raw_text_coding_system` (src/coding.c:5934-5955).
+///
+/// A coding system that already has the raw-text type is returned unchanged
+/// (`no-conversion` stays itself); otherwise the result is `raw-text` with
+/// CODING's concrete end-of-line type, or the plain `raw-text` when its EOL
+/// is undecided.
+pub(crate) fn raw_text_coding_system(mgr: &CodingSystemManager, coding: SymId) -> SymId {
+    let name = resolve_sym(coding);
+    if coding_name_is_raw_text(mgr, name) {
+        return coding;
+    }
+    let resolved = resolve_runtime_name(mgr, name).unwrap_or_else(|| name.to_string());
+    match concrete_eol(mgr, &resolved) {
+        Some(EolType::Unix) => intern("raw-text-unix"),
+        Some(EolType::Dos) => intern("raw-text-dos"),
+        Some(EolType::Mac) => intern("raw-text-mac"),
+        Some(EolType::Undecided) | None => intern("raw-text"),
+    }
+}
+
+/// The parent whose end-of-line type an undecided coding system inherits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EolParent {
+    /// GNU `parent == nil`: the system's EOL (Unix on this platform).
+    System,
+    /// GNU `parent == CODING`: its concrete EOL, or the system's when it has
+    /// none.
+    Coding(SymId),
+}
+
+/// GNU `coding_inherit_eol_type (coding_system, parent)` (src/coding.c:5972).
+///
+/// An undecided coding system becomes its subsidiary with the parent's
+/// concrete end-of-line type (`raw-text` -> `raw-text-unix` with the system
+/// parent, `raw-text` + `utf-8-dos` -> `raw-text-dos`); a coding system that
+/// already fixes its EOL is returned unchanged.
+pub(crate) fn coding_inherit_eol_type(
+    mgr: &CodingSystemManager,
+    coding: SymId,
+    parent: EolParent,
+) -> SymId {
+    let name = resolve_sym(coding);
+    let Some(resolved) = resolve_runtime_name(mgr, name) else {
+        return coding;
+    };
+    if concrete_eol(mgr, &resolved).is_some() {
+        return coding;
+    }
+    let parent_eol = match parent {
+        EolParent::System => EolType::Unix,
+        EolParent::Coding(parent) => {
+            let parent_name = resolve_sym(parent);
+            resolve_runtime_name(mgr, parent_name)
+                .as_deref()
+                .and_then(|resolved| concrete_eol(mgr, resolved))
+                .unwrap_or(EolType::Unix)
+        }
+    };
+    let base = eol_vector_base(strip_eol_suffix(&resolved));
+    intern(&format!("{base}{}", parent_eol.suffix()))
+}
+
 /// Port of GNU `coding_inherit_eol_type` (src/coding.c) with PARENT == nil.
 ///
 /// If CODING-SYSTEM is nil it becomes `raw-text`.  Then, if its end-of-line
@@ -2543,24 +2658,10 @@ pub(crate) fn coding_inherit_eol_type_unix(
     let Some(name) = coding_system.as_symbol_name(mode) else {
         return coding_system;
     };
-    let Some(resolved_name) = resolve_runtime_name(mgr, name) else {
+    let Some(id) = lookup_interned(name) else {
         return coding_system;
     };
-    // Concrete EOL already encoded in the name suffix -> unchanged.
-    if EolType::from_suffix(&resolved_name).is_some() {
-        return coding_system;
-    }
-    if let Some(bucket) = runtime_bucket_name(mgr, &resolved_name)
-        && let Some(info) = mgr.get(&bucket)
-    {
-        // EOL fixed by the coding-system definition -> unchanged.
-        if info.eol_type.specified_index().is_some() {
-            return coding_system;
-        }
-    }
-    // Undecided EOL -> inherit system (unix) EOL == AREF (eol_type, 0).
-    let base = eol_vector_base(strip_eol_suffix(&resolved_name));
-    Value::symbol(format!("{base}-unix"))
+    Value::from_sym_id(coding_inherit_eol_type(mgr, id, EolParent::System))
 }
 
 /// `(coding-system-type CODING-SYSTEM)` -- return the type symbol of the
@@ -2926,10 +3027,9 @@ fn scan_unencodable_positions(
     let mut byte = 0usize;
     let mut char_index = 0i64;
     while byte < text.len() {
-        let (code, len) = super::emacs_char::string_char(&text[byte..]);
+        let (ch, len) = super::emacs_char::string_char(&text[byte..]);
         byte += len;
-        let ch = EmacsChar::from_code(code).expect("decoded Emacs character");
-        let is_ascii = code < 0x80;
+        let is_ascii = ch.code() < 0x80;
         if !(repertoire.encodes(ch) || is_ascii && repertoire.ascii_compatible) {
             positions.push(base_pos + char_index);
             if positions.len() >= limit {
@@ -3052,10 +3152,9 @@ pub(crate) fn builtin_unencodable_char_position(
     if !is_known_or_derived_coding_system(&eval.coding_systems, &coding_name) {
         return Err(signal(LispCondition::CodingSystemError, vec![args[2]]));
     }
-    let resolved = resolve_runtime_name(&eval.coding_systems, &coding_name)
-        .unwrap_or_else(|| coding_name.clone());
-    if coding_type_for_base(strip_eol_suffix(&resolved)) == Some("raw-text") {
-        return Ok(Value::NIL);
+    match classify_write_coding(&eval.coding_systems, &coding_name) {
+        WriteCodingClass::RawText => return Ok(Value::NIL),
+        WriteCodingClass::Selectable => {}
     }
     let Some(repertoire) =
         CodingRepertoire::for_coding_system(&eval.coding_systems, &coding_name, eval.symbol_mode())
@@ -3718,7 +3817,7 @@ impl<'a> DetectSrc<'a> {
             // A genuine multibyte character: decode and negate.
             self.pos -= 1;
             let ch = crate::emacs_core::emacs_char::string_char_advance(self.bytes, &mut self.pos);
-            return Some(-(ch as i32));
+            return Some(-(ch.code() as i32));
         }
         Some(i32::from(c))
     }
@@ -5749,8 +5848,8 @@ fn safe_coding_systems_for_text(
     while byte < text.sbytes() {
         let (code, len) = super::emacs_char::string_char(&text.as_bytes()[byte..]);
         byte += len;
-        if code >= 0x80 {
-            chars.push(EmacsChar::from_code(code).expect("decoded Emacs character"));
+        if code.code() >= 0x80 {
+            chars.push(code);
         }
     }
     chars.sort_unstable();

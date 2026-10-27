@@ -33,12 +33,16 @@
 //! * `verify`: a hit renders anyway and compares the two rows; a mismatch is
 //!   logged and counted, and the rendered row stands.
 
+mod glyph_reservoir;
 mod source_projection;
+pub(crate) use glyph_reservoir::ChromeGlyphReservoir;
+mod value_comparison;
 use source_projection::ChromeSourceProjection;
 pub(crate) use source_projection::{
     ChromeSourceBindings, ChromeSourceProjectionMode, ChromeSourceSpan,
     chrome_source_projection_mode,
 };
+use value_comparison::{CapturedMemoKey, MemoKeyScope};
 
 use std::sync::Arc;
 
@@ -125,6 +129,24 @@ pub(crate) fn chrome_row_role(kind: WindowChromeKind) -> GlyphRowRole {
     }
 }
 
+/// Whether this render has captured automatic composition rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChromeCompositionRules {
+    Absent,
+    Present,
+}
+
+impl From<&Option<neovm_core::emacs_core::composite::AutomaticCompositionRules>>
+    for ChromeCompositionRules
+{
+    fn from(rules: &Option<neovm_core::emacs_core::composite::AutomaticCompositionRules>) -> Self {
+        match rules {
+            Some(_) => Self::Present,
+            None => Self::Absent,
+        }
+    }
+}
+
 /// The inputs of one chrome row render other than the string itself.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChromeRowInputs {
@@ -140,7 +162,7 @@ pub(crate) struct ChromeRowInputs {
     /// Identity of the buffer's `glyphless-char-display` table, if any. Its
     /// contents are covered by `char_table_revision`.
     pub(crate) glyphless_table_bits: Option<usize>,
-    pub(crate) automatic_composition: bool,
+    pub(crate) automatic_composition: ChromeCompositionRules,
     pub(crate) face_change_count: u64,
     pub(crate) char_table_revision: neovm_core::window::CharTableLayoutRevision,
     pub(crate) media_generation: u64,
@@ -152,11 +174,52 @@ pub(crate) struct ChromeRowInputs {
 /// Everything a chrome row render reads, as plain data.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChromeRowFingerprint {
+    context: ChromeRowContext,
+    text: ChromeTextContent,
+}
+
+/// Shared paint/source context. Derived equality is the single admission rule
+/// for both full-row equality and primitive reuse when only text changes.
+#[derive(Clone, Debug, PartialEq)]
+struct ChromeRowContext {
     inputs: ChromeRowInputs,
-    text: Box<[u8]>,
-    multibyte: bool,
+    storage: ChromeTextStorage,
     props: Box<[u8]>,
     spans: Box<[ChromeSpanShape]>,
+    root_alias: ChromeRootAlias,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChromeTextContent(Box<[u8]>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChromeTextStorage {
+    Unibyte,
+    Multibyte,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChromeSourceIndex(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChromeRootAlias {
+    Separate,
+    Source(ChromeSourceIndex),
+}
+
+impl From<usize> for ChromeSourceIndex {
+    fn from(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+impl From<Option<ChromeSourceIndex>> for ChromeRootAlias {
+    fn from(index: Option<ChromeSourceIndex>) -> Self {
+        match index {
+            Some(index) => Self::Source(index),
+            None => Self::Separate,
+        }
+    }
 }
 
 /// One source span: where it sits in the output, where it starts in its
@@ -203,19 +266,22 @@ impl ChromeRowFingerprint {
                 )
             }
             ChromeSourceProjectionMode::Off => {
-                let mut sources: Vec<Value> = Vec::new();
+                let keys = MemoKeyScope::for_formatted(formatted);
+                let root_key = keys.capture(root);
+                let mut sources: Vec<CapturedMemoKey<'_>> = Vec::new();
                 let spans = formatted
                     .source_spans()
                     .iter()
                     .map(|span| {
-                        let source = span.source();
-                        let source_index = match sources.iter().position(|seen| *seen == source) {
-                            Some(index) => index,
-                            None => {
-                                sources.push(source);
-                                sources.len() - 1
-                            }
-                        };
+                        let source = keys.capture(span.source());
+                        let source_index =
+                            match sources.iter().position(|seen| seen.equivalent(&source)) {
+                                Some(index) => index,
+                                None => {
+                                    sources.push(source);
+                                    sources.len() - 1
+                                }
+                            };
                         ChromeSpanShape {
                             output_start: span.output_start(),
                             output_end: span.output_end(),
@@ -225,38 +291,40 @@ impl ChromeRowFingerprint {
                     })
                     .collect();
                 // Whether a span's source IS the root string decides its string id.
-                let root_index = sources.iter().position(|source| *source == root);
+                let root_index = sources
+                    .iter()
+                    .position(|source| source.equivalent(&root_key));
                 (spans, root_index, None)
             }
         };
-        let mut text = Vec::with_capacity(string.as_bytes().len() + 8);
-        text.extend_from_slice(string.as_bytes());
-        text.extend_from_slice(
-            &root_index
-                .map_or(u64::MAX, |index| index as u64)
-                .to_le_bytes(),
-        );
         Some((
             Self {
-                inputs,
-                text: text.into_boxed_slice(),
-                multibyte: string.is_multibyte(),
-                props: encoder.finish(),
-                spans,
+                context: ChromeRowContext {
+                    inputs,
+                    storage: if string.is_multibyte() {
+                        ChromeTextStorage::Multibyte
+                    } else {
+                        ChromeTextStorage::Unibyte
+                    },
+                    props: encoder.finish(),
+                    spans,
+                    root_alias: ChromeRootAlias::from(root_index.map(ChromeSourceIndex::from)),
+                },
+                text: ChromeTextContent(string.as_bytes().into()),
             },
             bindings,
         ))
     }
 
     pub(crate) fn kind(&self) -> WindowChromeKind {
-        self.inputs.kind
+        self.context.inputs.kind
     }
 
     /// The first part of `self` that differs from `other`, for the miss
     /// diagnostics (`RUST_LOG=neomacs::chrome_memo=debug`).
     pub(crate) fn first_difference(&self, other: &Self) -> Option<&'static str> {
-        let a = &self.inputs;
-        let b = &other.inputs;
+        let a = &self.context.inputs;
+        let b = &other.context.inputs;
         [
             (a.kind != b.kind, "kind"),
             (
@@ -294,10 +362,13 @@ impl ChromeRowFingerprint {
             ),
             (a.media_generation != b.media_generation, "media_generation"),
             (a.symbol_values != b.symbol_values, "symbol_values"),
-            (self.text != other.text, "text"),
-            (self.multibyte != other.multibyte, "multibyte"),
-            (self.props != other.props, "props"),
-            (self.spans != other.spans, "spans"),
+            (
+                self.text != other.text || self.context.root_alias != other.context.root_alias,
+                "text",
+            ),
+            (self.context.storage != other.context.storage, "multibyte"),
+            (self.context.props != other.context.props, "props"),
+            (self.context.spans != other.context.spans, "spans"),
         ]
         .into_iter()
         .find_map(|(differs, name)| differs.then_some(name))
@@ -436,16 +507,17 @@ impl PlainEncoder {
         if intervals.is_empty() {
             return Ok(());
         }
-        let display = Value::symbol("display");
+        let keys = MemoKeyScope::for_string(string);
+        let display = keys.capture(Value::symbol("display"));
         let name_only = [
-            Value::symbol("help-echo"),
-            Value::symbol("local-map"),
-            Value::symbol("keymap"),
+            keys.capture(Value::symbol("help-echo")),
+            keys.capture(Value::symbol("local-map")),
+            keys.capture(Value::symbol("keymap")),
         ];
         let runs = intervals.object_interval_plist_runs_for_char_len(
             neovm_core::buffer::CharLen::new(string.schars()),
         );
-        let mut properties: Vec<(Value, Value)> = Vec::new();
+        let mut properties: Vec<(CapturedMemoKey<'_>, Value)> = Vec::new();
         for run in runs {
             let mut plist = run.plist();
             if plist.is_nil() {
@@ -468,7 +540,8 @@ impl PlainEncoder {
                 } else {
                     Value::NIL
                 };
-                if !properties.iter().any(|(seen, _)| *seen == name) {
+                let name = keys.capture(name);
+                if !properties.iter().any(|(seen, _)| seen.equivalent(&name)) {
                     properties.push((name, value));
                 }
                 plist = if rest.is_cons() {
@@ -477,19 +550,22 @@ impl PlainEncoder {
                     Value::NIL
                 };
             }
-            properties.sort_by_key(|(name, _)| name.bits());
-            for &(name, value) in &properties {
-                self.value(name, depth + 1)?;
-                if scope == PropertyScope::Root {
-                    if name == display && !value.is_nil() {
-                        return Err(NotPlain);
+            properties.sort_by_key(|(name, _)| name.original().bits());
+            for (name, value) in &properties {
+                self.value(name.original(), depth + 1)?;
+                match scope {
+                    PropertyScope::Root => {
+                        if name.equivalent(&display) && !value.is_nil() {
+                            return Err(NotPlain);
+                        }
+                        if name_only.iter().any(|key| key.equivalent(name)) {
+                            self.out.push(tag::NAME_ONLY);
+                            continue;
+                        }
                     }
-                    if name_only.contains(&name) {
-                        self.out.push(tag::NAME_ONLY);
-                        continue;
-                    }
+                    PropertyScope::Nested => {}
                 }
-                self.value(value, depth + 1)?;
+                self.value(*value, depth + 1)?;
             }
         }
         Ok(())
@@ -534,6 +610,15 @@ impl ChromeMemo {
                     .first_difference(fingerprint)
                     .unwrap_or("no retained row")
             })
+    }
+
+    /// An immutable primitive reservoir for this render's canonical source walk.
+    /// Full-row hits return before requesting this narrower miss-path admission.
+    pub(crate) fn glyph_reservoir(
+        &self,
+        fingerprint: &ChromeRowFingerprint,
+    ) -> Option<ChromeGlyphReservoir> {
+        ChromeGlyphReservoir::capture(self, fingerprint)
     }
 
     /// The previous row for `fingerprint`'s kind, when it was rendered from

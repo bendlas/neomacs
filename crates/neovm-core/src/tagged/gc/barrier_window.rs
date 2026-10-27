@@ -410,12 +410,28 @@ impl TaggedHeap {
     /// (`JitHeapState`). Called at every writer of an input.
     pub(super) fn publish_barrier_window(&mut self) {
         let window = self.barrier_window();
-        let observed = super::super::collection_reads::compiled_observation_gate(
+        self._satb_layout_reserve
+            .observations()
+            .publish_dump_window(self.collection_dump_window());
+        let observed = super::super::collection_reads::compiled_observation_gate_for_world(
+            self._satb_layout_reserve.observations(),
             self.collection_dump_window(),
         );
         self.set_compiled_barrier_window(window, observed);
         TAGGED_HEAP_BARRIER_WINDOW.with(|w| w.set(window));
         TAGGED_HEAP_CONS_BARRIER_WINDOW.with(|w| w.set(self.cons_barrier_window(window)));
+        // Same publication edge as the cold TLS mirrors. Only the executing
+        // World or a collector holding its stopped handshake may write Cells.
+        let owner = self._satb_layout_reserve.observations();
+        if owner.is_detached() {
+            // The detached home is outside this heap loan.
+            unsafe { owner.root().as_ref() }
+                .publish_windows(self.cons_barrier_window(window), window);
+        } else {
+            // Read the initialized tail through this legitimate heap loan.
+            unsafe { self.store.assume_init_ref() }
+                .publish_windows(self.cons_barrier_window(window), window);
+        }
     }
 
     /// Test hook: arm or disarm the concurrent SATB barrier exactly as

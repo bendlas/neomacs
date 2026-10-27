@@ -4,6 +4,152 @@
 //! the same view of `Context` and the parent's private items (`use super::*`).
 
 use super::*;
+use crate::tagged::gc::MarkPhase;
+
+/// Labels for the structured GC diagnostics; text compatibility stays in the
+/// event message for existing pause-analysis tools.
+#[derive(Clone, Copy)]
+enum GcTraceKind {
+    SynchronousRecoveryPending,
+    ConcurrentStart,
+    ConcurrentTermination,
+}
+
+impl GcTraceKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SynchronousRecoveryPending => "synchronous_recovery_pending",
+            Self::ConcurrentStart => "concurrent_start",
+            Self::ConcurrentTermination => "concurrent_termination",
+        }
+    }
+}
+
+/// Fixed command-loop identities. Each spelling is resolved once per registry
+/// epoch. A use after arbitrary Lisp
+/// must call `id` again: callbacks may unintern a symbol or replace the registry.
+#[derive(Clone, Copy, Debug, strum::EnumIter)]
+enum CommandLoopSymbol {
+    PrefixArg,
+    LastPrefixArg,
+    CurrentPrefixArg,
+    ThisCommand,
+    RealThisCommand,
+    ThisOriginalCommand,
+    LastCommandEvent,
+    DeactivateMark,
+    DisablePointAdjustment,
+    GlobalDisablePointAdjustment,
+    LastCommand,
+    RealLastCommand,
+    LastRepeatableCommand,
+    InhibitQuit,
+    UndoAutoAddBoundary,
+    MemoryFull,
+    DelayedWarningsList,
+    AutoSaveInterval,
+    CommandRemapping,
+    Undefined,
+    CommandExecute,
+}
+
+impl CommandLoopSymbol {
+    #[inline]
+    fn id(self) -> SymId {
+        use crate::emacs_core::intern::EpochCachedSymbol;
+
+        match self {
+            Self::PrefixArg => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("prefix-arg");
+                SYMBOL.get()
+            }
+            Self::LastPrefixArg => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("last-prefix-arg");
+                SYMBOL.get()
+            }
+            Self::CurrentPrefixArg => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("current-prefix-arg");
+                SYMBOL.get()
+            }
+            Self::ThisCommand => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("this-command");
+                SYMBOL.get()
+            }
+            Self::RealThisCommand => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("real-this-command");
+                SYMBOL.get()
+            }
+            Self::ThisOriginalCommand => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("this-original-command");
+                SYMBOL.get()
+            }
+            Self::LastCommandEvent => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("last-command-event");
+                SYMBOL.get()
+            }
+            Self::DeactivateMark => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("deactivate-mark");
+                SYMBOL.get()
+            }
+            Self::DisablePointAdjustment => {
+                static SYMBOL: EpochCachedSymbol =
+                    EpochCachedSymbol::new("disable-point-adjustment");
+                SYMBOL.get()
+            }
+            Self::GlobalDisablePointAdjustment => {
+                static SYMBOL: EpochCachedSymbol =
+                    EpochCachedSymbol::new("global-disable-point-adjustment");
+                SYMBOL.get()
+            }
+            Self::LastCommand => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("last-command");
+                SYMBOL.get()
+            }
+            Self::RealLastCommand => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("real-last-command");
+                SYMBOL.get()
+            }
+            Self::LastRepeatableCommand => {
+                static SYMBOL: EpochCachedSymbol =
+                    EpochCachedSymbol::new("last-repeatable-command");
+                SYMBOL.get()
+            }
+            Self::InhibitQuit => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("inhibit-quit");
+                SYMBOL.get()
+            }
+            Self::UndoAutoAddBoundary => {
+                static SYMBOL: EpochCachedSymbol =
+                    EpochCachedSymbol::new("undo-auto--add-boundary");
+                SYMBOL.get()
+            }
+            Self::MemoryFull => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("memory-full");
+                SYMBOL.get()
+            }
+            Self::DelayedWarningsList => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("delayed-warnings-list");
+                SYMBOL.get()
+            }
+            Self::AutoSaveInterval => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("auto-save-interval");
+                SYMBOL.get()
+            }
+            Self::CommandRemapping => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("command-remapping");
+                SYMBOL.get()
+            }
+            Self::Undefined => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("undefined");
+                SYMBOL.get()
+            }
+            Self::CommandExecute => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("command-execute");
+                SYMBOL.get()
+            }
+        }
+    }
+}
 
 #[path = "gc_generational.rs"]
 mod gc_generational;
@@ -503,8 +649,8 @@ impl Context {
                     let diagnostic = self.capture_command_loop_diagnostic(&sig);
                     // GNU `cmd_error' clears both prefix arguments and key
                     // echoing before calling `cmd_error_internal'.
-                    self.assign("prefix-arg", Value::NIL);
-                    self.assign("last-prefix-arg", Value::NIL);
+                    self.assign_by_id(CommandLoopSymbol::PrefixArg.id(), Value::NIL);
+                    self.assign_by_id(CommandLoopSymbol::LastPrefixArg.id(), Value::NIL);
                     self.cancel_key_echo_state();
 
                     let data = self.signal_error_data_value(&sig);
@@ -595,8 +741,10 @@ impl Context {
             // calls `call-interactively`, and prefix commands such as
             // `universal-argument` rely on `prefix-arg` surviving
             // until that point.
-            let outgoing_prefix_arg = self.eval_symbol("current-prefix-arg").unwrap_or(Value::NIL);
-            self.assign("last-prefix-arg", outgoing_prefix_arg);
+            let outgoing_prefix_arg = self
+                .eval_symbol_by_id(CommandLoopSymbol::CurrentPrefixArg.id())
+                .unwrap_or(Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::LastPrefixArg.id(), outgoing_prefix_arg);
 
             // Reset this-command and related variables before reading
             // the next key sequence.  GNU keyboard.c:1416-1419 clears
@@ -604,9 +752,9 @@ impl Context {
             // and Vthis_command_keys_shift_translated to nil so that idle
             // timer callbacks (e.g. which-key) running inside
             // read_key_sequence observe (null this-command) => t.
-            self.assign("this-command", Value::NIL);
-            self.assign("real-this-command", Value::NIL);
-            self.assign("this-original-command", Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::ThisCommand.id(), Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::RealThisCommand.id(), Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::ThisOriginalCommand.id(), Value::NIL);
 
             // Read a complete key sequence (may be multi-key, e.g. C-x C-f).
             //
@@ -629,7 +777,11 @@ impl Context {
             // this binding) and bind no `inhibit-quit`, so their waits stay
             // interruptible by C-g — the sleep-for quit fix is preserved.
             let read_specpdl_count = self.specpdl.len();
-            self.try_specbind_or_unwind_to(read_specpdl_count, intern("inhibit-quit"), Value::T)?;
+            self.try_specbind_or_unwind_to(
+                read_specpdl_count,
+                CommandLoopSymbol::InhibitQuit.id(),
+                Value::T,
+            )?;
             let read_result = self.read_command_key_sequence_with_options(
                 crate::keyboard::ReadKeySequenceOptions::new(Value::NIL, false, false, true),
             );
@@ -732,7 +884,7 @@ impl Context {
             self.sync_current_buffer_to_selected_window();
 
             if input_end.is_some() {
-                self.assign("this-command", Value::NIL);
+                self.assign_by_id(CommandLoopSymbol::ThisCommand.id(), Value::NIL);
                 return Ok(Value::NIL);
             }
 
@@ -765,13 +917,13 @@ impl Context {
             // the preceding command's `post-command-hook` and leaves that
             // value visible to the next `pre-command-hook` (keyboard.c's
             // `kset_real_last_command` near the command-loop finalize tail).
-            self.assign("real-this-command", binding);
+            self.assign_by_id(CommandLoopSymbol::RealThisCommand.id(), binding);
 
             // Apply command remapping per GNU
             // `keyboard.c:1340-1343`. The remapped command becomes
             // this-command for execution. Finding 4.
             let remapped = self.command_remapping_for_loop(binding);
-            self.assign("this-command", remapped);
+            self.assign_by_id(CommandLoopSymbol::ThisCommand.id(), remapped);
             let mut command_observation = command_observation_start.map(|start| {
                 UserCommandObservation::begin(
                     start,
@@ -793,15 +945,15 @@ impl Context {
             // (pre-remap) command for the duration of the iteration
             // unless a pre-command-hook explicitly cleared it.
             if self
-                .eval_symbol("this-original-command")
+                .eval_symbol_by_id(CommandLoopSymbol::ThisOriginalCommand.id())
                 .unwrap_or(Value::NIL)
                 .is_nil()
             {
-                self.assign("this-original-command", binding);
+                self.assign_by_id(CommandLoopSymbol::ThisOriginalCommand.id(), binding);
             }
 
             if let Some(last) = keys.last() {
-                self.assign("last-command-event", *last);
+                self.assign_by_id(CommandLoopSymbol::LastCommandEvent.id(), *last);
             }
             tracing::debug!(
                 "command_loop_1: binding={} current_buffer={:?} active_minibuffer_window={:?}",
@@ -818,7 +970,7 @@ impl Context {
             // (left by an earlier buffer-modifying command such as self-insert)
             // leaks forward and immediately kills a freshly `set-mark`ed region,
             // so e.g. `C-SPC M-> M-;` sees no active region.
-            self.assign("deactivate-mark", Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::DeactivateMark.id(), Value::NIL);
 
             // GNU `keyboard.c:1500-1506` records the command pseudo-event
             // before `pre-command-hook`, so `recent-keys 'include-cmds` can
@@ -835,8 +987,14 @@ impl Context {
             // `pre-command-hook` and before command execution, so the
             // previous command's edits are grouped before the next command
             // mutates any buffer state.
-            if self.obarray.fboundp("undo-auto--add-boundary") {
-                let _ = self.apply(Value::symbol("undo-auto--add-boundary"), vec![]);
+            if self
+                .obarray
+                .fboundp_id(CommandLoopSymbol::UndoAutoAddBoundary.id())
+            {
+                let _ = self.apply(
+                    Value::from_sym_id(CommandLoopSymbol::UndoAutoAddBoundary.id()),
+                    vec![],
+                );
             }
             if let Some(current_id) = self.buffers.current_buffer_id() {
                 let _ = self.buffers.record_undo_point_before_command(current_id);
@@ -852,7 +1010,7 @@ impl Context {
                 .and_then(|id| self.buffers.get(id))
                 .map(|b| b.modified_tick())
                 .unwrap_or(0);
-            self.assign("disable-point-adjustment", Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::DisablePointAdjustment.id(), Value::NIL);
 
             // Execute the remapped command, matching GNU's
             // `calln (Qcommand_execute, Vthis_command)`.
@@ -925,11 +1083,11 @@ impl Context {
                     .and_then(|w| w.buffer_id());
                 let cur_pt = cur_buffer.map(|id| self.apfp_point(id)).unwrap_or(0);
                 let disabled = self
-                    .eval_symbol("disable-point-adjustment")
+                    .eval_symbol_by_id(CommandLoopSymbol::DisablePointAdjustment.id())
                     .unwrap_or(Value::NIL)
                     .is_truthy()
                     || self
-                        .eval_symbol("global-disable-point-adjustment")
+                        .eval_symbol_by_id(CommandLoopSymbol::GlobalDisablePointAdjustment.id())
                         .unwrap_or(Value::NIL)
                         .is_truthy();
                 if cur_buffer.is_some()
@@ -954,27 +1112,31 @@ impl Context {
             // kset_real_last_command near the bottom of command_loop_1).
             // Undo uses `last-command` to decide whether a following undo
             // continues the same undo chain or starts a redo.
-            if let Ok(this_cmd) = self.eval_symbol("this-command") {
-                self.assign("last-command", this_cmd);
+            if let Ok(this_cmd) = self.eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id()) {
+                self.assign_by_id(CommandLoopSymbol::LastCommand.id(), this_cmd);
             }
-            let real_this = self.eval_symbol("real-this-command").unwrap_or(Value::NIL);
-            self.assign("real-last-command", real_this);
+            let real_this = self
+                .eval_symbol_by_id(CommandLoopSymbol::RealThisCommand.id())
+                .unwrap_or(Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::RealLastCommand.id(), real_this);
 
             // GNU records the real command as last-repeatable-command for
             // ordinary key events.
-            let last_event = self.eval_symbol("last-command-event").unwrap_or(Value::NIL);
+            let last_event = self
+                .eval_symbol_by_id(CommandLoopSymbol::LastCommandEvent.id())
+                .unwrap_or(Value::NIL);
             if !last_event.is_cons() {
-                self.assign("last-repeatable-command", real_this);
+                self.assign_by_id(CommandLoopSymbol::LastRepeatableCommand.id(), real_this);
             }
 
             // Reset this-original-command for the next iteration so
             // a fresh command starts the cycle clean (mirroring
             // GNU's clear at the bottom of command_loop_1).
-            self.assign("this-original-command", Value::NIL);
+            self.assign_by_id(CommandLoopSymbol::ThisOriginalCommand.id(), Value::NIL);
 
             if self.command_loop.keyboard.kboard.defining_kbd_macro
                 && self
-                    .eval_symbol("prefix-arg")
+                    .eval_symbol_by_id(CommandLoopSymbol::PrefixArg.id())
                     .unwrap_or(Value::NIL)
                     .is_nil()
             {
@@ -1021,9 +1183,9 @@ impl Context {
     /// `inhibit-redisplay` during startup and clears it from an initial
     /// `post-command-hook` before the first input wait/redisplay.
     pub(super) fn command_loop_1_entry_prologue(&mut self) -> EvalResult {
-        self.assign("prefix-arg", Value::NIL);
-        self.assign("last-prefix-arg", Value::NIL);
-        self.assign("deactivate-mark", Value::NIL);
+        self.assign_by_id(CommandLoopSymbol::PrefixArg.id(), Value::NIL);
+        self.assign_by_id(CommandLoopSymbol::LastPrefixArg.id(), Value::NIL);
+        self.assign_by_id(CommandLoopSymbol::DeactivateMark.id(), Value::NIL);
 
         // GNU `command_loop_1` clears `this_command_key_count` and
         // `this_single_command_key_start` before its initial
@@ -1035,14 +1197,14 @@ impl Context {
         self.set_translated_command_keys(Vec::new());
 
         if self
-            .eval_symbol("memory-full")
+            .eval_symbol_by_id(CommandLoopSymbol::MemoryFull.id())
             .unwrap_or(Value::NIL)
             .is_nil()
         {
             self.safe_run_hook_if_bound("post-command-hook")?;
 
             if self
-                .eval_symbol("delayed-warnings-list")
+                .eval_symbol_by_id(CommandLoopSymbol::DelayedWarningsList.id())
                 .unwrap_or(Value::NIL)
                 .is_truthy()
             {
@@ -1050,15 +1212,24 @@ impl Context {
             }
         }
 
-        let this_command = self.eval_symbol("this-command").unwrap_or(Value::NIL);
-        self.assign("last-command", this_command);
+        let this_command = self
+            .eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id())
+            .unwrap_or(Value::NIL);
+        self.assign_by_id(CommandLoopSymbol::LastCommand.id(), this_command);
 
-        let real_this_command = self.eval_symbol("real-this-command").unwrap_or(Value::NIL);
-        self.assign("real-last-command", real_this_command);
+        let real_this_command = self
+            .eval_symbol_by_id(CommandLoopSymbol::RealThisCommand.id())
+            .unwrap_or(Value::NIL);
+        self.assign_by_id(CommandLoopSymbol::RealLastCommand.id(), real_this_command);
 
-        let last_command_event = self.eval_symbol("last-command-event").unwrap_or(Value::NIL);
+        let last_command_event = self
+            .eval_symbol_by_id(CommandLoopSymbol::LastCommandEvent.id())
+            .unwrap_or(Value::NIL);
         if !last_command_event.is_cons() {
-            self.assign("last-repeatable-command", real_this_command);
+            self.assign_by_id(
+                CommandLoopSymbol::LastRepeatableCommand.id(),
+                real_this_command,
+            );
         }
 
         Ok(Value::NIL)
@@ -1067,7 +1238,10 @@ impl Context {
     /// Per-iteration `auto-save-interval` check, mirroring GNU
     /// `keyboard.c:1491-1506`. Keyboard audit Finding 9.
     pub(super) fn command_loop_1_maybe_auto_save(&mut self) {
-        let interval = match self.eval_symbol("auto-save-interval").ok() {
+        let interval = match self
+            .eval_symbol_by_id(CommandLoopSymbol::AutoSaveInterval.id())
+            .ok()
+        {
             Some(v) => match v.as_fixnum() {
                 Some(n) if n > 0 => n,
                 _ => return,
@@ -1130,7 +1304,10 @@ impl Context {
         if command.is_nil() {
             return command;
         }
-        match self.apply(Value::symbol("command-remapping"), vec![command]) {
+        match self.apply(
+            Value::from_sym_id(CommandLoopSymbol::CommandRemapping.id()),
+            vec![command],
+        ) {
             Ok(remapped) if !remapped.is_nil() => remapped,
             _ => command,
         }
@@ -1141,7 +1318,9 @@ impl Context {
     pub(super) fn dispatch_command_in_loop(&mut self, command: Value) -> EvalResult {
         // Re-resolve `this-command` from the obarray so a
         // pre-command-hook that mutated the symbol takes effect.
-        let cmd = self.eval_symbol("this-command").unwrap_or(command);
+        let cmd = self
+            .eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id())
+            .unwrap_or(command);
         if cmd.is_nil() {
             // GNU `command_loop_1` keyboard.c:1512-1514:
             //   if (NILP (Vthis_command))
@@ -1153,13 +1332,19 @@ impl Context {
             // key gives the same feedback as GNU instead of silently doing
             // nothing. If `undefined` is not yet defined (minimal runtimes),
             // fall back to a bare ding so the key is still audible.
-            if self.obarray.fboundp("undefined") {
-                return self.apply(Value::symbol("undefined"), vec![]);
+            if self.obarray.fboundp_id(CommandLoopSymbol::Undefined.id()) {
+                return self.apply(
+                    Value::from_sym_id(CommandLoopSymbol::Undefined.id()),
+                    vec![],
+                );
             }
             let _ = super::super::builtins::dispatch_builtin(self, "ding", vec![]);
             return Ok(Value::NIL);
         }
-        self.apply(Value::symbol("command-execute"), vec![cmd])
+        self.apply(
+            Value::from_sym_id(CommandLoopSymbol::CommandExecute.id()),
+            vec![cmd],
+        )
     }
 
     /// Run a hook with `safe-run-hooks` semantics: each hook
@@ -1198,7 +1383,11 @@ impl Context {
         // that when its local `post-command-hook` calls
         // `exit-minibuffer`.
         let specpdl_count = self.specpdl.len();
-        self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-quit"), Value::T)?;
+        self.try_specbind_or_unwind_to(
+            specpdl_count,
+            CommandLoopSymbol::InhibitQuit.id(),
+            Value::T,
+        )?;
         let result = super::super::hook_runtime::safe_run_named_hook(self, hook_sym, &[]);
         self.unbind_to_with_result(specpdl_count, result)
     }
@@ -1208,7 +1397,7 @@ impl Context {
         if !saved_running {
             self.command_loop.running = true;
         }
-        self.assign("prefix-arg", Value::NIL);
+        self.assign_by_id(CommandLoopSymbol::PrefixArg.id(), Value::NIL);
         let result = self.command_loop_2();
         if !saved_running && self.command_loop.running {
             self.command_loop.running = false;
@@ -1226,7 +1415,9 @@ impl Context {
     {
         let scope = ExecutingKbdMacroRuntimeScope {
             snapshot: self.snapshot_executing_kbd_macro_runtime(),
-            real_this_command: self.eval_symbol("real-this-command").unwrap_or(Value::NIL),
+            real_this_command: self
+                .eval_symbol_by_id(CommandLoopSymbol::RealThisCommand.id())
+                .unwrap_or(Value::NIL),
         };
         self.begin_executing_kbd_macro_runtime(macro_events);
         let result = run(self);
@@ -1247,7 +1438,10 @@ impl Context {
         scope: ExecutingKbdMacroRuntimeScope,
     ) -> EvalResult {
         self.restore_executing_kbd_macro_runtime(scope.snapshot);
-        self.assign("real-this-command", scope.real_this_command);
+        self.assign_by_id(
+            CommandLoopSymbol::RealThisCommand.id(),
+            scope.real_this_command,
+        );
         self.run_hook_if_bound("kbd-macro-termination-hook")
     }
 
@@ -1308,11 +1502,14 @@ impl Context {
         }
 
         if !self
-            .eval_symbol("deactivate-mark")
+            .eval_symbol_by_id(CommandLoopSymbol::DeactivateMark.id())
             .unwrap_or(Value::NIL)
             .is_nil()
         {
-            let _ = self.apply(Value::symbol("deactivate-mark"), vec![])?;
+            let _ = self.apply(
+                Value::from_sym_id(CommandLoopSymbol::DeactivateMark.id()),
+                vec![],
+            )?;
             self.assign("saved-region-selection", Value::NIL);
             return Ok(Value::NIL);
         }
@@ -1342,7 +1539,9 @@ impl Context {
             return Ok(Value::NIL);
         }
 
-        let this_command = self.eval_symbol("this-command").unwrap_or(Value::NIL);
+        let this_command = self
+            .eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id())
+            .unwrap_or(Value::NIL);
         let inhibited_commands = self
             .eval_symbol("selection-inhibit-update-commands")
             .unwrap_or(Value::NIL);
@@ -2051,7 +2250,7 @@ impl Context {
     }
 
     pub(super) fn this_command_name_for_log(&self) -> String {
-        self.eval_symbol("this-command")
+        self.eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id())
             .map(|value| format!("{}", value))
             .unwrap_or_else(|_| "<unbound>".to_string())
     }
@@ -2158,7 +2357,13 @@ impl Context {
         // new cycle is about to start: an in-flight mark or sweep is the
         // continuation of a collection whose compaction already ran.
         if force_complete
-            || !(self.tagged_heap.mark_in_progress() || self.tagged_heap.sweep_in_progress())
+            || match self.tagged_heap.mark_phase() {
+                MarkPhase::Idle => true,
+                MarkPhase::ConcurrentRunning
+                | MarkPhase::StoppedMarking
+                | MarkPhase::PublishingSweep
+                | MarkPhase::Sweeping => false,
+            }
         {
             crate::emacs_core::undo::compact_buffers_for_gc(self);
         }
@@ -2193,11 +2398,22 @@ impl Context {
                 // Explicit GC: drive any in-flight cycle to completion, then run
                 // a fresh full stop-the-world collection of the current state
                 // (GNU `garbage-collect` semantics).
-                if (*heap_ptr).concurrent_mark_running() {
-                    self.terminate_concurrent_mark(heap_ptr);
-                }
-                if (*heap_ptr).sweep_in_progress() {
-                    (*heap_ptr).finish_incremental_sweep_now();
+                match (*heap_ptr).mark_phase() {
+                    MarkPhase::Idle => {}
+                    MarkPhase::ConcurrentRunning | MarkPhase::StoppedMarking => {
+                        // Joining is idempotent. Both running and explicitly
+                        // joined workers leave a mark to terminate and promote.
+                        self.terminate_concurrent_mark(heap_ptr);
+                        (*heap_ptr).finish_incremental_sweep_now();
+                    }
+                    MarkPhase::Sweeping => (*heap_ptr).finish_incremental_sweep_now(),
+                    MarkPhase::PublishingSweep => {
+                        debug_assert!(
+                            false,
+                            "a collection driver cannot reenter sweep publication"
+                        );
+                        return;
+                    }
                 }
                 // Disarms a concurrent first cycle drained above, so this
                 // cycle traces the whole image before it promotes (see
@@ -2206,113 +2422,129 @@ impl Context {
                 self.seed_registered_mutator_roots_world_stopped(heap_ptr);
                 (*heap_ptr).complete_collection();
                 cycle_completed = true;
-            } else if (*heap_ptr).sweep_in_progress() {
-                // Phase 3: drain the deferred sweep started at mark termination.
-                //
-                // A sweep that allocation has outrun -- the NEXT cycle is
-                // already due -- finishes now, as the concurrent mark's cap
-                // does. Slices come one per safe point, and a loop whose safe
-                // points are sparse can cons faster than they reclaim: the next
-                // cycle cannot start until this one drains, so each cycle began
-                // with more garbage, swept longer, and set a higher threshold
-                // from the consing its own sweep let through. elb pidigits'
-                // threshold climbed 18 MB -> 311 MB over 14 cycles at a flat
-                // ~10 MB live, and the benchmark peaked at 3 GB resident (GNU,
-                // which sweeps synchronously, 495 MB). The cap is the threshold
-                // itself, not a multiple: at 4x (the mark's) a threshold that
-                // counts half the consing since the last cycle could still
-                // double every cycle.
-                let overdue = (*heap_ptr).bytes_since_gc() > (*heap_ptr).gc_threshold();
-                if overdue {
-                    (*heap_ptr).finish_incremental_sweep_now();
-                    cycle_completed = true;
-                } else if (*heap_ptr).incremental_sweep_slice(INCREMENTAL_SWEEP_BUDGET) {
-                    cycle_completed = true; // sweep drained -> cycle done
-                } else {
-                    return; // more sweep to do; defer bookkeeping
-                }
-            } else if (*heap_ptr).concurrent_mark_running() {
-                // Phase 5: the background GC thread is marking while we run. If it
-                // has drained, run the (short) stop-the-world termination; else
-                // return immediately and keep mutating — this is the pause win.
-                // A hard cap forces termination if allocation outruns marking.
-                let cap = (*heap_ptr).gc_threshold().saturating_mul(4);
-                let must_finish = (*heap_ptr).bytes_since_gc() > cap;
-                let mark_done = (*heap_ptr).concurrent_mark_done();
-                // A tentative done flag is sufficient to stop now. The
-                // stopped-world admission folds every owner's bounded partial;
-                // publishing it and waiting another poll only grows the window.
-                if mark_done || must_finish {
-                    if must_finish && !mark_done {
-                        // Cap-forced: the GC thread had NOT drained — the
-                        // residual mark now runs synchronously in the
-                        // termination below. Record it so the pacing
-                        // instrumentation escalates its lead and the trace
-                        // attributes the pause.
-                        (*heap_ptr).note_must_finish();
+            } else {
+                match (*heap_ptr).mark_phase() {
+                    MarkPhase::Sweeping => {
+                        // Phase 3: drain the deferred sweep started at mark termination.
+                        //
+                        // A sweep that allocation has outrun -- the NEXT cycle is
+                        // already due -- finishes now, as the concurrent mark's cap
+                        // does. Slices come one per safe point, and a loop whose safe
+                        // points are sparse can cons faster than they reclaim: the next
+                        // cycle cannot start until this one drains, so each cycle began
+                        // with more garbage, swept longer, and set a higher threshold
+                        // from the consing its own sweep let through. elb pidigits'
+                        // threshold climbed 18 MB -> 311 MB over 14 cycles at a flat
+                        // ~10 MB live, and the benchmark peaked at 3 GB resident (GNU,
+                        // which sweeps synchronously, 495 MB). The cap is the threshold
+                        // itself, not a multiple: at 4x (the mark's) a threshold that
+                        // counts half the consing since the last cycle could still
+                        // double every cycle.
+                        let overdue = (*heap_ptr).bytes_since_gc() > (*heap_ptr).gc_threshold();
+                        if overdue {
+                            (*heap_ptr).finish_incremental_sweep_now();
+                            cycle_completed = true;
+                        } else if (*heap_ptr).incremental_sweep_slice(INCREMENTAL_SWEEP_BUDGET) {
+                            cycle_completed = true; // sweep drained -> cycle done
+                        } else {
+                            return; // more sweep to do; defer bookkeeping
+                        }
                     }
-                    self.terminate_concurrent_mark(heap_ptr);
-                    return; // sweep deferred; cycle not done yet
-                }
-                return; // GC thread still marking; mutator continues
-            } else if (*heap_ptr).mark_in_progress() {
-                // A joined worker or dropped unpublished capture can leave a
-                // major's residual mark. Minor admission requires quiescence;
-                // finish that cycle with the complete current root set first.
-                match (*heap_ptr).drain_to_quiescent(|heap| {
-                    self.seed_registered_mutator_roots_world_stopped(heap);
-                }) {
-                    Ok(quiescent) => drop(quiescent),
-                    Err(error) => {
-                        // Preserve the unfinished cycle on failed recovery.
-                        tracing::warn!(target: "neovm::gc", %error, "residual major recovery pending");
+                    MarkPhase::ConcurrentRunning => {
+                        // Phase 5: the background GC thread is marking while we run. If it
+                        // has drained, run the (short) stop-the-world termination; else
+                        // return immediately and keep mutating — this is the pause win.
+                        // A hard cap forces termination if allocation outruns marking.
+                        let cap = (*heap_ptr).gc_threshold().saturating_mul(4);
+                        let must_finish = (*heap_ptr).bytes_since_gc() > cap;
+                        let mark_done = (*heap_ptr).concurrent_mark_done();
+                        // A tentative done flag is sufficient to stop now. The
+                        // stopped-world admission folds every owner's bounded partial;
+                        // publishing it and waiting another poll only grows the window.
+                        if mark_done || must_finish {
+                            if must_finish && !mark_done {
+                                // Cap-forced: the GC thread had NOT drained — the
+                                // residual mark now runs synchronously in the
+                                // termination below. Record it so the pacing
+                                // instrumentation escalates its lead and the trace
+                                // attributes the pause.
+                                (*heap_ptr).note_must_finish();
+                            }
+                            self.terminate_concurrent_mark(heap_ptr);
+                            return; // sweep deferred; cycle not done yet
+                        }
+                        return; // GC thread still marking; mutator continues
+                    }
+                    MarkPhase::StoppedMarking => {
+                        // A joined worker or dropped unpublished capture can leave a
+                        // major's residual mark. Minor admission requires quiescence;
+                        // finish that cycle with the complete current root set first.
+                        match (*heap_ptr).drain_to_quiescent(|heap| {
+                            self.seed_registered_mutator_roots_world_stopped(heap);
+                        }) {
+                            Ok(quiescent) => drop(quiescent),
+                            Err(error) => {
+                                // Preserve the unfinished cycle on failed recovery.
+                                tracing::warn!(target: "neovm::gc", %error, "residual major recovery pending");
+                                return;
+                            }
+                        }
+                        cycle_completed = true;
+                    }
+                    MarkPhase::PublishingSweep => {
+                        debug_assert!(
+                            false,
+                            "a collection driver cannot reenter sweep publication"
+                        );
                         return;
                     }
-                }
-                cycle_completed = true;
-            } else if self.gc_stress && (*heap_ptr).generational_enabled() {
-                // A fresh automatic stress cycle is synchronous. Choose its
-                // generation before advancing the next-cycle stride; an
-                // explicit full collection and every continuation took the
-                // earlier branches and never advance this counter here.
-                let minor = (*heap_ptr)
-                    .should_run_minor(self.gc_runtime_settings_cache.memory_full.is_full(), true);
-                (*heap_ptr).note_generation_stress_cycle_started();
-                if minor {
-                    (*heap_ptr).begin_minor_collection().expect(
+                    MarkPhase::Idle => {
+                        if self.gc_stress && (*heap_ptr).generational_enabled() {
+                            // A fresh automatic stress cycle is synchronous. Choose its
+                            // generation before advancing the next-cycle stride; an
+                            // explicit full collection and every continuation took the
+                            // earlier branches and never advance this counter here.
+                            let minor = (*heap_ptr).should_run_minor(
+                                self.gc_runtime_settings_cache.memory_full.is_full(),
+                                true,
+                            );
+                            (*heap_ptr).note_generation_stress_cycle_started();
+                            if minor {
+                                (*heap_ptr).begin_minor_collection().expect(
                         "scheduler drained the preceding mark and sweep before minor admission",
                     );
-                    self.seed_registered_mutator_roots_world_stopped(heap_ptr);
-                    (*heap_ptr).complete_minor_collection();
-                    (*heap_ptr).finish_incremental_sweep_now();
-                } else {
-                    (*heap_ptr).begin_stw_collection();
-                    self.seed_registered_mutator_roots_world_stopped(heap_ptr);
-                    (*heap_ptr).complete_collection();
-                }
-                cycle_completed = true;
-            } else if (*heap_ptr)
-                .should_run_minor(self.gc_runtime_settings_cache.memory_full.is_full(), false)
-            {
-                // Minor marking stops every registered mutator and visits
-                // their roots. Promotion completes before mutating resumes;
-                // the existing sweep continuation records cycle completion.
-                (*heap_ptr).begin_minor_collection().expect(
+                                self.seed_registered_mutator_roots_world_stopped(heap_ptr);
+                                (*heap_ptr).complete_minor_collection();
+                                (*heap_ptr).finish_incremental_sweep_now();
+                            } else {
+                                (*heap_ptr).begin_stw_collection();
+                                self.seed_registered_mutator_roots_world_stopped(heap_ptr);
+                                (*heap_ptr).complete_collection();
+                            }
+                            cycle_completed = true;
+                        } else if (*heap_ptr).should_run_minor(
+                            self.gc_runtime_settings_cache.memory_full.is_full(),
+                            false,
+                        ) {
+                            // Minor marking stops every registered mutator and visits
+                            // their roots. Promotion completes before mutating resumes;
+                            // the existing sweep continuation records cycle completion.
+                            (*heap_ptr).begin_minor_collection().expect(
                     "scheduler drained the preceding mark and sweep before minor admission",
                 );
-                self.seed_registered_mutator_roots_world_stopped(heap_ptr);
-                (*heap_ptr).complete_minor_collection();
-                return;
-            } else {
-                let concurrent_kind = if (*heap_ptr).should_run_concurrent() {
-                    Some(ConcurrentCycleKind::Threshold)
-                } else if (*heap_ptr).is_partition_first_cycle() {
-                    Some(ConcurrentCycleKind::FirstPartition)
-                } else {
-                    None
-                };
-                if let Some(kind) = concurrent_kind {
-                    match self.start_concurrent_mark(heap_ptr, kind) {
+                            self.seed_registered_mutator_roots_world_stopped(heap_ptr);
+                            (*heap_ptr).complete_minor_collection();
+                            return;
+                        } else {
+                            let concurrent_kind = if (*heap_ptr).should_run_concurrent() {
+                                Some(ConcurrentCycleKind::Threshold)
+                            } else if (*heap_ptr).is_partition_first_cycle() {
+                                Some(ConcurrentCycleKind::FirstPartition)
+                            } else {
+                                None
+                            };
+                            if let Some(kind) = concurrent_kind {
+                                match self.start_concurrent_mark(heap_ptr, kind) {
                         Ok(()) => return,
                         Err(crate::tagged::gc::ConcurrentMarkAdmissionError::Excluded(_)) => {
                             // Held facade roots choose exact synchronous GC.
@@ -2333,33 +2565,54 @@ impl Context {
                             // the synchronous recovery below must finish it.
                         }
                     }
-                }
-                if (*heap_ptr).mark_in_progress() {
-                    // SAFETY: this current owner's closed GC-driver extent
-                    // excludes heap/obarray/TLS writers and callbacks. The
-                    // complete owner census reseeds every external root before
-                    // the unlaunched cycle drains marking and sweep.
-                    let drain = (*heap_ptr).drain_to_quiescent(|heap| {
-                        self.seed_registered_mutator_roots_world_stopped(heap);
-                    });
-                    match drain {
-                        Ok(quiescent) => drop(quiescent),
-                        Err(error) => {
-                            // Preserve incomplete storage and work for explicit
-                            // retry; do not start or account another collection.
-                            if std::env::var("NEOVM_GC_TRACE").as_deref() == Ok("1") {
-                                eprintln!("NEOVM_GC synchronous recovery pending: {error}");
                             }
-                            return;
+                            match (*heap_ptr).mark_phase() {
+                                MarkPhase::StoppedMarking => {
+                                    // SAFETY: this current owner's closed GC-driver extent
+                                    // excludes heap/obarray/TLS writers and callbacks. The
+                                    // complete owner census reseeds every external root before
+                                    // the unlaunched cycle drains marking and sweep.
+                                    let recovery_cycle =
+                                        (*heap_ptr).gc_collections().saturating_add(1);
+                                    let drain = (*heap_ptr).drain_to_quiescent(|heap| {
+                                        self.seed_registered_mutator_roots_world_stopped(heap);
+                                    });
+                                    match drain {
+                                        Ok(quiescent) => drop(quiescent),
+                                        Err(error) => {
+                                            // Preserve incomplete storage and work for explicit
+                                            // retry; do not start or account another collection.
+                                            tracing::debug!(
+                                                target: "neovm::gc",
+                                                kind = GcTraceKind::SynchronousRecoveryPending.as_str(),
+                                                cycle = recovery_cycle,
+                                                error = %error,
+                                                "NEOVM_GC synchronous recovery pending: {error}"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                                MarkPhase::Idle => {
+                                    // No concurrent state has been armed on exclusion rejection.
+                                    (*heap_ptr).begin_stw_collection();
+                                    self.seed_registered_mutator_roots_world_stopped(heap_ptr);
+                                    (*heap_ptr).complete_collection();
+                                }
+                                MarkPhase::ConcurrentRunning
+                                | MarkPhase::PublishingSweep
+                                | MarkPhase::Sweeping => {
+                                    debug_assert!(
+                                        false,
+                                        "failed mark admission must leave idle or stopped marking"
+                                    );
+                                    return;
+                                }
+                            }
+                            cycle_completed = true;
                         }
                     }
-                } else {
-                    // No concurrent state has been armed on exclusion rejection.
-                    (*heap_ptr).begin_stw_collection();
-                    self.seed_registered_mutator_roots_world_stopped(heap_ptr);
-                    (*heap_ptr).complete_collection();
                 }
-                cycle_completed = true;
             }
         }
         if !cycle_completed {
@@ -2603,6 +2856,7 @@ impl Context {
         let specpdl_depth = self.specpdl.len();
         // SAFETY: the capture loan ended at launch; this current owner's
         // original heap designator is again valid for exclusive statistics.
+        let cycle = self.tagged_heap.gc_collections().saturating_add(1);
         let hs = unsafe { (*heap_ptr).handshake_stats_mut() };
         hs.last_start_obsnap_us = obsnap_us;
         hs.last_start_roots = roots_breakdown;
@@ -2621,8 +2875,32 @@ impl Context {
             .find(|(name, _, _)| *name == "marker_heads")
             .map(|&(_, _, count)| count)
             .unwrap_or(0);
-        if std::env::var("NEOVM_GC_TRACE").as_deref() == Ok("1") {
-            eprintln!(
+        if tracing::event_enabled!(target: "neovm::gc", tracing::Level::DEBUG, kind, cycle) {
+            let groups = hs.last_start_roots.format_nonzero();
+            let probes = hs.format_probes();
+            tracing::debug!(
+                target: "neovm::gc",
+                kind = GcTraceKind::ConcurrentStart.as_str(),
+                cycle,
+                total_us,
+                pace_bytes,
+                pace_threshold = pace_thr,
+                pace_lead,
+                clear_us = hs.last_start_clear_us,
+                clear_cons_us = hs.last_start_clear_cons_us,
+                clear_noncons_us = hs.last_start_clear_noncons_us,
+                clear_mapped_us = hs.last_start_clear_mapped_us,
+                runtime_us = hs.last_start_runtime_us,
+                runtime_roots = hs.last_start_runtime_roots,
+                remembered_us = hs.last_start_remembered_us,
+                remembered_roots = hs.last_start_remembered_roots,
+                obsnap_us,
+                roots_us = hs.last_start_roots.total_us,
+                conssnap_us = hs.last_start_conssnap_us,
+                vecsnap_us = hs.last_start_vecsnap_us,
+                jobasm_us = hs.last_start_jobasm_us,
+                groups = %groups,
+                probes = %probes,
                 "NEOVM_GC concurrent_start {total_us}us \
                  pace[bytes={pace_bytes} thr={pace_thr} lead={pace_lead}] \
                  [clear={}us[cons={} noncons={} \
@@ -2641,8 +2919,8 @@ impl Context {
                 hs.last_start_conssnap_us,
                 hs.last_start_vecsnap_us,
                 hs.last_start_jobasm_us,
-                hs.last_start_roots.format_nonzero(),
-                hs.format_probes(),
+                groups,
+                probes,
             );
         }
         Ok(())
@@ -2744,17 +3022,52 @@ impl Context {
             .find(|(name, _, _)| *name == "marker_heads")
             .map(|&(_, _, count)| count)
             .unwrap_or(0);
-        if std::env::var("NEOVM_GC_TRACE").as_deref() == Ok("1") {
+        if tracing::event_enabled!(target: "neovm::gc", tracing::Level::DEBUG, kind, cycle) {
+            let cycle = self.tagged_heap.gc_collections().saturating_add(1);
             let stats = self.tagged_heap.sweep_stats();
             let (leaf_claimed, hash_claimed) = self.tagged_heap.last_concurrent_claim_counts();
             let hs = self.tagged_heap.handshake_stats();
-            eprintln!(
+            let total_us = term_t0.elapsed().as_micros();
+            let groups = hs.last_term_ctxroots.format_nonzero();
+            let probes = hs.format_probes();
+            tracing::debug!(
+                target: "neovm::gc",
+                kind = GcTraceKind::ConcurrentTermination.as_str(),
+                cycle,
+                total_us,
+                roots_us,
+                drain_us,
+                fold_us = stats.last_termination_fold_us,
+                deferred = stats.last_termination_deferred,
+                satb = stats.last_termination_satb,
+                partial_words = stats.last_termination_partial_words,
+                str_claimed = stats.last_concurrent_str_claimed,
+                f_claimed = stats.last_concurrent_float_claimed,
+                sub_dropped = stats.last_concurrent_subr_dropped,
+                v_claimed = stats.last_concurrent_vec_claimed,
+                bc_claimed = stats.last_concurrent_bc_claimed,
+                leaf_claimed,
+                ht_claimed = hash_claimed,
+                kinds = %stats.last_termination_kinds,
+                join_us = hs.last_term_join_us,
+                runtime_us = hs.last_term_runtime_us,
+                runtime_roots = hs.last_term_runtime_roots,
+                remembered_us = hs.last_term_remembered_us,
+                remembered_roots = hs.last_term_remembered_roots,
+                ctxroots_us = hs.last_term_ctxroots.total_us,
+                newsyms_us,
+                newsyms_roots,
+                finalizer_us = hs.last_term_finalizer_us,
+                weak_us = hs.last_term_weak_us,
+                unchain_us = hs.last_term_unchain_us,
+                groups = %groups,
+                probes = %probes,
                 "NEOVM_GC concurrent_termination {}us [roots={roots_us}us drain={drain_us}us \
                  fold={}us deferred={} satb={} partial_words={} str_claimed={} f_claimed={} sub_dropped={} \
                  v_claimed={} bc_claimed={} leaf_claimed={} ht_claimed={} kinds[{}] join={}us \
                  runtime={}us({}) remembered={}us({}) ctxroots={}us newsyms={newsyms_us}us({}) \
                  finalizer={}us weak={}us unchain={}us groups[{}] probes[{}]]",
-                term_t0.elapsed().as_micros(),
+                total_us,
                 stats.last_termination_fold_us,
                 stats.last_termination_deferred,
                 stats.last_termination_satb,
@@ -2777,8 +3090,8 @@ impl Context {
                 hs.last_term_finalizer_us,
                 hs.last_term_weak_us,
                 hs.last_term_unchain_us,
-                hs.last_term_ctxroots.format_nonzero(),
-                hs.format_probes(),
+                groups,
+                probes,
             );
         }
     }
@@ -2934,7 +3247,8 @@ impl Context {
     /// two address-keyed lexenv caches only go stale when a sweep recycles a
     /// cons -- every sweep runs inside that body, past this point.
     fn concurrent_mark_is_still_the_gc_thread_s(&self) -> bool {
-        if !self.tagged_heap.concurrent_mark_running() || self.tagged_heap.concurrent_mark_done() {
+        debug_assert_eq!(self.tagged_heap.mark_phase(), MarkPhase::ConcurrentRunning);
+        if self.tagged_heap.concurrent_mark_done() {
             return false;
         }
         let cap = self.tagged_heap.gc_threshold().saturating_mul(4);
@@ -2948,7 +3262,9 @@ impl Context {
         // The common answer, decided from plain fields without a call: no
         // collection is in flight, none is pending or forced, and the
         // allocation pacing has not tripped. Everything else takes the
-        // exact path below, unchanged.
+        // exact path below. These short-circuit fact reads preserve the hot
+        // guard's sweep-before-mark loads; the slow path decides what the
+        // complete phase means through its exhaustive MarkPhase match.
         if self.gc_inhibit_depth == 0
             && !self.tagged_heap.sweep_in_progress()
             && !self.tagged_heap.mark_in_progress()
@@ -2967,21 +3283,16 @@ impl Context {
         if self.gc_inhibit_depth > 0 {
             return false;
         }
-        // A deferred sweep must keep getting slices at every safe point until
-        // it drains, regardless of the allocation threshold.
-        if self.tagged_heap.sweep_in_progress() {
-            return true;
-        }
-        // An in-flight mark must too -- but while the GC THREAD holds the mark,
-        // the mutator's job at a safe point is only to notice that it has
-        // drained. Saying so here, rather than entering the collector to find
-        // out, is what keeps that safe point cheap: the caller wraps this in a
-        // specpdl root save/restore and the collector body opened with a
-        // `clock_gettime`, so a poll that had nothing to do still cost ~90
-        // instructions. On one rust-lsp-typing capture that was 5,800,003
-        // timestamps taken for the 25 durations anything ever read.
-        if self.tagged_heap.mark_in_progress() {
-            return !self.concurrent_mark_is_still_the_gc_thread_s();
+        match self.tagged_heap.mark_phase() {
+            MarkPhase::Idle => {}
+            MarkPhase::Sweeping | MarkPhase::StoppedMarking => return true,
+            MarkPhase::ConcurrentRunning => {
+                return !self.concurrent_mark_is_still_the_gc_thread_s();
+            }
+            MarkPhase::PublishingSweep => {
+                debug_assert!(false, "a safe point cannot reenter sweep publication");
+                return true;
+            }
         }
         if self.gc_pending {
             return true;
@@ -3447,3 +3758,7 @@ mod gc_heap_mut_closure_tests;
 #[cfg(test)]
 #[path = "tests/chrome_transitions_test.rs"]
 mod chrome_transition_tests;
+
+#[cfg(test)]
+#[path = "tests/command_symbols_test.rs"]
+mod command_symbols_tests;

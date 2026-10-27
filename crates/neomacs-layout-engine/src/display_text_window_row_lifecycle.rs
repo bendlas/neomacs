@@ -286,6 +286,7 @@ pub(crate) struct TextWindowTailFinalizeContext<'a> {
     charpos: i64,
     point_is_visible_eob: bool,
     row_limit: DisplayRowLimit,
+    preceding_zv_byte: crate::window_output::MiniPrecedingZvByte,
 }
 
 pub(crate) struct TextWindowTailFinalizeState<'a, 'emit> {
@@ -324,6 +325,44 @@ pub(crate) struct TextWindowBodyInstallState<'emit, 'output, 'face> {
     render_services: ChromeRowRenderServices<'emit, 'face>,
 }
 
+/// Attempt-local admission for the ordinary TTY EOB insertion row.
+/// Source exhaustion alone is not a visible-row witness. Other source kinds
+/// retain their existing explicit-cursor and partial-row policies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrdinaryEobRowAdmission {
+    ExistingPolicy,
+    Visible,
+    Unavailable,
+}
+
+static_assertions::assert_impl_all!(OrdinaryEobRowAdmission: Copy, Send, Sync);
+const _: () = assert!(std::mem::size_of::<OrdinaryEobRowAdmission>() == 1);
+
+/// Join the point-proven capture's absolute matrix row to its actual enabled
+/// ZV row and insertion geometry. No physical cursor style is required.
+#[inline]
+pub(crate) fn ordinary_eob_row_admission(
+    row_index: neovm_core::window::MatrixRow0,
+    row: &neomacs_display_protocol::glyph_matrix::GlyphRow,
+    insertion: Option<neovm_core::window::DisplayPointSnapshot>,
+    viewport: crate::buffer_source::tail_render::BufferSourceRetryBounds,
+) -> OrdinaryEobRowAdmission {
+    let visible = row.enabled
+        && row.role == neomacs_display_protocol::frame_glyphs::GlyphRowRole::Text
+        && row.ends_at_zv
+        && insertion.is_some_and(|point| {
+            i64::try_from(row_index.get()).ok() == Some(point.row)
+                && point.height > 0
+                && point.y >= viewport.text_area_top()
+                && point.y.saturating_add(point.height) <= viewport.text_area_bottom()
+        });
+    if visible {
+        OrdinaryEobRowAdmission::Visible
+    } else {
+        OrdinaryEobRowAdmission::Unavailable
+    }
+}
+
 pub(crate) struct TextWindowVisibilityRetryRequest<'a, 'buf, B: LayoutBufferView> {
     rows: &'a [DisplayRowSnapshot],
     window_start: i64,
@@ -332,6 +371,7 @@ pub(crate) struct TextWindowVisibilityRetryRequest<'a, 'buf, B: LayoutBufferView
     point_charpos: i64,
     charpos: i64,
     point_is_visible_eob: bool,
+    ordinary_eob_row_admission: OrdinaryEobRowAdmission,
     text_area_top: i64,
     text_area_bottom: i64,
     scroll_policy: ScrollPolicy,
@@ -627,7 +667,16 @@ impl<'a> TextWindowTailFinalizeContext<'a> {
             charpos,
             point_is_visible_eob,
             row_limit,
+            preceding_zv_byte: crate::window_output::MiniPrecedingZvByte::Unknown,
         }
+    }
+
+    pub(crate) fn with_preceding_zv_byte(
+        mut self,
+        byte: crate::window_output::MiniPrecedingZvByte,
+    ) -> Self {
+        self.preceding_zv_byte = byte;
+        self
     }
 }
 
@@ -694,13 +743,48 @@ impl<'a> TextWindowTailFinalizeRequest<'a> {
                     }
                 }
 
+                // GNU resize_mini_window (xdisp.c:13355–13368) uses the
+                // completed iterator's zero-current-metrics branch. The row's
+                // structural prefix minimum is not produced glyph metrics.
+                // A real prefix/glyph moves or marks emitter progress and must
+                // retain its current-row height. X is in visible text-area
+                // coordinates; hscroll skipping is already applied upstream.
+                let source_exhausted = context.charpos
+                    >= context.params.accessible_end_charpos().get();
+                if context.params.is_minibuffer()
+                    && !context.params.window_system
+                    && source_exhausted
+                    && row_geometry.is_within_row_limit(context.row_limit)
+                {
+                    use crate::output::window_state::AutomaticMiniTailHeight;
+                    let height = if !output_emitter.current_row_has_output()
+                        && match output_emitter.current_row_visible_start_position() {
+                            crate::window_output::RowVisibleStartPosition::AtOrBefore => true,
+                            crate::window_output::RowVisibleStartPosition::After
+                            | crate::window_output::RowVisibleStartPosition::Unavailable => false,
+                        }
+                        && context.params.wrap_mode == crate::types::LineWrapMode::Truncate
+                    {
+                        context.preceding_zv_byte.automatic_tail_height(
+                            output_emitter.previous_automatic_mini_row_end(),
+                            neomacs_display_protocol::types::Px(row_geometry.current_row_y(
+                                row_y_positions,
+                                context.text_y,
+                                context.char_h,
+                            ) - context.window_top),
+                        )
+                    } else {
+                        AutomaticMiniTailHeight::CurrentRow
+                    };
+                    output.builder().install_automatic_mini_tail_height(height);
+                }
+
                 let pending_row_finished = finish_pending_text_window_row(
                     output.reborrow(),
                     output_emitter,
                     TextWindowPendingRowFinish {
                         row_geometry,
-                        source_exhausted: context.charpos
-                            >= context.params.accessible_end_charpos().get(),
+                        source_exhausted,
                         row_limit: context.row_limit,
                         row_y_positions,
                         text_y: context.text_y,
@@ -832,6 +916,7 @@ impl<'a, 'buf, B: LayoutBufferView> TextWindowVisibilityRetryRequest<'a, 'buf, B
             point_charpos,
             charpos,
             point_is_visible_eob,
+            ordinary_eob_row_admission: OrdinaryEobRowAdmission::ExistingPolicy,
             text_area_top,
             text_area_bottom,
             scroll_policy,
@@ -839,6 +924,17 @@ impl<'a, 'buf, B: LayoutBufferView> TextWindowVisibilityRetryRequest<'a, 'buf, B
             forward_viewport_measurement,
             buf_access,
         }
+    }
+
+    /// The tail producer supplies this only after inspecting actual row and
+    /// insertion witnesses. It is not a retained viewport/invalidation key.
+    #[inline]
+    pub(crate) fn with_ordinary_eob_row_admission(
+        mut self,
+        admission: OrdinaryEobRowAdmission,
+    ) -> Self {
+        self.ordinary_eob_row_admission = admission;
+        self
     }
 
     pub(crate) fn decide(self) -> TextWindowVisibilityRetryOutcome {
@@ -850,7 +946,9 @@ impl<'a, 'buf, B: LayoutBufferView> TextWindowVisibilityRetryRequest<'a, 'buf, B
         );
         let point_lisp = layout_i64_char_pos_to_lisp_char_pos(self.point_charpos);
         let visible_end_lisp = self.rows.iter().rev().find_map(|row| row.end_buffer_pos);
-        let visible_end_lisp = if self.point_is_visible_eob {
+        let eob_row_unavailable =
+            self.ordinary_eob_row_admission == OrdinaryEobRowAdmission::Unavailable;
+        let visible_end_lisp = if self.point_is_visible_eob && !eob_row_unavailable {
             Some(visible_end_lisp.unwrap_or(point_lisp).max(point_lisp))
         } else {
             visible_end_lisp
@@ -858,9 +956,10 @@ impl<'a, 'buf, B: LayoutBufferView> TextWindowVisibilityRetryRequest<'a, 'buf, B
         let visible_progress = visible_end_lisp
             .map(LispCharPos1::as_i64)
             .unwrap_or(self.charpos);
-        let point_beyond_visible_span = visible_end_lisp
-            .map(|end_lisp| point_lisp > end_lisp)
-            .unwrap_or(self.point_charpos > self.charpos);
+        let point_beyond_visible_span = eob_row_unavailable
+            || visible_end_lisp
+                .map(|end_lisp| point_lisp > end_lisp)
+                .unwrap_or(self.point_charpos > self.charpos);
 
         // GNU `resize_mini_window` (src/xdisp.c:13361) scrolls a mini-window
         // whose measured content exceeds `max-mini-window-height` so the END
@@ -870,6 +969,7 @@ impl<'a, 'buf, B: LayoutBufferView> TextWindowVisibilityRetryRequest<'a, 'buf, B
         // has point reset to BEGV, so `point_beyond_visible_span` is false and
         // it never scrolls.
         let scroll_down = if self.forward_viewport_measurement.is_some()
+            || eob_row_unavailable
             || visible_progress > self.window_start
         {
             self.scroll_down_decision(point_lisp, visible_end_lisp, point_beyond_visible_span)
@@ -946,6 +1046,20 @@ impl<'a, 'buf, B: LayoutBufferView> TextWindowVisibilityRetryRequest<'a, 'buf, B
             return measurement
                 .clone()
                 .observe(self.rows, point_lisp, point_beyond_visible_span);
+        }
+        if self.ordinary_eob_row_admission == OrdinaryEobRowAdmission::Unavailable {
+            // The consumed newline/source endpoint cannot stand in for the
+            // missing EOB row. Default recenter uses canonical display motion;
+            // conservative/step policies measure rows through the same existing
+            // bounded continuation, rather than inventing an endpoint offset.
+            return ForwardViewportMeasurement::begin(
+                self.rows,
+                crate::buffer_source::window_source::ResolvedWindowStart::from_layout_charpos(
+                    self.window_start,
+                ),
+                self.scroll_policy,
+                self.scroll_margin,
+            );
         }
         // A point below the measured rows can be extrapolated in source lines
         // only when source and display progress monotonically together.  If an

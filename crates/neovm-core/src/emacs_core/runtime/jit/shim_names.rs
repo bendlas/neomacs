@@ -127,7 +127,82 @@ const NEOVM_JIT_SHIM_NAMES: &[&str] = &[
     "neovm_jit_unbind_collection",
     "neovm_jit_setcar_collection",
     "neovm_jit_setcdr_collection",
+    // ABI52: the dedicated `fboundp` spec shim. It is declared by every body
+    // with a subr-kind spec site (including AOT baseline leaves), so an AOT
+    // `.so` may import it: appended AFTER the frozen ABI26 prefix and the
+    // ABI31 collection block so no existing index moves.
+    "neovm_jit_fboundp_spec",
 ];
+
+// The AOT selections below are indices into the one name list above, so a
+// list edit that moves a name would silently select the wrong shim (the
+// emit-time import audit notices only a leaf that imports it). These const
+// checks make every selection a compile-time fact: `cargo check` fails
+// unless each selected index still names its shim and the frozen ABI26
+// prefix still ends at its boundary name. They are const-evaluated and emit
+// nothing: the literals, the selected set and the ABI tag are unchanged.
+#[allow(dead_code)] // this file is also included by build scripts
+const fn aot_shim_name_is(index: usize, name: &str) -> bool {
+    if index >= NEOVM_JIT_SHIM_NAMES.len() {
+        return false;
+    }
+    let candidate = NEOVM_JIT_SHIM_NAMES[index].as_bytes();
+    let wanted = name.as_bytes();
+    if candidate.len() != wanted.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < candidate.len() {
+        if candidate[at] != wanted[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
+#[allow(dead_code)] // this file is also included by build scripts
+const _: () = {
+    // ABI26's frozen prefix ends where the appended names begin.
+    assert!(NEOVM_JIT_AOT_ABI_SHIM_COUNT <= NEOVM_JIT_SHIM_NAMES.len());
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_ABI_SHIM_COUNT - 1,
+        "neovm_jit_direct_framed"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_ABI_SHIM_COUNT,
+        "neovm_jit_t2_record_array_use"
+    ));
+    // Every ABI31 collection import keeps its name.
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[0],
+        "neovm_jit_string_collection_write"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[1],
+        "neovm_jit_aset_collection"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[2],
+        "neovm_jit_varset_collection"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[3],
+        "neovm_jit_varbind_collection"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[4],
+        "neovm_jit_unbind_collection"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[5],
+        "neovm_jit_setcar_collection"
+    ));
+    assert!(aot_shim_name_is(
+        NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES[6],
+        "neovm_jit_setcdr_collection"
+    ));
+};
 
 // Keep ABI26's original AOT prefix unchanged. ABI31 adds only the collection
 // imports selected below; the Opt array/sqrt and observation-refinement names
@@ -141,3 +216,31 @@ const NEOVM_JIT_AOT_ABI_SHIM_COUNT: usize = 70;
 // reference the one name list above; no second literal name list can drift.
 #[allow(dead_code)] // this file is also included by build scripts
 const NEOVM_JIT_AOT_COLLECTION_SHIM_INDICES: &[usize] = &[72, 75, 76, 77, 78, 79, 80];
+
+// ABI52 admits one appended name: the dedicated `fboundp` spec shim. Its
+// index is DERIVED from the one name list at compile time, so editing the
+// list can never leave a stale index: `aot_shim_index` fails `cargo check`
+// when the name is missing. The frozen ABI26 prefix 0..=69 and the ABI31
+// collection block are untouched by the derivation.
+#[allow(dead_code)] // this file is also included by build scripts
+const fn aot_shim_index(name: &str) -> usize {
+    let wanted = name.as_bytes();
+    let mut i = 0;
+    while i < NEOVM_JIT_SHIM_NAMES.len() {
+        let candidate = NEOVM_JIT_SHIM_NAMES[i].as_bytes();
+        if candidate.len() == wanted.len() {
+            let mut j = 0;
+            while j < wanted.len() && candidate[j] == wanted[j] {
+                j += 1;
+            }
+            if j == wanted.len() {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    panic!("AOT shim name missing from NEOVM_JIT_SHIM_NAMES");
+}
+
+#[allow(dead_code)] // this file is also included by build scripts
+const NEOVM_JIT_AOT_FBOUNDP_SHIM_INDEX: usize = aot_shim_index("neovm_jit_fboundp_spec");

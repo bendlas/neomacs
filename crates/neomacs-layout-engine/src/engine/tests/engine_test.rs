@@ -76,6 +76,8 @@ mod display_motion;
 #[cfg(test)]
 #[path = "../../tests/engine_fontification_motion_test.rs"]
 mod fontification_motion;
+#[path = "motion_overlay_eob_test.rs"]
+mod motion_overlay_eob_test;
 
 #[path = "chrome_memo_engine_test.rs"]
 mod chrome_memo_engine_test;
@@ -8645,6 +8647,99 @@ fn fill_column_indicator_shows_when_text_length_equals_the_column() {
             .any(|glyph| matches!(glyph.glyph_type, GlyphType::Char { ch: '|' })),
         "indicator must be hidden when the text passes the fill column"
     );
+}
+
+#[test]
+fn fill_column_indicator_space_stipple_is_confined_to_its_cell() {
+    assert_fill_column_indicator_stipple_padding("");
+}
+
+#[test]
+fn fill_column_indicator_stipple_padding_preserves_buffer_default_remapping() {
+    assert_fill_column_indicator_stipple_padding(
+        "(set (make-local-variable 'face-remapping-alist) '((default (:background \"#315779\" :foreground \"#f1e2d3\"))))",
+    );
+}
+
+#[test]
+fn fill_column_indicator_stipple_padding_preserves_inverse_default_remapping() {
+    assert_fill_column_indicator_stipple_padding(
+        "(set (make-local-variable 'face-remapping-alist) '((default (:background \"#315779\" :foreground \"#f1e2d3\" :inverse-video t))))",
+    );
+}
+
+#[test]
+fn fill_column_indicator_stipple_padding_preserves_extend_background() {
+    assert_fill_column_indicator_stipple_padding(
+        "(put-text-property (point-min) (point-max) 'face '(:background \"#315779\" :extend t))",
+    );
+}
+
+fn assert_fill_column_indicator_stipple_padding(setup: &str) {
+    let (mut eval, frame_id, buffer_id, window_id) = incr_editing_frame("x\n", 480, 180);
+    realize_test_gui_frame(&mut eval, frame_id);
+    eval.eval_str(
+        "(progn
+           (internal-set-lisp-face-attribute 'fill-column-indicator :foreground \"#ed1731\" (selected-frame))
+           (internal-set-lisp-face-attribute 'fill-column-indicator :stipple
+             (list 8 1 (unibyte-string 1)) (selected-frame)))",
+    ).unwrap();
+    if !setup.is_empty() {
+        eval.eval_str(setup).unwrap();
+    }
+    let buffer = eval.buffer_manager_mut().get_mut(buffer_id).unwrap();
+    buffer.set_buffer_local("display-fill-column-indicator", Value::T);
+    buffer.set_buffer_local("display-fill-column-indicator-character", Value::char(' '));
+    buffer.set_buffer_local("display-fill-column-indicator-column", Value::fixnum(8));
+    let mut engine = LayoutEngine::new();
+    engine.layout_frame_rust(&mut eval, frame_id);
+    let state = engine.last_frame_display_state.as_ref().unwrap();
+    let window = state
+        .window_matrices
+        .iter()
+        .find(|w| w.window_id.get() == window_id.0 as i64)
+        .unwrap();
+    let row = window
+        .matrix
+        .rows
+        .iter()
+        .find(|r| r.enabled && r.role == GlyphRowRole::Text)
+        .unwrap();
+    let glyphs = &row.glyphs[GlyphArea::Text.index()];
+    let indicator = glyphs
+        .iter()
+        .rev()
+        .find(|g| matches!(g.glyph_type, GlyphType::Char { ch: ' ' }))
+        .unwrap();
+    assert!(
+        state
+            .faces
+            .get(&indicator.face_id)
+            .unwrap()
+            .stipple
+            .is_some(),
+        "indicator space must retain its background bitmap"
+    );
+    let gap = glyphs
+        .iter()
+        .find(|g| matches!(g.glyph_type, GlyphType::Stretch { .. }))
+        .unwrap();
+    let gap_face = state.faces.get(&gap.face_id).unwrap();
+    assert!(
+        gap_face.stipple.is_none(),
+        "padding before fill column must not repeat the indicator bitmap"
+    );
+    {
+        let body = glyphs
+            .iter()
+            .find(|g| matches!(g.glyph_type, GlyphType::Char { ch: 'x' }))
+            .unwrap();
+        let body_face = state.faces.get(&body.face_id).unwrap();
+        assert_eq!(
+            gap_face.background, body_face.background,
+            "padding keeps the buffer default or extend background"
+        );
+    }
 }
 
 #[test]
@@ -19629,6 +19724,7 @@ fn next_window_start_from_visible_rows_uses_visual_row_boundaries() {
             row: 0,
             y: 0,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19643,6 +19739,7 @@ fn next_window_start_from_visible_rows_uses_visual_row_boundaries() {
             row: 1,
             y: 16,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19657,6 +19754,7 @@ fn next_window_start_from_visible_rows_uses_visual_row_boundaries() {
             row: 2,
             y: 32,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19671,6 +19769,7 @@ fn next_window_start_from_visible_rows_uses_visual_row_boundaries() {
             row: 3,
             y: 48,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19717,6 +19816,7 @@ fn next_window_start_for_partially_visible_point_row_scrolls_enough_to_fit_row()
             row: 0,
             y: 0,
             height: 20,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19731,6 +19831,7 @@ fn next_window_start_for_partially_visible_point_row_scrolls_enough_to_fit_row()
             row: 1,
             y: 20,
             height: 20,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19745,6 +19846,7 @@ fn next_window_start_for_partially_visible_point_row_scrolls_enough_to_fit_row()
             row: 2,
             y: 40,
             height: 30,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19792,6 +19894,7 @@ fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
             row: 0,
             y: 0,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19806,6 +19909,7 @@ fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
             row: 1,
             y: 16,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19820,6 +19924,7 @@ fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
             row: 2,
             y: 32,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19843,6 +19948,7 @@ fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
             row: 0,
             y: 0,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19857,6 +19963,7 @@ fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
             row: 1,
             y: 16,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19903,6 +20010,7 @@ fn next_window_start_for_point_line_continuation_ignores_newline_terminated_rows
         row: 0,
         y: 0,
         height: 16,
+        extra_line_spacing: 0,
         start_x: 0,
         start_col: 0,
         end_x: 0,
@@ -19945,6 +20053,7 @@ fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_poin
             row: 0,
             y: 0,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19959,6 +20068,7 @@ fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_poin
             row: 1,
             y: 16,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19973,6 +20083,7 @@ fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_poin
             row: 2,
             y: 32,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -19987,6 +20098,7 @@ fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_poin
             row: 3,
             y: 48,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -20001,6 +20113,7 @@ fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_poin
             row: 4,
             y: 64,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 0,
@@ -36993,6 +37106,10 @@ mod prepared_viewport_test;
 #[path = "offscreen_row_test.rs"]
 mod offscreen_row_test;
 
+#[cfg(test)]
+#[path = "scroll_coverage_fairness_test.rs"]
+mod scroll_coverage_fairness_test;
+
 #[test]
 fn borrowed_and_snapshot_views_agree_on_composition_span_queries() {
     // The two LayoutBufferView implementations derive their composition spans
@@ -37592,3 +37709,21 @@ fn display_when_reuse_needs_a_valid_window_end_not_a_mode_line() {
     );
     assert!(row5(&eval, &engine).starts_with("ORIGINAL"));
 }
+#[cfg(test)]
+#[path = "window_input_ownership_resolver_test.rs"]
+mod window_input_ownership_resolver_test;
+
+#[cfg(test)]
+#[path = "mini_root_minimum_test.rs"]
+mod mini_root_minimum_test;
+
+#[path = "mini_offset_height_test.rs"]
+mod mini_offset_height_test;
+
+#[cfg(test)]
+#[path = "overlay_string_window_wrap_test.rs"]
+mod overlay_string_window_wrap_test;
+
+#[cfg(test)]
+#[path = "narrow_root_eob_test.rs"]
+mod narrow_root_eob_test;

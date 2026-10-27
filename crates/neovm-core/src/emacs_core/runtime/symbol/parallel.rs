@@ -1,7 +1,12 @@
 //! Narrow backing for proof-3 authority. No serial accessor calls this module.
 #![allow(dead_code)]
 
+mod functions;
+pub(crate) use functions::FunctionUpdate;
+mod intern;
 mod write;
+#[cfg(test)]
+pub(crate) use intern::{InitialInternFacts, InitialInternFault};
 
 use super::{Obarray, SymbolTrappedWrite, ValueCell};
 use crate::emacs_core::forward::{CanonicalArm, ThreadProjectionTable};
@@ -17,6 +22,13 @@ pub enum PlainSymbolBacking {
     VoidProjection,
 }
 
+/// Membership is distinct from a refused observation of a stale backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialMembership {
+    Member,
+    Absent,
+}
+
 /// Original World allocation roots, never references derived from a Context
 /// view. The era retains the World's Baton even on abandoned/poisoned teardown.
 pub(crate) struct SymbolBacking {
@@ -24,6 +36,10 @@ pub(crate) struct SymbolBacking {
     projections: NonNull<RefCell<ThreadProjectionTable>>,
     pub(crate) world: usize,
     pub(crate) generation: u64,
+    #[cfg(test)]
+    intern_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    intern_fault_receipt: std::sync::atomic::AtomicU8,
 }
 
 // SAFETY: only the keeper constructs this bridge from retained World roots.
@@ -36,6 +52,50 @@ unsafe impl Send for SymbolBacking {}
 unsafe impl Sync for SymbolBacking {}
 
 impl SymbolBacking {
+    /// Inspect only membership while the matching initial-obarray reader is
+    /// held. Neither absent storage nor a nonmember slot is initialized.
+    ///
+    /// # Safety
+    /// The token belongs to this retained World; ordinary views and markers
+    /// remain excluded. Absent is a real World-obarray soft miss.
+    pub(crate) unsafe fn initial_contains(
+        &self,
+        id: SymId,
+        _authority: &crate::tagged::gc::SymbolReadToken<'_>,
+    ) -> Result<InitialMembership, crate::tagged::gc::RegistrationError> {
+        // SAFETY: original World root covered by the live reader authority.
+        let obarray = unsafe { self.obarray.as_ref() };
+        if obarray.generation() != self.generation {
+            return Err(crate::tagged::gc::RegistrationError::StaleRegistration);
+        }
+        Ok(if obarray.is_global_member(id) {
+            InitialMembership::Member
+        } else {
+            InitialMembership::Absent
+        })
+    }
+
+    /// Copy the function word and explicit-unbound state under one real
+    /// symbol reader. This uses the landed interior-mutable function cell;
+    /// no builtin fallback, callback, stamp or owner-private cache is touched.
+    ///
+    /// # Safety
+    /// The token's live reader word belongs to this retained World. All
+    /// ordinary views and concurrent markers remain excluded by that era.
+    pub(crate) unsafe fn read_function(
+        &self,
+        id: SymId,
+        _authority: &crate::tagged::gc::SymbolReadToken<'_>,
+    ) -> Option<super::FunctionCellSnapshot> {
+        // SAFETY: original retained root, with the matching reader held.
+        let obarray = unsafe { self.obarray.as_ref() };
+        if obarray.generation() != self.generation {
+            return None;
+        }
+        obarray.get_by_id(id)?;
+        Some(obarray.function_cell_snapshot(id))
+    }
+
     /// # Safety
     /// Roots belong to the same live World, all ordinary views are escrowed,
     /// and the keeper retains that World until all era access ends. All calls
@@ -52,6 +112,10 @@ impl SymbolBacking {
             projections,
             world,
             generation,
+            #[cfg(test)]
+            intern_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            intern_fault_receipt: std::sync::atomic::AtomicU8::new(0),
         }
     }
 

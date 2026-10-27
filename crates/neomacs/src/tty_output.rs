@@ -4,7 +4,9 @@ use neomacs_display_protocol::tty_capabilities::TtyAttributeCapabilities;
 use neomacs_display_runtime::backend::tty::rif::painter::{
     CellOutput, TtyPainter, encode_cells_with,
 };
-use neomacs_display_runtime::backend::tty::rif::{TerminalCursorShape, TtyCell, TtyRif};
+use neomacs_display_runtime::backend::tty::rif::{
+    PendingPhysicalClear, TerminalCursorShape, TtyCell, TtyRif,
+};
 use std::io::{self, Write};
 
 #[cfg(windows)]
@@ -327,6 +329,7 @@ pub(crate) fn render_to(
     caps: &Capabilities,
 ) -> io::Result<()> {
     if caps.ansi && !caps.needs_padding {
+        let clear_requirement = rif.physical_clear_requirement();
         rif.diff_and_render();
         let body = rif.take_output();
         if body.is_empty() {
@@ -339,6 +342,10 @@ pub(crate) fn render_to(
         caps.reset_modes(&mut bytes);
         bytes.extend_from_slice(&body);
         if let Err(error) = bytes.write_to(output, caps) {
+            match clear_requirement {
+                PendingPhysicalClear::None => {}
+                PendingPhysicalClear::AfterResize => rif.retry_physical_clear(),
+            }
             rif.force_redraw();
             return Err(error);
         }
@@ -375,7 +382,11 @@ impl<W: Write> TerminfoPainter<'_, W> {
     fn bottom_row(&mut self, row: usize, cells: &[TtyCell]) -> io::Result<()> {
         // GNU tty_write_glyphs writes the suffix first, then inserts the first
         // glyph so no ordinary write touches the physical bottom-right cell.
-        let first_width = 1 + cells.iter().skip(1).take_while(|cell| cell.padding).count();
+        let first_width = 1 + cells
+            .iter()
+            .skip(1)
+            .take_while(|cell| cell.padding())
+            .count();
         let insert = !self.caps.control("ic").is_empty() || !self.caps.control("IC").is_empty();
         let insert_mode =
             !self.caps.control("im").is_empty() && !self.caps.control("ei").is_empty();
@@ -418,10 +429,10 @@ impl<W: Write> TerminfoPainter<'_, W> {
         }
         // A trailing default blank can instead be erased without advancing.
         if let Some(last) = cells.last()
-            && last.ch == ' '
-            && !last.padding
-            && last.extenders.is_none()
-            && last.attrs == Default::default()
+            && last.ch() == ' '
+            && !last.padding()
+            && last.extenders().is_none()
+            && last.attrs() == Default::default()
             && !self.caps.control("ce").is_empty()
         {
             encode_cells(
@@ -453,6 +464,10 @@ impl<W: Write> TtyPainter for TerminfoPainter<'_, W> {
         // Reset before repainting, even when the first desired face is default.
         self.caps.reset_modes(&mut self.bytes);
         self.caps.append(&mut self.bytes, "vi");
+        Ok(())
+    }
+    fn clear_screen(&mut self) -> io::Result<()> {
+        self.bytes.control(self.caps.control("cl"), self.height);
         Ok(())
     }
     fn row(&mut self, row: usize, cells: &[TtyCell]) -> io::Result<()> {
@@ -511,13 +526,14 @@ pub(crate) fn popup_line(row: usize, col: usize, text: &str) -> io::Result<()> {
         caps.goto(&mut bytes, row, col, width as usize, height as usize)?;
         let cells: Vec<_> = text
             .chars()
-            .map(|ch| TtyCell {
-                ch,
-                attrs: neomacs_display_runtime::backend::tty::rif::CellAttrs {
+            .map(|ch| {
+                let mut cell = TtyCell::default();
+                cell.set_ch(ch);
+                cell.set_attrs(neomacs_display_runtime::backend::tty::rif::CellAttrs {
                     inverse: true,
                     ..Default::default()
-                },
-                ..TtyCell::default()
+                });
+                cell
             })
             .collect();
         encode_cells(&mut bytes, &cells, &caps.attributes);

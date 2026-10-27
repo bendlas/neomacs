@@ -6,7 +6,9 @@
 //! tests can also mirror output-cursor moves into a live window.
 
 pub(crate) mod prepared_body;
+mod restart_sync;
 mod row_geometry;
+pub(crate) use restart_sync::{RestartSyncDecision, RestartSyncState, SyncStateError};
 mod snapshot_rows;
 use row_geometry::WindowRowGeometry;
 
@@ -340,7 +342,7 @@ impl<'a> TextWindowOutputTarget<'a> {
         install_rendered_display_row_fragment_assets(self.builder(), faces);
     }
 
-    pub(crate) fn install_measured_window_display_row(&mut self, measured: &MeasuredDisplayRow) {
+    pub(crate) fn install_measured_window_display_row(&mut self, measured: MeasuredDisplayRow) {
         install_measured_window_display_row(self.builder(), measured);
     }
 }
@@ -405,6 +407,11 @@ fn begin_display_text_row(
         begin.display_row_index,
         begin.start_charpos,
     ));
+    // BEGIN already owns the row's position, even if EOB leaves it without
+    // a finished source-row snapshot. A structural prefix can publish its
+    // minimum height before FINISH; keep that height at this row's real Y.
+    DisplayOutputTextRowMetricsInstallRequest::new(begin.display_row_index, begin.y, 0.0, 0.0)
+        .install(output_builder);
     begin.display_row_index
 }
 
@@ -451,7 +458,7 @@ pub(crate) fn finish_text_window_row(
 ) -> DisplayTextRowFinish {
     let display_row_index = output_emitter.current_display_text_row_index();
     let finish = finish_display_text_row(output.builder(), display_row_index, metrics);
-    output_emitter.push_text_row(metrics.y, metrics.height, metrics.ascent);
+    output_emitter.push_text_row(metrics);
     finish
 }
 
@@ -467,7 +474,7 @@ pub(crate) fn finish_and_end_text_window_row(
     output_builder.install_output_row_lifecycle(OutputRowLifecycleRequest::finalize(
         request.display_row_index(),
     ));
-    output_emitter.push_text_row(metrics.y, metrics.height, metrics.ascent);
+    output_emitter.push_text_row(metrics);
     DisplayTextRowFinish {
         display_row_index,
         metrics: matrix_metrics,
@@ -1323,7 +1330,83 @@ impl WindowChromeStringState {
     }
 }
 
+/// Native source-byte observation; Unknown never authorizes an EOB shortcut.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MiniPrecedingZvByte {
+    AtBufferStart,
+    LineFeed,
+    OtherByte,
+    Unknown,
+}
+
+static_assertions::assert_impl_all!(MiniPrecedingZvByte: Copy, Send, Sync);
+const _: () = assert!(std::mem::size_of::<MiniPrecedingZvByte>() == 1);
+
+impl From<u8> for MiniPrecedingZvByte {
+    fn from(byte: u8) -> Self {
+        match byte {
+            b'\n' => Self::LineFeed,
+            _ => Self::OtherByte,
+        }
+    }
+}
+
+/// The current row pen's relation to its first visible text-area origin.
+/// An absent current row carries no permission to use the empty-row shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowVisibleStartPosition {
+    Unavailable,
+    AtOrBefore,
+    After,
+}
+
+static_assertions::assert_impl_all!(RowVisibleStartPosition: Copy, Send, Sync);
+const _: () = assert!(std::mem::size_of::<RowVisibleStartPosition>() == 1);
+
+/// Numeric facts of one exclusive speculative emitter. They are discarded
+/// with that emitter on retry/completion, never published in the glyph matrix
+/// or shared with a mutator/retained cache.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AutomaticMiniRowEnd {
+    Ordinary,
+    Truncated,
+}
+
+static_assertions::assert_impl_all!(AutomaticMiniRowEnd: Copy, Send, Sync);
+const _: () = assert!(std::mem::size_of::<AutomaticMiniRowEnd>() == 1);
+
+impl MiniPrecedingZvByte {
+    /// Called only for a completed empty current row at/before first-visible X
+    /// in TRUNCATE mode. Keep GNU's mover and final-height guards distinct.
+    pub(crate) fn automatic_tail_height(
+        self,
+        previous_row: AutomaticMiniRowEnd,
+        height_px: neomacs_display_protocol::types::Px,
+    ) -> crate::output::window_state::AutomaticMiniTailHeight {
+        use crate::output::window_state::AutomaticMiniTailHeight;
+        match previous_row {
+            AutomaticMiniRowEnd::Truncated => match self {
+                // move_it_to:11122–11145 exits before Y advance/metrics reset
+                // after a clipped final string line, including true ZV_BYTE==1.
+                Self::AtBufferStart | Self::OtherByte => {
+                    AutomaticMiniTailHeight::TruncatedLineStop { height_px }
+                }
+                Self::LineFeed | Self::Unknown => AutomaticMiniTailHeight::CurrentRow,
+            },
+            AutomaticMiniRowEnd::Ordinary => match self {
+                // resize_mini_window:13355–13368 suppresses last_height only
+                // for a real preceding non-LF byte, never merely empty BEGV..ZV.
+                Self::OtherByte => AutomaticMiniTailHeight::ZeroMetricsTruncatedEnd { height_px },
+                Self::AtBufferStart | Self::LineFeed | Self::Unknown => {
+                    AutomaticMiniTailHeight::CurrentRow
+                }
+            },
+        }
+    }
+}
+
 pub(crate) struct WindowOutputEmitter {
+    sync_attempt: restart_sync::SyncAttempt,
     query_target: Option<LayoutCharPos0>,
     // A stable buffer glyph completed a position query inside this row.
     // This is a prefix observation, never proof of a complete final row.
@@ -1338,9 +1421,20 @@ pub(crate) struct WindowOutputEmitter {
     frame_id: neovm_core::window::FrameId,
     window_id: neovm_core::window::WindowId,
     geometry: WindowRowGeometry,
+    eob_overlay_motion: neovm_core::window::EobOverlayMotionCoverage,
+    current_automatic_mini_row_end: AutomaticMiniRowEnd,
+    previous_automatic_mini_row_end: AutomaticMiniRowEnd,
     logical_cursor: Option<WindowCursorPos>,
     phys_cursor: Option<WindowCursorSnapshot>,
     chrome_strings: WindowChromeStringState,
+}
+
+/// One exclusive observation of every ordered string at an EOB anchor.
+/// Construction stays with the emitter and completion consumes the token.
+pub(crate) struct EobOverlayMotionStart {
+    window: neovm_core::window::WindowId,
+    anchor: LispCharPos1,
+    first_row: usize,
 }
 
 impl DisplayProgressSink for WindowOutputEmitter {
@@ -1434,6 +1528,7 @@ impl WindowOutputEmitter {
         publish_live: bool,
     ) -> Self {
         Self {
+            sync_attempt: restart_sync::SyncAttempt::Inactive,
             publish_live,
             query_target: None,
             query_target_reached: false,
@@ -1442,6 +1537,9 @@ impl WindowOutputEmitter {
             frame_id,
             window_id,
             geometry: WindowRowGeometry::new(text_row_base, text_x, window_top),
+            eob_overlay_motion: neovm_core::window::EobOverlayMotionCoverage::NotObserved,
+            current_automatic_mini_row_end: AutomaticMiniRowEnd::Ordinary,
+            previous_automatic_mini_row_end: AutomaticMiniRowEnd::Ordinary,
             logical_cursor: None,
             phys_cursor: None,
             chrome_strings: WindowChromeStringState::Building(Vec::new()),
@@ -1576,6 +1674,18 @@ impl WindowOutputEmitter {
             .restore_current_row_pen(position.x_px(), position.col());
     }
 
+    pub(crate) fn note_automatic_mini_row_truncation(&mut self) {
+        self.current_automatic_mini_row_end = AutomaticMiniRowEnd::Truncated;
+    }
+
+    pub(crate) fn previous_automatic_mini_row_end(&self) -> AutomaticMiniRowEnd {
+        self.previous_automatic_mini_row_end
+    }
+
+    pub(crate) fn current_row_visible_start_position(&self) -> RowVisibleStartPosition {
+        self.geometry.current_row_visible_start_position()
+    }
+
     pub(crate) fn current_row_has_output(&self) -> bool {
         self.geometry.current_row_has_output()
     }
@@ -1627,6 +1737,47 @@ impl WindowOutputEmitter {
         kind: crate::display_origin::OverlayStringKind,
     ) {
         self.geometry.note_overlay_string_row_end(buffer_pos, kind)
+    }
+
+    pub(crate) fn mark_eob_overlay_motion_incomplete(&mut self, anchor: LispCharPos1) {
+        self.eob_overlay_motion =
+            neovm_core::window::EobOverlayMotionCoverage::Incomplete { anchor };
+    }
+
+    pub(crate) fn begin_eob_overlay_motion(
+        &mut self,
+        anchor: LispCharPos1,
+        first_row: usize,
+    ) -> EobOverlayMotionStart {
+        self.mark_eob_overlay_motion_incomplete(anchor);
+        EobOverlayMotionStart {
+            window: self.window_id,
+            anchor,
+            first_row,
+        }
+    }
+
+    pub(crate) fn complete_eob_overlay_motion(
+        &mut self,
+        start: EobOverlayMotionStart,
+        completion_row: usize,
+    ) {
+        use neovm_core::window::{CompletedEobOverlayMotionExtent, EobOverlayMotionCoverage};
+        if start.window != self.window_id
+            || self.eob_overlay_motion
+                != (EobOverlayMotionCoverage::Incomplete {
+                    anchor: start.anchor,
+                })
+        {
+            return;
+        }
+        if let Some(extent) = CompletedEobOverlayMotionExtent::from_physical_rows(
+            start.anchor,
+            start.first_row,
+            completion_row,
+        ) {
+            self.eob_overlay_motion = EobOverlayMotionCoverage::Complete(extent);
+        }
     }
 
     pub(crate) fn note_row_walk_start(&mut self, buffer_pos: LispCharPos1) {
@@ -1775,6 +1926,7 @@ impl WindowOutputEmitter {
         y: f32,
         x: f32,
     ) {
+        self.current_automatic_mini_row_end = AutomaticMiniRowEnd::Ordinary;
         self.geometry.note_query_y(y);
         let output_row = self.geometry.text_row_base + row as i64;
         let output_col = col as i64;
@@ -1891,9 +2043,10 @@ impl WindowOutputEmitter {
         self.geometry.note_truncated_end(end);
     }
 
-    pub(crate) fn push_text_row(&mut self, row_y_start: f32, row_height: f32, row_ascent: f32) {
-        self.geometry
-            .push_text_row(row_y_start, row_height, row_ascent)
+    pub(crate) fn push_text_row(&mut self, metrics: DisplayTextRowMetrics) {
+        self.previous_automatic_mini_row_end = self.current_automatic_mini_row_end;
+        self.current_automatic_mini_row_end = AutomaticMiniRowEnd::Ordinary;
+        self.geometry.push_text_row(metrics)
     }
 
     pub(crate) fn push_reused_chrome(&mut self, rows: Vec<DisplayRowSnapshot>) {
@@ -1943,6 +2096,7 @@ impl WindowOutputEmitter {
         let window_id = self.window_id;
         let logical_cursor = self.logical_cursor.take();
         let phys_cursor = self.phys_cursor.take();
+        let mut eob_overlay_motion = self.eob_overlay_motion;
         let prepared_rows = self
             .geometry
             .finish((regions.text_body.y - regions.outer.y).round() as i64);
@@ -1957,6 +2111,21 @@ impl WindowOutputEmitter {
             .get(frame_id)
             .and_then(|frame| frame.find_window(window_id))
             .and_then(|window| window.buffer_id());
+        // Cursor/scroll replay can retain a source-anchored overlay row without
+        // replaying its stream-completion proof. Preserve that uncertainty:
+        // the EOB anchor is measured, but its entire virtual tail is not.
+        if eob_overlay_motion == neovm_core::window::EobOverlayMotionCoverage::NotObserved
+            && let Some(anchor) = buffer_id
+                .and_then(|buffer| evaluator.buffer_manager().get(buffer))
+                .map(|buffer| buffer.accessible_char_region().end_lisp())
+            && prepared_rows
+                .rows
+                .iter()
+                .any(|row| row.end_source.is_overlay_string() && row.end_buffer_pos == Some(anchor))
+        {
+            eob_overlay_motion =
+                neovm_core::window::EobOverlayMotionCoverage::Incomplete { anchor };
+        }
         let buffer_modiff = buffer_id
             .and_then(|buffer_id| evaluator.buffer_manager().get(buffer_id))
             .map(|buffer| buffer.modified_tick());
@@ -1987,6 +2156,7 @@ impl WindowOutputEmitter {
             points: prepared_rows.points,
             point_rows: prepared_rows.point_rows,
             rows: prepared_rows.rows,
+            eob_overlay_motion,
             buffer_modiff,
             layout_freshness,
             window_end_record: None,
@@ -2009,3 +2179,7 @@ mod tests;
 #[cfg(test)]
 #[path = "window_output/tests/chrome_strings_test.rs"]
 mod chrome_strings_tests;
+
+#[cfg(test)]
+#[path = "window_output/tests/eob_overlay_motion_test.rs"]
+mod eob_overlay_motion_tests;

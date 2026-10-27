@@ -1,6 +1,27 @@
 use super::*;
 use crate::tagged::gc::PlainSymbolBacking;
 
+#[test]
+fn p3sym_c5_global_executor_cannot_admit_intern_even_if_unreachable() {
+    Context::with_test_symbol_era(|era, id| {
+        let tape = source(
+            vec![
+                Op::Jump { target: 2 },
+                Op::Intern(InternOp::InitialIntern { name: 0, dst: 0 }),
+            ],
+            1,
+        );
+        assert!(matches!(
+            GlobalSession::admit(&era, &[id], &[tape]),
+            Err(AdmissionError::Program(Reject::Excluded("initial obarray")))
+        ));
+        era.admit_plain_symbol(id).unwrap();
+        let (collector, keeper) = era.finish().unwrap();
+        drop(collector);
+        drop(keeper);
+    });
+}
+
 pub(super) fn source(ops: Vec<Op>, nslots: usize) -> Source {
     Source {
         insns: ops
@@ -21,7 +42,7 @@ pub(super) fn drive<'era>(
     frame: &mut Frame<'era>,
 ) -> Result<(), ExecError> {
     loop {
-        match session.step(owner, frame)? {
+        match session.wait_step(owner, frame)? {
             Step::Done => return Ok(()),
             Step::Retry => thread::yield_now(),
             Step::Progress | Step::Safepoint => {}
@@ -321,7 +342,13 @@ fn p3sym_c3_executor_refusal_preserves_pc_and_retries() {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut run = peer.run_access().unwrap();
                 let writer = run.symbol_mut(&session.handles[0]).unwrap();
+                let budget = frame.attempts_left;
+                frame.attempts_left = 1;
                 assert_eq!(session.step(owner, frame), Ok(Step::Retry));
+                assert_eq!(frame.attempts_left, 1);
+                assert_eq!(session.step(owner, frame), Ok(Step::Retry));
+                assert_eq!(frame.attempts_left, 1);
+                frame.attempts_left = budget;
                 assert_eq!(
                     frame.machine.pc, 0,
                     "Busy is a legal refusal, never a completed op"

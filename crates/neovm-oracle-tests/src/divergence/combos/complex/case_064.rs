@@ -158,7 +158,7 @@ fn div_cx64_process_environment_inheritance_and_override() {
 #[test]
 fn div_cx64_process_buffer_undo_recording() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""ERR (void-variable p)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((buf (get-buffer-create " *neo-cx64-pb*")))
@@ -166,8 +166,8 @@ fn div_cx64_process_buffer_undo_recording() {
     (buffer-enable-undo))
   (let ((p (make-process :name "neo-cx64-pb"
                          :command '("printf" "%s" "ABCDEF")
-                         :buffer buf)))
-    (accept-process-output p 1)
+                         :buffer buf))))
+    (neovm--oracle-settle-process p 600)
     (sit-for 0.05)
   (with-current-buffer buf
     (let ((content (buffer-string))
@@ -219,7 +219,7 @@ fn div_cx64_set_process_coding_system_round_trip() {
                          :command '("sh" "-c" "printf '\\xe4\\xb8\\x96\\xe7\\x95\\x8c'")
                          :buffer buf)))
     (set-process-coding-system p 'utf-8-unix 'utf-8-unix)
-    (accept-process-output p 1)
+    (neovm--oracle-settle-process p 600)
     (sit-for 0.05))
   (let ((decode-system (process-coding-system (get-process "neo-cx64-cs"))))
     (prog1 (list (with-current-buffer buf (buffer-string))

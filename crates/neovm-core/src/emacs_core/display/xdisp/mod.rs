@@ -23,12 +23,12 @@
 //! | `NEOMACS_POSN_BOUNDED_TEXT` | `on` | `off`; `on`/`1`/`true`/`yes` | Bound text copied by approximate window-position fallbacks |
 //! | `NEOMACS_MODE_LINE_PROP_SLICE` | `off` | `off`; `on`/`1`/`true`/`yes` | Clip and graft literal source intervals with one plist copy |
 //! | `NEOMACS_MODE_LINE_PROP_BORROW` | `off` | `off`; `on`/`1`/`true`/`yes` | Borrow source string intervals during synchronous mode-line property reads |
-//! | `NEOMACS_MODE_LINE_PLAIN_FIELD` | `off` | `off`; `on`/`1`/`true`/`yes` | Append property-free percent text directly to the mode-line output |
 //! | `NEOMACS_MODE_LINE_NUMERIC_PADDING` | `on` | `off`; `on`/`1`/`true`/`yes` | Keep numeric-wrapper padding independent of inherited mode-line properties |
 //! | `NEOMACS_REDISPLAY_GNU_HOOKS` | `on` | `off`/`0`/`false`/`no`; `on`/`1`/`true`/`yes` | GNU redisplay transaction, owned pre targets, live hook order and core configuration-hook default; selected-mini preparation; renderer-inert snapshot positions |
 
 #[path = "mode_line_flow.rs"]
 mod mode_line_flow_policy;
+mod mode_line_point;
 
 #[inline]
 pub fn mode_line_flow_enabled() -> bool {
@@ -40,6 +40,7 @@ use text_measurement::TextMeasurement;
 mod fontification_boundary;
 mod mode_line_gc;
 mod mode_line_numeric_padding;
+mod mode_line_symbols;
 use fontification_boundary::{FontificationBoundaryAdmission, FontificationBoundaryMode};
 pub(crate) mod motion;
 
@@ -186,9 +187,11 @@ impl super::eval::Context {
         // window's buffer current).
         let window = Value::make_window(window_id.0);
         let specpdl_count = self.specpdl.len();
-        if let Err(flow) =
-            self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-redisplay"), Value::T)
-        {
+        if let Err(flow) = self.try_specbind_or_unwind_to(
+            specpdl_count,
+            ModeLineSymbol::InhibitRedisplay.id(),
+            Value::T,
+        ) {
             tracing::debug!("window-scroll binding signalled (ignored): {flow:?}");
             return;
         }
@@ -1799,7 +1802,7 @@ fn walk_overlay_string(
 
         let (code, len) = if multibyte {
             let (code, len) = super::emacs_char::string_char(&bytes[byte_off..]);
-            (code, len.max(1))
+            (code.code(), len.max(1))
         } else {
             (bytes[byte_off] as u32, 1)
         };
@@ -2221,6 +2224,11 @@ fn try_format_mode_line_display(
         pctx.target = ModeLineTarget::Display {
             columns: target_cols,
         };
+        pctx.point.enter_context(
+            &mut eval.frames,
+            &eval.buffers,
+            mode_line_point::PointSelection::CurrentBuffer,
+        );
         let mut rendered = ModeLineRendered::default();
         {
             // pctx caches heap Values (frame name, eol indicator) captured
@@ -2301,13 +2309,20 @@ pub(crate) fn finish_format_mode_line_in_eval(
         } else {
             let format_val = args[0];
             let face_spec = resolve_mode_line_face_spec(args);
-            let pctx = build_mode_line_percent_context(
+            let mut pctx = build_mode_line_percent_context(
                 &eval.frames,
                 &eval.buffers,
                 Some(&eval.coding_systems),
                 eval.variables(),
                 args.get(2),
             );
+            let point_selection = if mode_line_flow_policy::enabled() {
+                mode_line_point::PointSelection::CurrentBuffer
+            } else {
+                mode_line_point::PointSelection::WindowSnapshot
+            };
+            pctx.point
+                .enter_context(&mut eval.frames, &eval.buffers, point_selection);
             let mut result = ModeLineRendered::default();
             {
                 // pctx caches heap Values (frame name, eol indicator) captured
@@ -2418,6 +2433,75 @@ pub(crate) fn finish_format_mode_line_in_state_with_eval(
     result
 }
 
+/// Fixed mode-line identities pre-resolve native spellings per registry epoch.
+/// The shared cache is safe for concurrent mutators; this enum holds no Lisp
+/// values or per-format mutable state. Resolve again after arbitrary Lisp.
+#[derive(Clone, Copy, Debug, strum::EnumIter)]
+enum ModeLineSymbol {
+    ModeName,
+    DefaultDirectory,
+    RiskyLocalVariable,
+    InhibitRedisplay,
+    InhibitQuit,
+    Eval,
+}
+
+impl ModeLineSymbol {
+    #[inline]
+    fn id(self) -> crate::emacs_core::intern::SymId {
+        use crate::emacs_core::intern::EpochCachedSymbol;
+
+        match self {
+            Self::ModeName => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("mode-name");
+                SYMBOL.get()
+            }
+            Self::DefaultDirectory => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("default-directory");
+                SYMBOL.get()
+            }
+            Self::RiskyLocalVariable => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("risky-local-variable");
+                SYMBOL.get()
+            }
+            Self::InhibitRedisplay => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("inhibit-redisplay");
+                SYMBOL.get()
+            }
+            Self::InhibitQuit => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("inhibit-quit");
+                SYMBOL.get()
+            }
+            Self::Eval => {
+                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("eval");
+                SYMBOL.get()
+            }
+        }
+    }
+}
+
+/// The existing name-based read, specialized only for closed fixed keys.
+/// Keep the buffer-local gate and owner-aware fallback identical to the
+/// general helper; a cached identity is not a cached variable value.
+#[inline]
+fn mode_line_fixed_symbol_value_in_state(
+    vars: VariableView<'_>,
+    buffers: &crate::buffer::BufferManager,
+    symbol: ModeLineSymbol,
+) -> Option<Value> {
+    let obarray = vars.obarray();
+    let sym = symbol.id();
+    if let Some(buf) = buffers.current_buffer()
+        && let Some(value) = buf.get_buffer_local_by_sym_id_gated(sym, obarray.is_localized(sym))
+    {
+        return Some(value);
+    }
+
+    vars.value(sym)
+}
+
+// Name-based baseline retained for fixed-key equivalence tests.
+#[cfg(test)]
 fn mode_line_symbol_value_in_state(
     vars: VariableView<'_>,
     _dynamic: &[OrderedRuntimeBindingMap],
@@ -2518,9 +2602,10 @@ fn mode_line_process_status_in_state(
         .unwrap_or("no process")
 }
 
+#[cfg(test)]
 fn mode_line_symbol_is_risky(obarray: &crate::emacs_core::symbol::Obarray, name: &str) -> bool {
     obarray
-        .get_property(name, "risky-local-variable")
+        .get_property_id(intern(name), ModeLineSymbol::RiskyLocalVariable.id())
         .is_some_and(|value| !value.is_nil())
 }
 
@@ -2543,8 +2628,9 @@ fn mode_line_conditional_branch(cdr: Value, branch_is_then: bool) -> Option<Valu
 ///
 /// Corresponds to the `struct window *w` and `struct frame *f` parameters
 /// in GNU's `decode_mode_spec` (xdisp.c:29083).
-#[derive(Clone)]
 struct ModeLinePercentContext {
+    /// Identity reuse is scoped to this formatter pass and existing registry epoch.
+    dynamic_symbols: std::cell::RefCell<mode_line_symbols::DynamicSymbols>,
     /// Internal zero-based character offset of the first visible character.
     /// Derived from GNU `marker_position(w->start)`, which is Lisp one-based.
     window_start: usize,
@@ -2568,12 +2654,9 @@ struct ModeLinePercentContext {
     /// `%-` expansion without letting an untyped optional width conflate string
     /// formatting with direct display formatting.
     target: ModeLineTarget,
-    /// Byte position of THIS window's point, for point-dependent specs (`%l`,
-    /// `%c`). GNU sets the buffer's point to `w->pointm` while displaying a
-    /// window's mode line, so these reflect that window — not the selected
-    /// window's point (which is the live buffer point). `None` falls back to the
-    /// buffer point. Set per-window in `build_mode_line_percent_context`.
-    window_point: Option<EmacsBytePos>,
+    /// Context walks read live PT and the original window's shared counter;
+    /// read-only split entry points retain their isolated native snapshot.
+    point: mode_line_point::PointContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2619,6 +2702,7 @@ impl BufferCodingDisplay {
 impl Default for ModeLinePercentContext {
     fn default() -> Self {
         Self {
+            dynamic_symbols: Default::default(),
             window_start: 0,
             window_end: 0,
             frame_name: None,
@@ -2626,7 +2710,7 @@ impl Default for ModeLinePercentContext {
             frame_coding_mnemonics: FrameCodingMnemonics::WindowSystem,
             eol_indicator: None,
             target: ModeLineTarget::String,
-            window_point: None,
+            point: mode_line_point::PointContext::default(),
         }
     }
 }
@@ -2689,11 +2773,26 @@ fn build_mode_line_percent_context(
                 let is_selected = frames
                     .selected_frame()
                     .is_some_and(|frame| frame.selected_window == *id);
-                ctx.window_point = Some(if is_selected {
+                let point = if is_selected {
                     buf.point_emacs_byte_pos()
                 } else {
                     buf.char_pos_to_emacs_byte_pos_clamped(point.to_char_pos())
-                });
+                };
+                let height = frames
+                    .find_window_frame_id(*id)
+                    .and_then(|frame_id| frames.get(frame_id))
+                    .map(|frame| {
+                        usize::try_from(window.total_lines(frame.char_height)).unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                ctx.point = mode_line_point::PointContext::new(
+                    buf,
+                    *id,
+                    window_start.to_char_pos(),
+                    point,
+                    height,
+                    window.mode_line_base(),
+                );
             } else {
                 ctx.window_end = ctx.window_start;
             }
@@ -3107,7 +3206,7 @@ fn append_mode_line_source_slice(
                 .append_source_slice_at_char_offset(source, range, offset);
         }
     } else {
-        target.append_properties(&source.slice_char_range(range), offset.get());
+        target.append_properties(&source.slice_char_range(range), offset);
     }
 }
 
@@ -3170,9 +3269,7 @@ fn mode_line_string_char_codes(string: &crate::heap_types::LispString) -> Vec<u3
         let mut codes = Vec::new();
         let mut pos = 0;
         while pos < bytes.len() {
-            codes.push(crate::emacs_core::emacs_char::string_char_advance(
-                bytes, &mut pos,
-            ));
+            codes.push(crate::emacs_core::emacs_char::string_char_advance(bytes, &mut pos).code());
         }
         codes
     } else {
@@ -3240,31 +3337,31 @@ impl ModeLineRendered {
         }
     }
 
-    fn append_properties(&mut self, other: &TextPropertyTable, offset: usize) {
+    fn append_properties(&mut self, other: &TextPropertyTable, offset: CharLen) {
         if let Some(roots) = &mut self.gc_roots {
-            self.text_props.append_shifted_at_char_offset_with_roots(
-                other,
-                CharLen::new(offset),
-                |value| mode_line_gc::pin_accumulator_value(roots, value),
-            );
-        } else {
             self.text_props
-                .append_shifted_at_char_offset(other, CharLen::new(offset));
+                .append_shifted_at_char_offset_with_roots(other, offset, |value| {
+                    mode_line_gc::pin_accumulator_value(roots, value)
+                });
+        } else {
+            self.text_props.append_shifted_at_char_offset(other, offset);
         }
     }
 
-    fn plain(text: impl Into<String>) -> Self {
-        let text = text.into();
-        let multibyte = text.chars().any(|c| !c.is_ascii());
-        Self {
-            text: text.chars().map(|c| c as u32).collect(),
-            multibyte,
-            text_props: TextPropertyTable::new(),
-            source_spans: Vec::new(),
-            min_width_transitions: Vec::new(),
-            gc_roots: None,
-            numeric_padding: Default::default(),
-        }
+    fn plain(text: impl AsRef<str>) -> Self {
+        let mut rendered = Self::default();
+        rendered.append_plain_utf8(text.as_ref());
+        rendered
+    }
+
+    /// Native UTF-8 fields have no Lisp-string source or min-width sidecar.
+    /// The caller owns the output exclusively; no reference or shared cache
+    /// survives the append, and this operation cannot invoke Lisp.
+    fn append_plain_utf8(&mut self, text: &str) -> CharRange {
+        let start = CharPos0::new(self.char_len());
+        self.multibyte |= text.chars().any(|ch| !ch.is_ascii());
+        self.text.extend(text.chars().map(u32::from));
+        CharRange::new(start, CharPos0::new(self.char_len()))
     }
 
     fn append_rendered(&mut self, other: &Self) {
@@ -3273,7 +3370,7 @@ impl ModeLineRendered {
         self.numeric_padding
             .append_shifted(&other.numeric_padding, char_offset);
         self.text.extend_from_slice(&other.text);
-        self.append_properties(&other.text_props, char_offset);
+        self.append_properties(&other.text_props, CharLen::new(char_offset));
         for span in &other.source_spans {
             self.pin_value(span.source());
         }
@@ -3343,7 +3440,7 @@ impl ModeLineRendered {
                 self.text.extend(mode_line_string_char_codes(string));
                 self.record_source_span(char_offset, self.char_len(), *value, 0);
                 with_mode_line_string_properties(*value, |props| {
-                    self.append_properties(props, char_offset);
+                    self.append_properties(props, CharLen::new(char_offset));
                 });
             }
             None => {
@@ -3756,13 +3853,11 @@ impl ModeLineRendered {
         if self.text.is_empty() || props.is_empty() {
             return;
         }
-        for (name, value) in props {
-            self.text_props.put_property_in_char_range(
-                display_char_range(0, self.char_len()),
-                name,
-                value,
-            );
-        }
+        overlay_mode_line_property_map(
+            &mut self.text_props,
+            CharRange::from_start_len(CharPos0::ZERO, CharLen::new(self.text.len())),
+            &props,
+        );
         self.pin_properties();
     }
 
@@ -3943,36 +4038,41 @@ fn append_mode_line_rendered_segment(
     result.append_rendered(&segment);
 }
 
-/// Immutable process selector published by OnceLock. The direct field append
-/// uses only its caller's exclusive rendered output and retains no Lisp state;
-/// independent mutators never share formatter data through this selector.
-#[inline]
-fn mode_line_plain_field_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = MODE_LINE_PLAIN_FIELD_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
+/// Apply the source format's map in its existing iteration order. Both
+/// temporary Lisp-text segments and directly emitted native fields use this
+/// definition, retaining the property table's canonical insertion semantics.
+fn overlay_mode_line_property_map(
+    table: &mut TextPropertyTable,
+    range: CharRange,
+    properties: &std::collections::HashMap<Value, Value>,
+) {
+    if range.is_empty() {
+        return;
     }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEOMACS_MODE_LINE_PLAIN_FIELD")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("on" | "1" | "true" | "yes")
-        )
-    })
+    for (&name, &value) in properties {
+        table.put_property_in_char_range(range, name, value);
+    }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+enum ModeLinePlainFieldPath {
+    #[default]
+    Direct,
+    Temporary,
+}
+
+// Reuses the existing test-only selector slot; no product TLS or runtime
+// measurement selector. The guard restores the previous path on every exit.
 #[cfg(test)]
 thread_local! {
-    static MODE_LINE_PLAIN_FIELD_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
+    static MODE_LINE_PLAIN_FIELD_OVERRIDE: std::cell::Cell<ModeLinePlainFieldPath> =
+        const { std::cell::Cell::new(ModeLinePlainFieldPath::Direct) };
 }
 
 #[cfg(test)]
-fn set_mode_line_plain_field_for_test(enabled: Option<bool>) {
-    MODE_LINE_PLAIN_FIELD_OVERRIDE.with(|cell| cell.set(enabled));
+fn set_mode_line_plain_field_for_test(path: ModeLinePlainFieldPath) -> ModeLinePlainFieldPath {
+    MODE_LINE_PLAIN_FIELD_OVERRIDE.with(|cell| cell.replace(path))
 }
 
 fn append_mode_line_percent_string_spec(
@@ -3981,31 +4081,37 @@ fn append_mode_line_percent_string_spec(
     props_at_percent: &std::collections::HashMap<Value, Value>,
     field_width: i64,
 ) {
-    if props_at_percent.is_empty() && mode_line_plain_field_enabled() {
-        let char_offset = result.char_len();
-        // ModeLineRendered::plain decodes UTF-8 chars to these same codes.
-        // Extend the final buffer directly, avoiding its temporary String,
-        // character-code Vec, and second copy. This field has no source or
-        // min-width sidecar to append.
-        result.multibyte |= spec.chars().any(|ch| !ch.is_ascii());
-        result.text.extend(spec.chars().map(|ch| ch as u32));
-        let rendered_len = (result.char_len() - char_offset) as i64;
-        if field_width > 0 && rendered_len < field_width {
-            result.pad_plain_spaces((field_width - rendered_len) as usize);
+    #[cfg(test)]
+    match MODE_LINE_PLAIN_FIELD_OVERRIDE.with(std::cell::Cell::get) {
+        ModeLinePlainFieldPath::Direct => {}
+        ModeLinePlainFieldPath::Temporary => {
+            append_mode_line_percent_segment(
+                result,
+                ModeLineRendered::plain(spec),
+                props_at_percent,
+                field_width,
+            );
+            return;
         }
-        // Preserve the empty segment's property mutation/syntax ticks and
-        // cache revalidation. Its empty graft changes no interval boundaries.
-        result
-            .text_props
-            .append_shifted_at_char_offset(&TextPropertyTable::new(), CharLen::new(char_offset));
-        return;
     }
-    append_mode_line_percent_segment(
-        result,
-        ModeLineRendered::plain(spec),
+
+    let emitted = result.append_plain_utf8(spec);
+    // The parser's nonpositive width means no minimum. Convert once at this
+    // boundary; every position and length below is measured in characters.
+    let minimum = CharLen::new(usize::try_from(field_width).unwrap_or_default());
+    let padding = minimum.saturating_sub(emitted.len());
+    result.pad_plain_spaces(padding.get());
+    let field_len = emitted.len().add_len(padding);
+    let mut properties = TextPropertyTable::new();
+    overlay_mode_line_property_map(
+        &mut properties,
+        CharRange::from_start_len(CharPos0::ZERO, field_len),
         props_at_percent,
-        field_width,
     );
+    // Keep the same local property graft, even for an empty field/map: its
+    // mutation/syntax ticks and newly copied plist roots are observable by
+    // later formatter elements. Native fields add no source/min-width record.
+    result.append_properties(&properties, CharLen::new(emitted.start().get()));
 }
 
 fn append_mode_line_percent_segment(
@@ -4048,6 +4154,57 @@ fn append_mode_line_string_in_state(
     value: &Value,
     literal: bool,
 ) {
+    append_mode_line_string_with_point_access(
+        vars,
+        dynamic,
+        buffers,
+        processes,
+        command_loop_depth,
+        pctx,
+        result,
+        value,
+        literal,
+        &mut mode_line_point::Access::Snapshot,
+    );
+}
+
+fn append_mode_line_string_in_eval(
+    eval: &mut super::eval::Context,
+    pctx: &ModeLinePercentContext,
+    result: &mut ModeLineRendered,
+    value: &Value,
+    literal: bool,
+) {
+    let command_loop_depth = eval.recursive_command_loop_depth();
+    let vars = VariableView::new(&eval.obarray, &eval.owner);
+    let mut access = mode_line_point::Access::Live(&mut eval.frames);
+    append_mode_line_string_with_point_access(
+        vars,
+        &[],
+        &eval.buffers,
+        &eval.processes,
+        command_loop_depth,
+        pctx,
+        result,
+        value,
+        literal,
+        &mut access,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_mode_line_string_with_point_access(
+    vars: VariableView<'_>,
+    dynamic: &[OrderedRuntimeBindingMap],
+    buffers: &crate::buffer::BufferManager,
+    processes: &crate::emacs_core::process::ProcessManager,
+    command_loop_depth: usize,
+    pctx: &ModeLinePercentContext,
+    result: &mut ModeLineRendered,
+    value: &Value,
+    literal: bool,
+    point_access: &mut mode_line_point::Access<'_>,
+) {
     // `%` is ASCII (0x25), which can never appear as a UTF-8 continuation or
     // lead byte, so scanning the raw bytes detects format specs without a lossy
     // decode and stays byte-faithful for raw-unibyte literal segments.
@@ -4070,6 +4227,7 @@ fn append_mode_line_string_in_state(
             pctx,
             value,
             result,
+            point_access,
         );
     }
 }
@@ -4152,17 +4310,7 @@ fn format_mode_line_recursive_rooted(
     match format.kind() {
         ValueKind::Nil => {}
 
-        ValueKind::String => append_mode_line_string_in_state(
-            eval.variables(),
-            &[],
-            &eval.buffers,
-            &eval.processes,
-            eval.recursive_command_loop_depth(),
-            pctx,
-            result,
-            format,
-            false,
-        ),
+        ValueKind::String => append_mode_line_string_in_eval(eval, pctx, result, format, false),
 
         ValueKind::Fixnum(n) => {
             let _ = n;
@@ -4178,22 +4326,16 @@ fn format_mode_line_recursive_rooted(
             // discarded the `(:eval (unless (display-graphic-p) "-%-"))`
             // dash-fill construct that bindings.el installs on TTY.
             if let Some(name) = format.as_symbol_name(symbol_mode)
-                && let Some(val) =
-                    mode_line_symbol_value_in_state(eval.variables(), &[], &eval.buffers, name)
+                && let Some((symbol, val)) = {
+                    let symbol = pctx.resolve_dynamic_symbol(name);
+                    symbol
+                        .value(eval.variables(), &eval.buffers)
+                        .map(|value| (symbol, value))
+                }
                 && !val.is_nil()
             {
                 if val.is_string() {
-                    append_mode_line_string_in_state(
-                        eval.variables(),
-                        &[],
-                        &eval.buffers,
-                        &eval.processes,
-                        eval.recursive_command_loop_depth(),
-                        pctx,
-                        result,
-                        &val,
-                        true,
-                    );
+                    append_mode_line_string_in_eval(eval, pctx, result, &val, true);
                 } else {
                     format_mode_line_recursive(
                         eval,
@@ -4201,7 +4343,7 @@ fn format_mode_line_recursive_rooted(
                         &val,
                         result,
                         depth + 1,
-                        risky || !mode_line_symbol_is_risky(&eval.obarray, name),
+                        risky || !symbol.is_risky(&eval.obarray),
                         selection.as_deref_mut(),
                     )?;
                 }
@@ -4285,13 +4427,10 @@ fn format_mode_line_recursive_rooted(
 
             if car.is_symbol(symbol_mode) && !car.is_symbol_named("t", symbol_mode) {
                 if let Some(sym_name) = car.as_symbol_name(symbol_mode)
-                    && mode_line_symbol_value_in_state(
-                        eval.variables(),
-                        &[],
-                        &eval.buffers,
-                        sym_name,
-                    )
-                    .is_some_and(|value| value.is_truthy())
+                    && pctx
+                        .resolve_dynamic_symbol(sym_name)
+                        .value(eval.variables(), &eval.buffers)
+                        .is_some_and(|value| value.is_truthy())
                     && let Some(branch) = mode_line_conditional_branch(cdr, true)
                 {
                     format_mode_line_recursive(
@@ -4383,7 +4522,10 @@ fn format_mode_line_recursive_in_state(
             // mode-line-end-spaces; see the note on the equivalent
             // branch in `format_mode_line_recursive`.
             if let Some(name) = format.as_bare_symbol_name()
-                && let Some(val) = mode_line_symbol_value_in_state(vars, dynamic, buffers, name)
+                && let Some((symbol, val)) = {
+                    let symbol = pctx.resolve_dynamic_symbol(name);
+                    symbol.value(vars, buffers).map(|value| (symbol, value))
+                }
                 && !val.is_nil()
             {
                 if val.is_string() {
@@ -4399,7 +4541,7 @@ fn format_mode_line_recursive_in_state(
                     &val,
                     result,
                     depth + 1,
-                    risky || !mode_line_symbol_is_risky(obarray, name),
+                    risky || !symbol.is_risky(obarray),
                 ) {
                     return true;
                 }
@@ -4466,7 +4608,9 @@ fn format_mode_line_recursive_in_state(
 
             if car.is_bare_symbol() && !car.is_bare_symbol_named("t") {
                 let branch = if let Some(sym_name) = car.as_bare_symbol_name()
-                    && mode_line_symbol_value_in_state(vars, dynamic, buffers, sym_name)
+                    && pctx
+                        .resolve_dynamic_symbol(sym_name)
+                        .value(vars, buffers)
                         .is_some_and(|value| value.is_truthy())
                 {
                     mode_line_conditional_branch(cdr, true)
@@ -4557,7 +4701,10 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
             // mode-line-end-spaces; they are ordinary symbols whose
             // value must be resolved and recursed on.
             if let Some(name) = format.as_bare_symbol_name()
-                && let Some(val) = mode_line_symbol_value_in_state(vars, dynamic, buffers, name)
+                && let Some((symbol, val)) = {
+                    let symbol = pctx.resolve_dynamic_symbol(name);
+                    symbol.value(vars, buffers).map(|value| (symbol, value))
+                }
                 && !val.is_nil()
             {
                 if val.is_string() {
@@ -4574,7 +4721,7 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
                         &val,
                         result,
                         depth + 1,
-                        risky || !mode_line_symbol_is_risky(obarray, name),
+                        risky || !symbol.is_risky(obarray),
                         eval_form,
                         roots,
                     )?;
@@ -4668,7 +4815,9 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
 
             if car.is_bare_symbol() && !car.is_bare_symbol_named("t") {
                 let branch = if let Some(sym_name) = car.as_bare_symbol_name()
-                    && mode_line_symbol_value_in_state(vars, dynamic, buffers, sym_name)
+                    && pctx
+                        .resolve_dynamic_symbol(sym_name)
+                        .value(vars, buffers)
                         .is_some_and(|value| value.is_truthy())
                 {
                     mode_line_conditional_branch(cdr, true)
@@ -4738,6 +4887,7 @@ fn expand_mode_line_percent_in_state(
     pctx: &ModeLinePercentContext,
     value: &Value,
     result: &mut ModeLineRendered,
+    point_access: &mut mode_line_point::Access<'_>,
 ) {
     let fmt_storage = if let Some(string) = value.as_lisp_string() {
         crate::emacs_core::emacs_char::to_utf8_lossy(string.as_bytes())
@@ -4748,40 +4898,39 @@ fn expand_mode_line_percent_in_state(
     };
     let fmt_str = fmt_storage.as_str();
     let buf = buffers.current_buffer();
-    let buf_name = buf
-        .map(|b| b.name_runtime_string_owned())
-        .unwrap_or_else(|| "*scratch*".to_string());
-    let file_name_storage = buf.and_then(|b| {
-        b.file_name_value()
-            .as_lisp_string()
-            .map(|ls| crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes()))
-    });
-    let file_name = file_name_storage.as_deref().unwrap_or("");
-    let modified = buf.map(|b| b.is_modified()).unwrap_or(false);
-    let read_only = buf.is_some_and(|b| {
-        crate::emacs_core::editfns::buffer_read_only_active_in_state(vars, dynamic, b)
-    });
-    let narrowed = buf.is_some_and(|b| b.is_narrowed());
-
-    // GNU computes %l/%c lazily inside decode_mode_spec's switch — the
-    // O(point) line count and O(column) scan run only when the format
-    // actually contains the spec. Memoize on first demand: one compute per
-    // walk even when both %l and %c appear.
-    let mut point_line_column_memo: Option<LineColumn> = None;
-    let mut point_line_column = || -> LineColumn {
-        *point_line_column_memo.get_or_insert_with(|| {
-            if let Some(b) = buf {
-                // Use THIS window's point (GNU sets point to `w->pointm` per
-                // window), falling back to the live buffer point when no
-                // window context.
-                let point_byte = pctx
-                    .window_point
-                    .unwrap_or_else(|| b.point_emacs_byte_pos());
-                prefix_line_and_column(b, b.accessible_emacs_byte_region(), point_byte)
-            } else {
-                LineColumn { line: 1, column: 0 }
-            }
+    // GNU decode_mode_spec reads each input in its matching switch arm.
+    // This native expansion cannot run Lisp; share repeated name fields only
+    // within this string, before the walker can run the next :eval.
+    let buf_name = std::cell::OnceCell::new();
+    let file_name_storage = std::cell::OnceCell::new();
+    let modified = || buf.is_some_and(|b| b.is_modified());
+    let read_only = || {
+        buf.is_some_and(|b| {
+            crate::emacs_core::editfns::buffer_read_only_active_in_state(vars, dynamic, b)
         })
+    };
+
+    // A native string cannot evaluate Lisp or move point. Columns can share
+    // their calculation here. Every %l must still decode and publish its next
+    // shared base: reseating can invalidate that base before the next field.
+    let mut column_memo = None;
+    let mut point_field = |field| -> usize {
+        let Some(buffer) = buf else {
+            return match field {
+                mode_line_point::Field::Line => 1,
+                mode_line_point::Field::Column => 0,
+            };
+        };
+        match field {
+            mode_line_point::Field::Line => {
+                let value = pctx.point.line_and_column(buffer, point_access);
+                column_memo = Some(value.column);
+                value.line
+            }
+            mode_line_point::Field::Column => {
+                *column_memo.get_or_insert_with(|| pctx.point.column(buffer))
+            }
+        }
     };
 
     let chars: Vec<char> = fmt_str.chars().collect();
@@ -4821,7 +4970,10 @@ fn expand_mode_line_percent_in_state(
             Some('b') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    &buf_name,
+                    buf_name.get_or_init(|| {
+                        buf.map(|b| b.name_runtime_string_owned())
+                            .unwrap_or_else(|| "*scratch*".to_string())
+                    }),
                     &props_at_percent,
                     field_width,
                 );
@@ -4830,7 +4982,16 @@ fn expand_mode_line_percent_in_state(
             Some('f') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    file_name,
+                    file_name_storage
+                        .get_or_init(|| {
+                            buf.and_then(|b| {
+                                b.file_name_value().as_lisp_string().map(|ls| {
+                                    crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes())
+                                })
+                            })
+                        })
+                        .as_deref()
+                        .unwrap_or(""),
                     &props_at_percent,
                     field_width,
                 );
@@ -4882,9 +5043,9 @@ fn expand_mode_line_percent_in_state(
             Some('*') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    if read_only {
+                    if read_only() {
                         "%"
-                    } else if modified {
+                    } else if modified() {
                         "*"
                     } else {
                         "-"
@@ -4897,9 +5058,9 @@ fn expand_mode_line_percent_in_state(
             Some('+') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    if modified {
+                    if modified() {
                         "*"
-                    } else if read_only {
+                    } else if read_only() {
                         "%"
                     } else {
                         "-"
@@ -4912,7 +5073,7 @@ fn expand_mode_line_percent_in_state(
             Some('&') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    if modified { "*" } else { "-" },
+                    if modified() { "*" } else { "-" },
                     &props_at_percent,
                     field_width,
                 );
@@ -4963,7 +5124,11 @@ fn expand_mode_line_percent_in_state(
             Some('n') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    if narrowed { " Narrow" } else { "" },
+                    if buf.is_some_and(|b| b.is_narrowed()) {
+                        " Narrow"
+                    } else {
+                        ""
+                    },
                     &props_at_percent,
                     field_width,
                 );
@@ -4981,7 +5146,7 @@ fn expand_mode_line_percent_in_state(
             Some('l') => {
                 append_mode_line_percent_string_spec(
                     result,
-                    &point_line_column().line.to_string(),
+                    &point_field(mode_line_point::Field::Line).to_string(),
                     &props_at_percent,
                     field_width,
                 );
@@ -4991,7 +5156,7 @@ fn expand_mode_line_percent_in_state(
                 note_column_spec_consumed();
                 append_mode_line_percent_string_spec(
                     result,
-                    &point_line_column().column.to_string(),
+                    &point_field(mode_line_point::Field::Column).to_string(),
                     &props_at_percent,
                     field_width,
                 );
@@ -5002,7 +5167,7 @@ fn expand_mode_line_percent_in_state(
                 note_column_spec_consumed();
                 append_mode_line_percent_string_spec(
                     result,
-                    &(point_line_column().column + 1).to_string(),
+                    &(point_field(mode_line_point::Field::Column) + 1).to_string(),
                     &props_at_percent,
                     field_width,
                 );
@@ -5011,7 +5176,7 @@ fn expand_mode_line_percent_in_state(
             Some('m') => {
                 // GNU: major mode name from buffer-local `mode-name`.
                 if let Some(mode_name) =
-                    mode_line_symbol_value_in_state(vars, dynamic, buffers, "mode-name")
+                    mode_line_fixed_symbol_value_in_state(vars, buffers, ModeLineSymbol::ModeName)
                         .filter(|value| value.is_string())
                 {
                     append_mode_line_percent_lisp_text_spec(
@@ -5167,11 +5332,14 @@ fn expand_mode_line_percent_in_state(
             }
             Some('@') => {
                 // GNU xdisp.c:29477 — "@" if default-directory is remote, "-" otherwise.
-                let remote =
-                    mode_line_symbol_value_in_state(vars, dynamic, buffers, "default-directory")
-                        .and_then(|v| mode_line_runtime_string(&v))
-                        .map(|dir| is_remote_directory(&dir))
-                        .unwrap_or(false);
+                let remote = mode_line_fixed_symbol_value_in_state(
+                    vars,
+                    buffers,
+                    ModeLineSymbol::DefaultDirectory,
+                )
+                .and_then(|v| mode_line_runtime_string(&v))
+                .map(|dir| is_remote_directory(&dir))
+                .unwrap_or(false);
                 append_mode_line_percent_string_spec(
                     result,
                     if remote { "@" } else { "-" },
@@ -8477,9 +8645,10 @@ pub use fontification_demand::{
 };
 
 fn get_fontified_property(ctx: &mut super::eval::Context, pos: i64) -> EvalResult {
-    super::textprop::builtin_get_char_property(
-        ctx,
-        vec![Value::fixnum(pos), Value::symbol("fontified")],
+    super::textprop::fontified_property_at_position_in_state(
+        ctx.variables(),
+        ctx.buffer_manager(),
+        LispCharPos1::new(pos),
     )
 }
 
@@ -8489,22 +8658,81 @@ fn next_fontified_property_change(
     limit: i64,
     mode: FontificationBoundaryMode,
 ) -> EvalResult {
+    // Bound the text walk BEFORE visiting its intervals. Computing a full
+    // text suffix and only then clipping to an earlier overlay stop repeats
+    // that suffix at every overlay endpoint in densely highlighted buffers.
+    // The two independent stop sources still select exactly their minimum.
+    let limit = ctx
+        .buffers
+        .current_buffer()
+        .and_then(|buffer| {
+            if buffer.overlays().is_empty() || limit <= pos {
+                return None;
+            }
+            // A callback may have narrowed since the caller captured LIMIT.
+            // Endpoints at/past the live end do not introduce a new stop; retain
+            // the original limit and canonical argument validation in that case.
+            let live_end = buffer.point_max_lisp_char_pos().as_i64();
+            if pos < buffer.point_min_lisp_char_pos().as_i64() || pos >= live_end {
+                return None;
+            }
+            let byte_pos = buffer
+                .char_pos_to_emacs_byte_pos_clamped_no_alloc(LispCharPos1::new(pos).to_char_pos());
+            let byte_end = buffer.char_pos_to_emacs_byte_pos_clamped_no_alloc(
+                LispCharPos1::new(limit.min(live_end)).to_char_pos(),
+            );
+            buffer
+                .overlays()
+                .next_boundary_after_until_emacs_byte_pos_no_alloc(byte_pos, byte_end)
+                .map(|boundary| {
+                    buffer
+                        .emacs_byte_pos_to_char_pos_clamped_no_alloc(boundary)
+                        .to_lisp()
+                        .as_i64()
+                })
+                .filter(|boundary| *boundary < live_end)
+        })
+        .unwrap_or(limit);
     match fontification_boundary::admit(ctx, pos, limit, mode)? {
         FontificationBoundaryAdmission::Raw(next)
-        | FontificationBoundaryAdmission::Resolved(next) => {
-            return Ok(Value::fixnum(next.as_i64()));
+        | FontificationBoundaryAdmission::Resolved(next) => Ok(Value::fixnum(next.as_i64())),
+        FontificationBoundaryAdmission::UseGeneric => {
+            super::textprop::resolved_fontified_property_boundary_in_state(
+                ctx.variables(),
+                ctx.buffer_manager(),
+                LispCharPos1::new(pos),
+                LispCharPos1::new(limit),
+            )
         }
-        FontificationBoundaryAdmission::UseGeneric => {}
     }
-    super::textprop::builtin_next_single_property_change(
-        ctx,
-        vec![
-            Value::fixnum(pos),
-            Value::symbol("fontified"),
-            Value::NIL,
-            Value::fixnum(limit),
-        ],
-    )
+}
+
+/// Find the next effective nil position without retaining a cursor across
+/// Lisp. The common proof seats one bounded interval walk; the fallback
+/// resolves values at text/overlay stops, including aliases and categories.
+fn next_unfontified_position(
+    ctx: &mut super::eval::Context,
+    mut pos: i64,
+    end: i64,
+    mode: FontificationBoundaryMode,
+) -> Result<i64, Flow> {
+    match fontification_boundary::first_unfontified(ctx, pos, end, mode) {
+        fontification_boundary::FontificationScanAdmission::Raw(next) => {
+            return Ok(next.map_or(end, |next| next.as_i64()));
+        }
+        fontification_boundary::FontificationScanAdmission::UseGeneric => {}
+    }
+    while pos < end {
+        if get_fontified_property(ctx, pos)?.is_nil() {
+            return Ok(pos);
+        }
+        let next = next_fontified_property_change(ctx, pos, end, mode)?;
+        let Some(next) = next.as_int() else {
+            return Ok(end);
+        };
+        pos = if next <= pos { pos + 1 } else { next.min(end) };
+    }
+    Ok(end)
 }
 
 fn call_fontification_functions_at<O: FontificationDemandObserver>(
@@ -8545,9 +8773,11 @@ fn call_fontification_functions_at<O: FontificationDemandObserver>(
     // hook cannot prevent later hooks from running.
     for function in functions {
         let call_count = ctx.specpdl.len();
-        if let Err(flow) =
-            ctx.try_specbind_or_unwind_to(call_count, intern("inhibit-redisplay"), Value::T)
-        {
+        if let Err(flow) = ctx.try_specbind_or_unwind_to(
+            call_count,
+            ModeLineSymbol::InhibitRedisplay.id(),
+            Value::T,
+        ) {
             let rendered = super::error::format_flow_with_eval(ctx, &flow);
             tracing::warn!(
                 "error binding redisplay inhibition at {}: {}",
@@ -8756,52 +8986,40 @@ fn ensure_fontified_for_redisplay_inner<O: FontificationDemandObserver>(
                 break;
             }
 
-            let before = get_fontified_property(ctx, pos)?;
-            if before.is_nil() {
-                observer.unknown();
-                // Mark before entering Lisp, including callbacks which fail,
-                // decline to fontify, or remove the current buffer.
-                outcome = outcome.merge(RedisplayFontificationOutcome::CallbacksUnchanged);
-                call_fontification_functions_at(ctx, hook_value, pos, observer);
-                if ctx.buffers.current_buffer_id() != Some(buf_id) {
-                    ctx.restore_current_buffer_if_live(buf_id);
-                }
-                if ctx.buffers.current_buffer_id() != Some(buf_id) {
-                    break;
-                }
-
-                // GNU recomputes properties only if the hook actually
-                // marked the current character fontified.  If it did not,
-                // advance one character to avoid looping forever on the
-                // same unfontified position.
-                let after = get_fontified_property(ctx, pos)?;
-                if after.is_nil() {
-                    observer.advance(LispCharPos1::new(pos), LispCharPos1::new(pos + 1), false);
-                    pos += 1;
-                    continue;
-                }
-                outcome = RedisplayFontificationOutcome::Fontified;
+            let next = next_unfontified_position(ctx, pos, end, mode)?;
+            if next > pos {
+                observer.advance(LispCharPos1::new(pos), LispCharPos1::new(next), true);
+                pos = next;
             }
-
-            let next = next_fontified_property_change(ctx, pos, end, mode)?;
-            let Some(next_pos) = next.as_int() else {
+            if pos >= end {
                 break;
-            };
-            if next_pos <= pos {
-                observer.advance(
-                    LispCharPos1::new(pos),
-                    LispCharPos1::new(pos + 1),
-                    !before.is_nil(),
-                );
-                pos += 1;
-            } else {
-                observer.advance(
-                    LispCharPos1::new(pos),
-                    LispCharPos1::new(next_pos.min(end)),
-                    !before.is_nil(),
-                );
-                pos = next_pos.min(end);
             }
+            observer.unknown();
+            // Mark before entering Lisp, including callbacks which fail,
+            // decline to fontify, or remove the current buffer.
+            outcome = outcome.merge(RedisplayFontificationOutcome::CallbacksUnchanged);
+            call_fontification_functions_at(ctx, hook_value, pos, observer);
+            if ctx.buffers.current_buffer_id() != Some(buf_id) {
+                ctx.restore_current_buffer_if_live(buf_id);
+            }
+            if ctx.buffers.current_buffer_id() != Some(buf_id) {
+                break;
+            }
+
+            // GNU recomputes properties only if the hook actually
+            // marked the current character fontified.  If it did not,
+            // advance one character to avoid looping forever on the
+            // same unfontified position.
+            let after = get_fontified_property(ctx, pos)?;
+            if after.is_nil() {
+                observer.advance(LispCharPos1::new(pos), LispCharPos1::new(pos + 1), false);
+                pos += 1;
+                continue;
+            }
+            outcome = RedisplayFontificationOutcome::Fontified;
+            // Reacquire restrictions, resolution controls, overlays and the
+            // interval tree at this stop. A hook may have changed any later
+            // island, so no precomputed future position crosses the callback.
         }
 
         Ok(outcome)
@@ -10270,3 +10488,15 @@ mod mode_line_outer_handlers;
 #[cfg(test)]
 #[path = "tests/fontification_demand_test.rs"]
 mod fontification_demand_tests;
+
+#[cfg(test)]
+#[path = "tests/mode_line_fixed_symbols_test.rs"]
+mod mode_line_fixed_symbols;
+
+#[cfg(test)]
+#[path = "tests/mode_line_point_test.rs"]
+mod mode_line_point_test;
+
+#[cfg(test)]
+#[path = "tests/mode_line_nested_point_test.rs"]
+mod mode_line_nested_point_test;

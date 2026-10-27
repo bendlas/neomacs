@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly usage="usage: $0 [--list] {build|oracle|ecosystem|release}"
+readonly usage="usage: $0 [--list] {build|oracle|ecosystem|fonts|release}"
 
 list_only=false
 if [[ ${1:-} == "--list" ]]; then
@@ -47,6 +47,9 @@ readonly -a build_packages=(
     gnutls-bin
     libgnutls28-dev
     zlib1g-dev
+    # The workspace test archive links with mold; it is a drop-in ELF linker
+    # and is faster than lld for the many test binaries this repo links.
+    mold
 )
 
 readonly -a video_backend_packages=(
@@ -54,9 +57,23 @@ readonly -a video_backend_packages=(
     libgstreamer-plugins-base1.0-dev
 )
 
+# Fonts the layout-engine, renderer and GUI tests resolve through the system
+# fontconfig.  They are the environment contract of those tests, not build
+# inputs: char_width_dejavu_* names DejaVu, the face-realization tests name
+# Noto Sans (Mono), and the CJK families (gb2312 candidate queries, double-
+# width metrics, offscreen CJK glyph runs) need a wide CJK face; without one
+# every fallback collapses to the primary font's .notdef advance.
+readonly -a font_packages=(
+    fonts-noto-core
+    fonts-dejavu-core
+    fonts-ubuntu
+    fonts-noto-cjk
+)
+
 declare -a profile_packages=()
 declare -a required_commands=()
 requires_libfaketime=false
+install_nerd_fonts=false
 case "$profile" in
     build)
         ;;
@@ -81,21 +98,29 @@ case "$profile" in
             xvfb
             xauth
             x11-utils
+            x11-xkb-utils
             xdotool
             wmctrl
             kwin-x11
             dbus
             imagemagick
+            ripgrep
             weston
             sway
             wtype
             grim
-            fonts-noto-core
-            fonts-dejavu-core
-            fonts-ubuntu
+            "${font_packages[@]}"
         )
-        required_commands=(gpg Xvfb xauth xdpyinfo xprop xwininfo xdotool wmctrl kwin_x11 dbus-run-session fc-match import weston sway wtype grim)
+        required_commands=(gpg rg Xvfb xauth xdpyinfo xprop xwininfo xkbcomp xdotool wmctrl kwin_x11 dbus-run-session fc-match import weston sway wtype grim)
         requires_libfaketime=true
+        install_nerd_fonts=true
+        ;;
+    # Jobs that run the font-sensitive Rust tests (the display stack shards)
+    # but need no window system of their own.
+    fonts)
+        profile_packages=("${font_packages[@]}")
+        required_commands=(fc-match)
+        install_nerd_fonts=true
         ;;
     release)
         profile_packages=(rpm binutils cpio file dpkg-dev)
@@ -136,6 +161,34 @@ pkg-config --modversion gstreamer-1.0
 if $requires_libfaketime; then
     dpkg -L libfaketime | grep -q '/libfaketime\.so\.1$'
 fi
+
+# The layout, renderer and GUI suites resolve the default family
+# "JetBrainsMono Nerd Font" and the Nerd Fonts glyph ranges through the system
+# fontconfig.  Ubuntu packages only the unpatched JetBrains Mono, so without a
+# patched family those tests degrade to the fontconfig fallback (Lato) and the
+# Nerd Font probes never publish a binding.  Nerd Fonts ships patched families
+# only as release artifacts; pin the artifact by version and sha256 instead of
+# trusting whichever font a host happens to have.
+if $install_nerd_fonts; then
+    nerd_fonts_version=3.4.0
+    nerd_fonts_sha256=ef552a3e638f25125c6ad4c51176a6adcdce295ab1d2ffacf0db060caf8c1582
+    nerd_fonts_dir=/usr/share/fonts/truetype/nerd-fonts
+    nerd_fonts_archive=$(mktemp)
+    curl -fsSL --retry 3 -o "$nerd_fonts_archive" \
+        "https://github.com/ryanoasis/nerd-fonts/releases/download/v${nerd_fonts_version}/JetBrainsMono.tar.xz"
+    printf '%s  %s\n' "$nerd_fonts_sha256" "$nerd_fonts_archive" | sha256sum -c -
+    sudo mkdir -p "$nerd_fonts_dir"
+    sudo tar -xJf "$nerd_fonts_archive" -C "$nerd_fonts_dir" \
+        JetBrainsMonoNerdFont-Regular.ttf \
+        JetBrainsMonoNerdFont-Bold.ttf \
+        JetBrainsMonoNerdFont-Italic.ttf \
+        JetBrainsMonoNerdFont-BoldItalic.ttf \
+        OFL.txt
+    rm -f "$nerd_fonts_archive"
+    sudo fc-cache -f "$nerd_fonts_dir"
+    fc-match -f '%{file}\n' "JetBrainsMono Nerd Font" | grep -Fq "$nerd_fonts_dir/"
+fi
+
 for program in "${required_commands[@]}"; do
     command -v "$program" >/dev/null
 done

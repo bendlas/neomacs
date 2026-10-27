@@ -6,6 +6,8 @@
 use super::*;
 use crate::emacs_core::error::FlowKind;
 use crate::emacs_core::eval::AttentionMask;
+#[cfg(feature = "jit")]
+use crate::tagged::header::{SubrFn0, SubrFn1, SubrFn2, SubrFn3, SubrFn4, SubrFn5};
 
 pub(crate) type JitBuiltin1 = fn(&mut Context, Value) -> Result<Value, Flow>;
 pub(crate) type JitBuiltin2 = fn(&mut Context, Value, Value) -> Result<Value, Flow>;
@@ -421,54 +423,177 @@ fn scan_cdr<const OBSERVE: bool>(cell: Value) -> Value {
     }
 }
 
-/// `(memq ELT LIST)` for a short list, bit-identity only. `None` when
-/// `symbols-with-pos-enabled` (`eq` then looks through positions), the
-/// list is improper before a match, or it is longer than
-/// [`LIST_SHIM_FAST_STEPS`]; the builtin answers those. A match is found
-/// before the builtin's cycle check could fire: that check fires only after
-/// every distinct cons has been visited.
+/// A bounded `memq` walk's answer: `Ok` is the answer (a matching tail or
+/// `NIL`), `Err` is the tail where the walk stopped -- an improper cell or
+/// the cell after [`LIST_SHIM_FAST_STEPS`] checked ones -- and the builtin's
+/// scan continues there instead of re-walking the prefix. Both variants are
+/// one `Value`, so the walk returns in two registers; a three-word struct
+/// would go through the stack and tax every match.
+type MemqWalk = Result<Value, Value>;
+
+/// `(memq ELT LIST)` for a short list: bit identity, and -- while
+/// `symbols-with-pos-enabled` (`eq` then looks through positions) -- GNU
+/// `slow_eq`'s positioned-symbol rule, the same one the builtin applies.
+/// `answer` is `None` when the list is improper before a match or longer
+/// than [`LIST_SHIM_FAST_STEPS`]; the builtin answers those, continuing from
+/// `tail`. A match is found before the builtin's cycle check could fire:
+/// that check fires only after every distinct cons has been visited.
 #[inline(always)]
-fn memq_fast(ctx: &Context, elt: Value, list: Value) -> Option<Value> {
+fn memq_fast(ctx: &Context, elt: Value, list: Value) -> MemqWalk {
     if !crate::tagged::collection_reads::reads_need_observation() {
         memq_fast_walk::<false>(ctx, elt, list)
     } else {
-        memq_fast_walk::<true>(ctx, elt, list)
+        memq_observed_walk(ctx, elt, list)
     }
 }
 
+/// The observed instantiation answers only while a capture scope is open.
+/// Keep it out of line so the shim's hot body holds just the unobserved
+/// walks and keeps its former prologue; the observation calls themselves
+/// are unchanged.
+#[inline(never)]
+fn memq_observed_walk(ctx: &Context, elt: Value, list: Value) -> MemqWalk {
+    memq_fast_walk::<true>(ctx, elt, list)
+}
+
+/// The flag selects which comparison `eq` means. The flag-off body here must
+/// stay the exact bit-identity scan it was: it answers nearly every compiled
+/// `memq`, and a per-cell flag test or a stack frame would tax them all (the
+/// observed instantiation is out of line for the same reason).
 #[inline(always)]
-fn memq_fast_walk<const OBSERVE: bool>(ctx: &Context, elt: Value, list: Value) -> Option<Value> {
+fn memq_fast_walk<const OBSERVE: bool>(ctx: &Context, elt: Value, list: Value) -> MemqWalk {
     if ctx.symbols_with_pos_enabled {
-        return None;
+        return memq_swp_walk::<OBSERVE>(elt, list);
     }
     let mut tail = list;
     for _ in 0..LIST_SHIM_FAST_STEPS {
         if !tail.is_cons() {
-            return tail.is_nil().then_some(Value::NIL);
+            return if tail.is_nil() {
+                Ok(Value::NIL)
+            } else {
+                Err(tail)
+            };
         }
         if scan_car::<OBSERVE>(tail).bits() == elt.bits() {
-            return Some(tail);
+            return Ok(tail);
         }
         tail = scan_cdr::<OBSERVE>(tail);
     }
-    None
+    Err(tail)
+}
+
+/// GNU `BASE_EQ`: a short-list scan with the flag off (also the shape the
+/// flag-on walk uses when the target is no symbol).
+#[inline(always)]
+fn memq_bits_walk<const OBSERVE: bool>(elt: Value, list: Value) -> MemqWalk {
+    let mut tail = list;
+    for _ in 0..LIST_SHIM_FAST_STEPS {
+        if !tail.is_cons() {
+            return if tail.is_nil() {
+                Ok(Value::NIL)
+            } else {
+                Err(tail)
+            };
+        }
+        if scan_car::<OBSERVE>(tail).bits() == elt.bits() {
+            return Ok(tail);
+        }
+        tail = scan_cdr::<OBSERVE>(tail);
+    }
+    Err(tail)
+}
+
+/// GNU `EQ` while the flag is on (`lisp.h` `EQ` -> `data.c` `slow_eq`): bit
+/// identity, else each side unwraps only if it is itself a symbol with
+/// position. Hoist the target's unwrap out of the loop. A target that is no
+/// symbol after unwrapping can only match by identity (a positioned symbol
+/// unwraps to a symbol), exactly as the builtin's scan decides.
+///
+/// A bare-symbol target (94% of the byte compiler's calls) is the hot shape:
+/// its identity test just ran, so a positioned element only has to unwrap to
+/// the same symbol. The positioned-target shape, which must also compare
+/// the element's bits with the bare symbol, is out of line.
+#[inline(always)]
+fn memq_swp_walk<const OBSERVE: bool>(elt: Value, list: Value) -> MemqWalk {
+    let elt_bare = b::positioned_symbol_scan::<OBSERVE>(elt).unwrap_or(elt);
+    if !elt_bare.is_bare_symbol() {
+        return memq_bits_walk::<OBSERVE>(elt, list);
+    }
+    if elt_bare.bits() != elt.bits() {
+        return memq_positioned_target_walk::<OBSERVE>(elt, elt_bare, list);
+    }
+    let mut tail = list;
+    for _ in 0..LIST_SHIM_FAST_STEPS {
+        if !tail.is_cons() {
+            return if tail.is_nil() {
+                Ok(Value::NIL)
+            } else {
+                Err(tail)
+            };
+        }
+        let element = scan_car::<OBSERVE>(tail);
+        if element.bits() == elt.bits()
+            || (element.is_veclike()
+                && b::positioned_symbol_scan::<OBSERVE>(element)
+                    .is_some_and(|sym| sym.bits() == elt.bits()))
+        {
+            return Ok(tail);
+        }
+        tail = scan_cdr::<OBSERVE>(tail);
+    }
+    Err(tail)
+}
+
+/// [`memq_swp_walk`] with a symbol-with-position target: the element must be
+/// the target itself, its bare symbol, or a positioned symbol of that
+/// symbol.
+#[inline(never)]
+fn memq_positioned_target_walk<const OBSERVE: bool>(
+    elt: Value,
+    elt_bare: Value,
+    list: Value,
+) -> MemqWalk {
+    let mut tail = list;
+    for _ in 0..LIST_SHIM_FAST_STEPS {
+        if !tail.is_cons() {
+            return if tail.is_nil() {
+                Ok(Value::NIL)
+            } else {
+                Err(tail)
+            };
+        }
+        let element = scan_car::<OBSERVE>(tail);
+        if element.bits() == elt.bits() || b::eq_bare_symbol_swp_scan::<OBSERVE>(element, elt_bare)
+        {
+            return Ok(tail);
+        }
+        tail = scan_cdr::<OBSERVE>(tail);
+    }
+    Err(tail)
 }
 
 /// `(assq KEY LIST)` for a short list, as [`memq_fast`]: the first element
-/// that is a cons whose car is KEY's bits.
+/// that is a cons whose car is `eq` to KEY.
 #[inline(always)]
 fn assq_fast(ctx: &Context, key: Value, list: Value) -> Option<Value> {
     if !crate::tagged::collection_reads::reads_need_observation() {
         assq_fast_walk::<false>(ctx, key, list)
     } else {
-        assq_fast_walk::<true>(ctx, key, list)
+        assq_observed_walk(ctx, key, list)
     }
 }
 
+/// [`memq_observed_walk`]'s twin for `assq`.
+#[inline(never)]
+fn assq_observed_walk(ctx: &Context, key: Value, list: Value) -> Option<Value> {
+    assq_fast_walk::<true>(ctx, key, list)
+}
+
+/// The same two rules as [`memq_fast_walk`], on the entry's key.
 #[inline(always)]
 fn assq_fast_walk<const OBSERVE: bool>(ctx: &Context, key: Value, list: Value) -> Option<Value> {
     if ctx.symbols_with_pos_enabled {
-        return None;
+        return assq_swp_walk::<OBSERVE>(key, list);
     }
     let mut tail = list;
     for _ in 0..LIST_SHIM_FAST_STEPS {
@@ -478,6 +603,83 @@ fn assq_fast_walk<const OBSERVE: bool>(ctx: &Context, key: Value, list: Value) -
         let entry = scan_car::<OBSERVE>(tail);
         if entry.is_cons() && scan_car::<OBSERVE>(entry).bits() == key.bits() {
             return Some(entry);
+        }
+        tail = scan_cdr::<OBSERVE>(tail);
+    }
+    None
+}
+
+/// GNU `BASE_EQ`: the flag-off walk, unchanged.
+#[inline(always)]
+fn assq_bits_walk<const OBSERVE: bool>(key: Value, list: Value) -> Option<Value> {
+    let mut tail = list;
+    for _ in 0..LIST_SHIM_FAST_STEPS {
+        if !tail.is_cons() {
+            return tail.is_nil().then_some(Value::NIL);
+        }
+        let entry = scan_car::<OBSERVE>(tail);
+        if entry.is_cons() && scan_car::<OBSERVE>(entry).bits() == key.bits() {
+            return Some(entry);
+        }
+        tail = scan_cdr::<OBSERVE>(tail);
+    }
+    None
+}
+
+/// GNU `EQ` with the flag on, as [`memq_swp_walk`]: the first entry that is
+/// a cons whose key is `eq` to KEY. The bare-key shape (53% of the byte
+/// compiler's calls) is `memq_swp_walk`'s hot shape; the positioned-key
+/// shape is out of line.
+#[inline(always)]
+fn assq_swp_walk<const OBSERVE: bool>(key: Value, list: Value) -> Option<Value> {
+    let key_bare = b::positioned_symbol_scan::<OBSERVE>(key).unwrap_or(key);
+    if !key_bare.is_bare_symbol() {
+        return assq_bits_walk::<OBSERVE>(key, list);
+    }
+    if key_bare.bits() != key.bits() {
+        return assq_positioned_key_walk::<OBSERVE>(key, key_bare, list);
+    }
+    let mut tail = list;
+    for _ in 0..LIST_SHIM_FAST_STEPS {
+        if !tail.is_cons() {
+            return tail.is_nil().then_some(Value::NIL);
+        }
+        let entry = scan_car::<OBSERVE>(tail);
+        if entry.is_cons() {
+            let entry_key = scan_car::<OBSERVE>(entry);
+            if entry_key.bits() == key.bits()
+                || (entry_key.is_veclike()
+                    && b::positioned_symbol_scan::<OBSERVE>(entry_key)
+                        .is_some_and(|sym| sym.bits() == key.bits()))
+            {
+                return Some(entry);
+            }
+        }
+        tail = scan_cdr::<OBSERVE>(tail);
+    }
+    None
+}
+
+/// [`assq_swp_walk`] with a symbol-with-position key.
+#[inline(never)]
+fn assq_positioned_key_walk<const OBSERVE: bool>(
+    key: Value,
+    key_bare: Value,
+    list: Value,
+) -> Option<Value> {
+    let mut tail = list;
+    for _ in 0..LIST_SHIM_FAST_STEPS {
+        if !tail.is_cons() {
+            return tail.is_nil().then_some(Value::NIL);
+        }
+        let entry = scan_car::<OBSERVE>(tail);
+        if entry.is_cons() {
+            let entry_key = scan_car::<OBSERVE>(entry);
+            if entry_key.bits() == key.bits()
+                || b::eq_bare_symbol_swp_scan::<OBSERVE>(entry_key, key_bare)
+            {
+                return Some(entry);
+            }
         }
         tail = scan_cdr::<OBSERVE>(tail);
     }
@@ -497,8 +699,8 @@ pub extern "C" fn neovm_jit_memq(ctx: *mut u8, elt: i64, list: i64) -> i64 {
     // SAFETY: seam-provided dormant Context; read-only access.
     let ctx_ref = unsafe { &*(ctx as *const Context) };
     match memq_fast(ctx_ref, elt, list) {
-        Some(value) => value.bits() as i64,
-        None => list_slow(ctx, pure_memq, elt, list),
+        Ok(value) => value.bits() as i64,
+        Err(tail) => list_slow_memq_from(ctx, elt, list, tail),
     }
 }
 
@@ -617,30 +819,21 @@ fn compiled_cons_store(cell: Value, value: Value, cdr: bool) -> bool {
     } else {
         false
     };
-    if observed {
-        crate::tagged::gc::TaggedHeap::record_compiled_collection_write(cell.bits());
-    } else {
-        // Complete the first refused store here, then publish its proven
-        // empty gap for later native stores. Ordinary dump, tracking and
-        // concurrent-GC requirements remain authoritative in this helper.
+    if !observed {
+        // Refine the native gap before entering the shared mutation body.
         crate::tagged::gc::neovm_jit_unobserved_collection_owner(cell.bits() as i64);
     }
-    let kind = if cdr {
-        crate::tagged::gc::HeapWriteKind::ConsCdr
-    } else {
-        crate::tagged::gc::HeapWriteKind::ConsCar
-    };
-    crate::tagged::gc::note_heap_slot_write(cell, kind, usize::from(cdr), value);
-    let owner = address as *mut crate::tagged::header::ConsCell;
-    // SAFETY: the Cons tag names a live cell, and the GC barrier completed.
-    unsafe {
-        if cdr {
-            (*owner).set_cdr(value);
-        } else {
-            (*owner).set_car(value);
+    crate::tagged::gc::with_store_state(|store| {
+        if observed {
+            crate::tagged::collection_reads::record_projected_write_in_store(
+                store,
+                cell,
+                crate::tagged::collection_reads::WriteProjection::Cons,
+            );
         }
-    }
-    true
+        // SAFETY: the preceding Cons tag check validated the live owner.
+        unsafe { crate::tagged::mutate::finish_cons_store_in_store(store, cell, value, cdr) }
+    })
 }
 
 #[cold]
@@ -652,6 +845,29 @@ fn list_slow(ctx: *mut u8, builtin: JitBuiltin2Pure, a: Value, b_: Value) -> i64
         // SAFETY: seam-provided dormant Context; read-only access.
         let ctx_ref = unsafe { &*(ctx as *const Context) };
         match builtin(ctx_ref, a, b_) {
+            Ok(value) => value.bits() as i64,
+            Err(flow) => {
+                stash_pending_flow(flow);
+                VALUE_SHIM_SIGNAL
+            }
+        }
+    })
+}
+
+/// [`list_slow`] for `memq`: the builtin's budgeted scan continues at `tail`
+/// (where [`memq_fast`] stopped) instead of re-visiting the prefix that walk
+/// already checked. `list` stays the original head, which only the exact
+/// fallback (improper, circular, or budget-exhausted) reads, so every error
+/// and its data are unchanged.
+#[cold]
+#[inline(never)]
+fn list_slow_memq_from(ctx: *mut u8, elt: Value, list: Value, tail: Value) -> i64 {
+    #[cfg(test)]
+    ARRAY_SHIM_SLOW_CALLS.with(|c| c.set(c.get() + 1));
+    jit_shim_contain!(ctx, VALUE_SHIM_SIGNAL, {
+        // SAFETY: seam-provided dormant Context; read-only access.
+        let ctx_ref = unsafe { &*(ctx as *const Context) };
+        match b::builtin_memq_values_from(elt, list, tail, ctx_ref.symbols_with_pos_enabled) {
             Ok(value) => value.bits() as i64,
             Err(flow) => {
                 stash_pending_flow(flow);
@@ -693,24 +909,27 @@ fn aset_fast(array: Value, index: Value, value: Value) -> bool {
         // One pass over what `set_vector_slot` would check again: owned
         // storage (a mapped pdump vector copies itself on the slow path),
         // bounds, a plain vector, the barrier, the store.
-        let obj = array.as_veclike_ptr().unwrap() as *mut crate::tagged::header::VectorObj;
-        // SAFETY: a live vector owner; nothing below runs Lisp or collects.
-        let data = unsafe { &mut (*obj).data };
-        if !data.is_owned() {
+        // veclike_type already performed the original projection read.
+        let obj = (array.bits() & !TAG_MASK) as *mut crate::tagged::header::VectorObj;
+        let data = unsafe { std::ptr::addr_of_mut!((*obj).data) };
+        // End the preparation loan before any journal/barrier/preimage work.
+        if !unsafe { &*data }.is_owned() || idx >= unsafe { &*data }.len() {
             return false;
         }
-        let items = data.as_slice();
-        if idx >= items.len() {
-            return false;
-        }
-        crate::tagged::gc::note_heap_slot_write(
-            array,
-            crate::tagged::gc::HeapWriteKind::VectorSlot,
-            idx,
-            value,
-        );
-        data.store_atomic(idx, value);
-        return true;
+        return crate::tagged::gc::with_store_state(|store| {
+            // SAFETY: owned backing and bounds were validated without a
+            // callback or safe point. Off retains its unjournaled policy.
+            unsafe {
+                crate::tagged::mutate::finish_slot_store_in_store(
+                    store,
+                    array,
+                    crate::tagged::gc::HeapWriteKind::VectorSlot,
+                    idx,
+                    value,
+                    data,
+                )
+            }
+        });
     }
     if array.is_veclike() {
         let (items, record) = match array.veclike_type() {
@@ -774,30 +993,41 @@ fn aset_journaled_vector(
     // no callback or GC safe point between the guards and this mutation.
     let (data, kind) = match unsafe { (*header).type_tag } {
         crate::tagged::header::VecLikeType::Vector => (
-            unsafe { &mut (*(header as *mut crate::tagged::header::VectorObj)).data },
+            unsafe {
+                std::ptr::addr_of_mut!((*(header as *mut crate::tagged::header::VectorObj)).data)
+            },
             crate::tagged::gc::HeapWriteKind::VectorSlot,
         ),
         crate::tagged::header::VecLikeType::Record => (
-            unsafe { &mut (*(header as *mut crate::tagged::header::RecordObj)).data },
+            unsafe {
+                std::ptr::addr_of_mut!((*(header as *mut crate::tagged::header::RecordObj)).data)
+            },
             crate::tagged::gc::HeapWriteKind::RecordSlot,
         ),
         _ => return None,
     };
-    if !data.is_owned() || idx >= data.as_slice().len() {
+    if !unsafe { &*data }.is_owned() || idx >= unsafe { &*data }.len() {
         return Some(false);
     }
     // GEN0 and GEN1 share the observed-owner decision. The remembered-set
     // barrier is note_heap_slot_write below and never depends on history.
-    if journal == crate::tagged::collection_reads::CompiledJournalMode::Eager
+    let record = journal == crate::tagged::collection_reads::CompiledJournalMode::Eager
         || crate::tagged::gc::current_write_tracking_enabled()
-        // The subtype guard above already established this live header.
-        || unsafe { (*header).gc.collection_observed() }
-    {
-        crate::tagged::gc::TaggedHeap::record_compiled_collection_write(array.bits());
-    }
-    crate::tagged::gc::note_heap_slot_write(array, kind, idx, value);
-    data.store_atomic(idx, value);
-    Some(true)
+        || unsafe { (*header).gc.collection_observed() };
+    Some(crate::tagged::gc::with_store_state(|store| {
+        if record {
+            crate::tagged::collection_reads::record_projected_write_in_store(
+                store,
+                array,
+                crate::tagged::collection_reads::WriteProjection::VecLike,
+            );
+        }
+        // SAFETY: subtype, owned backing and bounds were validated above;
+        // no payload loan spans recording or the barrier's preimage reads.
+        unsafe {
+            crate::tagged::mutate::finish_slot_store_in_store(store, array, kind, idx, value, data)
+        }
+    }))
 }
 
 /// `Op::Aset` (GNU `Baset`) from compiled code: VALUE's bits, or
@@ -1849,6 +2079,13 @@ pub(crate) fn subr_spec_armed_reference(
         let cur = ctx.obarray.symbol_function_id(SymId(sym as u32));
         if cur.is_some_and(|v| v.bits() as i64 == expected) {
             slot.epoch.store(epoch, Ordering::Relaxed);
+            // Drop the screened-entry cache
+            // (`SpecSlot::cache_screened_subr_entry`): the epoch move may
+            // have followed an IN-PLACE static-subr rewrite, which keeps the
+            // VALUE bits this re-arm just re-validated but changes the fn
+            // pointer/arity/kind the cache captured. (The subr shims never
+            // populate `slot.leaf`; the cache is the only word to clear.)
+            slot.clear_screened_subr_entry();
             true
         } else {
             // The subr shims never populate `slot.leaf`; nothing to clear.
@@ -1857,21 +2094,51 @@ pub(crate) fn subr_spec_armed_reference(
     }
 }
 
-/// The spec shim's direct fixed-arity builtin call: `target` is the armed
-/// `#<subr>` value. `None` = take the stack path (not a builtin subr, a
-/// Many/slice signature, or an arity the fixed entry does not accept — the
-/// stack path signals that one). Same observable protocol as
-/// `Context::call_spec_subr_from_bc_stack`: eval-depth accounting, a
-/// backtrace frame recording the SYMBOL (over the native args slot, as the
-/// bytecode direct path does), the signal hook, the frame pop.
+/// A fixed-arity builtin the armed subr spec shim calls directly: the
+/// [`SubrFn`](crate::tagged::header::SubrFn) entry's code address and its
+/// slot class (A0..A5 => 0..=5).
 #[cfg(feature = "jit")]
-fn call_fixed_builtin_from_native(
-    ctx: &mut Context,
-    sym_id: SymId,
-    target: Value,
-    args_ptr: *const i64,
-    nargs: usize,
-) -> Option<crate::emacs_core::error::EvalResult> {
+#[derive(Clone, Copy)]
+struct FixedBuiltinEntry {
+    fn_ptr: usize,
+    slots: usize,
+}
+
+/// The cached screened entry's code address, viewed as the
+/// [`SubrFn`](crate::tagged::header::SubrFn) variant its slot class names:
+/// written through `addr`, read through the class's fn-pointer field. A
+/// union rather than a `transmute` — the architecture transmute guard counts
+/// production sites and may only decrease. The validity requirement is the
+/// same: the address is one the screen read from a real `SubrFn::AN`, and
+/// the class says which N it is.
+#[cfg(feature = "jit")]
+#[repr(C)]
+union ScreenedFn {
+    addr: usize,
+    a0: SubrFn0,
+    a1: SubrFn1,
+    a2: SubrFn2,
+    a3: SubrFn3,
+    a4: SubrFn4,
+    a5: SubrFn5,
+}
+
+/// Screen `target` as the fixed-arity `Builtin` entry the spec shim may call
+/// directly. `None` = take the stack path (not a builtin subr, a Many/slice
+/// signature, or an arity the fixed entry does not accept — the stack path
+/// signals that one).
+///
+/// This re-reads the static subr object's entry on EVERY call, as GNU's
+/// `funcall_subr` does: `update_static_subr_object_entry` rewrites the fn
+/// pointer, arity bounds and dispatch kind IN PLACE keeping the VALUE bits
+/// identical, so the armed epoch/bits check alone does not prove the screen.
+/// The armed fast path's screened-entry cache
+/// (`SpecSlot::cache_screened_subr_entry`) exists precisely because those
+/// rewrites always bump `function_epoch`, and the shim's gate compares its
+/// slot's epoch with it before trusting the cache.
+#[cfg(feature = "jit")]
+#[inline]
+fn screen_fixed_builtin(target: Value, nargs: usize) -> Option<FixedBuiltinEntry> {
     use crate::tagged::header::{SubrFn, SubrObj, VecLikeType};
     let ptr = target.as_veclike_ptr()?;
     // SAFETY: a veclike pointer from a live Value; the type tag is checked
@@ -1895,19 +2162,65 @@ fn call_fixed_builtin_from_native(
     // below both discriminate on it, and re-reading it through `subr` made the
     // compiler load and branch on the same field twice on every builtin call
     // out of JIT-compiled code.
-    let function = subr.function;
-    let slots = match function {
-        Some(SubrFn::A0(_)) => 0,
-        Some(SubrFn::A1(_)) => 1,
-        Some(SubrFn::A2(_)) => 2,
-        Some(SubrFn::A3(_)) => 3,
-        Some(SubrFn::A4(_)) => 4,
-        Some(SubrFn::A5(_)) => 5,
+    let entry = match subr.function? {
+        SubrFn::A0(f) => FixedBuiltinEntry {
+            fn_ptr: f as usize,
+            slots: 0,
+        },
+        SubrFn::A1(f) => FixedBuiltinEntry {
+            fn_ptr: f as usize,
+            slots: 1,
+        },
+        SubrFn::A2(f) => FixedBuiltinEntry {
+            fn_ptr: f as usize,
+            slots: 2,
+        },
+        SubrFn::A3(f) => FixedBuiltinEntry {
+            fn_ptr: f as usize,
+            slots: 3,
+        },
+        SubrFn::A4(f) => FixedBuiltinEntry {
+            fn_ptr: f as usize,
+            slots: 4,
+        },
+        SubrFn::A5(f) => FixedBuiltinEntry {
+            fn_ptr: f as usize,
+            slots: 5,
+        },
         _ => return None,
     };
-    if nargs > slots {
+    if nargs > entry.slots {
         return None;
     }
+    Some(entry)
+}
+
+/// Run a screened fixed-arity builtin. Same observable protocol as
+/// `Context::call_spec_subr_from_bc_stack`: eval-depth accounting, a
+/// backtrace frame recording the SYMBOL (over the native args slot, as the
+/// bytecode direct path does), the signal hook, the frame pop.
+///
+/// `entry` must be one [`screen_fixed_builtin`] produced for this `nargs`
+/// (the armed fast path's cached form comes with the same proof, see
+/// `SpecSlot::cached_subr_entry`).
+///
+/// `#[inline(always)]` — measured, not assumed: as an out-of-line 0x338-byte
+/// helper it spent its own 6-push prologue and 6-pop epilogue (~14 Ir) on
+/// every armed builtin call (1.14M per elb-bytecomp run). The callers already
+/// hold every value the body needs (Context, the args slot, nargs, the
+/// patched frame index), and the body's own callee-saved set is a subset of
+/// the shim's, so the inline form only adds a class-dispatch jump table and
+/// the builtin call site to the caller. See the turn-2 report for the
+/// measured hit-path Ir and the shim's census size.
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn run_screened_fixed_builtin(
+    ctx: &mut Context,
+    sym_id: SymId,
+    entry: FixedBuiltinEntry,
+    args_ptr: *const i64,
+    nargs: usize,
+) -> crate::emacs_core::error::EvalResult {
     // SAFETY: the generated code stored exactly `nargs` argument words at
     // `args_ptr` (its call-args slot) immediately before this call.
     let arg = |i: usize| {
@@ -1932,30 +2245,59 @@ fn call_fixed_builtin_from_native(
         let flow = ctx
             .pop_bytecode_backtrace_frame_with_result(bt_count, Err(flow))
             .expect_err("a rejected callee has no cleanup or result");
-        return Some(Err(ctx.finish_lisp_depth_overflow(flow)));
+        return Err(ctx.finish_lisp_depth_overflow(flow));
     }
-    let result = match function {
-        Some(SubrFn::A0(f)) => f(ctx),
-        Some(SubrFn::A1(f)) => f(ctx, arg(0)),
-        Some(SubrFn::A2(f)) => f(ctx, arg(0), arg(1)),
-        Some(SubrFn::A3(f)) => f(ctx, arg(0), arg(1), arg(2)),
-        Some(SubrFn::A4(f)) => f(ctx, arg(0), arg(1), arg(2), arg(3)),
-        Some(SubrFn::A5(f)) => f(ctx, arg(0), arg(1), arg(2), arg(3), arg(4)),
-        _ => unreachable!("slot count matched above"),
+    // SAFETY: `entry` is the `SubrFn` variant its slot class was screened
+    // from, and the call's arguments follow that variant's arity; the union
+    // view reads exactly that variant's field.
+    let fns = ScreenedFn { addr: entry.fn_ptr };
+    let result = unsafe {
+        match entry.slots {
+            0 => (fns.a0)(ctx),
+            1 => (fns.a1)(ctx, arg(0)),
+            2 => (fns.a2)(ctx, arg(0), arg(1)),
+            3 => (fns.a3)(ctx, arg(0), arg(1), arg(2)),
+            4 => (fns.a4)(ctx, arg(0), arg(1), arg(2), arg(3)),
+            5 => (fns.a5)(ctx, arg(0), arg(1), arg(2), arg(3), arg(4)),
+            _ => unreachable!("screened classes are the A0..A5 entries"),
+        }
     };
     ctx.depth -= 1;
     // Extract the value before cleanup. Passing the whole Result through
     // the signal/unwind joins made LLVM copy its 16-byte aggregate with wide
     // loads after the builtin's narrow stores, even on balanced Ok returns.
-    Some(match result {
+    match result {
         Ok(value) => {
             if ctx.pop_native_backtrace_frame(bt_count) {
-                return Some(Ok(value));
+                return Ok(value);
             }
             finish_fixed_builtin_from_native(ctx, bt_count, Ok(value))
         }
         Err(flow) => finish_fixed_builtin_from_native(ctx, bt_count, Err(flow)),
-    })
+    }
+}
+
+/// The spec shim's direct fixed-arity builtin call: `target` is the armed
+/// `#<subr>` value. `None` = take the stack path (see
+/// [`screen_fixed_builtin`]). On a successful screen the entry is cached in
+/// `slot` for the armed fast path's next calls
+/// (`SpecSlot::cache_screened_subr_entry`).
+#[cfg(feature = "jit")]
+fn call_fixed_builtin_from_native(
+    ctx: &mut Context,
+    sym_id: SymId,
+    target: Value,
+    slot: &SpecSlot,
+    args_ptr: *const i64,
+    nargs: usize,
+) -> Option<crate::emacs_core::error::EvalResult> {
+    let entry = screen_fixed_builtin(target, nargs)?;
+    if let Some(encoded) = SpecSlot::pack_screened_subr_entry(entry.fn_ptr, entry.slots) {
+        slot.cache_screened_subr_entry(encoded);
+    }
+    Some(run_screened_fixed_builtin(
+        ctx, sym_id, entry, args_ptr, nargs,
+    ))
 }
 
 /// Preserve signal-hook ordering and the general unwinder for non-local
@@ -2108,10 +2450,38 @@ pub extern "C" fn neovm_jit_call_subr_spec(
         {
             #[cfg(debug_assertions)]
             SUBR_SPEC_FAST_COUNT.fetch_add(1, Ordering::Relaxed);
-            let target = Value::from_bits(expected as usize);
-            if let Some(res) =
-                call_fixed_builtin_from_native(ctx, SymId(sym as u32), target, args_ptr, nargs)
-            {
+            let sym_id = SymId(sym as u32);
+            // The slot's screened-entry cache
+            // (`SpecSlot::cache_screened_subr_entry`): a hit means the epoch
+            // equals the one the entry was screened under, so the tag,
+            // dispatch-kind and arity screens and the `SubrFn` class match
+            // are already proven — call the builtin body directly. The
+            // site's `nargs` is its compile-time arity, so the cached class
+            // covers every call through this slot; the compare stays as a
+            // guard on the shim's ABI contract.
+            let cached = slot.cached_subr_entry();
+            let screened = if cached != 0 {
+                let (fn_ptr, slots) = SpecSlot::decode_screened_subr_entry(cached);
+                if nargs <= slots {
+                    #[cfg(debug_assertions)]
+                    SUBR_SPEC_CACHED_COUNT.fetch_add(1, Ordering::Relaxed);
+                    Some(FixedBuiltinEntry { fn_ptr, slots })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let res = match screened {
+                Some(entry) => Some(run_screened_fixed_builtin(
+                    ctx, sym_id, entry, args_ptr, nargs,
+                )),
+                None => {
+                    let target = Value::from_bits(expected as usize);
+                    call_fixed_builtin_from_native(ctx, sym_id, target, slot, args_ptr, nargs)
+                }
+            };
+            if let Some(res) = res {
                 return match res {
                     Ok(value) => {
                         // SAFETY: `out` is the generated code's result stack slot.
@@ -2126,8 +2496,8 @@ pub extern "C" fn neovm_jit_call_subr_spec(
             }
             return call_stack_builtin_from_native(
                 ctx,
-                SymId(sym as u32),
-                target,
+                sym_id,
+                Value::from_bits(expected as usize),
                 args_ptr,
                 nargs,
                 out,
@@ -2173,7 +2543,7 @@ fn subr_spec_call_reference(
     // a debugger armed) takes the stack path below, the reference protocol.
     if !ctx.debug_on_next_call_is_armed()
         && let Some(res) =
-            call_fixed_builtin_from_native(ctx, SymId(sym as u32), target, args_ptr, nargs)
+            call_fixed_builtin_from_native(ctx, SymId(sym as u32), target, slot, args_ptr, nargs)
     {
         return match res {
             Ok(value) => {
@@ -2317,11 +2687,7 @@ pub extern "C" fn neovm_jit_pred_spec(
                     return STATUS_NEED_GENERIC;
                 };
                 Value::bool_val(
-                    crate::emacs_core::builtins::symbols::symbol_function_cell_in_obarray(
-                        ctx.obarray(),
-                        id,
-                    )
-                    .is_some_and(|function| !function.is_nil()),
+                    crate::emacs_core::builtins::symbols::function_cell_is_bound(ctx.obarray(), id),
                 )
             }
             // The registered `type-of`/`cl-type-of` bodies, which read the
@@ -2338,6 +2704,82 @@ pub extern "C" fn neovm_jit_pred_spec(
                 None => return STATUS_NEED_GENERIC,
             },
         };
+        // SAFETY: `out` is the generated code's result stack slot.
+        unsafe { *out = result.bits() as i64 };
+        STATUS_OK
+    })
+}
+
+/// Speculated `fboundp` call: the dedicated 4-argument shim. The sequence is
+/// exactly [`neovm_jit_pred_spec`]'s `PRED_KIND_FBOUNDP` arm — the quit poll,
+/// the debugger/depth gates, the armed-epoch check and the symbol's function
+/// cell read — without the `kind` argument, the site's `sym`/`expected` words
+/// and the arm dispatch. Those two words are read back from the slot
+/// (`SpecSlot::for_site` binds a `PredFboundp` slot like a `SubrGeneral` one)
+/// so the arming test is the full [`subr_spec_armed`]: a stale epoch whose
+/// live binding bits still match RE-ARMS the site and keeps the fast path,
+/// and only a changed binding (or an armed debugger, the depth limit, a
+/// pending overrides state) takes [`STATUS_NEED_GENERIC`] and the site's
+/// generic fallback — which then resolves the live binding, so `fset`/advice
+/// and the generic dispatch's Bcall depth accounting stay exact. Falling
+/// straight to the generic call on every epoch move would make one `fset`
+/// anywhere permanently slow every `fboundp` site.
+///
+/// GC-FREE INVARIANT (load-bearing): the generated caller roots nothing
+/// around this call, so no path here may allocate on the lisp heap or run
+/// lisp. `maybe_quit`'s Flow is Rust-heap only, the arming check only reads,
+/// and the cell read is a symbol-table lookup with no allocation or safe
+/// point. The skipped backtrace frame is unobservable: an armed hit cannot
+/// signal, GC or run lisp between push and pop.
+/// SAFETY + AOT-importable status: same as [`neovm_jit_call_subr_spec`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // C-ABI shim: raw ptrs per documented SAFETY contract; only ever called from generated code.
+#[unsafe(no_mangle)]
+pub extern "C" fn neovm_jit_fboundp_spec(ctx: *mut u8, slot: i64, a: i64, out: *mut i64) -> i64 {
+    jit_shim_contain!(ctx, STATUS_SIGNAL, {
+        #[cfg(debug_assertions)]
+        {
+            SUBR_SPEC_COUNT.fetch_add(1, Ordering::Relaxed);
+            FBOUNDP_SPEC_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: see neovm_jit_call's function-level contract.
+        let ctx = unsafe { &mut *(ctx as *mut Context) };
+        if let Err(flow) = ctx.maybe_quit() {
+            stash_pending_flow(flow);
+            return STATUS_SIGNAL;
+        }
+        // SAFETY: slot points into the executing leaf's spec_slots.
+        let slot = unsafe { &*(slot as *const SpecSlot) };
+        debug_assert!(
+            slot.holds_subr_binding(),
+            "an fboundp site's slot carries its binding words"
+        );
+        let (sym, expected) = slot.subr_binding();
+        if ctx.debug_on_next_call_is_armed()
+            || ctx.depth >= ctx.max_depth
+            || !subr_spec_armed(ctx, sym.0 as i64, expected as i64, slot)
+        {
+            #[cfg(debug_assertions)]
+            SUBR_SPEC_GENERIC_COUNT.fetch_add(1, Ordering::Relaxed);
+            return STATUS_NEED_GENERIC;
+        }
+        #[cfg(debug_assertions)]
+        SUBR_SPEC_FAST_COUNT.fetch_add(1, Ordering::Relaxed);
+        let v = Value::from_bits(a as usize);
+        // `builtin_fboundp_1`: a symbol's function cell, read off the obarray
+        // with no allocation, no Lisp and no safe point (a symbol-with-pos is
+        // a symbol here exactly when the builtin says so, i.e. only while
+        // `symbols-with-pos-enabled` is on). Anything else bounces to the
+        // generic call, which signals `(wrong-type-argument symbolp V)` from a
+        // real frame.
+        let Some(id) = crate::emacs_core::builtins::symbols::symbol_id_checked(
+            &v,
+            ctx.symbols_with_pos_enabled,
+        ) else {
+            return STATUS_NEED_GENERIC;
+        };
+        let result = Value::bool_val(
+            crate::emacs_core::builtins::symbols::function_cell_is_bound(ctx.obarray(), id),
+        );
         // SAFETY: `out` is the generated code's result stack slot.
         unsafe { *out = result.bits() as i64 };
         STATUS_OK
@@ -3432,3 +3874,7 @@ pub extern "C" fn neovm_jit_backedge(ctx: *mut u8) -> i64 {
         }
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/list_search_swp_test.rs"]
+mod list_search_swp_tests;

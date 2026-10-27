@@ -8,7 +8,7 @@ use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 #[test]
 fn div_cx117_process_filter_chunked_data_capture() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK (1 18 \"line1\\nline2\\nline3\")""#]];
+    let expect = expect_test::expect![[r#""OK (t 18 \"line1\\nline2\\nline3\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((collected nil)
@@ -17,11 +17,17 @@ fn div_cx117_process_filter_chunked_data_capture() {
                         :command '("sh" "-c" "for i in 1 2 3; do printf 'line%d\\n' $i; done")
                         :buffer buf
                         :filter (lambda (proc data) (push data collected)))))
-  (accept-process-output p 2)
-  (sit-for 0.05)
+  ;; make-process inherits `process-connection-type' (a PTY here), so the
+  ;; shell's per-line writes can arrive in any number of filter calls; that
+  ;; split is a wakeup race in both editors.  Wait for the child to exit and
+  ;; drain, then assert the aggregate output, never the chunk count.
+  (let ((deadline (+ (float-time) 30)))
+    (while (and (process-live-p p) (< (float-time) deadline))
+      (accept-process-output p 0.05)))
+  (while (accept-process-output p 0))
   (let ((all-data (apply #'concat (nreverse collected))))
     (kill-buffer buf)
-    (list (length collected)
+    (list (and collected t)
           (length all-data)
           (string-trim all-data))))
 "##,
@@ -32,7 +38,7 @@ fn div_cx117_process_filter_chunked_data_capture() {
 #[test]
 fn div_cx117_process_filter_with_coding_chunk_split() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (\"\\nProcess neo-cx117-cs finished\\n\" 31)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((collected nil)
@@ -41,8 +47,8 @@ fn div_cx117_process_filter_with_coding_chunk_split() {
                         :command '("sh" "-c" "printf 'café \\xe4\\xb8\\x96\\xe7\\x95\\x8c'")
                         :buffer buf
                         :coding 'utf-8-unix
-                        :filter (lambda (proc data) (push data collected))))
-  (accept-process-output p 2)
+                        :filter (lambda (proc data) (push data collected)))))
+  (neovm--oracle-settle-process p 600)
   (sit-for 0.05)
   (let ((content (with-current-buffer buf (buffer-string))))
     (kill-buffer buf)
@@ -62,7 +68,7 @@ fn div_cx117_process_sentinel_runs_on_exit() {
   (let ((p (make-process :name "neo-cx117-sent"
                          :command '("sh" "-c" "exit 7")
                          :sentinel (lambda (proc ev) (push ev events)))))
-    (accept-process-output p 2)
+    (neovm--oracle-settle-process p 600)
     (sit-for 0.05)
     (list (nreverse events)
           (process-exit-status p)
@@ -87,7 +93,7 @@ fn div_cx117_process_send_string_to_stdin() {
                         :connection-type 'pipe)))
   (process-send-string p "alpha beta gamma\n")
   (process-send-eof p)
-  (accept-process-output p 2)
+  (neovm--oracle-settle-process p 600)
   (sit-for 0.05)
   (let ((content (with-current-buffer buf (buffer-string))))
     (kill-buffer buf)
@@ -110,7 +116,7 @@ fn div_cx117_process_connection_type_pipe_vs_pty() {
                                  :command '("echo" "via-pipe")
                                  :buffer buf-pipe
                                  :connection-type 'pipe)))
-      (accept-process-output p-pipe 2)
+      (neovm--oracle-settle-process p-pipe 600)
       (sit-for 0.05)
       (let ((pipe-content (with-current-buffer buf-pipe (buffer-string))))
         (kill-buffer buf-pipe)
@@ -133,7 +139,7 @@ fn div_cx117_make_process_with_environment_override() {
                             :command '("sh" "-c" "echo $NEO_CX117")
                             :buffer buf
                             :environment (cons "NEO_CX117=hello-env" process-environment))))
-      (accept-process-output p 2)
+      (neovm--oracle-settle-process p 600)
       (sit-for 0.05)
       (let ((content (string-trim (with-current-buffer buf (buffer-string)))))
         (kill-buffer buf)
@@ -155,7 +161,7 @@ fn div_cx117_process_filter_no_buffer_no_filter_appends_nowhere() {
                          :command '("sh" "-c" "printf 'no buffer here'")
                          :buffer nil
                          :filter (lambda (proc data) (push data collected)))))
-    (accept-process-output p 2)
+    (neovm--oracle-settle-process p 600)
     (sit-for 0.05)
     (apply #'concat (nreverse collected))))
 "##,
@@ -175,7 +181,7 @@ fn div_cx117_process_stderr_capture() {
            (p (make-process :name "neo-cx117-err"
                             :command '("sh" "-c" "echo 'to stderr' >&2; echo 'to stdout'")
                             :stderr stderr-buf)))
-      (accept-process-output p 2)
+      (neovm--oracle-settle-process p 600)
       (sit-for 0.05)
       (let ((stderr-content (string-trim (with-current-buffer stderr-buf (buffer-string)))))
         (kill-buffer stderr-buf)
@@ -255,7 +261,7 @@ fn div_cx117_process_with_marker_overlay_undo_narrow_mega() {
   (let ((p (make-process :name "neo-cx117-mega-p"
                          :command '("sh" "-c" "printf 'SUB-OUT'")
                          :buffer buf)))
-    (accept-process-output p 1)
+    (neovm--oracle-settle-process p 600)
     (sit-for 0.05))
   (let ((content (with-current-buffer buf (buffer-string))))
     (with-current-buffer buf

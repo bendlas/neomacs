@@ -18,7 +18,8 @@ fn inputs() -> ChromeRowInputs {
         base_face: ResolvedFace::default(),
         image_scale_environment: ImageScaleEnvironment::default(),
         glyphless_table_bits: None,
-        automatic_composition: false,
+        automatic_composition:
+            crate::incremental_layout::chrome_memo::ChromeCompositionRules::Absent,
         face_change_count: 0,
         char_table_revision: neovm_core::window::CharTableLayoutRevision::default(),
         media_generation: 0,
@@ -85,7 +86,20 @@ fn legacy(
 }
 
 fn compare(root: Value, spans: &[InputSpan]) -> ChromeSourceProjection {
-    let actual = ChromeSourceProjection::classify(root, spans.iter().copied());
+    let owner = [root];
+    let scope = MemoKeyScope::for_values(&owner);
+    let actual = ChromeSourceProjection::classify(
+        &scope,
+        root,
+        spans
+            .iter()
+            .map(|&(source, start, end, source_start)| ProjectionSourceSpan {
+                source,
+                output_start: CharPos0::new(start),
+                output_end: CharPos0::new(end),
+                source_start: CharPos0::new(source_start),
+            }),
+    );
     let expected = legacy(root, spans);
     assert_eq!(&*actual.fingerprint_spans, expected.0);
     assert_eq!(actual.root_index, expected.1);

@@ -7,7 +7,7 @@
 //! an inactive mutator skips the shared gate. Active reads retain the process
 //! policy gate and cold recorder, while traversal selection keeps its own gate.
 use super::{mutate::LispCollectionRevision, value::TaggedValue};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::cell::{Cell, RefCell};
 use std::sync::{
     LazyLock,
@@ -105,11 +105,15 @@ const MAX_DEPTH: usize = 8;
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     static RECENT_READS: RecentReads = const { RecentReads::new() };
-    static STATE: RefCell<State> = RefCell::new(State::default());
+    static STATE: store_state::StateSlot = store_state::StateSlot::default();
     #[cfg(test)]
     static OBSERVATION_STATE_ACCESSES: Cell<usize> = const { Cell::new(0) };
     #[cfg(test)]
     static OBSERVED_OWNER_PUBLICATIONS: Cell<usize> = const { Cell::new(0) };
+    #[cfg(test)]
+    static RECENT_CLEARED_CELLS: Cell<usize> = const { Cell::new(0) };
+    #[cfg(test)]
+    static RECENT_CLEARED_MASKS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The existing mutator-local read deduplication, qualified by reclamation.
@@ -128,6 +132,21 @@ struct RecentReads {
     epoch: Cell<u64>,
 }
 
+const _: () = {
+    #[repr(C)]
+    struct LegacyRecentReads {
+        words: [Cell<usize>; 256],
+        observed: Cell<bool>,
+        epoch: Cell<u64>,
+    }
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<RecentReads>() == size_of::<LegacyRecentReads>());
+    assert!(align_of::<RecentReads>() == align_of::<LegacyRecentReads>());
+    assert!(offset_of!(RecentReads, words) == offset_of!(LegacyRecentReads, words));
+    assert!(offset_of!(RecentReads, observed) == offset_of!(LegacyRecentReads, observed));
+    assert!(offset_of!(RecentReads, epoch) == offset_of!(LegacyRecentReads, epoch));
+};
+
 impl RecentReads {
     const fn new() -> Self {
         Self {
@@ -138,8 +157,27 @@ impl RecentReads {
     }
 
     fn clear(&self, epoch: u64) {
-        for word in &self.words {
-            word.set(0);
+        if let Some(dirty) = store_state::take_recent_dirty() {
+            for (block, mut mask) in dirty.into_iter().enumerate() {
+                while mask != 0 {
+                    let index = block * 64 + mask.trailing_zeros() as usize;
+                    let word = &self.words[index];
+                    if word.get() != 0 {
+                        word.set(0);
+                        #[cfg(test)]
+                        RECENT_CLEARED_CELLS.with(|count| count.set(count.get() + 1));
+                    }
+                    mask &= mask - 1;
+                }
+            }
+        } else {
+            // Teardown can retire STATE before the recent-read cache.
+            // Keep reset total without accessing already destroyed TLS.
+            for word in &self.words {
+                word.set(0);
+            }
+            #[cfg(test)]
+            RECENT_CLEARED_CELLS.with(|count| count.set(count.get() + self.words.len()));
         }
         self.epoch.set(epoch);
     }
@@ -157,30 +195,25 @@ impl RecentReads {
 /// Once this mutator has observed required history, it never skips later writes,
 /// including writes after its last capture while a certificate can remain live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum JournalPolicy {
     JournalOnly,
     BeforeFirstCapture,
     JournalAndObserve,
 }
 
-// Keep the journal prefix independent of cold observation metadata growth.
-// This is a private Rust layout; generated code does not bake these offsets.
-// The executing mutator owns this State; only atomic marks/epochs are shared.
+// Cold capture metadata follows its World; the journal and revision share the
+// stable StoreState allocation. No generated code addresses this cold State.
 #[repr(C)]
 struct State {
     captures: Vec<Capture>,
-    writes: Box<[usize; JOURNAL_SIZE]>,
-    journal_policy: JournalPolicy,
     // Exact identities and conservative bounds live in the existing mutator
     // journal. Reclamation prunes dead identities without dereferencing them;
     // Context/dump changes reclassify the surviving owner ranges.
     observed: observed_envelope::ObservedEnvelope,
+    capture_pool: capture_storage::CapturePool,
+    certificate_pool: certificate_storage::CertificatePool,
 }
-
-const _: () = assert!(std::mem::offset_of!(State, captures) == 0);
-const _: () = assert!(std::mem::offset_of!(State, writes) == 3 * std::mem::size_of::<usize>());
-const _: () =
-    assert!(std::mem::offset_of!(State, journal_policy) == 4 * std::mem::size_of::<usize>());
 
 impl Default for State {
     fn default() -> Self {
@@ -190,20 +223,16 @@ impl Default for State {
         // history permanently: WRITE_LAZY may clear the conservative initial flag.
         initialize();
         Self {
-            writes: Box::new([0; JOURNAL_SIZE]),
-            captures: Vec::new(),
-            journal_policy: if history_required() {
-                JournalPolicy::JournalOnly
-            } else {
-                JournalPolicy::BeforeFirstCapture
-            },
+            captures: Vec::with_capacity(MAX_DEPTH),
             observed: observed_envelope::ObservedEnvelope::new(),
+            capture_pool: capture_storage::CapturePool::default(),
+            certificate_pool: certificate_storage::CertificatePool::default(),
         }
     }
 }
 
 struct Capture {
-    reads: FxHashMap<usize, LispCollectionRevision>,
+    reads: capture_storage::CaptureReads,
     started: LispCollectionRevision,
     overflow: bool,
     // Each entry has a completed Observed-mode projection or a validated
@@ -222,10 +251,24 @@ struct Capture {
 /// mutation journals remain local to the observing mutator.
 #[derive(Debug)]
 pub struct CollectionReads {
-    reads: FxHashSet<usize>,
-    revision: LispCollectionRevision,
+    reads: certificate_storage::CertificateLease,
+    owner: ObservationWorld,
     _not_send: std::marker::PhantomData<*const ()>,
 }
+
+const _: () = {
+    type LegacyCertificate = (FxHashSet<usize>, LispCollectionRevision);
+    assert!(std::mem::size_of::<CollectionReads>() == std::mem::size_of::<LegacyCertificate>());
+    assert!(std::mem::align_of::<CollectionReads>() == std::mem::align_of::<LegacyCertificate>());
+    assert!(
+        std::mem::size_of::<Option<CollectionReads>>()
+            == std::mem::size_of::<Option<LegacyCertificate>>()
+    );
+    assert!(
+        std::mem::align_of::<Option<CollectionReads>>()
+            == std::mem::align_of::<Option<LegacyCertificate>>()
+    );
+};
 
 static_assertions::assert_not_impl_any!(CollectionReads: Send, Sync);
 
@@ -236,7 +279,9 @@ impl CollectionReads {
     }
 
     pub fn unchanged(&self) -> bool {
-        unchanged_since(&self.reads, self.revision)
+        self.reads
+            .dependencies()
+            .is_some_and(|(reads, revision)| unchanged_since(reads, revision, self.owner.store()))
     }
 
     /// A nested cache hit reads its original dependencies transitively.
@@ -244,8 +289,11 @@ impl CollectionReads {
         if !self.unchanged() {
             return false;
         }
+        if !self.owner.is_current() {
+            return false;
+        }
         if ACTIVE.with(Cell::get) {
-            for &bits in &self.reads {
+            for &bits in self.reads.iter() {
                 // The original observation already published its sticky mark
                 // and this mutator's envelope. Certificates retain identities,
                 // not object storage: transitive reuse must not dereference an
@@ -259,18 +307,27 @@ impl CollectionReads {
     }
 }
 
-fn unchanged_since(reads: &FxHashSet<usize>, revision: LispCollectionRevision) -> bool {
-    let now = LispCollectionRevision::current();
-    let count = now.sequence().wrapping_sub(revision.sequence());
+impl Drop for CollectionReads {
+    fn drop(&mut self) {
+        let reads = &mut self.reads;
+        self.owner.with_state(|state| {
+            state.borrow_mut().certificate_pool.recycle(reads);
+        });
+    }
+}
+
+fn unchanged_since(
+    reads: &FxHashSet<usize>,
+    revision: LispCollectionRevision,
+    store: &StoreState,
+) -> bool {
+    let count = store.sequence().wrapping_sub(revision.sequence());
     if count > JOURNAL_SIZE as u64 {
         return false;
     }
-    STATE.with(|state| {
-        let state = state.borrow();
-        (1..=count).all(|offset| {
-            let slot = revision.sequence().wrapping_add(offset) as usize % JOURNAL_SIZE;
-            !reads.contains(&state.writes[slot])
-        })
+    (1..=count).all(|offset| {
+        let slot = revision.sequence().wrapping_add(offset) as usize % JOURNAL_SIZE;
+        !reads.contains(&store.journal()[slot].get())
     })
 }
 
@@ -280,6 +337,7 @@ fn unchanged_since(reads: &FxHashSet<usize>, revision: LispCollectionRevision) -
 #[must_use = "dropping the guard ends this mutator's collection-read capture"]
 struct CollectionReadScope {
     active: bool,
+    owner: ObservationWorld,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
@@ -289,9 +347,13 @@ impl CollectionReadScope {
     fn begin() -> Self {
         initialize();
         HISTORY_REQUIRED.store(true, Ordering::Relaxed);
-        let admitted = STATE.with(|state| {
+        let owner = ObservationWorld::current();
+        let admitted = with_state(|state| {
             let mut state = state.borrow_mut();
-            state.journal_policy = JournalPolicy::JournalAndObserve;
+            with_store(|store| {
+                store.mutator.policy.set(JournalPolicy::JournalAndObserve);
+                store.mutator.observe.set(true);
+            });
             let overflow = state.captures.len() >= MAX_DEPTH;
             if overflow {
                 for capture in &mut state.captures {
@@ -300,8 +362,9 @@ impl CollectionReadScope {
                 return false;
             }
             clear_recent_reads();
+            let reads = state.capture_pool.acquire();
             state.captures.push(Capture {
-                reads: FxHashMap::default(),
+                reads,
                 started: LispCollectionRevision::current(),
                 overflow,
                 publication_epoch: recent_publication_epoch(),
@@ -314,6 +377,7 @@ impl CollectionReadScope {
         }
         Self {
             active: admitted,
+            owner,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -323,60 +387,91 @@ impl CollectionReadScope {
             return None;
         }
         let capture = self.take();
+        let result = self.finish_capture(&capture);
+        self.recycle(capture);
+        result
+    }
+
+    fn finish_capture(&self, capture: &Capture) -> Option<CollectionReads> {
+        // Guards always retire in their own State, even when a callback
+        // activates a different World. A certificate is meaningful only in
+        // the World in which its captured projections were made.
+        if !self.owner.is_current() {
+            return None;
+        }
         // Reject writes after a dependency's first read. Writes before its
         // first read (including initialization of fresh objects) are harmless.
-        let now = LispCollectionRevision::current();
+        let now = LispCollectionRevision::from_sequence(self.owner.store().sequence());
         let count = now.sequence().wrapping_sub(capture.started.sequence());
         if capture.overflow || count > JOURNAL_SIZE as u64 {
             tracing::trace!(target: "neovm_core::collection_reads", reads = capture.reads.len(), writes = count, overflow = capture.overflow, "capture rejected");
             return None;
         }
-        let coherent = STATE.with(|state| {
-            let state = state.borrow();
+        let coherent = {
+            let store = self.owner.store();
             (1..=count).all(|offset| {
                 let slot = capture.started.sequence().wrapping_add(offset) as usize % JOURNAL_SIZE;
                 capture
                     .reads
-                    .get(&state.writes[slot])
+                    .get(&store.journal()[slot].get())
                     .is_none_or(|read_at| {
                         offset <= read_at.sequence().wrapping_sub(capture.started.sequence())
                     })
             })
-        });
+        };
         if !coherent {
             tracing::trace!(target: "neovm_core::collection_reads", reads = capture.reads.len(), writes = count, "capture changed during observation");
             return None;
         }
+        let reads = self.owner.with_state(|state| {
+            state
+                .borrow_mut()
+                .certificate_pool
+                .acquire(&capture.reads, now)
+        });
         Some(CollectionReads {
-            reads: capture.reads.into_keys().collect(),
-            revision: now,
+            reads,
+            owner: self.owner.clone(),
             _not_send: std::marker::PhantomData,
         })
     }
 
+    fn recycle(&self, capture: Capture) {
+        self.owner.with_state(|state| {
+            state.borrow_mut().capture_pool.recycle(capture.reads);
+        });
+    }
+
     fn take(&mut self) -> Capture {
         self.active = false;
-        STATE.with(|state| {
+        let capture = self.owner.with_state(|state| {
             let mut state = state.borrow_mut();
             let capture = state.captures.pop().expect("collection read scope");
-            clear_recent_reads();
             let active = !state.captures.is_empty();
-            state.journal_policy = if active {
+            let store = self.owner.store();
+            store.mutator.policy.set(if active {
                 JournalPolicy::JournalAndObserve
             } else {
                 JournalPolicy::JournalOnly
-            };
-            ACTIVE.with(|membership| membership.set(active));
+            });
+            store.mutator.observe.set(active);
+            if self.owner.is_current() {
+                clear_recent_reads();
+                ACTIVE.with(|membership| membership.set(active));
+            }
             CAPTURE_SCOPES.fetch_sub(SCOPE_INCREMENT, Ordering::Relaxed);
             capture
-        })
+        });
+        store_state::refresh_membership();
+        capture
     }
 }
 
 impl Drop for CollectionReadScope {
     fn drop(&mut self) {
         if self.active {
-            self.take();
+            let capture = self.take();
+            self.recycle(capture);
         }
     }
 }
@@ -404,6 +499,7 @@ fn observe_active(bits: usize) {
     if !ACTIVE.with(Cell::get) {
         return;
     }
+    store_state::reject_foreign_capture_reads();
     observe_bits(bits);
 }
 
@@ -480,11 +576,12 @@ pub(super) fn reset_recent_reads_for_heap_installation() {
 #[cold]
 #[inline(never)]
 fn observe_new_owner(bits: usize) {
+    store_state::note_recent_miss(bits);
     // Misses acquire the shared epoch here, rather than on every cached read.
     // A real owner remains live while its pointer projection executes, even
     // if unrelated reclamation advances the global epoch concurrently.
     let publication_epoch = recent_publication_epoch();
-    STATE.with(|state| {
+    with_state(|state| {
         let mut state = state.borrow_mut();
         if let Some(epoch) = publication_epoch
             && state.observed.was_refreshed_at(epoch)
@@ -512,7 +609,9 @@ fn observe_new_owner(bits: usize) {
 #[cold]
 #[inline(never)]
 fn observe_uncached(bits: usize) {
-    STATE.with(|state| {
+    store_state::note_recent_miss(bits);
+    store_state::reject_foreign_capture_reads();
+    with_state(|state| {
         let mut state = state.borrow_mut();
         // A transitive cache hit must never dereference its old owner words.
         // Safe metadata filtering still refreshes its mutator's live bounds.
@@ -556,23 +655,77 @@ fn record_observation(
         if capture.overflow {
             continue;
         }
-        if capture.reads.len() == MAX_READS && !capture.reads.contains_key(&bits) {
+        if !capture.reads.insert_first(bits, revision) {
             capture.overflow = true;
-        } else {
-            capture.reads.entry(bits).or_insert(revision);
         }
     }
 }
 
+/// Ordered protocol evidence for native/interpreter parity tests. Identities
+/// remain words; taking this snapshot does not observe or dereference owners.
+#[cfg(test)]
+pub(crate) fn journal_since_for_test(start: LispCollectionRevision) -> Option<Vec<usize>> {
+    with_store(|store| {
+        let count = store.sequence().wrapping_sub(start.sequence());
+        if count > JOURNAL_SIZE as u64 {
+            return None;
+        }
+        Some(
+            (1..=count)
+                .map(|offset| {
+                    let sequence = start.sequence().wrapping_add(offset);
+                    store.journal()[sequence as usize % JOURNAL_SIZE].get()
+                })
+                .collect(),
+        )
+    })
+}
+
 pub(super) fn record_write(value: TaggedValue, revision: u64) {
-    STATE.with(|state| state.borrow_mut().writes[revision as usize % JOURNAL_SIZE] = value.bits());
+    with_store(|store| store.record(value.bits(), revision));
+}
+
+/// A string byte store retains its original journal-before-read order.
+/// Observation is a separate projection after this shared history step.
+#[inline(always)]
+pub(super) fn record_unprojected_write_in_store(store: &StoreState, value: TaggedValue) {
+    if store.mutator.policy.get() == JournalPolicy::BeforeFirstCapture {
+        record_unprojected_write_before_first_capture(store, value);
+        return;
+    }
+    let revision = store.advance();
+    store.record(value.bits(), revision);
+}
+
+#[cold]
+#[inline(never)]
+fn record_unprojected_write_before_first_capture(store: &StoreState, value: TaggedValue) {
+    if history_required() {
+        store.mutator.policy.set(JournalPolicy::JournalOnly);
+        let revision = store.advance();
+        store.record(value.bits(), revision);
+    }
+}
+
+/// Preserve ordinary projection policy without an idle ACTIVE TLS read.
+#[inline(always)]
+pub(crate) fn observe_store_projection_in_store(store: &StoreState, value: TaggedValue) {
+    if store.mutator.observe.get() {
+        observe_store_projection_active(value);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn observe_store_projection_active(value: TaggedValue) {
+    observe(value);
 }
 
 /// The exact pointer projection performed by the four fused setters. A failed
 /// Cons tag check observes nothing; veclike setters observe every veclike header
 /// before rejecting a subtype. This is deliberately narrower than heap objects.
 #[derive(Clone, Copy)]
-pub(super) enum WriteProjection {
+pub(crate) enum WriteProjection {
     Cons,
     VecLike,
 }
@@ -588,33 +741,72 @@ pub(super) enum WriteProjection {
 /// a header, GC barrier, backing ownership, slot bounds, or the actual store.
 #[inline(always)]
 pub(super) fn record_projected_write(value: TaggedValue, projection: WriteProjection) -> bool {
+    super::gc::with_store_state(|store| record_projected_write_in_store(store, value, projection))
+}
+
+#[inline(always)]
+pub(crate) fn record_projected_write_in_store(
+    store: &StoreState,
+    value: TaggedValue,
+    projection: WriteProjection,
+) -> bool {
     let projected = match projection {
         WriteProjection::Cons => value.is_cons(),
         WriteProjection::VecLike => value.is_veclike(),
     };
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let observe = match state.journal_policy {
-            JournalPolicy::JournalOnly => false,
-            JournalPolicy::JournalAndObserve => true,
-            JournalPolicy::BeforeFirstCapture => {
-                if !history_required() {
-                    return;
-                }
-                state.journal_policy = JournalPolicy::JournalOnly;
-                false
+    if store.mutator.policy.get() != JournalPolicy::JournalOnly {
+        record_projected_write_cold_policy(store, value, projected);
+        return projected;
+    }
+    let revision = store.advance();
+    store.record(value.bits(), revision);
+    projected
+}
+
+// Every inline store carries only the policy-byte test and this cold edge.
+// Prefix-policy transitions and active captures must not duplicate their
+// bookkeeping at each native caller's store site.
+#[cold]
+#[inline(never)]
+fn record_projected_write_cold_policy(store: &StoreState, value: TaggedValue, projected: bool) {
+    match store.mutator.policy.get() {
+        JournalPolicy::JournalAndObserve => {
+            record_projected_write_observed(store, value, projected);
+            return;
+        }
+        JournalPolicy::BeforeFirstCapture => {
+            if !history_required() {
+                return;
             }
-        };
-        // Keep capture eligibility ahead of the common journal block. In
-        // JournalOnly, this branches directly to the revision/write pair;
-        // no observation booleans remain live across that block.
-        let recent = observe && projected && recently_observed(value.bits());
-        if observe && projected && !recent {
+            store.mutator.policy.set(JournalPolicy::JournalOnly);
+        }
+        JournalPolicy::JournalOnly => {}
+    }
+    let revision = store.advance();
+    store.record(value.bits(), revision);
+}
+
+// Capture/recent/envelope TLS and the RefCell are confined to this active
+// path. Owner publication still precedes the write; its first read records
+// the new revision, so a setter-only capture rejects its own mutation.
+#[cold]
+#[inline(never)]
+fn record_projected_write_observed(store: &StoreState, value: TaggedValue, projected: bool) {
+    let recent = projected && recently_observed(value.bits());
+    if projected && !recent {
+        store_state::note_recent_miss(value.bits());
+    }
+    if projected {
+        store_state::reject_foreign_capture_reads();
+    }
+    with_state(|state| {
+        let mut state = state.borrow_mut();
+        if projected && !recent {
             publish_observed_owner_in_state(&mut state, value.bits());
         }
-        let revision = LispCollectionRevision::advance();
-        state.writes[revision.sequence() as usize % JOURNAL_SIZE] = value.bits();
-        if observe && projected && !recent {
+        let revision = LispCollectionRevision::from_sequence(store.advance());
+        store.record(value.bits(), revision.sequence());
+        if projected && !recent {
             record_observation(
                 &mut state,
                 value.bits(),
@@ -623,8 +815,15 @@ pub(super) fn record_projected_write(value: TaggedValue, projection: WriteProjec
             );
         }
     });
-    projected
 }
+
+mod capture_storage;
+mod certificate_storage;
+mod store_state;
+use store_state::with_state;
+pub(crate) use store_state::{
+    ObservationWorld, StoreState, clear_installed_store_heap, with_store,
+};
 
 mod compiled_journal;
 mod observed_envelope;
@@ -640,7 +839,7 @@ pub(crate) fn compiled_observation_window() -> (usize, usize) {
     {
         return (usize::MAX, 0);
     }
-    STATE.with(|state| {
+    with_state(|state| {
         let mut state = state.borrow_mut();
         refresh_observed_envelope(&mut state);
         state.observed.full_bounds()
@@ -653,12 +852,21 @@ pub(crate) fn compiled_observation_window() -> (usize, usize) {
 pub(crate) fn compiled_observation_gate(
     dump: super::gc::BarrierWindow,
 ) -> super::gc::CompiledObservationGate {
+    compiled_observation_gate_for_world(&ObservationWorld::current(), dump)
+}
+
+/// Collector publication uses the named World's envelope even when another
+/// World is selected in TLS. The caller owns its stopped/installation phase.
+pub(crate) fn compiled_observation_gate_for_world(
+    owner: &ObservationWorld,
+    dump: super::gc::BarrierWindow,
+) -> super::gc::CompiledObservationGate {
     if compiled_journal_mode() != CompiledJournalMode::Observed
         || !super::gc::has_collection_observations()
     {
         return super::gc::CompiledObservationGate::NONE;
     }
-    STATE.with(|state| {
+    owner.with_state(|state| {
         let mut state = state.borrow_mut();
         state.observed.refresh(dump);
         state.observed.gate()
@@ -680,7 +888,7 @@ pub(crate) fn exclude_unobserved_compiled_cons(bits: usize) -> bool {
         return false;
     }
     let dump = super::gc::current_collection_dump_window();
-    STATE.with(|state| {
+    with_state(|state| {
         let mut state = state.borrow_mut();
         let refreshed = state.observed.refresh(dump);
         let excluded = state.observed.exclude_unobserved(bits);
@@ -826,14 +1034,12 @@ pub fn capture_normalized<S, T>(
     let scope = CollectionReadScope::begin();
     normalize(state);
     if scope.active {
-        STATE.with(|state| {
+        scope.owner.with_state(|state| {
             let mut state = state.borrow_mut();
             let capture = state.captures.last_mut().expect("normalization scope");
-            let now = LispCollectionRevision::current();
+            let now = LispCollectionRevision::from_sequence(scope.owner.store().sequence());
             capture.started = now;
-            for revision in capture.reads.values_mut() {
-                *revision = now;
-            }
+            capture.reads.rebase(now);
         });
     }
     let value = read(state);
@@ -844,6 +1050,14 @@ pub fn capture_normalized<S, T>(
 #[path = "collection_reads/tests/collection_reads_test.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "collection_reads/tests/allocation_test.rs"]
+mod allocation_tests;
+
+#[cfg(test)]
+#[path = "collection_reads/tests/recent_clear_test.rs"]
+mod recent_clear_tests;
+
 /// Round 3w (plan-3w.md section 7, C1): this World state lives in a
 /// thread-local while its World's Baton holder runs, and in the World while
 /// it is parked; the Green runtime moves it at each park and resume, so
@@ -852,17 +1066,12 @@ mod tests;
 /// storage instead: a recorded obligation.)
 #[cold]
 pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
-    Box::new((false, State::default()))
+    store_state::carried_placeholder()
 }
 
 #[cold]
 pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
-    let slot = slot
-        .downcast_mut::<(bool, State)>()
-        .expect("carried World state");
-    ACTIVE.with(|active| slot.0 = active.replace(slot.0));
-    STATE.with(|state| std::mem::swap(&mut *state.borrow_mut(), &mut slot.1));
-    reset_recent_reads_for_heap_installation();
+    store_state::swap_carried(slot);
 }
 
 #[cfg(test)]

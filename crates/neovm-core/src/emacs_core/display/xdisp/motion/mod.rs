@@ -8,6 +8,7 @@ mod measurement;
 pub(crate) mod paging;
 pub(crate) mod pixels;
 mod policy;
+pub(crate) mod recenter;
 pub(crate) use policy::ScrollGoal;
 
 use crate::buffer::{AccessibleCharRange, BufferId, LispCharPos1};
@@ -393,6 +394,73 @@ fn motion_parameters(
     ))
 }
 
+/// Integer motion leaves an EOB overlay before returning a valid buffer point.
+/// Its physical distance is independent of the reachable-source-row view.
+/// GNU resets that distance only when the motion origin itself is ZV
+/// (`src/indent.c:2496-2525`), not whenever the current row happens to end there.
+fn integer_eob_overlay_motion(
+    snapshot: &WindowDisplaySnapshot,
+    request: MotionRequest,
+    end: LispCharPos1,
+    current: &DisplayRowSnapshot,
+    anchor_row: &DisplayRowSnapshot,
+) -> Option<RowMotion> {
+    use crate::window::EobOverlayMotionCoverage;
+
+    // A goal-column walk has a separate GNU traversal phase; this extent
+    // certifies the integer-LINES walk only.
+    if request.rows <= 0 || request.goal_column.is_some() || anchor_row.end_buffer_pos != Some(end)
+    {
+        return None;
+    }
+    let extent = match snapshot.eob_overlay_motion {
+        EobOverlayMotionCoverage::NotObserved => {
+            if !anchor_row.end_source.is_overlay_string() {
+                return None;
+            }
+            None
+        }
+        EobOverlayMotionCoverage::Incomplete { anchor } => {
+            if anchor != end && !anchor_row.end_source.is_overlay_string() {
+                return None;
+            }
+            None
+        }
+        EobOverlayMotionCoverage::Complete(extent) => {
+            if extent.anchor() == end {
+                Some(extent)
+            } else {
+                if !anchor_row.end_source.is_overlay_string() {
+                    return None;
+                }
+                None
+            }
+        }
+    };
+    if request.origin == end {
+        return Some(RowMotion::AccessibleBoundary(MeasuredMotion {
+            target: end,
+            moved: 0,
+        }));
+    }
+    let Some(extent) = extent else {
+        return Some(RowMotion::NeedsMoreRows);
+    };
+    let moved = anchor_row
+        .row
+        .checked_sub(current.row)
+        .filter(|distance| *distance >= 0)
+        .and_then(|distance| {
+            i64::try_from(extent.following_rows())
+                .ok()
+                .and_then(|tail| distance.checked_add(tail))
+        });
+    Some(match moved {
+        Some(moved) => RowMotion::AccessibleBoundary(MeasuredMotion { target: end, moved }),
+        None => RowMotion::NeedsMoreRows,
+    })
+}
+
 fn vertical_motion_on_rows(
     snapshot: &WindowDisplaySnapshot,
     request: MotionRequest,
@@ -401,7 +469,22 @@ fn vertical_motion_on_rows(
 ) -> RowMotion {
     use crate::window::DisplayRowEndSource;
 
-    let rows = snapshot_text_rows(snapshot);
+    let mut rows = snapshot_text_rows(snapshot);
+    // Further EOB overlay rows carry the same anchor, so they are not distinct
+    // source landings. Keep their physical distance in the producer's extent
+    // instead of trying to recover it from repeated or sourceless rows.
+    while rows.len() > 1 {
+        let last = rows[rows.len() - 1];
+        let previous = rows[rows.len() - 2];
+        if !last.end_source.is_overlay_string()
+            || !previous.end_source.is_overlay_string()
+            || last.end_buffer_pos != Some(accessible.end_lisp())
+            || previous.end_buffer_pos != Some(accessible.end_lisp())
+        {
+            break;
+        }
+        rows.pop();
+    }
     let Some(mut current_idx) =
         snapshot_row_index_for_pos_or_truncated_line(&rows, request.origin, accessible.end_lisp())
     else {
@@ -425,7 +508,18 @@ fn vertical_motion_on_rows(
     // remaining steps advance from that valid source position. Keep the
     // original physical index so traversed replacement rows remain counted.
     let current = rows[current_idx];
+    if let Some(motion) =
+        integer_eob_overlay_motion(snapshot, request, accessible.end_lisp(), current, current)
+    {
+        return motion;
+    }
     if request.rows > 0 && current.end_source.is_overlay_string() {
+        if current.end_buffer_pos == Some(accessible.end_lisp()) {
+            return RowMotion::AccessibleBoundary(MeasuredMotion {
+                target: accessible.end_lisp(),
+                moved: 0,
+            });
+        }
         let mut first_step = current_idx + 1;
         while first_step < rows.len() && rows[first_step].end_source.is_overlay_string() {
             first_step += 1;
@@ -494,6 +588,15 @@ fn vertical_motion_on_rows(
         if rows[last_idx].end_buffer_pos != Some(accessible.end_lisp()) {
             return RowMotion::NeedsMoreRows;
         }
+        if let Some(motion) = integer_eob_overlay_motion(
+            snapshot,
+            request,
+            accessible.end_lisp(),
+            current,
+            rows[last_idx],
+        ) {
+            return motion;
+        }
         return RowMotion::AccessibleBoundary(MeasuredMotion {
             target: accessible.end_lisp(),
             moved: last_idx as i64 - current_idx as i64,
@@ -501,10 +604,15 @@ fn vertical_motion_on_rows(
     }
     let mut target_idx = target_idx as usize;
     if request.rows > 0 {
-        while target_idx + 1 < rows.len() && rows[target_idx].end_source.is_overlay_string() {
+        while target_idx + 1 < rows.len()
+            && rows[target_idx].end_source.is_overlay_string()
+            && rows[target_idx].end_buffer_pos != Some(accessible.end_lisp())
+        {
             target_idx += 1;
         }
-        if rows[target_idx].end_source.is_overlay_string() {
+        if rows[target_idx].end_source.is_overlay_string()
+            && rows[target_idx].end_buffer_pos != Some(accessible.end_lisp())
+        {
             return RowMotion::NeedsMoreRows;
         }
     }

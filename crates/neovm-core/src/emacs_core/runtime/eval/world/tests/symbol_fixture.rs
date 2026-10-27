@@ -23,6 +23,108 @@ impl Context {
         kinds: &[crate::tagged::gc::PlainSymbolBacking],
         body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
+        Self::with_test_symbol_backings_init_era(kinds, |_, _| {}, body)
+    }
+
+    /// C4's real immutable `(lambda () N)` definitions are created and stored
+    /// by the sole serial setup owner. The matching value homes provide
+    /// rooted input operands through the already-qualified C3 read API.
+    pub(crate) fn with_test_symbol_functions_era<R>(
+        kind: crate::tagged::gc::PlainSymbolBacking,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+    ) -> R {
+        Self::with_test_symbol_functions_init_era(kind, |_, _| {}, body)
+    }
+
+    /// A fixture may change initial binding states while this setup still
+    /// exclusively owns the actual Obarray. The callback ends before the era.
+    pub(crate) fn with_test_symbol_functions_init_era<R>(
+        kind: crate::tagged::gc::PlainSymbolBacking,
+        init: impl FnOnce(&mut Obarray, &[SymId]),
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+    ) -> R {
+        Self::with_test_symbol_backings_init_era(
+            &[kind, kind],
+            |obarray, ids| {
+                let lambda = TaggedValue::from_sym_id(crate::emacs_core::intern::intern("lambda"));
+                for (&id, answer) in ids.iter().zip([73, 97]) {
+                    let body = TaggedValue::cons(TaggedValue::fixnum(answer), TaggedValue::NIL);
+                    let args = TaggedValue::cons(TaggedValue::NIL, body);
+                    let definition = TaggedValue::cons(lambda, args);
+                    obarray.seed_value_id(id, definition);
+                    obarray.set_symbol_function_id(id, definition);
+                }
+                init(obarray, ids);
+            },
+            body,
+        )
+    }
+
+    /// C5 fixture operands are created by the sole serial setup owner, then
+    /// copied from existing plain cells through the qualified rooted value API.
+    /// No string allocation, raw name word or mutable heap view enters the era.
+    pub(crate) fn with_test_symbol_name_inputs_era<R>(
+        kind: crate::tagged::gc::PlainSymbolBacking,
+        spelling: &str,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+    ) -> R {
+        Self::with_test_symbol_name_inputs_init_era(kind, spelling, |_, _| {}, body)
+    }
+
+    pub(crate) fn with_test_symbol_name_inputs_init_era<R>(
+        kind: crate::tagged::gc::PlainSymbolBacking,
+        spelling: &str,
+        init: impl FnOnce(&mut Obarray, &[SymId]),
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+    ) -> R {
+        use crate::tagged::gc::PlainSymbolBacking;
+        Self::with_test_symbol_backings_init_era(
+            &[
+                kind,
+                PlainSymbolBacking::Unprojected,
+                PlainSymbolBacking::Unprojected,
+            ],
+            |obarray, ids| {
+                obarray.seed_value_id(ids[1], TaggedValue::string(spelling));
+                obarray.seed_value_id(ids[2], TaggedValue::string(spelling));
+                init(obarray, ids);
+            },
+            body,
+        )
+    }
+
+    /// Native C5 histories: real, independently allocated name operands in
+    /// existing plain holders. Registry gaps are issued only AFTER those
+    /// World slots exist, so intern itself must grow the retained spine/sides.
+    pub(crate) fn with_test_symbol_intern_race_era<R>(
+        kind: crate::tagged::gc::PlainSymbolBacking,
+        spellings: &[String],
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+    ) -> R {
+        let mut kinds =
+            vec![crate::tagged::gc::PlainSymbolBacking::Unprojected; spellings.len() + 1];
+        kinds[0] = kind;
+        Self::with_test_symbol_backings_init_era(
+            &kinds,
+            |obarray, ids| {
+                for (&id, spelling) in ids[1..].iter().zip(spellings) {
+                    obarray.seed_value_id(id, TaggedValue::string(spelling));
+                }
+                let mut id = crate::emacs_core::intern::intern_uninterned("p3sym-c5-native-gap");
+                let target = (u64::from(id.0) / 4096 + 2) * 4096 + 17;
+                while u64::from(id.0) + 1 < target {
+                    id = crate::emacs_core::intern::intern_uninterned("p3sym-c5-native-gap");
+                }
+            },
+            body,
+        )
+    }
+
+    fn with_test_symbol_backings_init_era<R>(
+        kinds: &[crate::tagged::gc::PlainSymbolBacking],
+        init: impl FnOnce(&mut Obarray, &[SymId]),
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+    ) -> R {
         use crate::tagged::gc::{AliasableBox, ParallelHeapEra, TaggedHeap};
 
         let heap = AliasableBox::new(TaggedHeap::new());
@@ -40,6 +142,7 @@ impl Context {
                 id
             })
             .collect();
+        init(&mut obarray, &ids);
         let mut ready = WorldStorageBuilder {
             owned_roots: Default::default(),
             tagged_heap: heap,
@@ -94,6 +197,8 @@ impl Context {
         let frozen = FrozenLegacyRoots {
             heap: collector.heap_identity(),
             words: Vec::new(),
+            // No Context or legacy activation exists in this minimal World.
+            functions_quiescent: true,
         };
         let era = ParallelHeapEra::admit_rooted(collector, keeper, frozen)
             .unwrap_or_else(|e| panic!("minimal symbol fixture admission: {:?}", e.reason));

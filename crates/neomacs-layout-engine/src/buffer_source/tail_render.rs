@@ -1,6 +1,7 @@
 //! Buffer source post-loop tail rendering and install context.
 
 use crate::buffer_source::loop_context::BufferSourceLoopRequestContext;
+use crate::buffer_source::loop_state::BufferSourceRowCarryoverState;
 use crate::display_cursor::CursorCaptureState;
 use crate::display_row::face_state::DisplayRowActiveFaceState;
 use crate::display_row::geometry::{
@@ -8,15 +9,13 @@ use crate::display_row::geometry::{
 };
 use crate::display_row::overlay_string::BufferOverlayStringTextRowRenderContext;
 use crate::display_row::source_render::TextRowSourceRenderState;
-use crate::display_row::walk_state::{
-    DisplayRowSourceStart, FaceScanCheckpoint, LineNumberRenderState,
-};
-use crate::display_source_progress::DisplaySourceRowProgressState;
+use crate::display_row::walk_state::{DisplayRowSourceStart, FaceScanCheckpoint};
+use crate::display_source_progress::DisplaySourceVisualRowProgress;
 use crate::display_text_window_row_lifecycle::{
-    TextWindowBodyInstallRenderContext, TextWindowBodyInstallRequest,
+    OrdinaryEobRowAdmission, TextWindowBodyInstallRenderContext, TextWindowBodyInstallRequest,
     TextWindowCursorPublishStatus, TextWindowFinishRequest, TextWindowFinishState,
     TextWindowTailFinalizeContext, TextWindowTailFinalizeRequest, TextWindowTailFinalizeState,
-    TextWindowVisibilityRetryOutcome, TextWindowVisibilityRetryRequest,
+    TextWindowVisibilityRetryOutcome, TextWindowVisibilityRetryRequest, ordinary_eob_row_admission,
 };
 use crate::frame_face_arena::FrameFaceAttempt;
 use crate::neovm_bridge::{LayoutBufferView, ResolvedFace, RustBufferAccess};
@@ -219,23 +218,27 @@ impl<'a> BufferSourceTailRequestContext<'a> {
         text: &'request [u8],
         charpos: i64,
         point_is_visible_eob: bool,
+        preceding_zv_byte: crate::window_output::MiniPrecedingZvByte,
     ) -> TextWindowTailFinalizeRequest<'request> {
-        TextWindowTailFinalizeRequest::new(TextWindowTailFinalizeContext::new(
-            self.params,
-            text,
-            self.display_text_row_base,
-            self.text_area_left,
-            self.window_top,
-            self.text_y,
-            self.text_height,
-            self.char_width,
-            self.char_height,
-            self.window_start,
-            self.params.point_charpos().get(),
-            charpos,
-            point_is_visible_eob,
-            self.row_limit,
-        ))
+        TextWindowTailFinalizeRequest::new(
+            TextWindowTailFinalizeContext::new(
+                self.params,
+                text,
+                self.display_text_row_base,
+                self.text_area_left,
+                self.window_top,
+                self.text_y,
+                self.text_height,
+                self.char_width,
+                self.char_height,
+                self.window_start,
+                self.params.point_charpos().get(),
+                charpos,
+                point_is_visible_eob,
+                self.row_limit,
+            )
+            .with_preceding_zv_byte(preceding_zv_byte),
+        )
     }
 
     pub(crate) fn visibility_retry_request<'rows, 'buf, B>(
@@ -327,13 +330,14 @@ pub(crate) fn render_buffer_source_tail_and_decide_retry<
 >(
     loop_context: BufferSourceLoopRequestContext,
     mut source_render: TextRowSourceRenderState<'emit, FS>,
-    mut row_progress: DisplaySourceRowProgressState<'emit>,
+    mut row_progress: DisplaySourceVisualRowProgress<'emit>,
     row_geometry: &'emit mut DisplayRowGeometryState,
+    row_flags: &'emit mut DisplayRowFlags,
     cursor_info: &'emit mut CursorCaptureState,
     row_source_start: &'emit mut DisplayRowSourceStart,
     row_y_positions: &'rows mut DisplayRowYPositions,
     face_ids: &'emit mut FrameFaceAttempt,
-    line_numbers: &'emit mut LineNumberRenderState,
+    row_carryover: BufferSourceRowCarryoverState<'emit>,
     face_scan: &'emit mut FaceScanCheckpoint,
     overlay_context: BufferOverlayStringTextRowRenderContext<'surface>,
     tail_context: &BufferSourceTailRequestContext<'_>,
@@ -348,14 +352,23 @@ pub(crate) fn render_buffer_source_tail_and_decide_retry<
 where
     'surface: 'request,
 {
-    if source_stop
-        == crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome::QueryTargetReached
-    {
-        // GNU move_it_to stops at the stable target iterator. Complete the
-        // observed row's metrics, without EOB anchors or after-strings at the
-        // unconsumed position. The final row remains a certified prefix.
+    use crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome;
+    use crate::window_output::MiniPrecedingZvByte;
+    let finalize_prefix = match source_stop {
+        BufferSourceVisibleLoopOutcome::QueryTargetReached
+        | BufferSourceVisibleLoopOutcome::EarlyBoundaryReached => true,
+        BufferSourceVisibleLoopOutcome::Complete
+        | BufferSourceVisibleLoopOutcome::MiniSourcePositionReached
+        | BufferSourceVisibleLoopOutcome::SyncHorizonExhausted
+        | BufferSourceVisibleLoopOutcome::QueryHorizonExhausted
+        | BufferSourceVisibleLoopOutcome::SyncStateInvalid => false,
+    };
+    if finalize_prefix {
+        // Query completion and a selected edit frontier both stop before
+        // unconsumed source. Publish the captured cursor and canonically
+        // discard an empty begun row, without EOB anchors or after-strings.
         let finalized = tail_context
-            .tail_finalize_request(text, charpos, false)
+            .tail_finalize_request(text, charpos, false, MiniPrecedingZvByte::Unknown)
             .finalize_and_apply(TextWindowTailFinalizeState::new(
                 cursor_info,
                 row_geometry,
@@ -387,26 +400,62 @@ where
     let tail_progress = loop_context
         .end_of_buffer_tail_request(byte_idx, charpos, overlay_context, active_face_state)
         .with_overlay_policy(match source_stop {
-            crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome::MiniSourcePositionReached =>
+            BufferSourceVisibleLoopOutcome::MiniSourcePositionReached =>
                 crate::buffer_source::row_lifecycle::BufferSourceEobOverlayPolicy::SourcePositionReached,
-            _ => crate::buffer_source::row_lifecycle::BufferSourceEobOverlayPolicy::Render,
+            BufferSourceVisibleLoopOutcome::Complete
+            | BufferSourceVisibleLoopOutcome::QueryTargetReached
+            | BufferSourceVisibleLoopOutcome::EarlyBoundaryReached
+            | BufferSourceVisibleLoopOutcome::SyncHorizonExhausted
+            | BufferSourceVisibleLoopOutcome::QueryHorizonExhausted
+            | BufferSourceVisibleLoopOutcome::SyncStateInvalid =>
+                crate::buffer_source::row_lifecycle::BufferSourceEobOverlayPolicy::Render,
         })
         .render_and_apply(
             buffer,
             source_render.reborrow(),
             row_progress.reborrow(),
             row_geometry,
+            row_flags,
             cursor_info,
             row_source_start,
             row_y_positions,
             face_ids,
-            line_numbers,
+            row_carryover,
             face_scan,
         );
     let point_is_visible_eob = tail_progress.point_is_visible_eob();
+    // Observe one byte only after the whole source/string tail completes.
+    // A prefix or bounded stop cannot authorize GNU's exhausted-string exit.
+    // The borrowed view can read just before an empty narrowed BEGV==ZV;
+    // no text clone or live Lisp query is needed.
+    let preceding_zv_byte = match tail_progress.progress {
+        crate::buffer_source::row_lifecycle::BufferSourceEobTailProgress::Complete => {
+            if tail_context.params.is_minibuffer() && !tail_context.params.window_system {
+                // Rust EmacsBytePos is zero-based; GNU ZV_BYTE is one-based.
+                // GNU ZV_BYTE <= 1 is therefore Rust zv == 0, and GNU's
+                // FETCH_BYTE(ZV_BYTE - 1) is the byte at Rust zv - 1.
+                let zv = buf_access.view().layout_point_max_emacs_byte_pos();
+                if zv == neovm_core::buffer::EmacsBytePos::ZERO {
+                    MiniPrecedingZvByte::AtBufferStart
+                } else {
+                    buf_access
+                        .byte_at_emacs_pos(
+                            zv.saturating_sub_len(neovm_core::buffer::EmacsByteLen::new(1)),
+                        )
+                        .map_or(MiniPrecedingZvByte::Unknown, MiniPrecedingZvByte::from)
+                }
+            } else {
+                MiniPrecedingZvByte::Unknown
+            }
+        }
+        crate::buffer_source::row_lifecycle::BufferSourceEobTailProgress::SourceRowsExhausted
+        | crate::buffer_source::row_lifecycle::BufferSourceEobTailProgress::OverlayRowsExhausted => {
+            MiniPrecedingZvByte::Unknown
+        }
+    };
 
     let finalized = tail_context
-        .tail_finalize_request(text, charpos, point_is_visible_eob)
+        .tail_finalize_request(text, charpos, point_is_visible_eob, preceding_zv_byte)
         .finalize_and_apply(TextWindowTailFinalizeState::new(
             cursor_info,
             row_geometry,
@@ -460,6 +509,51 @@ where
         BufferSourceEobCursorRow::Unchanged
     };
 
+    // A consumed trailing newline can reach ZV without beginning its empty
+    // insertion row inside this viewport. Keep source progress separate from
+    // an actual enabled cursor-owning row, also when this nonselected window
+    // has no physical cursor style. Other source/partial-row policies stay in
+    // their existing paths above.
+    let ordinary_eob_row_admission = if point_is_visible_eob
+        && !tail_context.params.is_minibuffer()
+        && !tail_context.params.window_system
+        && !tail_context.params.force_start
+        && tail_context.retry_bounds.text_area_bottom() > tail_context.retry_bounds.text_area_top()
+        && !cursor_info.eob_row_candidates().any(|(_, kind)| {
+            kind == crate::display_cursor::EobCursorCandidateKind::ExplicitStringProperty
+        })
+        && source_render
+            .output_rows()
+            .iter()
+            .all(|row| row.end_source == neovm_core::window::DisplayRowEndSource::Buffer)
+    {
+        let point = crate::coords::layout_i64_char_pos_to_lisp_char_pos(
+            tail_context.params.point_charpos().get(),
+        );
+        let candidate_row = cursor_info
+            .eob_row_candidates()
+            .find_map(|(offset, _)| tail_context.display_text_row_base.checked_add(offset));
+        source_render
+            .output_render()
+            .with_output_target_parts(|mut output, emitter, _| {
+                let insertion = emitter.point_for_lisp_buffer_pos(point);
+                candidate_row
+                    .and_then(|index| {
+                        output.builder().current_window_row(index).map(|row| {
+                            ordinary_eob_row_admission(
+                                neovm_core::window::MatrixRow0::new(index),
+                                row,
+                                insertion,
+                                tail_context.retry_bounds,
+                            )
+                        })
+                    })
+                    .unwrap_or(OrdinaryEobRowAdmission::Unavailable)
+            })
+    } else {
+        OrdinaryEobRowAdmission::ExistingPolicy
+    };
+
     // GNU redisplay keeps iterating until point visibility converges or no
     // further progress can be made. Advance by actual rendered row spans
     // from this pass, since wrapped and variable-height lines are exactly
@@ -471,6 +565,7 @@ where
             point_is_visible_eob,
             buf_access,
         )
+        .with_ordinary_eob_row_admission(ordinary_eob_row_admission)
         .decide();
     BufferSourcePostLoopRenderOutcome {
         retry,

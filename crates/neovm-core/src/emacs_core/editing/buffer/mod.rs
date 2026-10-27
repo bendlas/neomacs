@@ -555,6 +555,25 @@ fn run_kill_buffer_hooks(
     Ok(KillBufferHooks::Proceed)
 }
 
+/// GNU `other_buffer_safely` (buffer.c:1802): the first live, non-hidden
+/// buffer other than `avoid_id`, ignoring frame-local buffer lists, window
+/// visibility and frame predicates.  Only when no other live buffer exists
+/// does it fall back to `*scratch*`, matching GNU's
+/// `get-scratch-buffer-create` fallback.
+fn other_buffer_safely_in_state(
+    buffers: &mut crate::buffer::BufferManager,
+    avoid_id: Option<crate::buffer::BufferId>,
+) -> crate::buffer::BufferId {
+    for id in buffers.buffer_list() {
+        if Some(id) != avoid_id && !is_hidden_buffer(buffers, id) {
+            return id;
+        }
+    }
+    buffers
+        .find_buffer_by_name("*scratch*")
+        .unwrap_or_else(|| buffers.create_buffer("*scratch*"))
+}
+
 pub(crate) fn builtin_kill_buffer(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_max_args("kill-buffer", &args, 1)?;
     let id = match args.first() {
@@ -725,14 +744,28 @@ pub(crate) fn builtin_kill_buffer(eval: &mut super::eval::Context, args: Vec<Val
         eval.owner_buffers_killed(&killed_ids);
     }
 
-    // Ensure dead-buffer windows continue to point at a live fallback buffer.
-    let scratch = if let Some(scratch) = eval.buffers.find_buffer_by_name("*scratch*") {
-        scratch
-    } else {
-        eval.buffers.create_buffer("*scratch*")
-    };
+    // GNU `replace_buffer_in_windows_safely` (window.c:3742) repairs only
+    // windows that still show the dead buffer after the Lisp
+    // `replace-buffer-in-windows` pass above.  Do not materialize a fallback
+    // buffer just because a buffer died: killing an unshown temporary buffer
+    // must not create `*scratch*` (it would reappear in `list-buffers`).
+    let mut dead_window_fallback = None;
     for killed_id in &killed_ids {
-        eval.frames.replace_buffer_in_windows(*killed_id, scratch);
+        if eval.frames.window_count_showing_buffer(*killed_id) == 0 {
+            continue;
+        }
+        let fallback = match dead_window_fallback {
+            Some(fallback) => fallback,
+            None => {
+                // GNU picks `other_buffer_safely` per repaired window; with
+                // no hooks run by the raw binding replacement, one safe
+                // fallback serves every such window.
+                let fallback = other_buffer_safely_in_state(&mut eval.buffers, Some(*killed_id));
+                dead_window_fallback = Some(fallback);
+                fallback
+            }
+        };
+        eval.frames.replace_buffer_in_windows(*killed_id, fallback);
     }
 
     // Discard killed buffers from every frame's buffer list and buried
@@ -756,6 +789,12 @@ pub(crate) fn builtin_kill_buffer(eval: &mut super::eval::Context, args: Vec<Val
             if let Some(next) = eval.buffers.buffer_list().into_iter().next() {
                 eval.set_current_buffer_unrecorded(next)?;
             } else {
+                // No live buffer remains: GNU's `Fother_buffer` falls back to
+                // `get-scratch-buffer-create`.
+                let scratch = eval
+                    .buffers
+                    .find_buffer_by_name("*scratch*")
+                    .unwrap_or_else(|| eval.buffers.create_buffer("*scratch*"));
                 eval.set_current_buffer_unrecorded(scratch)?;
             }
         }
@@ -1318,7 +1357,8 @@ fn compare_buffer_substring_strings(
         match (lp < left_bytes.len(), rp < right_bytes.len()) {
             (true, true) => {
                 let (a_code, a_len) = if left.is_multibyte() {
-                    crate::emacs_core::emacs_char::string_char(&left_bytes[lp..])
+                    let (c, n) = crate::emacs_core::emacs_char::string_char(&left_bytes[lp..]);
+                    (c.code(), n)
                 } else {
                     (
                         crate::emacs_core::emacs_char::unibyte_to_char(left_bytes[lp]),
@@ -1326,7 +1366,8 @@ fn compare_buffer_substring_strings(
                     )
                 };
                 let (b_code, b_len) = if right.is_multibyte() {
-                    crate::emacs_core::emacs_char::string_char(&right_bytes[rp..])
+                    let (c, n) = crate::emacs_core::emacs_char::string_char(&right_bytes[rp..]);
+                    (c.code(), n)
                 } else {
                     (
                         crate::emacs_core::emacs_char::unibyte_to_char(right_bytes[rp]),
@@ -1717,7 +1758,7 @@ fn decode_chars_with_byte_offsets(bytes: &[u8]) -> Vec<(u32, usize)> {
     let mut pos = 0usize;
     while pos < bytes.len() {
         let (code, len) = crate::emacs_core::emacs_char::string_char(&bytes[pos..]);
-        out.push((code, pos));
+        out.push((code.code(), pos));
         pos += len.max(1);
     }
     out.push((0, bytes.len()));

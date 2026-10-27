@@ -708,6 +708,7 @@ fn preparing_accepted_presentation_commits_live_window_output() {
                     row: 1,
                     y: 29,
                     height: 16,
+                    extra_line_spacing: 0,
                     start_x: 0,
                     start_col: 0,
                     end_x: 44,
@@ -2709,6 +2710,8 @@ fn frame_resize_pixelwise_updates_window_tree_and_invalidates_display_state() {
             3,
         );
 
+    // GNU resize_frame_windows uses one current FRAME_LINE_HEIGHT for the
+    // ordinary minibuffer on a vertical resize, not its old 16px allocation.
     frame.resize_pixelwise(400, 260);
 
     assert_eq!(frame.width, 400);
@@ -2726,18 +2729,18 @@ fn frame_resize_pixelwise_updates_window_tree_and_invalidates_display_state() {
     assert_eq!(frame.parameter("height"), Some(Value::fixnum(13)));
 
     let root_bounds = *frame.root_window().bounds();
-    assert_eq!(root_bounds, Rect::new(0.0, 0.0, 400.0, 244.0));
+    assert_eq!(root_bounds, Rect::new(0.0, 0.0, 400.0, 240.0));
 
     let mini_bounds = *frame.minibuffer_leaf.as_ref().unwrap().bounds();
-    assert_eq!(mini_bounds, Rect::new(0.0, 244.0, 400.0, 16.0));
+    assert_eq!(mini_bounds, Rect::new(0.0, 240.0, 400.0, 20.0));
 
     assert_eq!(
         frame.find_window(w1).unwrap().bounds(),
-        &Rect::new(0.0, 0.0, 200.0, 244.0)
+        &Rect::new(0.0, 0.0, 200.0, 240.0)
     );
     assert_eq!(
         frame.find_window(w2).unwrap().bounds(),
-        &Rect::new(200.0, 0.0, 200.0, 244.0)
+        &Rect::new(200.0, 0.0, 200.0, 240.0)
     );
     assert_eq!(
         frame.find_window(w1).unwrap().window_end_valid(),
@@ -2771,6 +2774,79 @@ fn resize_pixelwise_minibuffer_only_does_not_add_minibuffer_line() {
     assert_eq!(
         frame.parameter("neovm--frame-text-lines"),
         Some(Value::fixnum(4))
+    );
+}
+
+fn expanded_mini_frame_for_resize_control() -> FrameManager {
+    let mut frames = FrameManager::new();
+    let fid = frames.create_frame("expanded-mini-resize", 80, 29, BufferId(1));
+    let frame = frames.get_mut(fid).expect("frame");
+    frame.char_width = 1.0;
+    frame.char_height = 1.0;
+    frame.shrink_mini_window();
+    frame.grow_mini_window_with_max_lines(10, 20.0);
+    assert_eq!(
+        frame
+            .minibuffer_leaf
+            .as_ref()
+            .expect("mini")
+            .bounds()
+            .height,
+        11.0
+    );
+    frames
+}
+
+#[test]
+fn width_only_frame_resize_preserves_expanded_minibuffer_height() {
+    let mut frames = expanded_mini_frame_for_resize_control();
+    let frame = frames.selected_frame_mut().expect("frame");
+    frame.resize_pixelwise(100, 29);
+    assert_eq!(
+        frame
+            .minibuffer_leaf
+            .as_ref()
+            .expect("mini")
+            .bounds()
+            .height,
+        11.0
+    );
+    assert_eq!(
+        frame.minibuffer_leaf.as_ref().expect("mini").bounds().width,
+        100.0
+    );
+}
+
+#[test]
+fn same_size_frame_refresh_preserves_expanded_minibuffer_height() {
+    let mut frames = expanded_mini_frame_for_resize_control();
+    let frame = frames.selected_frame_mut().expect("frame");
+    frame.resize_pixelwise(80, 29);
+    assert_eq!(
+        frame
+            .minibuffer_leaf
+            .as_ref()
+            .expect("mini")
+            .bounds()
+            .height,
+        11.0
+    );
+}
+
+#[test]
+fn font_geometry_refresh_preserves_expanded_minibuffer_pixel_allocation() {
+    let mut frames = expanded_mini_frame_for_resize_control();
+    let frame = frames.selected_frame_mut().expect("frame");
+    frame.char_width = 2.0;
+    frame.refresh_geometry_for_changed_font(&crate::buffer::BufferManager::new());
+    assert_eq!(
+        frame
+            .minibuffer_leaf
+            .as_ref()
+            .expect("mini")
+            .bounds()
+            .height,
+        11.0
     );
 }
 
@@ -2906,15 +2982,17 @@ fn frame_resize_pixelwise_preserves_flexible_window_proportions() {
         .unwrap();
 
     let frame = mgr.get_mut(fid).unwrap();
+    // GNU resize_frame_windows uses one current FRAME_LINE_HEIGHT for the
+    // ordinary minibuffer on a vertical resize, not its old 16px allocation.
     frame.resize_pixelwise(800, 260);
 
     assert_eq!(
         frame.find_window(side).unwrap().bounds(),
-        &Rect::new(0.0, 0.0, 200.0, 244.0)
+        &Rect::new(0.0, 0.0, 200.0, 240.0)
     );
     assert_eq!(
         frame.find_window(main).unwrap().bounds(),
-        &Rect::new(200.0, 0.0, 600.0, 244.0)
+        &Rect::new(200.0, 0.0, 600.0, 240.0)
     );
 }
 
@@ -2950,6 +3028,7 @@ fn completed_redisplay_syncs_live_window_cursor_state() {
             row: 1,
             y: 29,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: output_cursor.x,
@@ -2991,6 +3070,7 @@ fn completed_redisplay_replaces_old_output_cursor_progress() {
             row: 1,
             y: 29,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 44,
@@ -3011,6 +3091,7 @@ fn completed_redisplay_replaces_old_output_cursor_progress() {
             row: 3,
             y: 61,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 88,
@@ -3069,6 +3150,7 @@ fn cache_only_fixture_preserves_live_window_cursor_state() {
             row: 1,
             y: 29,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: output_cursor.x,
@@ -3132,6 +3214,7 @@ fn no_op_set_window_vscroll_preserves_display_snapshot() {
                 row: 0,
                 y: 0,
                 height: 33,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 96,
@@ -3181,6 +3264,7 @@ fn completed_redisplay_preserves_logical_cursor_without_physical_cursor() {
             row: 1,
             y: 16,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 64,
@@ -3271,6 +3355,7 @@ fn clear_physical_cursor_state_preserves_committed_cursor_history() {
             row: 2,
             y: 21,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 9,
@@ -3439,6 +3524,7 @@ fn output_pass_commits_output_cursor_from_row_geometry() {
             row: 2,
             y: 32,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 80,
@@ -3589,6 +3675,7 @@ fn explicit_window_output_finalization_preserves_live_logical_and_physical_curso
             row: 4,
             y: 64,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 144,
@@ -3655,6 +3742,7 @@ fn finish_window_output_update_preserves_live_cursor_state_with_snapshot_output_
             row: 4,
             y: 64,
             height: 16,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 144,
@@ -3715,6 +3803,7 @@ fn output_pass_keeps_cursor_target_and_output_progress_separate() {
                 row: 0,
                 y: 0,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 64,
@@ -3729,6 +3818,7 @@ fn output_pass_keeps_cursor_target_and_output_progress_separate() {
                 row: 1,
                 y: 16,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 72,
@@ -3743,6 +3833,7 @@ fn output_pass_keeps_cursor_target_and_output_progress_separate() {
                 row: 2,
                 y: 32,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 80,
@@ -3843,16 +3934,18 @@ fn frame_resize_pixelwise_reserves_tab_bar_height_above_root_window_tree() {
     frame.set_parameter(Value::symbol("tab-bar-lines"), Value::fixnum(1));
 
     frame.sync_tab_bar_height_from_parameters();
+    // GNU resize_frame_windows uses one current FRAME_LINE_HEIGHT for the
+    // ordinary minibuffer on a vertical resize, not its old 16px allocation.
     frame.resize_pixelwise(400, 260);
 
     assert_eq!(frame.tab_bar_height, 20);
     assert_eq!(
         *frame.root_window().bounds(),
-        Rect::new(0.0, 20.0, 400.0, 224.0)
+        Rect::new(0.0, 20.0, 400.0, 220.0)
     );
     assert_eq!(
         *frame.minibuffer_leaf.as_ref().unwrap().bounds(),
-        Rect::new(0.0, 244.0, 400.0, 16.0)
+        Rect::new(0.0, 240.0, 400.0, 20.0)
     );
     assert_eq!(frame.parameter("height"), Some(Value::fixnum(12)));
 }
@@ -4334,6 +4427,7 @@ fn positions_in_a_truncated_tail_resolve_to_the_truncation_marker() {
         row,
         y,
         height: 1,
+        extra_line_spacing: 0,
         start_x: 0,
         start_col: 0,
         end_x: end_col,
@@ -4424,6 +4518,7 @@ fn positions_left_of_a_rows_first_glyph_are_hidden_by_hscroll() {
             row: 10,
             y: 10,
             height: 1,
+            extra_line_spacing: 0,
             start_x: 0,
             start_col: 0,
             end_x: 30,

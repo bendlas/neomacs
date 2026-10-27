@@ -18,7 +18,7 @@ fn ascii_roundtrip_all_128() {
         assert_eq!(n, 1);
         assert_eq!(buf[0], byte);
         let (decoded, len) = string_char(&buf[..n]);
-        assert_eq!(decoded, c);
+        assert_eq!(decoded.code(), c);
         assert_eq!(len, 1);
     }
 }
@@ -38,7 +38,7 @@ fn two_byte_unicode_roundtrip() {
     assert_eq!(buf[0], 0xC3);
     assert_eq!(buf[1], 0xA9);
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 2);
 }
 
@@ -58,7 +58,7 @@ fn three_byte_unicode_roundtrip() {
     assert_eq!(buf[1], 0x80);
     assert_eq!(buf[2], 0x98);
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 3);
 }
 
@@ -79,7 +79,7 @@ fn four_byte_unicode_roundtrip() {
     assert_eq!(buf[2], 0x8D);
     assert_eq!(buf[3], 0x84);
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 4);
 }
 
@@ -104,7 +104,7 @@ fn raw_byte_0x80_roundtrip() {
     assert_eq!(buf[1], 0x80);
 
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 2);
 }
 
@@ -129,7 +129,7 @@ fn raw_byte_0xff_roundtrip() {
     assert_eq!(buf[1], 0xBF);
 
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 2);
 }
 
@@ -147,7 +147,12 @@ fn raw_byte_all_roundtrip() {
         let n = char_string(c, &mut buf);
         assert_eq!(n, 2);
         let (decoded, len) = string_char(&buf[..n]);
-        assert_eq!(decoded, c, "roundtrip failed for byte 0x{:02X}", byte);
+        assert_eq!(
+            decoded.code(),
+            c,
+            "roundtrip failed for byte 0x{:02X}",
+            byte
+        );
         assert_eq!(len, 2);
     }
 }
@@ -172,6 +177,56 @@ fn unchecked_decoder_matches_checked_decoder_for_valid_internal_bytes() {
             string_char(&buf[..len]),
             "fast decoder mismatch for U+{code:X}"
         );
+    }
+}
+
+#[test]
+fn checked_decoder_keeps_an_out_of_range_five_byte_tail_in_the_character_domain() {
+    // F8 B8 96 B8 96 carries a 24-bit payload (0xE16E16).  GNU's five-byte
+    // form encodes only MAX_4_BYTE_CHAR..=MAX_5_BYTE_CHAR; a larger payload
+    // is not a character, and letting it out of the checked decoder reaches
+    // `EmacsChar::from_code_unchecked`'s assertion (regex fuzz artifact
+    // bfc34a9633d9bd0a2879e0552f0871a9eccf47d1).  Fall back to the lead
+    // byte, as `decode_declared_multibyte_char` already does.
+    let bytes = [0xF8, 0xB8, 0x96, 0xB8, 0x96];
+    let (code, len) = string_char(&bytes);
+    assert_eq!((code.code(), len), (byte8_to_char(0xF8), 1));
+}
+
+#[test]
+fn checked_decoder_bounds_five_byte_tails_at_the_character_domain() {
+    // `string_char` decodes like GNU, so it deliberately does not reject
+    // overlong tails (`multibyte_length` is the validity check): F8 80 80 80
+    // 80 decodes as code 0.  It only keeps the payload representable, so a
+    // tail above MAX_CHAR becomes its lead byte.
+    for code in [
+        0x00_0000,
+        MAX_4_BYTE_CHAR,
+        MAX_5_BYTE_CHAR,
+        MAX_5_BYTE_CHAR + 1,
+        MAX_CHAR,
+        MAX_CHAR + 1,
+        0xFF_FFFF,
+    ] {
+        let bytes = [
+            0xF8,
+            0x80 | ((code >> 18) & 0x3F) as u8,
+            0x80 | ((code >> 12) & 0x3F) as u8,
+            0x80 | ((code >> 6) & 0x3F) as u8,
+            0x80 | (code & 0x3F) as u8,
+        ];
+        // `decoded` is an `EmacsChar`, so the domain bound needs no assertion:
+        // the type now carries what this test used to check.
+        let (decoded, len) = string_char(&bytes);
+        if code <= MAX_CHAR {
+            assert_eq!((decoded.code(), len), (code, 5), "U+{code:X}");
+        } else {
+            assert_eq!(
+                (decoded.code(), len),
+                (byte8_to_char(0xF8), 1),
+                "U+{code:X}"
+            );
+        }
     }
 }
 
@@ -346,7 +401,7 @@ fn five_byte_char_roundtrip() {
     assert_eq!(n, 5);
     assert_eq!(buf[0], 0xF8);
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 5);
 }
 
@@ -358,7 +413,7 @@ fn five_byte_max_roundtrip() {
     let n = char_string(c, &mut buf);
     assert_eq!(n, 5);
     let (decoded, len) = string_char(&buf[..n]);
-    assert_eq!(decoded, c);
+    assert_eq!(decoded.code(), c);
     assert_eq!(len, 5);
 }
 
@@ -562,10 +617,13 @@ fn string_char_advance_walks_through() {
     }
 
     let mut pos = 0;
-    assert_eq!(string_char_advance(&buf, &mut pos), b'A' as u32);
-    assert_eq!(string_char_advance(&buf, &mut pos), 0x4E2D);
-    assert_eq!(string_char_advance(&buf, &mut pos), byte8_to_char(0xFF));
-    assert_eq!(string_char_advance(&buf, &mut pos), b'B' as u32);
+    assert_eq!(string_char_advance(&buf, &mut pos).code(), b'A' as u32);
+    assert_eq!(string_char_advance(&buf, &mut pos).code(), 0x4E2D);
+    assert_eq!(
+        string_char_advance(&buf, &mut pos).code(),
+        byte8_to_char(0xFF)
+    );
+    assert_eq!(string_char_advance(&buf, &mut pos).code(), b'B' as u32);
     assert_eq!(pos, buf.len());
 }
 
@@ -840,7 +898,7 @@ fn emacs_char_range_and_unibyte_promotion() {
         let bytes = ec.to_emacs_bytes();
         let (decoded, len) = string_char(&bytes);
         assert_eq!(len, bytes.len());
-        assert_eq!(decoded, code, "round-trip {code:#x}");
+        assert_eq!(decoded.code(), code, "round-trip {code:#x}");
     }
 }
 

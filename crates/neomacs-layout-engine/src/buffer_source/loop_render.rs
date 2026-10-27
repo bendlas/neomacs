@@ -26,6 +26,10 @@ pub(crate) enum BufferSourceVisibleLoopOutcome {
     QueryHorizonExhausted,
     /// A stable ordinary buffer glyph answered the query inside its row.
     QueryTargetReached,
+    /// The live source proof selected the matching earlier retained frontier.
+    EarlyBoundaryReached,
+    /// An inconsistent selected/builder frontier requires ordinary replay fallback.
+    SyncStateInvalid,
 }
 
 impl<'rows, 'emit, 'surface, FS: crate::neovm_bridge::FaceServices>
@@ -142,6 +146,16 @@ impl<'rows, 'emit, 'surface, FS: crate::neovm_bridge::FaceServices>
             ) {
                 break;
             }
+        }
+
+        match self.source_render.output_emitter().restart_sync_state() {
+            crate::window_output::RestartSyncState::Selected => {
+                return BufferSourceVisibleLoopOutcome::EarlyBoundaryReached;
+            }
+            crate::window_output::RestartSyncState::Invalid => {
+                return BufferSourceVisibleLoopOutcome::SyncStateInvalid;
+            }
+            crate::window_output::RestartSyncState::Continuing => {}
         }
 
         // Completion wins over an acquisition boundary even when the target
@@ -313,6 +327,9 @@ impl<'rows, 'emit, 'surface, FS: crate::neovm_bridge::FaceServices>
                 self.row_build.row_geometry,
             );
         }
+        // Prefixes decorate the row but do not count as source progress when
+        // a pushed string retries an oversized element on a fresh row.
+        self.progress.record_row_text_start();
         if wrap_prefix {
             self.progress
                 .record_wrap_prefix_width((prefix_end_x - prefix_start_x).max(0.0));

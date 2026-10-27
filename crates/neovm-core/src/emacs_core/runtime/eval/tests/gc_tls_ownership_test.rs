@@ -1,6 +1,88 @@
 use super::*;
 
 #[test]
+fn storefast_world_certificate_survives_another_worlds_journal_wrap() {
+    use crate::tagged::collection_reads::capture;
+
+    let mut first = Context::new();
+    let source = Value::cons(Value::NIL, Value::NIL);
+    first.set_variable("storefast-source", source);
+    let (_, certificate) = capture(|| source.cons_car());
+    let certificate = certificate.expect("a stable source can be certified");
+
+    let mut second = Context::new();
+    assert!(
+        certificate.unchanged(),
+        "validation uses its originating World's sequence space"
+    );
+    let unrelated = Value::cons(Value::NIL, Value::NIL);
+    second.set_variable("storefast-unrelated", unrelated);
+    // Exceed one complete journal: identities alone cannot hide accidental
+    // sharing of the revision/ring between these independent Worlds.
+    for _ in 0..8193 {
+        unrelated.set_car(Value::T);
+    }
+
+    first.setup_thread_locals();
+    assert!(
+        certificate.unchanged(),
+        "another World's writes must not consume this World's journal"
+    );
+    source.set_cdr(Value::T);
+    assert!(
+        !certificate.unchanged(),
+        "the owner's write still invalidates"
+    );
+}
+
+#[test]
+fn storefast_world_capture_rejects_a_local_world_switch_without_stranding_its_guard() {
+    use crate::tagged::collection_reads::capture;
+
+    let mut first = Context::new();
+    let source = Value::cons(Value::NIL, Value::NIL);
+    first.set_variable("storefast-source", source);
+    let (_, certificate) = capture(|| {
+        source.cons_car();
+        let mut second = Context::new();
+        let second_source = Value::cons(Value::NIL, Value::NIL);
+        let (_, local) = capture(|| second_source.cons_car());
+        assert!(local.unwrap().unchanged());
+        second.gc_collect_exact();
+    });
+    assert!(certificate.is_none());
+    first.setup_thread_locals();
+    let (_, certificate) = capture(|| source.cons_car());
+    assert!(certificate.unwrap().unchanged());
+}
+
+#[test]
+fn storefast_world_capture_rejects_foreign_reads_after_return_to_its_owner() {
+    use crate::tagged::collection_reads::capture;
+
+    let mut first = Context::new();
+    let first_source = Value::cons(Value::NIL, Value::NIL);
+    first.set_variable("storefast-source", first_source);
+    let mut second = Context::new();
+    let second_source = Value::cons(Value::NIL, Value::NIL);
+    second.set_variable("storefast-source", second_source);
+
+    first.setup_thread_locals();
+    let (_, certificate) = capture(|| {
+        first_source.cons_car();
+        second.setup_thread_locals();
+        second_source.cons_car();
+        first.setup_thread_locals();
+    });
+    assert!(
+        certificate.is_none(),
+        "a World-local certificate must not omit foreign dependency reads"
+    );
+    let (_, local) = capture(|| first_source.cons_car());
+    assert!(local.unwrap().unchanged());
+}
+
+#[test]
 fn gc_tls_ownership_exact_collection_uses_the_collecting_heap() {
     let mut first = Context::new();
     let mut second = Context::new();

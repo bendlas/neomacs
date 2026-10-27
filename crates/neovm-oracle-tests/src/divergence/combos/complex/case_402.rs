@@ -42,7 +42,7 @@ fn div_cx402_process_buffer_output() {
                             :connection-type 'pipe :buffer buf)))
     (set-process-sentinel proc #'ignore)
     (set-process-query-on-exit-flag proc nil)
-    (accept-process-output proc 2)
+    (neovm--oracle-settle-process proc 600)
     (delete-process proc))
   (prog1 (with-current-buffer buf
            (string-trim-right (buffer-string) "\n"))
@@ -352,13 +352,14 @@ fn div_cx402_font_spec_match() {
 fn div_cx402_format_prompt_default() {
     return_if_neovm_enable_oracle_proptest_not_set!();
     let expect = expect_test::expect![[
-        r#""OK (\"Enter name: \" \"Enter name (default default): \" \"Select file (default /tmp/foo): \")""#
+        r#""OK (\"Enter name: \" \"Enter name (default default): \" \"Select file (default [SESSION-TMPDIR]/foo): \")""#
     ]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (list (format-prompt "Enter name" nil)
       (format-prompt "Enter name" "default")
-      (format-prompt "Select file" "/tmp/foo"))
+      (format-prompt "Select file"
+                     (expand-file-name "foo" temporary-file-directory)))
 "##,
         expect,
     );

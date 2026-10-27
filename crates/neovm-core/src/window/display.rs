@@ -236,15 +236,18 @@ fn frame_default_right_fringe_width(frame: &Frame) -> i32 {
 }
 
 fn frame_vertical_scroll_bar_side(frame: &Frame) -> Option<Value> {
+    // GNU gates the scroll-bar type on FRAME_WINDOW_P /
+    // FRAME_HAS_VERTICAL_SCROLL_BARS (src/window.c), so a terminal frame has
+    // no scroll bar no matter what its parameter alist says:
+    // `set-frame-parameter' on a tty is a no-op and every query stays zero.
+    // Trusting the stored parameter here reserved a column the TTY backend
+    // never paints and shrank window-body-width 80 -> 79.
+    if frame.effective_window_system().is_none() {
+        return None;
+    }
     let raw = frame
         .known_parameter(FrameParam::VerticalScrollBars)
-        .unwrap_or_else(|| {
-            if frame.effective_window_system().is_some() {
-                Value::symbol("right")
-            } else {
-                Value::NIL
-            }
-        });
+        .unwrap_or_else(|| Value::symbol("right"));
     match VerticalScrollBarType::from_symbol_value(&raw) {
         Some(side) => Some(side.symbol()),
         _ if raw.is_nil() => None,
@@ -254,6 +257,11 @@ fn frame_vertical_scroll_bar_side(frame: &Frame) -> Option<Value> {
 }
 
 fn frame_has_horizontal_scroll_bar(frame: &Frame) -> bool {
+    // Same FRAME_WINDOW_P gate as the vertical resolver: a tty frame has no
+    // scroll bar, so its horizontal parameter is inert.
+    if frame.effective_window_system().is_none() {
+        return false;
+    }
     let raw = frame
         .known_parameter(FrameParam::HorizontalScrollBars)
         .unwrap_or(Value::NIL);
@@ -707,11 +715,19 @@ impl crate::emacs_core::eval::Context {
         {
             crate::window::window_markers::sync_all_frames_for_buffer(&mut self.frames, buffer_id);
         }
-        crate::emacs_core::window_cmds::remember_selected_window_point_in_state(
-            &mut self.frames,
-            &mut self.buffers,
-            frame_id,
-        );
+        // A queried frame need not be globally selected. Its locally selected
+        // window still owns an independent point marker in that case.
+        if self
+            .frames
+            .selected_frame()
+            .is_some_and(|frame| frame.id == frame_id)
+        {
+            crate::emacs_core::window_cmds::remember_selected_window_point_in_state(
+                &mut self.frames,
+                &mut self.buffers,
+                frame_id,
+            );
+        }
         let adapter = std::mem::replace(
             &mut self.window_layout_query_adapter,
             WindowLayoutQueryAdapter::Running,
@@ -1371,6 +1387,7 @@ impl FrameManager {
 
         if let Some(Window::Leaf {
             buffer_id: leaf_buffer_id,
+            mode_line_base,
             window_start: leaf_window_start,
             position_markers,
             window_end,
@@ -1387,6 +1404,9 @@ impl FrameManager {
             .get_mut(frame_id)
             .and_then(|frame| frame.find_window_mut(window_id))
         {
+            // GNU wset_buffer invalidates the numeric line base for every
+            // install, including the same buffer and identity round trips.
+            *mode_line_base = None;
             *leaf_buffer_id = buffer_id;
             *leaf_window_start = window_start.max(LispCharPos1::ONE);
             *position_markers = super::WindowPositionMarkerState::Detached;

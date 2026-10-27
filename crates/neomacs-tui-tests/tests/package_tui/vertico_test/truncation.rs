@@ -204,12 +204,24 @@ fn open_session(pair: &mut PackageTuiPair, description: &str, input: &str) {
             "the switch-to-buffer prompt",
             |grid| grid.iter().any(|row| row.contains(PROMPT)),
         );
-        session.send(format!("{PREFIX}{input}").as_bytes());
+        let typed_input = format!("{PREFIX}{input}");
+        let candidate_count = if input.is_empty() { TOTAL } else { 1 };
+        let indicator = format!("1/{candidate_count}");
+        session.send(typed_input.as_bytes());
         wait_for(
             session,
             Duration::from_secs(8),
-            "the fixture's candidates",
-            |grid| (1..=TOTAL).contains(&candidate_rows(grid, PREFIX).len()),
+            "the typed input and its filtered candidates",
+            |grid| {
+                // Opening the session already shows fixture rows, before any
+                // input is processed. The narrow prompt wraps onto a second
+                // row, so locate its input after the colon on either row.
+                grid.iter().any(|row| {
+                    row.split_once(": ")
+                        .is_some_and(|(_, value)| value.trim_end() == typed_input.as_str())
+                }) && count_indicator_in(grid, PROMPT) == indicator
+                    && candidate_rows(grid, PREFIX).len() == candidate_count
+            },
         );
     })
     .expect("both peers open the session");
@@ -237,9 +249,16 @@ fn assert_gnu_line_glyph(pair: &PackageTuiPair, description: &str, marker: fn(&s
         grid.join("\n")
     );
     for row in rows {
-        let drawn: Vec<char> = grid[usize::from(row)].chars().collect();
+        // Terminal columns count cells, not Unicode scalars: combining
+        // marks share a cell and wide characters occupy two.
+        let last_column = u16::try_from(COLUMNS - 1).expect("terminal column fits");
+        let line_glyph = pair
+            .gnu
+            .screen()
+            .cell(row, last_column)
+            .and_then(|cell| cell.contents().chars().next());
         assert_eq!(
-            drawn.get(COLUMNS - 1).copied(),
+            line_glyph,
             Some(LINE_GLYPH),
             "GNU's candidate row {row} does not carry the glyph for a line that \
              does not fit in its last column, for {description}: {:?}",

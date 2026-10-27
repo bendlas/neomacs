@@ -18,9 +18,13 @@ pub(crate) use parallel_admission::{OwnedParallelError, OwnedParallelProjection}
 pub(crate) struct FrozenLegacyRoots {
     heap: HeapIdentity,
     words: Vec<TaggedValue>,
+    functions_quiescent: bool,
 }
 
 impl FrozenLegacyRoots {
+    pub(crate) fn permits_function_writes(&self) -> bool {
+        self.functions_quiescent
+    }
     pub(crate) fn heap_identity(&self) -> HeapIdentity {
         self.heap
     }
@@ -35,6 +39,34 @@ impl FrozenLegacyRoots {
 static_assertions::assert_not_impl_any!(FrozenLegacyRoots: Send, Sync, Clone, Copy);
 
 impl Context {
+    /// C4 admits inactive compiled caches, but no suspended legacy Lisp/native
+    /// activation or outstanding job from this owner. Its closed executor can
+    /// create neither while this original Context remains suspended.
+    #[cold]
+    fn function_cells_quiescent(&self) -> bool {
+        use crate::emacs_core::eval::SpecBinding;
+        if self.jit_root_stack_top != 0
+            || self.specpdl.iter().any(|entry| {
+                matches!(
+                    entry,
+                    SpecBinding::Backtrace { .. }
+                        | SpecBinding::Backtrace1 { .. }
+                        | SpecBinding::Backtrace2 { .. }
+                        | SpecBinding::BacktraceNative { .. }
+                )
+            })
+        {
+            return false;
+        }
+        #[cfg(feature = "jit")]
+        if crate::emacs_core::jit::cache::native_depth() != 0
+            || crate::emacs_core::jit::bg::pending_count() != 0
+        {
+            return false;
+        }
+        true
+    }
+
     #[cold]
     #[inline(never)]
     // No external capture factory: a same-heap snapshot could become stale
@@ -106,6 +138,7 @@ impl Context {
         Ok(FrozenLegacyRoots {
             heap: keeper.parallel_heap_identity(),
             words,
+            functions_quiescent: self.function_cells_quiescent(),
         })
     }
 }
@@ -299,3 +332,11 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/symbol_fixture.rs"]
 mod symbol_fixture;
+
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+#[path = "tests/function_boundary.rs"]
+mod function_boundary;
+
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+#[path = "tests/intern_boundary.rs"]
+mod intern_boundary;

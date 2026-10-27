@@ -31,24 +31,90 @@ where
     operation(&mut pair.neo);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PydocInputStage {
+    Prompt,
+    Literal,
+}
+
+impl PydocInputStage {
+    fn expected_input(self) -> &'static str {
+        match self {
+            Self::Prompt => "M-x",
+            Self::Literal => "M-x helm-pydoc",
+        }
+    }
+}
+
+fn wait_for_pydoc_input(session: &mut TuiSession, deadline: Instant, stage: PydocInputStage) {
+    loop {
+        let observed = session
+            .observe_at_fence()
+            .expect("Helm Pydoc command observation fence");
+        let grid = observed.text_grid();
+        if grid
+            .last()
+            .is_some_and(|row| row.trim_end() == stage.expected_input())
+        {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{} did not consume Helm Pydoc command {stage:?}:\n{}",
+            session.name,
+            grid.join("\n")
+        );
+        session.read(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 pub(super) fn open_pydoc(pair: &mut PackageTuiPair) {
-    send_to_both(pair, |session| {
+    for session in [&mut pair.gnu, &mut pair.neo] {
+        // Committed bytes can precede minibuffer consumption while the prior
+        // Helm command unwinds. Submit RET only after the full literal is painted.
+        let input_deadline = Instant::now() + Duration::from_secs(8);
         session.send_key("M-x");
+        wait_for_pydoc_input(session, input_deadline, PydocInputStage::Prompt);
         session.send(b"helm-pydoc");
+        wait_for_pydoc_input(session, input_deadline, PydocInputStage::Literal);
         session.send_key("RET");
-    });
+    }
     wait_for_both(pair, Duration::from_secs(12), |grid| {
         grid.iter().any(|row| row.contains("Imported Modules"))
             && grid.iter().any(|row| row.contains("Installed Modules"))
     });
 }
 
+/// A Helm Pydoc candidate row: a bare Python module name.  Headers, the mode
+/// line and the surrounding console chrome all contain spaces or punctuation.
+fn is_module_name_row(row: &str) -> bool {
+    let mut chars = row.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 pub(super) fn filter_module(pair: &mut PackageTuiPair, module: &str) {
     send_to_both(pair, |session| session.send(module.as_bytes()));
+    // Helm updates its `pattern:' line as soon as the keystrokes arrive but
+    // redraws the candidate list from its input-idle timer.  Wait for the
+    // filtered list itself in both editors: every remaining module row
+    // matches the pattern and the pattern's module is among them, so the
+    // snapshot cannot catch the old unfiltered layout behind a new pattern
+    // line.  No fixed delay: both editors are polled until the content
+    // condition holds or the bound expires.
     wait_for_both(pair, Duration::from_secs(12), |grid| {
-        grid.iter()
-            .any(|row| row.contains("pattern:") && row.contains(module))
-            && grid.iter().any(|row| row.trim_start().starts_with(module))
+        let pattern_updated = grid
+            .iter()
+            .any(|row| row.contains("pattern:") && row.contains(module));
+        let module_rows: Vec<&str> = grid
+            .iter()
+            .map(|row| row.trim())
+            .filter(|row| is_module_name_row(row))
+            .collect();
+        pattern_updated
+            && module_rows.iter().any(|row| row.contains(module))
+            && module_rows.iter().all(|row| row.contains(module))
     });
 }
 

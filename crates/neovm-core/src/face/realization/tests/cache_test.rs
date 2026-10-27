@@ -14,6 +14,35 @@ fn source() -> Face {
 }
 
 #[test]
+fn generic_default_slot_projection_tracks_equal_basic_winners_without_rekeying_paint() {
+    let attributes = source();
+    let mut cache = FrameFaceRealizationCache::default();
+    cache.prepare(7, FaceTable::new());
+    assert_eq!(
+        cache.lookup_slot(&attributes),
+        crate::face::realization::CachedFaceSlot::Unavailable
+    );
+    cache.insert_basic(BasicFace::Default, attributes.clone(), attributes.clone());
+    assert_eq!(
+        cache.lookup_slot(&attributes),
+        crate::face::realization::CachedFaceSlot::Default
+    );
+    cache.insert_basic(BasicFace::Margin, attributes.clone(), attributes.clone());
+    assert_eq!(cache.lookup(&attributes), Some(&attributes));
+    assert_eq!(
+        cache.lookup_slot(&attributes),
+        crate::face::realization::CachedFaceSlot::NonDefault
+    );
+    assert!(cache.generation_matches(7));
+    cache.insert_basic(BasicFace::Default, attributes.clone(), attributes.clone());
+    assert_eq!(
+        cache.lookup_slot(&attributes),
+        crate::face::realization::CachedFaceSlot::Default
+    );
+    assert!(cache.generation_matches(7));
+}
+
+#[test]
 fn realization_cache_compares_complete_attributes_within_color_buckets() {
     let source = source();
     let mut first = source.clone();

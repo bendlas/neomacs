@@ -314,7 +314,10 @@ impl PackageTuiPair {
     }
 
     pub fn assert_display(&mut self, checkpoint: DisplayCheckpoint) {
-        let label = format!("{}: {}", self.label, checkpoint.label);
+        let label = format!(
+            "{}: {} ({}; {})",
+            self.label, checkpoint.label, self.gnu.name, self.neo.name
+        );
         let marker = format!("display: {}", checkpoint.label);
         self.gnu.mark_recording(&marker);
         self.neo.mark_recording(&marker);
@@ -439,7 +442,9 @@ fn editor_launch(
     display_env: &SymmetricDisplayEnvironment,
     gnu: bool,
 ) -> TuiLaunch {
-    let mut launch = TuiLaunch::new(runtime.executable.as_os_str()).args(["-nw", "-Q"]);
+    let mut launch = TuiLaunch::new(runtime.executable.as_os_str())
+        .with_uncertified_startup()
+        .args(["-nw", "-Q"]);
     if gnu {
         launch = launch.arg("-no-comp-spawn").arg(QUIET_NATIVE_COMP_EVAL);
     }

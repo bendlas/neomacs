@@ -10,6 +10,10 @@
 //! more closely: a symbol is an object with a name, not just "slot N in the
 //! string interner".
 
+mod fixed_symbol;
+pub(crate) mod parallel;
+pub use fixed_symbol::EpochCachedSymbol;
+
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHashMap};
@@ -116,7 +120,7 @@ fn format_lisp_symbol_name_for_diagnostic(name: &LispString) -> String {
     let mut pos = 0;
     while pos < bytes.len() {
         let (code, len) = crate::emacs_core::emacs_char::string_char(&bytes[pos..]);
-        push_char(&mut out, code, confusing_prefix);
+        push_char(&mut out, code.code(), confusing_prefix);
         confusing_prefix = false;
         pos += len;
     }
@@ -230,14 +234,15 @@ const NAME_ATOM_CHUNK: usize = 4096;
 
 /// One frozen, property-free name atom in process-lifetime storage.
 ///
-/// Only `NameAtomStorage::push` constructs this reference, after stripping
-/// heap-backed text properties and moving the string into a leaked slot.
+/// `NameAtomStorage::push` and sealed prepared publication construct this
+/// reference after stripping properties and moving the string into a leaked slot.
 /// Hash and equality inspect only its immutable bytes and representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 struct NameAtomRef(&'static LispString);
 
-// SAFETY: construction is confined to `NameAtomStorage::push`. Its referenced
+// SAFETY: construction is confined to the serial push and sealed prepared
+// publication, both using leaked, property-free storage. The referenced
 // string has no interval table, never moves or drops, and is never mutated after
 // publication. Its bytes are owned by that leaked string or are immutable
 // process-lifetime mapped/static storage, so they contain no heap-local Values.
@@ -1428,7 +1433,12 @@ fn global_symbol_registry() -> &'static RwLock<SymbolRegistry> {
 /// The epoch positive canonical-name caches validate against. Removing a
 /// canonical mapping publishes invalidation under the registry write guard;
 /// readers load it with Acquire. Fresh intern/dump insertions preserve existing
-/// mappings, and these caches never retain misses, so insertions need no bump.
+/// mappings, and these caches never retain misses, so fresh insertions need no
+/// bump on the serial path. Sealed C5 publication additionally advances once
+/// per winning fresh registry ID, under its retained registry write guard;
+/// existing-name hits and World-only membership/growth do not advance it.
+/// The public dump-restore seam conservatively republishes invalidation
+/// under the same write guard, including a partially failed restore.
 /// Caches outside this module, including `TaggedValue::subr_from_sym_id`'s memo,
 /// can use the same invalidation.
 pub(crate) fn symbol_registry_epoch_value() -> u64 {
@@ -1451,7 +1461,12 @@ pub(crate) fn restore_runtime_interner(
     canonical: Option<&[bool]>,
 ) -> Result<RestoredDumpSymbolTable, String> {
     let mut registry = global_symbol_registry().write();
-    registry.restore_dump_symbol_table(names, symbol_names, canonical)
+    let restored = registry.restore_dump_symbol_table(names, symbol_names, canonical);
+    // The current restore merges an append-only registry. Publish anyway at
+    // this boundary so fixed-symbol cells cannot retain an ID across a dump
+    // restore, including one which made partial progress before an error.
+    symbol_registry_epoch().fetch_add(1, Ordering::AcqRel);
+    restored
 }
 
 /// Intern a string using the global runtime symbol registry.

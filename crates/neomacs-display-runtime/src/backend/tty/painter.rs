@@ -1,10 +1,15 @@
 //! Structured output for terminals that cannot consume the ANSI encoder.
-use super::{CellAttrs, TerminalCursorShape, TtyCell, TtyRif};
+use super::{CellAttrs, PendingPhysicalClear, TerminalCursorShape, TtyCell, TtyRif};
 use neomacs_display_protocol::tty_capabilities::TtyAttributeCapabilities;
 use std::io;
 
 pub trait TtyPainter {
     fn begin(&mut self, width: usize, height: usize) -> io::Result<()>;
+    /// Clear resize-invalidated physical state when the terminal has `cl`.
+    /// Native cell painters need no terminal control-string fallback.
+    fn clear_screen(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     fn row(&mut self, row: usize, cells: &[TtyCell]) -> io::Result<()>;
     fn finish(&mut self, cursor: Option<(u16, u16, TerminalCursorShape)>) -> io::Result<()>;
 }
@@ -18,6 +23,10 @@ impl TtyRif {
         self.frame_stats = super::TtyFrameStats::default();
         let result = (|| {
             painter.begin(self.desired.width, self.desired.height)?;
+            match self.physical_clear_requirement() {
+                PendingPhysicalClear::None => {}
+                PendingPhysicalClear::AfterResize => painter.clear_screen()?,
+            }
             for row in 0..self.desired.height {
                 // A damage frame (NEOMACS_TTY_DAMAGE) rasterized only the rows
                 // whose painters changed; the others are on screen already.
@@ -28,17 +37,15 @@ impl TtyRif {
                 let range = start..start + self.desired.width;
                 let next = &self.desired.cells[range.clone()];
                 let previous = &self.current.cells[range];
-                let unchanged = next.iter().zip(previous).all(|(a, b)| {
-                    a.ch == b.ch
-                        && a.attrs == b.attrs
-                        && a.padding == b.padding
-                        && a.extenders == b.extenders
-                });
+                let unchanged = next
+                    .iter()
+                    .zip(previous)
+                    .all(|(a, b)| a.same_painter_visible(b));
                 if self.force_full_render || !unchanged {
                     painter.row(row, next)?;
                     self.frame_stats.write_runs += 1;
                     self.frame_stats.cells_written +=
-                        next.iter().filter(|cell| !cell.padding).count() as u32;
+                        next.iter().filter(|cell| !cell.padding()).count() as u32;
                 }
             }
             painter.finish(self.cursor_visible.then_some((
@@ -51,6 +58,7 @@ impl TtyRif {
             self.mark_planned_rows_written();
             self.commit_frame();
             self.force_full_render = false;
+            self.pending_physical_clear = super::PendingPhysicalClear::None;
             self.scroll_seed = None;
         } else {
             self.force_full_render = true;
@@ -88,15 +96,15 @@ pub fn encode_cells_with(
 ) {
     let mut previous: Option<CellAttrs> = None;
     let mut bytes = Vec::new();
-    for cell in cells.iter().filter(|cell| !cell.padding) {
-        if previous.as_ref() != Some(&cell.attrs) {
+    for cell in cells.iter().filter(|cell| !cell.padding()) {
+        if previous.as_ref() != Some(&cell.attrs()) {
             if let Some(attrs) = previous {
                 super::write_turn_off_face(&mut bytes, &attrs, capabilities);
             }
-            super::write_turn_on_face(&mut bytes, &cell.attrs, capabilities);
+            super::write_turn_on_face(&mut bytes, &cell.attrs(), capabilities);
             emit(CellOutput::Control(&bytes));
             bytes.clear();
-            previous = Some(cell.attrs);
+            previous = Some(cell.attrs());
         }
         super::write_cell_contents(&mut bytes, cell);
         emit(CellOutput::Text(&bytes));

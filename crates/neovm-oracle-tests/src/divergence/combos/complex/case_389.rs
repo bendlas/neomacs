@@ -9,7 +9,7 @@ use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 #[test]
 fn div_cx389_process_filter_chunked_capture() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK (1 18 \"line1\\nline2\\nline3\")""#]];
+    let expect = expect_test::expect![[r#""OK (t 18 \"line1\\nline2\\nline3\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((collected nil)
@@ -18,14 +18,22 @@ fn div_cx389_process_filter_chunked_capture() {
                         :command '("sh" "-c" "for i in 1 2 3; do printf 'line%d\\n' $i; done")
                         :buffer buf
                         :filter (lambda (proc data) (push data collected)))))
-  (accept-process-output p 2)
-  (sit-for 0.05)
-  (let ((all (apply #'concat (nreverse collected))))
+  ;; make-process inherits `process-connection-type' (a PTY here), so the
+  ;; shell's per-line writes can arrive in any number of filter calls; that
+  ;; split is a wakeup race in both editors.  Wait for the child to exit and
+  ;; drain, then assert the aggregate output, never the chunk count.
+  (let ((deadline (+ (float-time) 30)))
+    (while (and (process-live-p p) (< (float-time) deadline))
+      (accept-process-output p 0.05)))
+  (while (accept-process-output p 0))
+  (let ((all-data (apply #'concat (nreverse collected))))
     (kill-buffer buf)
-    (list (length collected) (length all) (string-trim all))))
+    (list (and collected t)
+          (length all-data)
+          (string-trim all-data))))
 "##,
         expect,
-    )
+    );
 }
 
 #[test]
@@ -41,7 +49,7 @@ fn div_cx389_process_sentinel_exit_signal() {
         (p2 (make-process :name "neo-cx389-sig"
                           :command '("sh" "-c" "kill -TERM $$")
                           :sentinel (lambda (proc ev) (push (cons :sig ev) events)))))
-    (accept-process-output p1 2)
+    (neovm--oracle-settle-process p1 600)
     (accept-process-output p2 2)
     (sit-for 0.05)
     (list (process-exit-status p1) (process-status p1)
@@ -64,7 +72,7 @@ fn div_cx389_process_coding_environment_override() {
                             :buffer buf
                             :environment (append '("NEO_A=alpha" "NEO_B=beta" "NEO_C=gamma")
                                                  process-environment))))
-      (accept-process-output p 2)
+      (neovm--oracle-settle-process p 600)
       (sit-for 0.05)
       (let ((content (string-trim (with-current-buffer buf (buffer-string)))))
         (kill-buffer buf)
@@ -90,7 +98,7 @@ fn div_cx389_process_stderr_capture() {
                             :command '("sh" "-c" "echo OUT; echo ERR >&2")
                             :buffer stdout-buf
                             :stderr stderr-buf)))
-      (accept-process-output p 2)
+      (neovm--oracle-settle-process p 600)
       (sit-for 0.05)
       (let ((out (string-trim (with-current-buffer stdout-buf (buffer-string))))
             (err (string-trim (with-current-buffer stderr-buf (buffer-string)))))
@@ -139,7 +147,7 @@ fn div_cx389_process_plist_and_mark() {
        (p (make-process :name "neo-cx389-pm"
                         :command '("echo" "mark-test")
                         :buffer buf)))
-  (accept-process-output p 2)
+  (neovm--oracle-settle-process p 600)
   (sit-for 0.05)
   (process-put p 'neo-cx389-key1 :val1)
   (process-put p 'neo-cx389-key2 99)
@@ -228,7 +236,7 @@ fn div_cx389_process_with_marker_overlay_undo_narrow_mega() {
                          :buffer buf)))
     (process-put p 'neo-cx389-tag :mega)
     (set-process-coding-system p 'utf-8-unix 'utf-8-unix)
-    (accept-process-output p 1)
+    (neovm--oracle-settle-process p 600)
     (sit-for 0.05))
   (let ((content (with-current-buffer buf (buffer-string))))
     (with-current-buffer buf

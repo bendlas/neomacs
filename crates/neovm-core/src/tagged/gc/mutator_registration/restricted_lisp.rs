@@ -8,14 +8,20 @@
 //! any owner is activated.
 #![cfg(not(feature = "gc-memory-telemetry"))]
 
+use super::a8_probes;
+use super::symbol_functions::FunctionOp;
+use super::symbol_functions::retry::{self as contention, Deadline, Retry, SPIN_WAIT, retry_owned};
 use super::symbol_globals::GlobalOp;
+use super::symbol_intern::InternOp;
 use super::{
     AllStopped, HeapIdentity, Mutator, MutatorPermit, OwnerRootSlot, ParallelHeapEra,
     RegistrationError, Registry, RendezvousError, RunAccess, RunSlice, SealedTableAccess,
     SliceRoot, TableMut, TableRef,
 };
 
+mod functions;
 mod globals;
+mod intern;
 use crate::emacs_core::builtins::maybe_resize_hash_table_for_insert;
 use crate::emacs_core::eval::Context;
 use crate::emacs_core::value::{HashProbe, HashTableEntry, HashTableTest};
@@ -23,19 +29,45 @@ use crate::tagged::transport::SharedRoot;
 use crate::tagged::value::{Fixnum, TaggedValue};
 use rustc_hash::FxHashSet;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const STEP_CAP: u32 = 10_000;
-const SPIN_WAIT: Duration = Duration::from_secs(60);
 const CHANNEL_WAIT: Duration = Duration::from_secs(90);
+
+/// The extent body committed publication; only a successful wrapper return
+/// permits heap access. Keep that cleanup obligation across unwinding.
+enum NativeState {
+    Running,
+    Published,
+}
+
+fn retry_exec<T>(op: impl FnMut() -> Result<T, ExecError>) -> Result<T, ExecError> {
+    contention::retry(Deadline::contention(), op, |error| match error {
+        ExecError::Registration(error) => contention::registration(error),
+        ExecError::Intern(error) => contention::initial_intern(error),
+        ExecError::Rendezvous(_)
+        | ExecError::ForeignCons
+        | ExecError::Type
+        | ExecError::Overflow
+        | ExecError::Backedge
+        | ExecError::Slot
+        | ExecError::UserTestMutation
+        | ExecError::EpochRetry
+        | ExecError::VoidVariable
+        | ExecError::Function(_) => Retry::Refuse,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
     /// C3: an index into a session's admitted, immutable symbol-handle table.
     Global(GlobalOp),
+    Function(FunctionOp),
+    Intern(InternOp),
     ConstNil {
         dst: u16,
     },
@@ -139,11 +171,41 @@ enum Op {
     Safepoint,
 }
 
+/// Closed session admission. Each variant carries exactly the symbol table
+/// admitted by that session; intern cannot be enabled independently of its
+/// global handles, and function handles share their session's global table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapeCapabilities {
+    Core,
+    Globals { symbols: usize },
+    Functions { symbols: usize },
+    InitialIntern { globals: usize },
+}
+
+impl TapeCapabilities {
+    fn global_handles(self) -> Option<usize> {
+        match self {
+            Self::Core => None,
+            Self::Globals { symbols } | Self::Functions { symbols } => Some(symbols),
+            Self::InitialIntern { globals } => Some(globals),
+        }
+    }
+
+    fn function_handles(self) -> Option<usize> {
+        match self {
+            Self::Functions { symbols } => Some(symbols),
+            Self::Core | Self::Globals { .. } | Self::InitialIntern { .. } => None,
+        }
+    }
+}
+
 /// Surface syntax the gate sees. Excluded variants never lower into [`Op`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Insn {
     Allowed(Op),
     Global(GlobalOp),
+    Function(FunctionOp),
+    Intern(InternOp),
     SymbolValue,
     Obarray,
     Buffer,
@@ -194,6 +256,8 @@ enum ExecError {
     /// revalidation rounds: the epoch moved under every scan.
     EpochRetry,
     VoidVariable,
+    Function(super::FunctionError),
+    Intern(super::InitialInternError),
 }
 
 /// Why exec handed control back to the driver. A safepoint pauses for the
@@ -366,26 +430,14 @@ fn recv<T>(rx: &Receiver<T>) -> T {
         .unwrap_or_else(|error| panic!("owner channel closed: {error}"))
 }
 
-fn retry_rv<T>(mut op: impl FnMut() -> Result<T, RendezvousError>) -> T {
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match op() {
-            Ok(value) => return value,
-            Err(RendezvousError::Busy) if Instant::now() < deadline => thread::yield_now(),
-            Err(error) => panic!("rendezvous: {error:?}"),
-        }
-    }
+fn retry_rv<T>(op: impl FnMut() -> Result<T, RendezvousError>) -> T {
+    contention::retry(Deadline::contention(), op, contention::rendezvous)
+        .unwrap_or_else(|error| panic!("rendezvous: {error:?}"))
 }
 
-fn retry_reg<T>(mut op: impl FnMut() -> Result<T, RegistrationError>) -> T {
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match op() {
-            Ok(value) => return value,
-            Err(RegistrationError::Busy) if Instant::now() < deadline => thread::yield_now(),
-            Err(error) => panic!("registration: {error:?}"),
-        }
-    }
+fn retry_reg<T>(op: impl FnMut() -> Result<T, RegistrationError>) -> T {
+    contention::retry(Deadline::contention(), op, contention::registration)
+        .unwrap_or_else(|error| panic!("registration: {error:?}"))
 }
 
 fn must<T>(result: Result<T, ExecError>) -> T {
@@ -398,6 +450,8 @@ fn lower(insns: &[Insn]) -> Result<Vec<Op>, Reject> {
         ops.push(match *insn {
             Insn::Allowed(op) => op,
             Insn::Global(op) => Op::Global(op),
+            Insn::Function(op) => Op::Function(op),
+            Insn::Intern(op) => Op::Intern(op),
             Insn::SymbolValue => return Err(Reject::Excluded("symbol")),
             Insn::Obarray => return Err(Reject::Excluded("obarray")),
             Insn::Buffer => return Err(Reject::Excluded("buffer")),
@@ -454,7 +508,14 @@ fn prevalidate_with(
     step_cap: u32,
     initial: &[(u16, Abs)],
 ) -> Result<(), Reject> {
-    prevalidate_inner(ops, nslots, bound, step_cap, initial, None)
+    prevalidate_inner(
+        ops,
+        nslots,
+        bound,
+        step_cap,
+        initial,
+        TapeCapabilities::Core,
+    )
 }
 
 fn prevalidate_inner(
@@ -463,15 +524,18 @@ fn prevalidate_inner(
     bound: u32,
     step_cap: u32,
     initial: &[(u16, Abs)],
-    globals: Option<usize>,
+    capabilities: TapeCapabilities,
 ) -> Result<(), Reject> {
     // Scan the entire tape, including unreachable code. A global session
     // checks all participating tapes before any participant is registered.
-    globals::check_tape(ops, nslots, globals)?;
+    globals::check_tape(ops, nslots, capabilities.global_handles())?;
+    functions::check_tape(ops, nslots, capabilities.function_handles())?;
+    intern::check_tape(ops, nslots, capabilities)?;
     let mut slots = vec![Abs::Nil; nslots];
     for &(index, kind) in initial {
         slots[slot_index(index, nslots)?] = kind;
     }
+    let mut call_selected = false;
     let mut pc = 0usize;
     let mut backedges = 0u32;
     let mut steps = 0u32;
@@ -482,6 +546,14 @@ fn prevalidate_inner(
         }
         let from = u16::try_from(pc).map_err(|_| Reject::Slot)?;
         match ops[pc] {
+            Op::Intern(op) => {
+                intern::abstract_step(op, &mut slots)?;
+                pc += 1;
+            }
+            Op::Function(op) => {
+                functions::abstract_step(op, &mut slots, &mut call_selected)?;
+                pc += 1;
+            }
             Op::Global(op) => {
                 globals::abstract_step(op, &mut slots)?;
                 pc += 1;
@@ -525,9 +597,22 @@ fn prevalidate_inner(
                 pc += 1;
             }
             Op::Eq { dst, a, b } => {
-                let (x, y) = fix_pair(slots.as_slice(), nslots, a, b)?;
-                let index = slot_index(dst, nslots)?;
-                slots[index] = if x == y { Abs::T } else { Abs::Nil };
+                let answer = match capabilities {
+                    TapeCapabilities::InitialIntern { .. } => {
+                        // Intern compares rooted symbol identities or NIL;
+                        // older sessions retain their fixnum gate.
+                        slot_index(a, nslots)?;
+                        slot_index(b, nslots)?;
+                        Abs::Top
+                    }
+                    TapeCapabilities::Core
+                    | TapeCapabilities::Globals { .. }
+                    | TapeCapabilities::Functions { .. } => {
+                        let (x, y) = fix_pair(slots.as_slice(), nslots, a, b)?;
+                        if x == y { Abs::T } else { Abs::Nil }
+                    }
+                };
+                slots[slot_index(dst, nslots)?] = answer;
                 pc += 1;
             }
             Op::BranchIfNil { cond, target } => {
@@ -558,7 +643,9 @@ fn prevalidate_inner(
             }
             Op::Car { dst, cell } | Op::Cdr { dst, cell } => {
                 let kind = slots[slot_index(cell, nslots)?];
-                if kind != Abs::Cons && !(globals.is_some() && kind == Abs::Top) {
+                if kind != Abs::Cons
+                    && !(capabilities.global_handles().is_some() && kind == Abs::Top)
+                {
                     return Err(Reject::RejectedType);
                 }
                 slots[slot_index(dst, nslots)?] = Abs::Top;
@@ -1045,7 +1132,9 @@ fn exec<'brand>(
                 machine.pc += 1;
             }
             Op::Eq { dst, a, b } => {
-                let (x, y) = fix_operands(slice, homes, a, b)?;
+                let a = home_index(a, homes.len())?;
+                let b = home_index(b, homes.len())?;
+                let (x, y) = (home_bits(slice, &homes[a]), home_bits(slice, &homes[b]));
                 let bits = if x == y {
                     TaggedValue::T.bits()
                 } else {
@@ -1124,7 +1213,9 @@ fn exec<'brand>(
             | Op::HtMake { .. }
             | Op::HtCopy { .. }
             | Op::HtCount { .. }
-            | Op::Global(_) => {
+            | Op::Global(_)
+            | Op::Function(_)
+            | Op::Intern(_) => {
                 // Leases mint from `&mut RunAccess`, and the open slice
                 // region is borrowing it: leave pc on the op and let the
                 // driver perform it between regions (design §6).
@@ -2247,75 +2338,59 @@ fn one_slice<'era>(
     })
 }
 
-fn activate_owner<'era>(
-    mut permit: MutatorPermit<'era>,
-    heap: HeapIdentity,
-    id: u64,
-) -> Mutator<'era> {
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match permit.activate(heap, id) {
-            Ok(owner) => return owner,
-            Err(failure)
-                if failure.reason == RegistrationError::Busy && Instant::now() < deadline =>
-            {
-                permit = failure.into_permit();
-                thread::yield_now();
-            }
-            Err(failure) => panic!("activate: {:?}", failure.reason),
-        }
-    }
+fn activate_owner<'era>(permit: MutatorPermit<'era>, heap: HeapIdentity, id: u64) -> Mutator<'era> {
+    retry_owned(
+        Deadline::contention(),
+        permit,
+        |permit| permit.activate(heap, id),
+        |failure| match contention::registration(&failure.reason) {
+            Retry::Busy => ControlFlow::Continue(failure.into_permit()),
+            Retry::Refuse => ControlFlow::Break(failure),
+        },
+    )
+    .unwrap_or_else(|failure| panic!("activate: {:?}", failure.reason))
 }
 
 fn restore(owner: &mut Mutator<'_>) {
-    let mut image = owner
+    let image = owner
         .begin_restore_retry(false)
         .unwrap_or_else(|error| panic!("restore: {error:?}"));
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match image.apply() {
-            Ok(()) => return,
-            Err(failure)
-                if failure.reason == RendezvousError::Busy && Instant::now() < deadline =>
-            {
-                image = failure.into_image();
-                thread::yield_now();
-            }
-            Err(failure) => panic!("apply: {:?}", failure.reason),
-        }
-    }
+    retry_owned(
+        Deadline::contention(),
+        image,
+        |image| image.apply(),
+        |failure| match contention::rendezvous(&failure.reason) {
+            Retry::Busy => ControlFlow::Continue(failure.into_image()),
+            Retry::Refuse => ControlFlow::Break(failure),
+        },
+    )
+    .unwrap_or_else(|failure| panic!("apply: {:?}", failure.reason))
 }
 
-fn retire(mut owner: Mutator<'_>) {
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match owner.retire_rooted(&[]) {
-            Ok(()) => return,
-            Err(failure)
-                if failure.reason == RendezvousError::Busy && Instant::now() < deadline =>
-            {
-                owner = failure.into_owner();
-                thread::yield_now();
-            }
-            Err(failure) => panic!("retire: {:?}", failure.reason),
-        }
-    }
+fn retire(owner: Mutator<'_>) {
+    retry_owned(
+        Deadline::contention(),
+        owner,
+        |owner| owner.retire_rooted(&[]),
+        |failure| match contention::rendezvous(&failure.reason) {
+            Retry::Busy => ControlFlow::Continue(failure.into_owner()),
+            Retry::Refuse => ControlFlow::Break(failure),
+        },
+    )
+    .unwrap_or_else(|failure| panic!("retire: {:?}", failure.reason))
 }
 
-fn complete(mut stopped: AllStopped<'_>) {
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match stopped.complete() {
-            Ok(()) => return,
-            Err(failure)
-                if failure.reason == RendezvousError::Busy && Instant::now() < deadline =>
-            {
-                stopped = failure.into_stopped();
-                thread::yield_now();
-            }
-            Err(failure) => panic!("complete: {:?}", failure.reason),
-        }
-    }
+fn complete(stopped: AllStopped<'_>) {
+    retry_owned(
+        Deadline::contention(),
+        stopped,
+        |stopped| stopped.complete(),
+        |failure| match contention::rendezvous(&failure.reason) {
+            Retry::Busy => ControlFlow::Continue(failure.into_stopped()),
+            Retry::Refuse => ControlFlow::Break(failure),
+        },
+    )
+    .unwrap_or_else(|failure| panic!("complete: {:?}", failure.reason))
 }
 
 fn on_heap<R>(
@@ -2323,14 +2398,7 @@ fn on_heap<R>(
     stopped: &AllStopped<'_>,
     body: impl Fn(&crate::tagged::gc::TaggedHeap) -> R,
 ) -> R {
-    let deadline = Instant::now() + SPIN_WAIT;
-    loop {
-        match era.with_stopped_heap_for_test(stopped, &body) {
-            Ok(value) => return value,
-            Err(RendezvousError::Busy) if Instant::now() < deadline => thread::yield_now(),
-            Err(error) => panic!("stopped heap: {error:?}"),
-        }
-    }
+    retry_rv(|| era.with_stopped_heap_for_test(stopped, &body))
 }
 
 fn open_collection<'a>(
@@ -5491,6 +5559,7 @@ fn a6_ht_reader_scaling_row() {
 /// table's epoch, so the next native dispatch must refuse the stale inline
 /// path and raise the shim's loud signal instead of jumping through a
 /// word the compiler never produced.
+#[cfg(feature = "jit")]
 #[test]
 fn a6_ht_sealed_edit_triggers_jit_switch_stale_shim() {
     if !crate::emacs_core::jit::compile::jit_inline_switch_on() {

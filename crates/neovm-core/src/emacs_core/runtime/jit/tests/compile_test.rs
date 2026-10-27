@@ -9217,6 +9217,114 @@ fn fboundp_call_sites_answer_as_the_builtin_on_the_fast_path() {
     }
 }
 
+/// A `PredFboundp` site lowers to the DEDICATED 4-argument shim
+/// (`neovm_jit_fboundp_spec`), not the generic pred shim: every call
+/// reaches it, and no other predicate site does. The other pred shims share
+/// `SUBR_SPEC_COUNT`, so the dedicated counter is the only way to tell.
+#[test]
+fn fboundp_sites_use_the_dedicated_shim() {
+    use crate::emacs_core::eval::Context;
+    use crate::emacs_core::intern::{SymId, intern};
+    crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+    let mut ev = Context::new();
+    let ctx = &mut ev as *mut Context as *mut u8;
+    let leaf_for = |name: &str| {
+        let mut f = ByteCodeFunction::new(LambdaParams {
+            required: vec![SymId(1)],
+            optional: Vec::new(),
+            rest: None,
+        });
+        f.lexical = true;
+        f.ops = vec![Op::Constant(0), Op::StackRef(1), Op::Call(1), Op::Return];
+        f.constants = vec![Value::symbol(name)].into();
+        f.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(8);
+        f
+    };
+    let f = leaf_for("fboundp");
+    let fboundp_leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("compiles");
+    let _ = ev.debug_on_next_call_is_armed();
+    for arg in [
+        Value::symbol("car"),
+        Value::symbol("jit-fboundp-never"),
+        Value::NIL,
+        Value::make_int(1),
+    ] {
+        #[cfg(debug_assertions)]
+        let count0 = FBOUNDP_SPEC_COUNT.load(Ordering::Relaxed);
+        match fboundp_leaf.call(ctx, &[arg]) {
+            NativeRun::Ok(_) => {}
+            NativeRun::Signal => {
+                let _ = take_pending_flow();
+            }
+            other => panic!(
+                "(fboundp {}) : {other:?}",
+                crate::emacs_core::print::print_value(&arg)
+            ),
+        }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            FBOUNDP_SPEC_COUNT.load(Ordering::Relaxed) - count0,
+            1,
+            "an fboundp site must reach the dedicated shim: ({})",
+            crate::emacs_core::print::print_value(&arg)
+        );
+    }
+    // An epoch move must RE-ARM the site through `subr_spec_armed` (the
+    // shim's slot carries the binding words for exactly this), not fall to
+    // the generic call forever: after an unrelated `fset`, the next call
+    // stays on the fast path and does not bounce generic.
+    #[cfg(debug_assertions)]
+    let (fast0, gen0) = (
+        SUBR_SPEC_FAST_COUNT.load(Ordering::Relaxed),
+        SUBR_SPEC_GENERIC_COUNT.load(Ordering::Relaxed),
+    );
+    ev.eval_str("(fset 'jit-fboundp-unrelated (lambda () 1))")
+        .expect("unrelated fset");
+    #[cfg(debug_assertions)]
+    let count0 = FBOUNDP_SPEC_COUNT.load(Ordering::Relaxed);
+    match fboundp_leaf.call(ctx, &[Value::symbol("car")]) {
+        NativeRun::Ok(bits) => assert_eq!(
+            crate::emacs_core::print::print_value(&Value::from_bits(bits)),
+            "t"
+        ),
+        other => panic!("after an unrelated epoch bump: {other:?}"),
+    }
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        FBOUNDP_SPEC_COUNT.load(Ordering::Relaxed) - count0,
+        1,
+        "the epoch-moved call enters the dedicated shim"
+    );
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            SUBR_SPEC_FAST_COUNT.load(Ordering::Relaxed) > fast0,
+            "an unrelated epoch bump re-arms the fboundp site"
+        );
+        assert_eq!(
+            SUBR_SPEC_GENERIC_COUNT.load(Ordering::Relaxed),
+            gen0,
+            "the re-armed call does not bounce generic"
+        );
+    }
+    // A recordp site (its inline lowering disabled for this check) goes
+    // through the generic pred shim, which must not touch the fboundp
+    // shim's counter.
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(false));
+    let f = leaf_for("recordp");
+    let recordp_leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("compiles");
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(None);
+    #[cfg(debug_assertions)]
+    let count0 = FBOUNDP_SPEC_COUNT.load(Ordering::Relaxed);
+    let _ = recordp_leaf.call(ctx, &[Value::make_int(1)]);
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        FBOUNDP_SPEC_COUNT.load(Ordering::Relaxed),
+        count0,
+        "a recordp site must not reach the fboundp shim"
+    );
+}
+
 /// `(autoload-do-load FUNDEF FUNNAME MACRO-ONLY)` through `Op::Call`, at one,
 /// two and three arguments, is the GC-free predicate intrinsic
 /// (`SpecCalleeKind::PredAutoloadDoLoad`): a FUNDEF that is not an autoload
@@ -9228,6 +9336,11 @@ fn autoload_do_load_call_sites_answer_as_the_builtin_on_the_fast_path() {
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::{SymId, intern};
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+    // The SHIM's protocol: the inline identity fast path is
+    // `autoload_do_load_sites_answer_non_autoload_inline`'s subject, and
+    // its default-on arm would answer the non-autoload FUNDEFs before the
+    // shim and hide what this test pins.
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(false));
     let mut ev = Context::new();
     let ctx = &mut ev as *mut Context as *mut u8;
     let binding = ev
@@ -9369,6 +9482,339 @@ fn autoload_do_load_call_sites_answer_as_the_builtin_on_the_fast_path() {
         ),
         other => panic!("restored autoload-do-load: {other:?}"),
     }
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(None);
+}
+
+/// `recordp` / `symbol-with-pos-p` through `Op::Call` answer their armed hit
+/// inline (`lowering::emit_inline_type_tag_predicate`): the shim's own entry
+/// guards, one veclike tag test and one pinned header byte. Every value
+/// answers inline — a non-veclike answers nil without a header read — and the
+/// answer is the builtin's for every shape. The shim keeps every miss: a
+/// redefinition, an armed `debug-on-next-call`, a pending quit and a call at
+/// the eval-depth limit. The same body is compiled under both inline modes.
+#[test]
+fn type_tag_predicate_sites_answer_inline() {
+    use crate::emacs_core::eval::Context;
+    use crate::emacs_core::intern::{SymId, intern};
+    crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+    let mut ev = Context::new();
+    let ctx = &mut ev as *mut Context as *mut u8;
+    let site = |name: &str| {
+        let mut f = ByteCodeFunction::new(LambdaParams {
+            required: vec![SymId(1)],
+            optional: Vec::new(),
+            rest: None,
+        });
+        f.lexical = true;
+        f.ops = vec![Op::Constant(0), Op::StackRef(1), Op::Call(1), Op::Return];
+        f.constants = vec![Value::symbol(name)].into();
+        f.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(8);
+        f
+    };
+    let pool = ev
+        .eval_str(
+            "(list (record 'foo 1) (record 'bar) (record (record 'eieio--class 'my-class) 2)
+                    (vector 1) (make-hash-table) (position-symbol 'y 3) (cons 1 2)
+                    (symbol-function 'car) (make-marker) 'sym nil t :kw 5 \"s\" 1.5)",
+        )
+        .expect("pool");
+    crate::emacs_core::eval::push_scratch_gc_root(pool);
+    let items = crate::emacs_core::value::list_to_vec(&pool).expect("list");
+    let want = |name: &str, item: &Value| {
+        if name == "recordp" {
+            item.is_record()
+        } else {
+            // GNU: "Ignore `symbols-with-pos-enabled'." — the tag alone.
+            item.is_symbol_with_pos()
+        }
+    };
+    for name in ["recordp", "symbol-with-pos-p"] {
+        for inline in [true, false] {
+            crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(inline));
+            let f = site(name);
+            let leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("compiles");
+            // Resolve the memoized debug-on-next-call cell the guards read.
+            let _ = ev.debug_on_next_call_is_armed();
+            #[cfg(debug_assertions)]
+            let shim0 = SUBR_SPEC_COUNT.load(Ordering::Relaxed);
+            for &item in &items {
+                let got = match leaf.call(ctx, &[item]) {
+                    NativeRun::Ok(bits) => Value::from_bits(bits),
+                    other => panic!(
+                        "({name} {}) inline={inline}: {other:?}",
+                        crate::emacs_core::print::print_value(&item)
+                    ),
+                };
+                assert_eq!(
+                    got,
+                    Value::bool_val(want(name, &item)),
+                    "({name} {}) inline={inline}",
+                    crate::emacs_core::print::print_value(&item)
+                );
+            }
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                SUBR_SPEC_COUNT.load(Ordering::Relaxed) - shim0,
+                if inline { 0 } else { items.len() as u64 },
+                "{name} inline={inline}: the shim answers exactly when the knob is off"
+            );
+        }
+        // The other half of the protocol, with the inline path armed.
+        crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(true));
+        let f = site(name);
+        let leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("compiles");
+        let _ = ev.debug_on_next_call_is_armed();
+        let record = items[0];
+        let expected = Value::bool_val(want(name, &record));
+        // A pending quit: the site takes the shim, which polls first and
+        // signals.
+        ev.set_quit_flag_value(Value::T);
+        let quit = leaf.call(ctx, &[record]);
+        ev.set_quit_flag_value(Value::NIL);
+        assert!(
+            matches!(quit, NativeRun::Signal),
+            "{name}: a pending quit signals at the call: {quit:?}"
+        );
+        let _ = take_pending_flow();
+        // An armed `debug-on-next-call` takes the shim.
+        let cell = ev
+            .obarray
+            .debug_on_next_call_bool_fwd(intern("debug-on-next-call"))
+            .expect("debug-on-next-call cell");
+        cell.set(true);
+        #[cfg(debug_assertions)]
+        let shim0 = SUBR_SPEC_COUNT.load(Ordering::Relaxed);
+        let _ = leaf.call(ctx, &[record]);
+        cell.set(false);
+        let _ = take_pending_flow();
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            SUBR_SPEC_COUNT.load(Ordering::Relaxed) - shim0,
+            1,
+            "{name}: an armed debug-on-next-call takes the shim"
+        );
+        // At the eval-depth limit the site takes the shim and from there the
+        // generic call, which counts the subr against `max-lisp-eval-depth`
+        // as GNU's `Bcall` does and signals; one below the limit the inline
+        // answer stands.
+        let (depth, max_depth) = (ev.depth, ev.max_depth);
+        ev.max_depth = 100;
+        ev.depth = 100;
+        match leaf.call(ctx, &[record]) {
+            NativeRun::Signal => {
+                let flow = take_pending_flow().expect("stashed flow");
+                let text = match Err::<Value, _>(flow).kinded() {
+                    Err(FlowKind::Signal(sig)) => format!(
+                        "{} {:?}",
+                        sig.symbol_name(),
+                        sig.data
+                            .iter()
+                            .map(crate::emacs_core::print::print_value)
+                            .collect::<Vec<_>>()
+                    ),
+                    other => format!("{other:?}"),
+                };
+                assert!(
+                    text.contains("max-lisp-eval-depth"),
+                    "{name} at the limit: the nesting error, got {text}"
+                );
+            }
+            other => panic!("({name}) at the depth limit: {other:?}"),
+        }
+        ev.depth = 99;
+        match leaf.call(ctx, &[record]) {
+            NativeRun::Ok(bits) => {
+                assert_eq!(Value::from_bits(bits), expected, "{name}: one below")
+            }
+            other => panic!("({name}) one below the limit: {other:?}"),
+        }
+        ev.depth = depth;
+        ev.max_depth = max_depth;
+        // A redefinition is honoured: the epoch move sends the site through
+        // the shim to the generic call.
+        let original = ev.obarray.symbol_function_id(intern(name)).expect("bound");
+        ev.eval_str(&format!("(fset '{name} (lambda (_) 'redefined))"))
+            .expect("fset");
+        match leaf.call(ctx, &[record]) {
+            NativeRun::Ok(bits) => assert_eq!(
+                crate::emacs_core::print::print_value(&Value::from_bits(bits)),
+                "redefined",
+                "{name} redefined"
+            ),
+            other => panic!("redefined {name}: {other:?}"),
+        }
+        ev.obarray.set_symbol_function_id(intern(name), original);
+        match leaf.call(ctx, &[record]) {
+            NativeRun::Ok(bits) => assert_eq!(Value::from_bits(bits), expected, "{name} restored"),
+            other => panic!("restored {name}: {other:?}"),
+        }
+    }
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(None);
+}
+
+/// `autoload-do-load` through `Op::Call` answers its non-autoload identity
+/// inline (`lowering::emit_inline_autoload_do_load`): a FUNDEF that is not
+/// an `(autoload ...)` cons comes back as it is with no shim frame. An
+/// autoload object, and a cons whose car is a symbol-with-pos (whose
+/// classification `symbols-with-pos-enabled` decides at run time), bounces to
+/// the shim exactly as before. The same body is compiled under both inline
+/// modes.
+#[test]
+fn autoload_do_load_sites_answer_non_autoload_inline() {
+    use crate::emacs_core::eval::Context;
+    use crate::emacs_core::intern::{SymId, intern};
+    crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+    let mut ev = Context::new();
+    let ctx = &mut ev as *mut Context as *mut u8;
+    let mut f = ByteCodeFunction::new(LambdaParams {
+        required: vec![SymId(1)],
+        optional: Vec::new(),
+        rest: None,
+    });
+    f.lexical = true;
+    f.ops = vec![Op::Constant(0), Op::StackRef(1), Op::Call(1), Op::Return];
+    f.constants = vec![Value::symbol("autoload-do-load")].into();
+    f.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(8);
+    let outcome = |r: Result<Value, crate::emacs_core::error::Flow>| -> String {
+        match r.kinded() {
+            Ok(v) => crate::emacs_core::print::print_value(&v),
+            Err(FlowKind::Signal(sig)) => format!(
+                "signal {} {:?}",
+                sig.symbol_name(),
+                sig.data
+                    .iter()
+                    .map(crate::emacs_core::print::print_value)
+                    .collect::<Vec<_>>()
+            ),
+            Err(other) => format!("{other:?}"),
+        }
+    };
+    let pool = ev
+        .eval_str(
+            "(list (symbol-function 'car) (lambda (x) x) nil t 'sym 5 \"s\"
+                    (cons 'lambda '(x)) (cons 'foo 1) (cons 5 1) (cons (vector 1) 2)
+                    (list 'autoload \"jit-adl-inline-missing-file\" nil nil nil))",
+        )
+        .expect("pool");
+    crate::emacs_core::eval::push_scratch_gc_root(pool);
+    let items = crate::emacs_core::value::list_to_vec(&pool).expect("list");
+    for inline in [true, false] {
+        crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(inline));
+        let leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("compiles");
+        let _ = ev.debug_on_next_call_is_armed();
+        #[cfg(debug_assertions)]
+        let shim0 = SUBR_SPEC_COUNT.load(Ordering::Relaxed);
+        let mut autoloads = 0u64;
+        for &item in &items {
+            let want = outcome(crate::emacs_core::autoload::builtin_autoload_do_load_3(
+                &mut ev,
+                item,
+                Value::NIL,
+                Value::NIL,
+            ));
+            let ctx = &mut ev as *mut Context as *mut u8;
+            let got = match leaf.call(ctx, &[item]) {
+                NativeRun::Ok(bits) => {
+                    crate::emacs_core::print::print_value(&Value::from_bits(bits))
+                }
+                NativeRun::Signal => outcome(Err(take_pending_flow().expect("stashed flow"))),
+                other => panic!(
+                    "(autoload-do-load {}) inline={inline}: {other:?}",
+                    crate::emacs_core::print::print_value(&item)
+                ),
+            };
+            assert_eq!(
+                got,
+                want,
+                "(autoload-do-load {}) inline={inline}",
+                crate::emacs_core::print::print_value(&item)
+            );
+            if crate::emacs_core::autoload::is_autoload_value(&item, ev.symbol_mode()) {
+                autoloads += 1;
+            }
+        }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            SUBR_SPEC_COUNT.load(Ordering::Relaxed) - shim0,
+            if inline {
+                autoloads
+            } else {
+                items.len() as u64
+            },
+            "inline={inline}: only an autoload object reaches the shim when the inline path is on"
+        );
+        let _ = autoloads;
+    }
+    // `symbols-with-pos-enabled` is a runtime Lisp variable: a cons whose car
+    // is a symbol-with-pos is mode-dependent, so the inline path bounces it
+    // and the shim decides. A symbol-with-pos of ANOTHER symbol is not an
+    // autoload object; of `autoload` it is, and the load fails as it does
+    // through the builtin.
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(true));
+    let leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("compiles");
+    let _ = ev.debug_on_next_call_is_armed();
+    ev.eval_str("(setq symbols-with-pos-enabled t)")
+        .expect("enable");
+    let swp_other = ev
+        .eval_str("(cons (position-symbol 'jit-adl-other 1) 2)")
+        .expect("swp car");
+    let swp_autoload = ev
+        .eval_str(
+            "(list (position-symbol 'autoload 1) \"jit-adl-inline-missing-file\" nil nil nil)",
+        )
+        .expect("autoload swp car");
+    for &item in &[swp_other, swp_autoload] {
+        let want = outcome(crate::emacs_core::autoload::builtin_autoload_do_load_3(
+            &mut ev,
+            item,
+            Value::NIL,
+            Value::NIL,
+        ));
+        #[cfg(debug_assertions)]
+        let shim0 = SUBR_SPEC_COUNT.load(Ordering::Relaxed);
+        let ctx = &mut ev as *mut Context as *mut u8;
+        let got = match leaf.call(ctx, &[item]) {
+            NativeRun::Ok(bits) => crate::emacs_core::print::print_value(&Value::from_bits(bits)),
+            NativeRun::Signal => outcome(Err(take_pending_flow().expect("stashed flow"))),
+            other => panic!("(autoload-do-load swp): {other:?}"),
+        };
+        assert_eq!(got, want, "symbol-with-pos car under Positioned mode");
+        // Conservative: both shapes take the shim even with the inline path
+        // armed (the car's classification depends on the mode).
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            SUBR_SPEC_COUNT.load(Ordering::Relaxed) - shim0,
+            1,
+            "a symbol-with-pos car bounces to the shim"
+        );
+    }
+    ev.eval_str("(setq symbols-with-pos-enabled nil)")
+        .expect("disable");
+    // A redefinition is honoured: the site re-validates and takes the
+    // generic call.
+    let original = ev
+        .obarray
+        .symbol_function_id(intern("autoload-do-load"))
+        .expect("bound");
+    ev.eval_str("(fset 'autoload-do-load (lambda (&rest _) 'redefined))")
+        .expect("fset");
+    match leaf.call(ctx, &[Value::make_int(1)]) {
+        NativeRun::Ok(bits) => assert_eq!(
+            crate::emacs_core::print::print_value(&Value::from_bits(bits)),
+            "redefined"
+        ),
+        other => panic!("redefined autoload-do-load: {other:?}"),
+    }
+    ev.obarray
+        .set_symbol_function_id(intern("autoload-do-load"), original);
+    match leaf.call(ctx, &[Value::make_int(1)]) {
+        NativeRun::Ok(bits) => assert_eq!(
+            crate::emacs_core::print::print_value(&Value::from_bits(bits)),
+            "1"
+        ),
+        other => panic!("restored autoload-do-load: {other:?}"),
+    }
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(None);
 }
 
 #[test]
@@ -9625,4 +10071,100 @@ fn refsetting_the_same_function_and_repeated_redefinitions_stop_recompiling() {
         0,
         "an unstable callee is called, not inlined"
     );
+}
+
+/// The armed subr spec shim's screened-entry cache
+/// (`SpecSlot::cache_screened_subr_entry`): the second call through an armed
+/// site takes the cached fixed-arity entry instead of re-reading the static
+/// subr object, and an in-place static-subr rewrite INVALIDATES it. The
+/// rewrite keeps the binding's VALUE bits (so the epoch-move re-arm
+/// re-validates and proceeds) while changing the arity the screen reads; the
+/// call after that re-arm must see the NEW entry — without the invalidation
+/// the cached entry would still call the old fn and return a value where GNU
+/// signals `wrong-number-of-arguments`.
+#[test]
+fn subr_spec_screened_entry_cache_engages_and_a_rewrite_invalidates_it() {
+    use crate::emacs_core::eval::{Context, SubrEntry, register_global_subr_entry};
+    use crate::emacs_core::intern::intern;
+    use crate::emacs_core::symbol::FunctionEpochBump;
+    use crate::tagged::header::{SubrDispatchKind, SubrFn};
+
+    // A call-dominated body is exactly what the profitability gate declines
+    // in production; this test needs the compiled site.
+    crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+
+    fn plus_one(ctx: &mut Context, v: Value) -> crate::emacs_core::error::EvalResult {
+        Ok(Value::make_int(v.as_fixnum().unwrap_or_default() + 1))
+    }
+    fn times_ten(ctx: &mut Context, v: Value) -> crate::emacs_core::error::EvalResult {
+        Ok(Value::make_int(v.as_fixnum().unwrap_or_default() * 10))
+    }
+    let mk_entry = |f: SubrFn, min: u16, max: Option<u16>| SubrEntry {
+        function: Some(f),
+        min_args: min,
+        max_args: max,
+        dispatch_kind: SubrDispatchKind::Builtin,
+        interactive_spec: None,
+    };
+
+    let name = "neovm-test--subr-spec-screened-entry";
+    let sym = intern(name);
+    let mut ev = Context::new();
+    // Materialize the static subr object first (the binding's VALUE), then
+    // fill its entry: `register_global_subr_entry` rewrites the object IN
+    // PLACE and is a no-op before the object exists.
+    ev.obarray
+        .set_symbol_function(name, Value::subr_from_sym_id(sym));
+    register_global_subr_entry(sym, mk_entry(SubrFn::A1(plus_one), 1, Some(1)));
+
+    // `(lambda (p0) (test-sym p0))`: one SubrGeneral spec site.
+    let mut f = ByteCodeFunction::new(LambdaParams {
+        required: vec![SymId(1)],
+        optional: Vec::new(),
+        rest: None,
+    });
+    f.lexical = true;
+    f.ops = vec![Op::Constant(0), Op::StackRef(1), Op::Call(1), Op::Return];
+    f.constants = vec![Value::symbol(name)].into();
+    f.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(16);
+    let leaf = compile_bytecode_function_with(&f, Some(&ev.obarray)).expect("subr spec body");
+
+    let ctx = &mut ev as *mut Context as *mut u8;
+    let one = Value::make_int(1);
+    assert_eq!(
+        leaf.call(ctx, &[one]),
+        NativeRun::Ok(Value::make_int(2).bits()),
+        "first call screens the fresh entry"
+    );
+    #[cfg(debug_assertions)]
+    let cached0 = SUBR_SPEC_CACHED_COUNT.load(Ordering::Relaxed);
+    assert_eq!(
+        leaf.call(ctx, &[one]),
+        NativeRun::Ok(Value::make_int(2).bits())
+    );
+    #[cfg(debug_assertions)]
+    assert!(
+        SUBR_SPEC_CACHED_COUNT.load(Ordering::Relaxed) > cached0,
+        "a repeat call takes the slot's screened-entry cache"
+    );
+
+    // In-place rewrite of the SAME subr object, exactly as
+    // `Context::install_subr` does it: the entry metadata changes, the VALUE
+    // bits do not, and the rewrite bumps `function_epoch`.
+    register_global_subr_entry(sym, mk_entry(SubrFn::A1(times_ten), 2, Some(2)));
+    ev.obarray
+        .invalidate_all_function_bindings(FunctionEpochBump::SubrRewrite);
+
+    // The next call takes the reference path (epoch moved) and re-arms; the
+    // one after it is the armed fast path whose cache must be gone.
+    let check_arity_signal = |result: NativeRun| {
+        assert_eq!(result, NativeRun::Signal);
+        let flow = take_pending_flow().expect("the arity signal is stashed");
+        let FlowKind::Signal(signal) = flow.into_kind() else {
+            panic!("expected a signal flow");
+        };
+        assert_eq!(signal.symbol, intern("wrong-number-of-arguments"));
+    };
+    check_arity_signal(leaf.call(ctx, &[one]));
+    check_arity_signal(leaf.call(ctx, &[one]));
 }

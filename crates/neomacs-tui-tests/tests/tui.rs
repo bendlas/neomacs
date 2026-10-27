@@ -12,9 +12,12 @@ mod buffer_local_completion;
 mod coding_detection;
 mod coding_save;
 mod dual_width_fixed_pitch;
+mod eob_overlay_motion;
+mod extended_keysyms;
 #[path = "fontset_family_only_test.rs"]
 mod fontset_family_only;
 mod frame_bar_parameters;
+mod frame_focus;
 mod idle_timer_output;
 mod pixel_measurement;
 mod process_plist_isolation;
@@ -102,8 +105,12 @@ mod mode_line_gc_lifetime_oracle;
 #[cfg(test)]
 #[path = "mode_line_numeric_padding_oracle.rs"]
 mod mode_line_numeric_padding_oracle;
+mod mode_line_percent_input_oracle;
+mod mode_line_point_oracle;
 #[path = "modes.rs"]
 mod modes;
+#[path = "mx_suggestion.rs"]
+mod mx_suggestion;
 #[path = "org.rs"]
 mod org;
 #[cfg(test)]
@@ -153,6 +160,9 @@ mod strict_grid;
 mod tty_color_index;
 #[path = "tty_input.rs"]
 mod tty_input;
+#[cfg(test)]
+#[path = "tty_relay.rs"]
+mod tty_relay;
 #[path = "window_divider_overlay_arrow.rs"]
 mod window_divider_overlay_arrow;
 #[path = "window_end_oracle.rs"]
@@ -172,3 +182,5 @@ mod font_coverage;
 #[path = "minibuffer_selected_window.rs"]
 mod minibuffer_selected_window;
 mod treesit_debug_mode_line;
+
+mod encoded_file;

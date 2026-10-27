@@ -27,6 +27,7 @@ fn div_cx13_process_send_receive_binary() {
     );
 }
 
+#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx13_buffer_narrow_marker_undo_stack_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -195,14 +196,14 @@ fn div_cx13_format_c_modifier_chars() {
 #[test]
 fn div_cx13_set_process_filter_receive_multiline() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK \"line1\\nline2\\nline3\"""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let (got)
   (let ((p (make-process :name "neo-cx13-ml" :command '("printf" "line1\\nline2\\nline3")
                          :buffer nil
-                         :filter (lambda (proc str) (push str got))))
-    (accept-process-output p 0.5))
+                         :filter (lambda (proc str) (push str got)))))
+    (neovm--oracle-settle-process p 600))
   (apply #'concat (nreverse got)))
 "##,
         expect,

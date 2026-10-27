@@ -4596,6 +4596,7 @@ fn read_char_mouse_press_uses_clicked_window_geometry() {
             buffer_modiff: None,
             layout_freshness: None,
             window_end_record: None,
+            eob_overlay_motion: crate::window::EobOverlayMotionCoverage::NotObserved,
             test_posn_object_extent_mode: None,
             points: vec![crate::window::DisplayPointSnapshot {
                 role: crate::window::DisplayPointRole::Glyph,
@@ -4612,6 +4613,7 @@ fn read_char_mouse_press_uses_clicked_window_geometry() {
                 row: 0,
                 y: 0,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 0,
@@ -4725,6 +4727,7 @@ fn read_key_sequence_uses_clicked_window_local_map_for_mouse_event() {
             buffer_modiff: None,
             layout_freshness: None,
             window_end_record: None,
+            eob_overlay_motion: crate::window::EobOverlayMotionCoverage::NotObserved,
             test_posn_object_extent_mode: None,
             points: vec![crate::window::DisplayPointSnapshot {
                 role: crate::window::DisplayPointRole::Glyph,
@@ -4741,6 +4744,7 @@ fn read_key_sequence_uses_clicked_window_local_map_for_mouse_event() {
                 row: 0,
                 y: 0,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 0,
@@ -4839,6 +4843,7 @@ fn read_key_sequence_drops_unbound_down_mouse_before_bound_click() {
             buffer_modiff: None,
             layout_freshness: None,
             window_end_record: None,
+            eob_overlay_motion: crate::window::EobOverlayMotionCoverage::NotObserved,
             test_posn_object_extent_mode: None,
             points: vec![crate::window::DisplayPointSnapshot {
                 role: crate::window::DisplayPointRole::Glyph,
@@ -4855,6 +4860,7 @@ fn read_key_sequence_drops_unbound_down_mouse_before_bound_click() {
                 row: 0,
                 y: 0,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 0,
@@ -5437,6 +5443,7 @@ fn read_key_sequence_uses_clicked_window_buffer_local_minor_mode_maps() {
             buffer_modiff: None,
             layout_freshness: None,
             window_end_record: None,
+            eob_overlay_motion: crate::window::EobOverlayMotionCoverage::NotObserved,
             test_posn_object_extent_mode: None,
             points: vec![crate::window::DisplayPointSnapshot {
                 role: crate::window::DisplayPointRole::Glyph,
@@ -5453,6 +5460,7 @@ fn read_key_sequence_uses_clicked_window_buffer_local_minor_mode_maps() {
                 row: 0,
                 y: 0,
                 height: 16,
+                extra_line_spacing: 0,
                 start_x: 0,
                 start_col: 0,
                 end_x: 0,
@@ -5548,6 +5556,7 @@ fn read_key_sequence_prefixes_mode_line_mouse_click_for_lookup() {
             buffer_modiff: None,
             layout_freshness: None,
             window_end_record: None,
+            eob_overlay_motion: crate::window::EobOverlayMotionCoverage::NotObserved,
             test_posn_object_extent_mode: None,
             points: Vec::new(),
             rows: Vec::new(),
@@ -5821,6 +5830,12 @@ fn fire_pending_timers_prefers_more_overdue_idle_timer_over_ordinary_timer() {
     )
     .expect("install timer ordering setup");
 
+    // Start idleness before the ordinary timer exists. The idle timer is due at
+    // idle start + 0 and the ordinary one at its creation + 5 ms, so the idle
+    // timer is the more overdue one by at least 5 ms in every schedule. Created
+    // the other way round, a setup slower than 5 ms (a loaded runner, the
+    // inline-off build) made the ordinary timer the more overdue one.
+    ev.timer_start_idle();
     ev.set_variable(
         "timer-list",
         Value::list(vec![gnu_timer_after(
@@ -5835,7 +5850,6 @@ fn fire_pending_timers_prefers_more_overdue_idle_timer_over_ordinary_timer() {
             "vm-idle-callback",
         )]),
     );
-    ev.timer_start_idle();
     thread::sleep(Duration::from_millis(20));
 
     ev.fire_pending_timers();
@@ -16645,6 +16659,13 @@ fn jit_subr_spec_pred_recordp_engages_and_matches() {
         crate::emacs_core::jit::bg::TestModeScope::enter(crate::emacs_core::jit::bg::BgMode::Sync);
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
+    // This pins the SHIM's Gap-1 engagement (entry + armed fast counters);
+    // the default-on inline `recordp` lowering answers before the shim
+    // (`lowering::emit_inline_type_tag_predicate`), so that counter is not
+    // what this test is about. The inline path's parity, both modes and
+    // every miss path are pinned by
+    // `compile_test::type_tag_predicate_sites_answer_inline`.
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(Some(false));
     let mut ev = Context::new();
     // Root each cross-eval Rust local AT CREATION (see the swp-p test note).
     let hot = jit_subr_spec_caller("recordp", 1, true);
@@ -16693,6 +16714,7 @@ fn jit_subr_spec_pred_recordp_engages_and_matches() {
         );
         assert!(fast1 > fast0, "the armed predicate fast path must fire");
     }
+    crate::emacs_core::jit::compile::force_inline_predicates_for_test(None);
 }
 
 /// `vectorp` must stay a GENERAL site (correct through the real builtin, no
@@ -24805,10 +24827,13 @@ fn drain_probe_median(samples: &mut [u64]) -> u64 {
 /// live graph every cycle after the STW bootstrap.
 #[allow(dead_code)]
 fn gc_drain_kinds_profile(pdump: bool, chunks: usize) {
-    crate::test_utils::init_test_tracing();
-    // Print the per-cycle `concurrent_termination ... kinds[...]` trace lines
-    // alongside the in-test capture (ground truth under --no-capture).
+    // Enable the stderr layer before its one-time initialization. Print the
+    // legacy `concurrent_termination ... kinds[...]` message alongside the
+    // structured fields and in-test capture (ground truth under --no-capture).
+    // SAFETY: this ignored nextest profiling aid runs alone in its process;
+    // set the diagnostic switch before initializing logging/runtime threads.
     unsafe { std::env::set_var("NEOVM_GC_TRACE", "1") };
+    crate::test_utils::init_test_tracing();
     if !pdump {
         unsafe { std::env::set_var("NEOVM_DISABLE_PDUMP", "1") };
     }

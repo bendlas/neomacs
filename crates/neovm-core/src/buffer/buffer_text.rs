@@ -6,7 +6,7 @@
 //! hidden behind a private enum.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
@@ -349,6 +349,10 @@ struct BufferTextStorage {
     /// `parse-partial-sexp` loop states of earlier scans (P3.4). Outside the
     /// copy-on-write backend: a snapshot starts without it (P3.0 §3.9).
     syntax_parse_cache: RefCell<SyntaxParseCache>,
+    /// Per-buffer GNU clip_changed witness. Indirect buffers share this heap
+    /// allocation but retain distinct restrictions. No Buffer/JIT layout change.
+    /// Kept after existing fields to avoid intentionally displacing hot fields.
+    mode_line_clipped: HashSet<BufferId>,
 }
 
 /// Validity key of a [`SyntaxSafePositions`] index: everything a forward
@@ -428,7 +432,7 @@ fn multibyte_chunk_contains_char_code(chunk: &[u8], code: u32, carry: &mut Vec<u
         }
 
         let (decoded, len) = crate::emacs_core::emacs_char::string_char(carry);
-        if decoded == code {
+        if decoded.code() == code {
             return true;
         }
         if len < carry.len() {
@@ -458,7 +462,7 @@ fn multibyte_chunk_contains_char_code(chunk: &[u8], code: u32, carry: &mut Vec<u
 
         let (decoded, len) =
             crate::emacs_core::emacs_char::string_char(&chunk[pos..pos + expected]);
-        if decoded == code {
+        if decoded.code() == code {
             return true;
         }
         pos += len;
@@ -519,6 +523,7 @@ impl Clone for BufferTextStorage {
             text_index_demand,
             line_index_role: LineIndexRole::Snapshot,
             syntax_parse_cache: RefCell::new(SyntaxParseCache::default()),
+            mode_line_clipped: self.mode_line_clipped.clone(),
         }
     }
 }
@@ -598,6 +603,7 @@ impl BufferText {
                 text_index_demand: OnceCell::new(),
                 line_index_role: LineIndexRole::Live,
                 syntax_parse_cache: RefCell::new(SyntaxParseCache::default()),
+                mode_line_clipped: HashSet::new(),
             })),
         }
     }
@@ -1523,6 +1529,18 @@ impl BufferText {
         storage.prop_beg_unchanged = i64::MAX;
     }
 
+    pub(crate) fn note_mode_line_clipped(&self, buffer: BufferId) {
+        self.storage.borrow_mut().mode_line_clipped.insert(buffer);
+    }
+
+    pub(crate) fn mode_line_clipped(&self, buffer: BufferId) -> bool {
+        self.storage.borrow().mode_line_clipped.contains(&buffer)
+    }
+
+    pub(crate) fn acknowledge_mode_line_clip(&self, buffer: BufferId) {
+        self.storage.borrow_mut().mode_line_clipped.remove(&buffer);
+    }
+
     /// GNU's `BEG_UNCHANGED` as a char count, with property changes counted
     /// from one char before their start exactly as `modify_text_properties`
     /// does (textprop.c:87). `None` when nothing changed since the ack.
@@ -1595,7 +1613,7 @@ impl BufferText {
         {
             return true;
         }
-        !carry.is_empty() && crate::emacs_core::emacs_char::string_char(&carry).0 == code
+        !carry.is_empty() && crate::emacs_core::emacs_char::string_char(&carry).0.code() == code
     }
 
     pub fn text_props_is_empty(&self) -> bool {
@@ -2221,6 +2239,20 @@ impl BufferText {
                 .next_single_property_change_after_char_pos(char_pos, name)
         };
         next.map(|next| self.char_pos_to_emacs_byte_pos(next))
+    }
+
+    /// Char-native bounded query for native fontification admission. This
+    /// borrows the existing property tree without converting or caching positions.
+    pub(crate) fn text_props_next_single_change_after_char_pos_bounded(
+        &self,
+        pos: CharPos0,
+        name: Value,
+        limit: CharPos0,
+    ) -> Option<CharPos0> {
+        self.storage
+            .borrow()
+            .text_props
+            .next_single_property_change_after_char_pos_bounded(pos, name, limit)
     }
 
     /// Display-engine bounded variant: like
@@ -2936,6 +2968,7 @@ impl BufferText {
     /// and sibling-indirect markers stay attached).
     pub fn remove_markers_for_buffers(&self, killed: &std::collections::HashSet<BufferId>) {
         let mut storage = self.storage.borrow_mut();
+        storage.mode_line_clipped.retain(|id| !killed.contains(id));
         let mut prev_slot: *mut *mut crate::tagged::header::MarkerObj = &mut storage.markers_head;
         // SAFETY: analogous to `chain_unlink`. Every non-null `*prev_slot`
         // was installed via `chain_splice_at_head`, i.e. a live GC-managed
@@ -3349,6 +3382,25 @@ impl BufferText {
         let metrics = self.storage.borrow().metrics;
         (metrics.char_len().get() == metrics.emacs_byte_len().get())
             .then(|| metrics.emacs_byte_end())
+    }
+
+    /// Convert a valid character position without growing the position-anchor
+    /// vector. Backend lookups only read existing nodes or update the gap
+    /// backend's fixed-size anchor ring; no heap storage is published.
+    pub(crate) fn char_pos_to_emacs_byte_pos_no_alloc(&self, target: CharPos0) -> EmacsBytePos {
+        self.storage
+            .borrow()
+            .backend
+            .char_pos_to_emacs_byte_pos(target)
+    }
+
+    /// Convert a valid character-boundary byte position without growing the
+    /// position-anchor vector. The caller owns byte-boundary validation.
+    pub(crate) fn emacs_byte_pos_to_char_pos_no_alloc(&self, target: EmacsBytePos) -> CharPos0 {
+        self.storage
+            .borrow()
+            .backend
+            .emacs_byte_pos_to_char_pos(target)
     }
 
     /// Convert a logical Emacs byte position to a character position. Symmetric
@@ -3836,3 +3888,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/buffer_text_chain_test.rs"]
 mod chain_test;
+
+#[cfg(test)]
+#[path = "buffer_text/tests/fontification_noalloc.rs"]
+mod fontification_noalloc_tests;

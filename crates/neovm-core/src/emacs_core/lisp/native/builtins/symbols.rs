@@ -8,6 +8,7 @@ use crate::emacs_core::eval::{
     push_scratch_gc_root, restore_scratch_gc_roots, save_scratch_gc_roots,
 };
 use crate::emacs_core::fontset;
+pub(crate) use crate::emacs_core::frame::{builtin_next_frame, builtin_previous_frame};
 use crate::emacs_core::intern::{NIL_SYM_ID, T_SYM_ID, intern, is_canonical_id};
 use crate::emacs_core::minibuffer;
 use crate::emacs_core::symbol::CanonicalAccess;
@@ -582,10 +583,7 @@ pub(crate) fn builtin_fboundp(eval: &mut super::eval::Context, args: Vec<Value>)
 
 typed_subr! {
     pub(crate) fn builtin_fboundp_1(eval, symbol: SymId) -> EvalResult {
-        Ok(Value::bool_val(
-            symbol_function_cell_in_obarray(eval.obarray(), symbol)
-                .is_some_and(|function| !function.is_nil()),
-        ))
+        Ok(Value::bool_val(function_cell_is_bound(eval.obarray(), symbol)))
     }
 }
 
@@ -1482,6 +1480,17 @@ pub(crate) fn symbol_function_cell_in_obarray(obarray: &Obarray, symbol: SymId) 
     }
 }
 
+/// `fboundp`'s one answer for a symbol id: the function cell holds a non-NIL
+/// function. A cell bound to NIL (an `(fset 'x nil)`) is not fboundp. The
+/// builtin and the spec shims share this definition; none of them re-derives
+/// the rule. The body is the existing accessor's exact composition so that
+/// inlining it emits the callers' previous code (the spec shim is measured
+/// per call).
+#[inline(always)]
+pub(crate) fn function_cell_is_bound(obarray: &Obarray, symbol: SymId) -> bool {
+    symbol_function_cell_in_obarray(obarray, symbol).is_some_and(|function| !function.is_nil())
+}
+
 pub(crate) fn resolve_indirect_symbol_by_id_in_obarray(
     obarray: &Obarray,
     symbol: SymId,
@@ -2346,39 +2355,6 @@ pub(crate) fn builtin_make_temp_file_internal(
 pub(crate) fn builtin_minibuffer_innermost_command_loop_p(args: Vec<Value>) -> EvalResult {
     expect_args_range("minibuffer-innermost-command-loop-p", &args, 0, 1)?;
     Ok(Value::NIL)
-}
-
-pub(crate) fn builtin_next_frame(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    expect_args_range("next-frame", &args, 0, 2)?;
-    if let Some(frame) = args.first()
-        && !frame.is_nil()
-    {
-        let _ = super::window_cmds::resolve_frame_id_in_state(
-            &mut eval.frames,
-            &mut eval.buffers,
-            Some(frame),
-            crate::emacs_core::window_cmds::FrameDomain::Live,
-        )?;
-    }
-    crate::emacs_core::frame::builtin_selected_frame(eval, Vec::new())
-}
-
-pub(crate) fn builtin_previous_frame(
-    eval: &mut super::eval::Context,
-    args: Vec<Value>,
-) -> EvalResult {
-    expect_args_range("previous-frame", &args, 0, 2)?;
-    if let Some(frame) = args.first()
-        && !frame.is_nil()
-    {
-        let _ = super::window_cmds::resolve_frame_id_in_state(
-            &mut eval.frames,
-            &mut eval.buffers,
-            Some(frame),
-            crate::emacs_core::window_cmds::FrameDomain::Live,
-        )?;
-    }
-    crate::emacs_core::frame::builtin_selected_frame(eval, Vec::new())
 }
 
 pub(crate) fn builtin_raise_frame(args: Vec<Value>) -> EvalResult {
@@ -3370,6 +3346,8 @@ pub(crate) fn builtin_resize_mini_window_internal(
 
     let char_width = frame.char_width;
     let char_height = frame.char_height;
+    let geometry_changed = root_height != root_new || mini_height != mini_new;
+    let is_tty = frame.effective_window_system().is_none();
     let root = frame.tree().root_id();
     crate::window::window_resize_apply(frame.tree_mut(), root, false, char_width, char_height);
     let mini = frame
@@ -3385,6 +3363,19 @@ pub(crate) fn builtin_resize_mini_window_internal(
     ));
     mini.set_new_pixel(None);
     frame.recalculate_minibuffer_bounds();
+    // Legacy has no GNU frame-local redisplay/current-matrix validity flag.
+    // A real allocation change must therefore forget the physical matrix,
+    // including a shrink/grow cycle completed before its next presentation.
+    // This uses existing output ownership, not the optional callback policy.
+    if geometry_changed && !eval.gnu_redisplay_hooks_policy_enabled() {
+        eval.invalidate_redisplay();
+        if is_tty {
+            eval.gnu_request_frame_redraw(fid);
+        }
+    }
+    // The successful primitive is the common GNU resize_mini_window_apply
+    // seam, including direct window.el calls outside preparatory redisplay.
+    eval.gnu_publish_mini_geometry_changed(fid);
     Ok(Value::T)
 }
 

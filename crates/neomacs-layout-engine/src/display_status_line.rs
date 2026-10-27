@@ -19,7 +19,9 @@ use super::window_output::{
 };
 use crate::display_origin::DisplayOrigin;
 use crate::display_rendered_row_output_install::install_measured_frame_chrome_display_row;
-use crate::display_row::builder::{DisplayTabPolicy, display_row_text_is_empty};
+use crate::display_row::builder::{
+    DisplayRowAppendStartPolicy, DisplayTabPolicy, display_row_text_is_empty,
+};
 pub(crate) use crate::display_row::face_state::DisplayRowFaceRealizer;
 use crate::display_row::face_state::DisplayRowMeasurementMode;
 use crate::display_row::measured_state::{
@@ -1196,12 +1198,12 @@ impl<'face> WindowChromeDisplayRowRenderRequest<'face> {
         };
         measured.reanchor_y(final_y);
         let progress = measured.output_progress();
-        state.output.install_measured_window_display_row(&measured);
+        state.output.install_measured_window_display_row(measured);
         state.output_emitter.emit_chrome_progress(
             state.evaluator,
             ChromeRowProgress::new(output.with_y(final_y), progress),
         );
-        Some(measured.row_height())
+        Some(measured_height)
     }
 }
 
@@ -1292,6 +1294,7 @@ impl<'face> WindowChromeDisplayRowRequest<'face> {
             .lisp_string_row_request()
             .with_symbol_values(self.symbol_values)
             .into_render_request(face_ids)
+            .with_append_start_policy(DisplayRowAppendStartPolicy::ExactIntegerFreshChrome)
             .with_chrome_text_area_left_px(self.text_area_left_px)
             .with_composition_source(
                 crate::display_source::LispStringCompositionSource::FormattedRegions(
@@ -1390,10 +1393,17 @@ impl<'state, 'services, 'face> WindowChromeRowsRenderState<'state, 'services, 'f
             neovm_core::window::WindowId(request.window_id),
         );
         let memo_mode = chrome_memo_mode();
-        let (memo_hit, source_bindings) = if memo_mode.enabled() {
-            self.memoize_chrome_row(&request, rules.is_some())
+        let (memo_hit, source_bindings, primitive_reuse) = if memo_mode.enabled() {
+            self.memoize_chrome_row(
+                &request,
+                crate::incremental_layout::chrome_memo::ChromeCompositionRules::from(&rules),
+            )
         } else {
-            (None, None)
+            (
+                None,
+                None,
+                crate::display_row::builder::ChromePrimitiveReuse::Canonical,
+            )
         };
         if memo_mode == ChromeMemoMode::On
             && let Some((index, row, snapshot)) = memo_hit
@@ -1413,7 +1423,13 @@ impl<'state, 'services, 'face> WindowChromeRowsRenderState<'state, 'services, 'f
             self.evaluator,
             source_bindings,
         ) {
-            Ok(request) => request.render_and_apply(self, anchor, rules),
+            Ok(mut request) => {
+                request.row.render_request = request
+                    .row
+                    .render_request
+                    .with_chrome_primitive_reuse(primitive_reuse);
+                request.render_and_apply(self, anchor, rules)
+            }
             Err(error) => {
                 tracing::error!(?error, "failed to root chrome row sources");
                 None
@@ -1433,10 +1449,11 @@ impl<'state, 'services, 'face> WindowChromeRowsRenderState<'state, 'services, 'f
     fn memoize_chrome_row(
         &mut self,
         request: &WindowChromeDisplayRowRequest<'_>,
-        automatic_composition: bool,
+        automatic_composition: crate::incremental_layout::chrome_memo::ChromeCompositionRules,
     ) -> (
         Option<(usize, MatrixRow, DisplayRowSnapshot)>,
         Option<ChromeSourceBindings>,
+        crate::display_row::builder::ChromePrimitiveReuse,
     ) {
         let (fingerprint, bindings) =
             match self.chrome_row_fingerprint(request, automatic_composition) {
@@ -1448,6 +1465,17 @@ impl<'state, 'services, 'face> WindowChromeRowsRenderState<'state, 'services, 'f
                 .hit(fingerprint)
                 .map(|hit| (hit.index, hit.row.clone(), hit.snapshot.clone())),
             _ => None,
+        };
+        // Whole-row hits pay no reservoir validation or rendering. A partial
+        // owner is admitted from the very same freshly captured context.
+        let primitive_reuse = if hit.is_none() {
+            self.memo
+                .zip(fingerprint.as_ref())
+                .and_then(|(memo, fingerprint)| memo.glyph_reservoir(fingerprint))
+                .map(crate::display_row::builder::ChromePrimitiveReuse::Retained)
+                .unwrap_or_default()
+        } else {
+            crate::display_row::builder::ChromePrimitiveReuse::Canonical
         };
         if tracing::enabled!(target: "neomacs::chrome_memo", tracing::Level::DEBUG) {
             let miss = match (self.memo, fingerprint.as_ref(), hit.is_some()) {
@@ -1466,13 +1494,13 @@ impl<'state, 'services, 'face> WindowChromeRowsRenderState<'state, 'services, 'f
             );
         }
         record_fingerprint(request.window_id as i64, request.kind, fingerprint);
-        (hit, bindings)
+        (hit, bindings, primitive_reuse)
     }
 
     fn chrome_row_fingerprint(
         &self,
         request: &WindowChromeDisplayRowRequest<'_>,
-        automatic_composition: bool,
+        automatic_composition: crate::incremental_layout::chrome_memo::ChromeCompositionRules,
     ) -> Option<(ChromeRowFingerprint, Option<ChromeSourceBindings>)> {
         let symbol_values = encode_symbol_values(
             request

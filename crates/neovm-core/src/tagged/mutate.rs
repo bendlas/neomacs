@@ -9,8 +9,11 @@ use crate::emacs_core::bytecode::ByteCodeFunction;
 use crate::emacs_core::value::LispHashTable;
 use crate::heap_types::{LispMarker, LispString, OverlayData};
 
-use super::collection_reads::{WriteProjection, record_projected_write};
-use super::gc::{HeapWriteKind, note_heap_slot_write, note_heap_write};
+use super::collection_reads::{StoreState, WriteProjection, record_projected_write_in_store};
+use super::gc::{
+    HeapWriteKind, note_heap_slot_write, note_heap_slot_write_in_store, note_heap_write,
+    with_store_state,
+};
 use super::header::{
     ByteCodeObj, ByteCodeSlotObject, ConsCell, HashTableObj, LambdaObj, MacroObj, MarkerObj,
     OverlayObj, RecordObj, StringObj, VecLikeHeader, VecLikeType, VectorObj, XwidgetObj,
@@ -22,10 +25,6 @@ mod chartable;
 pub use chartable::{CharTableWrite, SubCharTableWrite};
 pub(crate) use chartable::{with_char_table_write, with_sub_char_table_write};
 
-thread_local! {
-    static COLLECTION_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 /// Short-lived observations can depend on mutable Lisp collections nested
 /// inside display properties without a buffer-property write. Allocating a
 /// fresh object does not change this revision; mutating an existing one does.
@@ -35,6 +34,11 @@ thread_local! {
 pub struct LispCollectionRevision(u64);
 
 impl LispCollectionRevision {
+    #[inline]
+    pub(super) fn from_sequence(sequence: u64) -> Self {
+        Self(sequence)
+    }
+
     /// Exact mutation count for regression tests, including sequence wrap.
     #[cfg(test)]
     pub(crate) fn steps_since_for_test(self, earlier: Self) -> u64 {
@@ -42,7 +46,9 @@ impl LispCollectionRevision {
     }
 
     pub fn current() -> Self {
-        Self(COLLECTION_REVISION.with(std::cell::Cell::get))
+        Self(super::collection_reads::with_store(|store| {
+            store.sequence()
+        }))
     }
 
     #[inline]
@@ -52,11 +58,7 @@ impl LispCollectionRevision {
 
     #[inline]
     pub(super) fn advance() -> Self {
-        COLLECTION_REVISION.with(|revision| {
-            let next = revision.get().wrapping_add(1);
-            revision.set(next);
-            Self(next)
-        })
+        Self(super::collection_reads::with_store(|store| store.advance()))
     }
 
     #[inline]
@@ -64,9 +66,8 @@ impl LispCollectionRevision {
         if !super::collection_reads::history_required() {
             return;
         }
-        COLLECTION_REVISION.with(|revision| {
-            let next = revision.get().wrapping_add(1);
-            revision.set(next);
+        super::collection_reads::with_store(|store| {
+            let next = store.advance();
             super::collection_reads::record_write(value, next);
         });
     }
@@ -113,30 +114,94 @@ pub(crate) fn debug_assert_no_heap_mut_closure() {
 // arm grows: a rejected store must not gain a setter call under either mode.
 #[inline(always)]
 pub fn set_cons_car(cell: TaggedValue, value: TaggedValue) -> bool {
-    if !record_projected_write(cell, WriteProjection::Cons) {
+    with_store_state(|store| {
+        let _ = set_cons_car_in_store(store, cell, value);
+    });
+    // The tag is the only failure condition. Keep it visible to callers
+    // even when the outlined null-heap entry performs the shared store.
+    cell.is_cons()
+}
+
+#[inline(always)]
+pub(crate) fn set_cons_car_in_store(
+    store: &StoreState,
+    cell: TaggedValue,
+    value: TaggedValue,
+) -> bool {
+    if !record_projected_write_in_store(store, cell, WriteProjection::Cons) {
         return false;
     }
-    note_heap_slot_write(cell, HeapWriteKind::ConsCar, 0, value);
-    // The fused recorder proved the Cons tag and observed this pointer after
-    // journaling. Its STATE borrow ended before the barrier; no callback or
-    // collection revision change occurs between that observation and this store.
-    unsafe {
-        (*((cell.bits() & !TAG_MASK) as *mut ConsCell)).set_car(value);
-    }
-    true
+    // SAFETY: the shared recorder validated this live Cons tag.
+    unsafe { finish_cons_store_in_store(store, cell, value, false) }
 }
 
 #[inline(always)]
 pub fn set_cons_cdr(cell: TaggedValue, value: TaggedValue) -> bool {
-    if !record_projected_write(cell, WriteProjection::Cons) {
+    with_store_state(|store| {
+        let _ = set_cons_cdr_in_store(store, cell, value);
+    });
+    cell.is_cons()
+}
+
+#[inline(always)]
+pub(crate) fn set_cons_cdr_in_store(
+    store: &StoreState,
+    cell: TaggedValue,
+    value: TaggedValue,
+) -> bool {
+    if !record_projected_write_in_store(store, cell, WriteProjection::Cons) {
         return false;
     }
-    note_heap_slot_write(cell, HeapWriteKind::ConsCdr, 1, value);
-    // As for set_cons_car: projection is already observed, and the barrier
-    // has no Lisp callback or collection revision change.
+    // SAFETY: the shared recorder validated this live Cons tag.
+    unsafe { finish_cons_store_in_store(store, cell, value, true) }
+}
+
+/// Complete a prepared cons store with its unchanged GC barrier.
+///
+/// # Safety
+/// `cell` must name a live, exclusively mutated ConsCell. No safe point or
+/// callback may intervene between validating that owner and this operation.
+#[inline(always)]
+pub(crate) unsafe fn finish_cons_store_in_store(
+    store: &StoreState,
+    cell: TaggedValue,
+    value: TaggedValue,
+    cdr: bool,
+) -> bool {
+    let kind = if cdr {
+        HeapWriteKind::ConsCdr
+    } else {
+        HeapWriteKind::ConsCar
+    };
+    note_heap_slot_write_in_store(store, cell, kind, usize::from(cdr), value);
+    let owner = (cell.bits() & !TAG_MASK) as *mut ConsCell;
     unsafe {
-        (*((cell.bits() & !TAG_MASK) as *mut ConsCell)).set_cdr(value);
+        if cdr {
+            (*owner).set_cdr(value)
+        } else {
+            (*owner).set_car(value)
+        }
     }
+    true
+}
+
+/// Complete a prepared vector/record store without retaining a payload loan
+/// across the barrier's preimage reads.
+///
+/// # Safety
+/// `data` must be this live owner's slot backing and `index` must be in range.
+/// The caller owns mutation and retains no payload reference across this call.
+#[inline(always)]
+pub(crate) unsafe fn finish_slot_store_in_store(
+    store: &StoreState,
+    owner: TaggedValue,
+    kind: HeapWriteKind,
+    index: usize,
+    item: TaggedValue,
+    data: *mut super::header::LispValueVec,
+) -> bool {
+    note_heap_slot_write_in_store(store, owner, kind, index, item);
+    unsafe { (*data).store_atomic(index, item) };
     true
 }
 
@@ -163,19 +228,17 @@ pub(crate) fn set_compiled_cons_cdr(cell: TaggedValue, value: TaggedValue) -> bo
     }
     let address = cell.bits() & !TAG_MASK;
     let (lo, hi) = super::collection_reads::compiled_observation_window();
-    if lo <= address && address < hi && is_observed(cell.bits()) {
-        super::gc::TaggedHeap::record_compiled_collection_write(cell.bits());
-    } else {
-        // A refusal into the original BLV shim learns the same empty gap as
-        // the native cons guard. Its return does not rejoin a pre-store block,
-        // so unobserved BLV loops keep their original register allocation.
+    let observed = lo <= address && address < hi && is_observed(cell.bits());
+    if !observed {
         super::gc::neovm_jit_unobserved_collection_owner(cell.bits() as i64);
     }
-    note_heap_slot_write(cell, HeapWriteKind::ConsCdr, 1, value);
-    // SAFETY: the Cons tag names a live validated BLV owner. The barrier has
-    // completed, and no callback or collection intervenes before this store.
-    unsafe { (*((cell.bits() & !TAG_MASK) as *mut ConsCell)).set_cdr(value) };
-    true
+    with_store_state(|store| {
+        if observed {
+            record_projected_write_in_store(store, cell, WriteProjection::Cons);
+        }
+        // SAFETY: the preceding Cons tag check validated this BLV owner.
+        unsafe { finish_cons_store_in_store(store, cell, value, true) }
+    })
 }
 
 #[inline]
@@ -231,7 +294,20 @@ pub fn replace_vector_data(value: TaggedValue, items: Vec<TaggedValue>) -> bool 
 
 #[inline]
 pub fn set_vector_slot(value: TaggedValue, index: usize, item: TaggedValue) -> bool {
-    if !record_projected_write(value, WriteProjection::VecLike) {
+    with_store_state(
+        #[inline(always)]
+        move |store| set_vector_slot_in_store(store, value, index, item),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn set_vector_slot_in_store(
+    store: &StoreState,
+    value: TaggedValue,
+    index: usize,
+    item: TaggedValue,
+) -> bool {
+    if !record_projected_write_in_store(store, value, WriteProjection::VecLike) {
         return false;
     }
     // The observed header is reused for subtype and payload. Wrong veclike
@@ -245,10 +321,17 @@ pub fn set_vector_slot(value: TaggedValue, index: usize, item: TaggedValue) -> b
     if index >= data.len() {
         return false;
     }
-    note_heap_slot_write(value, HeapWriteKind::VectorSlot, index, item);
-    // Atomic store so a concurrent GC read of this slot sees a whole value.
-    unsafe { (*ptr).data.store_atomic(index, item) };
-    true
+    // SAFETY: the subtype and bounds guards proved this live owner/backing.
+    unsafe {
+        finish_slot_store_in_store(
+            store,
+            value,
+            HeapWriteKind::VectorSlot,
+            index,
+            item,
+            std::ptr::addr_of_mut!((*ptr).data),
+        )
+    }
 }
 
 #[inline]
@@ -274,7 +357,20 @@ pub fn replace_record_data(value: TaggedValue, items: Vec<TaggedValue>) -> bool 
 
 #[inline]
 pub fn set_record_slot(value: TaggedValue, index: usize, item: TaggedValue) -> bool {
-    if !record_projected_write(value, WriteProjection::VecLike) {
+    with_store_state(
+        #[inline(always)]
+        move |store| set_record_slot_in_store(store, value, index, item),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn set_record_slot_in_store(
+    store: &StoreState,
+    value: TaggedValue,
+    index: usize,
+    item: TaggedValue,
+) -> bool {
+    if !record_projected_write_in_store(store, value, WriteProjection::VecLike) {
         return false;
     }
     let header = (value.bits() & !TAG_MASK) as *const VecLikeHeader;
@@ -286,11 +382,17 @@ pub fn set_record_slot(value: TaggedValue, index: usize, item: TaggedValue) -> b
     if index >= data.len() {
         return false;
     }
-    note_heap_slot_write(value, HeapWriteKind::RecordSlot, index, item);
-    // Atomic store, as for vector slots: a concurrent reader of the slot
-    // (the GC thread, once records are traced there) sees a whole value.
-    unsafe { (*ptr).data.store_atomic(index, item) };
-    true
+    // SAFETY: the subtype and bounds guards proved this live owner/backing.
+    unsafe {
+        finish_slot_store_in_store(
+            store,
+            value,
+            HeapWriteKind::RecordSlot,
+            index,
+            item,
+            std::ptr::addr_of_mut!((*ptr).data),
+        )
+    }
 }
 
 #[inline]
@@ -397,13 +499,39 @@ pub fn with_lisp_string_mut<R>(
 /// full barrier -- 43 instructions per character on dhrystone.
 #[inline]
 pub fn set_string_byte_same_char_count(value: TaggedValue, byte_pos: usize, byte: u8) -> bool {
-    LispCollectionRevision::changed(value);
-    let Some(ptr) = value.as_string_ptr() else {
+    with_store_state(
+        #[inline(always)]
+        move |store| set_string_byte_same_char_count_in_store(store, value, byte_pos, byte),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn set_string_byte_same_char_count_in_store(
+    store: &StoreState,
+    value: TaggedValue,
+    byte_pos: usize,
+    byte: u8,
+) -> bool {
+    super::collection_reads::record_unprojected_write_in_store(store, value);
+    if !value.is_string() {
         return false;
-    };
-    let ptr = ptr as *mut StringObj;
-    // SAFETY: a live string object; the caller holds the only mutation.
-    unsafe { (*ptr).data.set_byte_same_char_count(byte_pos, byte) };
+    }
+    super::collection_reads::observe_store_projection_in_store(store, value);
+    let ptr = (value.bits() & !TAG_MASK) as *mut StringObj;
+    // SAFETY: a live string object, exclusively mutated with no callback or
+    // safepoint. Guards make the raw byte store total even for invalid callers.
+    let string = unsafe { &mut (*ptr).data };
+    if byte_pos >= string.sbytes()
+        || (string.is_multibyte()
+            && (byte >= 0x80
+                || string
+                    .as_bytes()
+                    .get(byte_pos)
+                    .is_none_or(|old| *old >= 0x80)))
+    {
+        return false;
+    }
+    string.set_byte_same_char_count(byte_pos, byte);
     true
 }
 
@@ -639,19 +767,3 @@ pub fn with_xwidget_view_mut<R>(
 #[cfg(debug_assertions)]
 #[path = "gc/tests/heap_mut_closure_test.rs"]
 mod gc_heap_mut_closure_tests;
-
-/// Round 3w (plan-3w.md section 7, C1): this World state lives in a
-/// thread-local while its World's Baton holder runs, and in the World while
-/// it is parked; the Green runtime moves it at each park and resume, so
-/// every Lisp thread sees one value, as in GNU. (N-mutator mode needs shared
-/// storage instead: a recorded obligation.)
-#[cold]
-pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
-    Box::new(0_u64)
-}
-
-#[cold]
-pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
-    let slot = slot.downcast_mut::<u64>().expect("carried World state");
-    COLLECTION_REVISION.with(|revision| *slot = revision.replace(*slot));
-}

@@ -1,7 +1,5 @@
 //! Native Lisp declarations for Little CMS support.
 
-use crate::emacs_core::eval::Context;
-
 std::cfg_select! {
     neomacs_have_lcms2 => {
         use super::*;
@@ -51,7 +49,7 @@ std::cfg_select! {
         }
     }
     _ => {
-        pub(crate) fn register_subrs(ctx: &mut Context) {
+        pub(crate) fn register_subrs(ctx: &mut crate::emacs_core::eval::Context) {
             let _ = ctx;
         }
     }

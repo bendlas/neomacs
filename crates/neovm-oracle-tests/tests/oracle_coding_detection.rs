@@ -1,6 +1,5 @@
 //! Runtime charset-category detection agrees with GNU and preserves file bytes.
-#[path = "../src/common.rs"]
-mod common;
+use crate::common;
 use common::return_if_neovm_enable_oracle_proptest_not_set;
 
 #[test]
@@ -69,3 +68,6 @@ fn multibyte_string_and_region_detection_preserve_raw_byte_interpretation() {
         expect_test::expect![[r#""OK (chinese-gbk-unix chinese-gbk-unix)""#]],
     );
 }
+
+#[path = "oracle_coding_detection/encoded_file.rs"]
+mod encoded_file;

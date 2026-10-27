@@ -5,6 +5,25 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "tests/mark_phase_test.rs"]
+mod mark_phase_tests;
+
+/// The coordinator's view of the existing phase flags, not an admission proof.
+/// Eager STW collection still relies on its exclusive driver/collector loan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MarkPhase {
+    Idle,
+    ConcurrentRunning,
+    /// Marking remains after a worker join or an unpublished capture. The
+    /// flags cannot distinguish those histories; recovery retains its roots.
+    StoppedMarking,
+    /// Internal to incremental_finish: sweep work is published before the
+    /// mark flag clears. No Context driver may reenter in this interval.
+    PublishingSweep,
+    Sweeping,
+}
+
 /// Explicit marker finish or resource shutdown could not complete.
 /// A failed marker handoff preserves active state; facade retention refuses
 /// resource reclamation while its publication or reader obligations remain.
@@ -25,6 +44,28 @@ pub enum MarkFinishError {
 static_assertions::assert_impl_all!(MarkFinishError: Send, Sync, std::fmt::Debug);
 
 impl TaggedHeap {
+    /// Classify without a new stored discriminant or an atomic gc_done load.
+    /// gc_done is a tentative work-queue observation, not worker termination.
+    #[inline]
+    pub(crate) fn mark_phase(&self) -> MarkPhase {
+        debug_assert!(
+            !self.concurrent_mark_running || (self.mark_in_progress && !self.sweep_in_progress),
+            "a concurrent worker requires marking and excludes sweep"
+        );
+        match (self.sweep_in_progress, self.mark_in_progress) {
+            (false, false) => MarkPhase::Idle,
+            (false, true) => {
+                if self.concurrent_mark_running {
+                    MarkPhase::ConcurrentRunning
+                } else {
+                    MarkPhase::StoppedMarking
+                }
+            }
+            (true, true) => MarkPhase::PublishingSweep,
+            (true, false) => MarkPhase::Sweeping,
+        }
+    }
+
     /// True if a concurrent mark should drive THIS collection.
     ///
     /// Dump heaps: a partitioned post-dump heap whose first partition cycle
@@ -845,6 +886,9 @@ impl TaggedHeap {
     /// On marker error or retained facade obligations, Drop abandons the
     /// backing allocations instead of reclaiming them.
     pub fn shutdown(mut self) -> Result<(), MarkFinishError> {
+        // The by-value receiver may have moved; resolve the inline bytes
+        // through this legitimate loan before observing or retiring the heap.
+        self.detach_store_protocol();
         // SAFETY: shutdown consumes this heap, and its only remaining access
         // is automatic destruction after the explicit resource teardown.
         unsafe { self.shutdown_owned_resources() }

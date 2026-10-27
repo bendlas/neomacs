@@ -40,8 +40,8 @@ fn new_creates_correct_grid_dimensions() {
 fn new_grids_are_blank_spaces() {
     let rif = TtyRif::new(10, 5);
     for cell in &rif.current.cells {
-        assert_eq!(cell.ch, ' ');
-        assert!(!cell.padding);
+        assert_eq!(cell.ch(), ' ');
+        assert!(!cell.padding());
     }
 }
 
@@ -66,7 +66,121 @@ fn resize_clears_grids() {
     rif.current.set(0, 0, 'X', CellAttrs::default(), false);
     rif.resize(10, 5);
     // After resize, the cell should be blank again.
-    assert_eq!(rif.current.cells[0].ch, ' ');
+    assert_eq!(rif.current.cells[0].ch(), ' ');
+}
+
+#[test]
+fn resize_clears_physical_screen_before_fresh_matrix_and_only_once() {
+    let caps = TermCaps {
+        synchronized_output: false,
+        ..TermCaps::default()
+    };
+    let terminal = TtyAttributeCapabilities {
+        clear_screen: Some(b"\x1b[H\x1b[J".to_vec()),
+        ..TtyAttributeCapabilities::none()
+    };
+    let mut rif = TtyRif::new_with_caps(8, 4, caps);
+    for (column, character) in "OLDVIEW".chars().enumerate() {
+        rif.desired
+            .set(0, column, character, CellAttrs::default(), false);
+    }
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    assert!(!rif.take_output().is_empty());
+
+    // In the saved Vertico resize, an old-width output already in flight
+    // reaches the newly narrowed terminal before its fresh matrix. Repainting
+    // cells alone leaves its soft-wrap history behind. GNU's post-resize
+    // clear_frame emits the entry's cl (screen-256color: home + ED) first.
+    rif.resize(6, 4);
+    for (column, character) in "NEW".chars().enumerate() {
+        rif.desired
+            .set(0, column, character, CellAttrs::default(), false);
+    }
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    let output = rif.take_output();
+    let clear = b"\x1b[H\x1b[J";
+    let clear_at = output
+        .windows(clear.len())
+        .position(|bytes| bytes == clear)
+        .expect("a resized/garbaged terminal needs GNU's physical screen clear");
+    let glyphs_at = output
+        .windows(3)
+        .position(|bytes| bytes == b"NEW")
+        .expect("the resized frame must paint its fresh row");
+    assert!(
+        clear_at < glyphs_at,
+        "clear must precede fresh matrix glyphs"
+    );
+
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    let unchanged = rif.take_output();
+    assert!(!unchanged.windows(3).any(|bytes| bytes == b"\x1b[J"));
+    assert!(!unchanged.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+
+    rif.desired.set(0, 1, 'O', CellAttrs::default(), false);
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    let incremental = rif.take_output();
+    assert!(!incremental.windows(3).any(|bytes| bytes == b"\x1b[J"));
+    assert!(!incremental.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+
+    // Menu restores still request a repaint, not a resize screen clear.
+    rif.force_redraw();
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    assert!(
+        !rif.take_output()
+            .windows(clear.len())
+            .any(|bytes| bytes == clear)
+    );
+}
+
+fn render_with_screen_clear_capability(rif: &mut TtyRif, caps: &TtyAttributeCapabilities) {
+    rif.diff_and_render_with_clear_screen(|output| write_clear_screen_with(output, caps));
+}
+
+#[test]
+fn resize_without_clear_screen_capability_does_not_invent_ansi_clear() {
+    let mut rif = TtyRif::new(8, 4);
+    rif.diff_and_render();
+    rif.take_output();
+    rif.resize(6, 4);
+    rif.desired.set(0, 0, 'N', CellAttrs::default(), false);
+
+    render_with_screen_clear_capability(&mut rif, &TtyAttributeCapabilities::none());
+    let output = rif.take_output();
+    assert!(output.contains(&b'N'));
+    assert!(!output.windows(3).any(|bytes| bytes == b"\x1b[J"));
+    assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+}
+
+#[test]
+fn resize_clear_uses_the_entry_sequence_and_survives_a_failed_write_retry() {
+    let terminal = TtyAttributeCapabilities {
+        clear_screen: Some(b"\x1b[2J\x1b[H".to_vec()),
+        ..TtyAttributeCapabilities::none()
+    };
+    let clear = terminal.clear_screen.as_deref().unwrap();
+    let mut rif = TtyRif::new(8, 4);
+    rif.diff_and_render();
+    rif.take_output();
+    rif.resize(6, 4);
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    let output = rif.take_output();
+    assert!(output.windows(clear.len()).any(|bytes| bytes == clear));
+    assert_eq!(rif.physical_clear_requirement(), PendingPhysicalClear::None);
+
+    // The output owner calls this only if writing that resize update failed.
+    rif.retry_physical_clear();
+    assert_eq!(
+        rif.physical_clear_requirement(),
+        PendingPhysicalClear::AfterResize
+    );
+    render_with_screen_clear_capability(&mut rif, &terminal);
+    assert!(
+        rif.take_output()
+            .windows(clear.len())
+            .any(|bytes| bytes == clear)
+    );
+    assert_eq!(rif.physical_clear_requirement(), PendingPhysicalClear::None);
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +408,7 @@ fn make_grid_state(
 }
 
 fn desired_char(rif: &TtyRif, row: usize, col: usize) -> char {
-    rif.desired.cells[row * rif.width() + col].ch
+    rif.desired.cells[row * rif.width() + col].ch()
 }
 
 #[test]
@@ -304,12 +418,12 @@ fn rasterize_simple_text() {
     rif.rasterize(&state);
 
     // First row should have "Hello" followed by spaces.
-    assert_eq!(rif.desired.cells[0].ch, 'H');
-    assert_eq!(rif.desired.cells[1].ch, 'e');
-    assert_eq!(rif.desired.cells[2].ch, 'l');
-    assert_eq!(rif.desired.cells[3].ch, 'l');
-    assert_eq!(rif.desired.cells[4].ch, 'o');
-    assert_eq!(rif.desired.cells[5].ch, ' '); // cleared to space
+    assert_eq!(rif.desired.cells[0].ch(), 'H');
+    assert_eq!(rif.desired.cells[1].ch(), 'e');
+    assert_eq!(rif.desired.cells[2].ch(), 'l');
+    assert_eq!(rif.desired.cells[3].ch(), 'l');
+    assert_eq!(rif.desired.cells[4].ch(), 'o');
+    assert_eq!(rif.desired.cells[5].ch(), ' '); // cleared to space
 }
 
 #[test]
@@ -552,9 +666,9 @@ fn later_window_blank_rows_do_not_inherit_an_overlapped_windows_face() {
     rif.rasterize(&state);
 
     let cell = &rif.desired.cells[2 * rif.width() + 4];
-    assert_eq!(cell.ch, ' ');
-    assert_eq!(cell.attrs, CellAttrs::default());
-    assert_eq!(cell.blank_erase, BlankErase::DefaultFace);
+    assert_eq!(cell.ch(), ' ');
+    assert_eq!(cell.attrs(), CellAttrs::default());
+    assert_eq!(cell.blank_erase(), BlankErase::DefaultFace);
 }
 
 #[test]
@@ -635,7 +749,7 @@ fn tty_line_end_filler_with_default_sgr_still_preserves_nondefault_face_identity
         }],
         "GNU's filtered TTY line-end face looks default but is not CHAR_GLYPH_SPACE_P",
     );
-    assert_eq!(rif.desired.cells[2].attrs, CellAttrs::default());
+    assert_eq!(rif.desired.cells[2].attrs(), CellAttrs::default());
 }
 
 #[test]
@@ -645,6 +759,8 @@ fn tty_line_end_filler_from_a_nonzero_default_style_face_remains_erasable() {
     default_face.use_default_foreground = true;
     default_face.use_default_background = true;
     let mut resolved_default = Face::new(FaceId::new(21));
+    resolved_default.tty_space_identity =
+        neomacs_display_protocol::face::TtySpaceIdentity::CanonicalDefault;
     resolved_default.use_default_foreground = true;
     resolved_default.use_default_background = true;
     state.faces.insert(FaceId::new(0), default_face);
@@ -694,6 +810,56 @@ fn tty_line_end_filler_from_a_nonzero_default_style_face_remains_erasable() {
 }
 
 #[test]
+fn tty_nondefault_logical_face_with_default_paint_writes_its_blank_tail() {
+    let mut state = FrameDisplayState::new(5, 1, 1.0, 1.0);
+    let mut default_face = Face::new(FaceId::new(0));
+    default_face.use_default_foreground = true;
+    default_face.use_default_background = true;
+    let mut margin_face = default_face.clone();
+    margin_face.id = FaceId::new(21);
+    margin_face.lisp_name = Some("margin".to_owned());
+    margin_face.tty_space_identity =
+        neomacs_display_protocol::face::TtySpaceIdentity::OtherRealized;
+    state.faces.insert(FaceId::new(0), default_face);
+    state.faces.insert(FaceId::new(21), margin_face);
+
+    let mut matrix = GlyphMatrix::new(1, 5);
+    let row = neomacs_display_protocol::glyph_matrix::MatrixRow::make_mut(&mut matrix.rows[0]);
+    row.enabled = true;
+    row.glyphs[GlyphArea::Text.index()].push(Glyph::char('x', FaceId::new(21), 0));
+    row.glyphs[GlyphArea::Text.index()].push(Glyph::char(
+        ' ',
+        FaceId::new(21),
+        neomacs_display_protocol::glyph_matrix::NO_BUFFER_POSITION_CHARPOS,
+    ));
+    state.window_matrices.push(WindowMatrixEntry {
+        window_id: DisplayWindowId::new(1),
+        matrix,
+        pixel_bounds: Rect::new(0.0, 0.0, 5.0, 1.0),
+        text_pixel_bounds: Rect::new(0.0, 0.0, 5.0, 1.0),
+        text_clip_bounds: None,
+        selected: true,
+    });
+
+    let caps = TermCaps {
+        synchronized_output: false,
+        ..TermCaps::default()
+    };
+    let mut rif = TtyRif::new_with_caps(5, 1, caps);
+    rif.rasterize(&state);
+
+    assert_eq!(
+        rif.plan_for_test(),
+        vec![TermOp::WriteRun {
+            row: 0,
+            start: 0,
+            end: 5
+        }],
+        "GNU's equal-paint margin slot is not CHAR_GLYPH_SPACE_P default slot zero",
+    );
+}
+
+#[test]
 fn rasterize_respects_matrix_position() {
     let mut state = FrameDisplayState::new(20, 10, 8.0, 16.0);
     state.background = Color::rgb(0.0, 0.0, 0.0);
@@ -719,9 +885,9 @@ fn rasterize_respects_matrix_position() {
 
     // 'A' should be at row=2, col=5.
     let idx = 2 * 20 + 5;
-    assert_eq!(rif.desired.cells[idx].ch, 'A');
+    assert_eq!(rif.desired.cells[idx].ch(), 'A');
     // row=0 col=0 should still be blank.
-    assert_eq!(rif.desired.cells[0].ch, ' ');
+    assert_eq!(rif.desired.cells[0].ch(), ' ');
 }
 
 #[test]
@@ -764,26 +930,26 @@ fn rasterize_face_fill_paints_blank_cells_before_glyphs() {
     let mut rif = TtyRif::new(8, 2);
     rif.rasterize(&state);
 
-    assert_eq!(rif.desired.cells[0].ch, ' ');
+    assert_eq!(rif.desired.cells[0].ch(), ' ');
     assert_eq!(
-        rif.desired.cells[0].attrs.bg,
+        rif.desired.cells[0].attrs().bg,
         Some(TerminalColor::Indexed(235))
     );
     assert_eq!(
-        rif.desired.cells[1].attrs.bg,
+        rif.desired.cells[1].attrs().bg,
         Some(TerminalColor::Indexed(235))
     );
-    assert_eq!(rif.desired.cells[2].ch, 'X');
+    assert_eq!(rif.desired.cells[2].ch(), 'X');
     assert_eq!(
-        rif.desired.cells[2].attrs.bg,
+        rif.desired.cells[2].attrs().bg,
         Some(TerminalColor::Indexed(240))
     );
     assert_eq!(
-        rif.desired.cells[7].attrs.bg,
+        rif.desired.cells[7].attrs().bg,
         Some(TerminalColor::Indexed(235))
     );
     assert_eq!(
-        rif.desired.cells[8].attrs.bg,
+        rif.desired.cells[8].attrs().bg,
         Some(TerminalColor::Indexed(0))
     );
 }
@@ -1024,7 +1190,7 @@ fn clipping_a_wide_child_glyph_does_not_leave_an_unrenderable_padding_cell() {
     rif.rasterize_frame_tree(&root, &[child]);
 
     assert_eq!(desired_char(&rif, 0, 0), ' ');
-    assert!(!rif.desired.cells[0].padding);
+    assert!(!rif.desired.cells[0].padding());
 }
 
 #[test]
@@ -1051,7 +1217,7 @@ fn rasterize_disabled_rows_are_skipped() {
     rif.rasterize(&state);
 
     // Row 0 should be blank because the glyph row is disabled.
-    assert_eq!(rif.desired.cells[0].ch, ' ');
+    assert_eq!(rif.desired.cells[0].ch(), ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,13 +1252,13 @@ fn rasterize_wide_char_creates_padding() {
     rif.rasterize(&state);
 
     // Col 0: the wide char.
-    assert_eq!(rif.desired.cells[0].ch, '\u{4e16}');
-    assert!(!rif.desired.cells[0].padding);
+    assert_eq!(rif.desired.cells[0].ch(), '\u{4e16}');
+    assert!(!rif.desired.cells[0].padding());
     // Col 1: padding cell.
-    assert!(rif.desired.cells[1].padding);
+    assert!(rif.desired.cells[1].padding());
     // Col 2: '!'
-    assert_eq!(rif.desired.cells[2].ch, '!');
-    assert!(!rif.desired.cells[2].padding);
+    assert_eq!(rif.desired.cells[2].ch(), '!');
+    assert!(!rif.desired.cells[2].padding());
 }
 
 #[test]
@@ -1121,10 +1287,10 @@ fn rasterize_explicit_padding_glyph_is_not_duplicated() {
     let mut rif = TtyRif::new(10, 5);
     rif.rasterize(&state);
 
-    assert_eq!(rif.desired.cells[0].ch, '\u{4f60}');
-    assert!(rif.desired.cells[1].padding);
-    assert_eq!(rif.desired.cells[2].ch, '!');
-    assert!(!rif.desired.cells[2].padding);
+    assert_eq!(rif.desired.cells[0].ch(), '\u{4f60}');
+    assert!(rif.desired.cells[1].padding());
+    assert_eq!(rif.desired.cells[2].ch(), '!');
+    assert!(!rif.desired.cells[2].padding());
 }
 
 #[test]
@@ -1151,12 +1317,12 @@ fn rasterize_stretch_glyph_uses_declared_width() {
     let mut rif = TtyRif::new(10, 5);
     rif.rasterize(&state);
 
-    assert_eq!(rif.desired.cells[0].ch, 'A');
-    assert_eq!(rif.desired.cells[1].ch, ' ');
-    assert_eq!(rif.desired.cells[2].ch, ' ');
-    assert_eq!(rif.desired.cells[3].ch, ' ');
-    assert_eq!(rif.desired.cells[4].ch, ' ');
-    assert_eq!(rif.desired.cells[5].ch, 'B');
+    assert_eq!(rif.desired.cells[0].ch(), 'A');
+    assert_eq!(rif.desired.cells[1].ch(), ' ');
+    assert_eq!(rif.desired.cells[2].ch(), ' ');
+    assert_eq!(rif.desired.cells[3].ch(), ' ');
+    assert_eq!(rif.desired.cells[4].ch(), ' ');
+    assert_eq!(rif.desired.cells[5].ch(), 'B');
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,10 +1488,10 @@ fn tty_frame_chrome_rasterizes_menu_and_tab_bands_in_order() {
     let mut rif = TtyRif::new(10, 5);
     rif.rasterize(&state);
 
-    assert_eq!(rif.desired.cells[0].ch, 'F');
-    assert_eq!(rif.desired.cells[1].ch, 'i');
-    assert_eq!(rif.desired.cells[10].ch, 'T');
-    assert_eq!(rif.desired.cells[11].ch, 'B');
+    assert_eq!(rif.desired.cells[0].ch(), 'F');
+    assert_eq!(rif.desired.cells[1].ch(), 'i');
+    assert_eq!(rif.desired.cells[10].ch(), 'T');
+    assert_eq!(rif.desired.cells[11].ch(), 'B');
 }
 
 #[test]
@@ -1402,9 +1568,9 @@ fn rasterize_keeps_phys_filled_box_cursor_out_of_cell_attrs() {
     rif.rasterize(&state);
 
     let cell = &rif.desired.cells[1];
-    assert_eq!(cell.ch, 'b');
-    assert_eq!(cell.attrs.bg, None);
-    assert_eq!(cell.attrs.fg, None);
+    assert_eq!(cell.ch(), 'b');
+    assert_eq!(cell.attrs().bg, None);
+    assert_eq!(cell.attrs().fg, None);
     assert!(rif.cursor_visible);
     assert_eq!(rif.cursor_row, 0);
     assert_eq!(rif.cursor_col, 1);
@@ -1437,8 +1603,8 @@ fn rasterize_ignores_nonselected_hollow_cursor_visual_on_tty() {
 
     let row_start = rif.width();
     let cell = &rif.desired.cells[row_start + 1];
-    assert_eq!(cell.ch, 'y');
-    assert!(!cell.attrs.inverse);
+    assert_eq!(cell.ch(), 'y');
+    assert!(!cell.attrs().inverse);
     assert!(!rif.cursor_visible);
 }
 
@@ -1485,7 +1651,7 @@ fn rasterize_uses_hardware_bar_shape_for_phys_bar_cursor() {
 
     assert!(rif.cursor_visible);
     assert_eq!(rif.cursor_shape, TerminalCursorShape::Bar);
-    assert!(!rif.desired.cells[0].attrs.inverse);
+    assert!(!rif.desired.cells[0].attrs().inverse);
 }
 
 /// Regression test for a bug observed after `C-x 2` in an
@@ -2406,7 +2572,7 @@ fn diff_swaps_current_and_desired() {
     rif.diff_and_render();
 
     // After diff, current should have 'X' at (0,0).
-    assert_eq!(rif.current.cells[0].ch, 'X');
+    assert_eq!(rif.current.cells[0].ch(), 'X');
 }
 
 #[test]
@@ -2569,8 +2735,8 @@ fn grid_clear_sets_background() {
     let mut grid = TtyGrid::new(5, 3);
     grid.clear(Some(TerminalColor::Indexed(94)));
     for cell in &grid.cells {
-        assert_eq!(cell.ch, ' ');
-        assert_eq!(cell.attrs.bg, Some(TerminalColor::Indexed(94)));
+        assert_eq!(cell.ch(), ' ');
+        assert_eq!(cell.attrs().bg, Some(TerminalColor::Indexed(94)));
     }
 }
 
@@ -2581,7 +2747,7 @@ fn grid_set_out_of_bounds_is_noop() {
     grid.set(100, 100, 'X', CellAttrs::default(), false);
     // All cells still blank.
     for cell in &grid.cells {
-        assert_eq!(cell.ch, ' ');
+        assert_eq!(cell.ch(), ' ');
     }
 }
 
@@ -2699,13 +2865,13 @@ fn automatic_composite_uses_gnu_terminal_gstring_cells() {
     rif.rasterize(&state_with_text_glyphs(10, glyphs));
 
     assert_eq!(desired_char(&rif, 0, 0), ' ');
-    assert_eq!(rif.desired.cells[0].extenders.as_deref(), Some("ꦮ"));
+    assert_eq!(rif.desired.cells[0].extenders(), Some("ꦮ"));
     assert_eq!(desired_char(&rif, 0, 1), ' ');
-    assert_eq!(rif.desired.cells[1].extenders.as_deref(), Some("ꦶ"));
+    assert_eq!(rif.desired.cells[1].extenders(), Some("ꦶ"));
     assert_eq!(desired_char(&rif, 0, 2), 'ꤸ');
-    assert_eq!(rif.desired.cells[2].extenders.as_deref(), Some("ꥉ"));
+    assert_eq!(rif.desired.cells[2].extenders(), Some("ꥉ"));
     assert_eq!(desired_char(&rif, 0, 3), 'ᠨ');
-    assert_eq!(rif.desired.cells[3].extenders.as_deref(), Some("\u{180E}"));
+    assert_eq!(rif.desired.cells[3].extenders(), Some("\u{180E}"));
 }
 
 #[test]
@@ -2726,7 +2892,7 @@ fn rtl_automatic_composite_emits_terminal_cells_in_visual_order() {
         .collect::<String>();
     assert_eq!(visual, "𐴝𐴤𐴑𐴠𐴓");
     assert!(rif.desired.cells[..5].iter().all(|cell| {
-        cell.extenders.is_none() && cell.terminal_advance == TerminalAdvance::TerminalResolved
+        cell.extenders().is_none() && cell.terminal_advance() == TerminalAdvance::TerminalResolved
     }));
 }
 
@@ -2777,8 +2943,8 @@ fn rtl_run_keeps_combining_mark_on_its_letter() {
     rif.rasterize(&state_with_text_glyphs(10, glyphs));
     assert_eq!(desired_char(&rif, 0, 0), '\u{0644}'); // lam (leftmost)
     let seen_cell = &rif.desired.cells[1];
-    assert_eq!(seen_cell.ch, '\u{0633}'); // seen base
-    assert_eq!(seen_cell.extenders.as_deref(), Some("\u{0651}")); // shadda rides along
+    assert_eq!(seen_cell.ch(), '\u{0633}'); // seen base
+    assert_eq!(seen_cell.extenders(), Some("\u{0651}")); // shadda rides along
 }
 
 fn run_member_padding_cluster(text: &str, charpos: usize) -> Glyph {
@@ -2807,9 +2973,9 @@ fn plain_cluster_composite_stays_one_cell_and_skips_joiners() {
     let glyphs = vec![run_composite("\u{1F468}\u{200D}\u{1F469}", 0)];
     let mut rif = TtyRif::new(10, 5);
     rif.rasterize(&state_with_text_glyphs(10, glyphs));
-    assert_eq!(rif.desired.cells[0].ch, '\u{1F468}');
+    assert_eq!(rif.desired.cells[0].ch(), '\u{1F468}');
     // The ZWJ is dropped; extenders hold only the second emoji.
-    assert_eq!(rif.desired.cells[0].extenders.as_deref(), Some("\u{1F469}"));
+    assert_eq!(rif.desired.cells[0].extenders(), Some("\u{1F469}"));
 }
 
 #[test]
@@ -2838,8 +3004,8 @@ fn glyphless_thin_space_projects_to_a_terminal_blank_cell() {
 
     rif.rasterize(&state_with_text_glyphs(10, vec![glyph]));
 
-    assert_eq!(rif.desired.cells[0].ch, ' ');
-    assert_eq!(rif.desired.cells[0].extenders, None);
+    assert_eq!(rif.desired.cells[0].ch(), ' ');
+    assert_eq!(rif.desired.cells[0].extenders(), None);
 }
 
 // --- The realized terminal colour is what the writer writes ----------------
@@ -4392,9 +4558,9 @@ fn overwriting_the_padding_half_of_a_wide_pair_blanks_the_base() {
     grid.set(1, 5, '|', CellAttrs::default(), false);
 
     let base = &grid.cells[10 + 4];
-    assert_eq!(base.ch, ' ', "orphaned wide base must become a space");
-    assert!(!base.padding);
-    assert_eq!(grid.cells[10 + 5].ch, '|');
+    assert_eq!(base.ch(), ' ', "orphaned wide base must become a space");
+    assert!(!base.padding());
+    assert_eq!(grid.cells[10 + 5].ch(), '|');
 }
 
 #[test]
@@ -4407,11 +4573,11 @@ fn overwriting_the_base_half_of_a_wide_pair_blanks_the_padding() {
 
     let orphan = &grid.cells[3];
     assert!(
-        !orphan.padding,
+        !orphan.padding(),
         "orphaned padding must become a plain space"
     );
-    assert_eq!(orphan.ch, ' ');
-    assert_eq!(grid.cells[2].ch, 'X');
+    assert_eq!(orphan.ch(), ' ');
+    assert_eq!(grid.cells[2].ch(), 'X');
 }
 
 #[test]
@@ -4425,9 +4591,9 @@ fn rewriting_a_wide_pair_in_place_keeps_it_intact() {
     grid.set(0, 2, '\u{672c}', CellAttrs::default(), false);
     grid.set(0, 3, ' ', CellAttrs::default(), true);
 
-    assert_eq!(grid.cells[2].ch, '\u{672c}');
+    assert_eq!(grid.cells[2].ch(), '\u{672c}');
     assert!(
-        grid.cells[3].padding,
+        grid.cells[3].padding(),
         "rewritten pair keeps its padding half"
     );
 }
@@ -4462,10 +4628,14 @@ fn wide_base_in_the_final_column_rasterizes_as_a_space() {
     let mut rif = TtyRif::new(10, 5);
     rif.rasterize(&state);
 
-    assert_eq!(rif.desired.cells[9].ch, ' ', "clipped wide base is a space");
-    assert!(!rif.desired.cells[9].padding);
+    assert_eq!(
+        rif.desired.cells[9].ch(),
+        ' ',
+        "clipped wide base is a space"
+    );
+    assert!(!rif.desired.cells[9].padding());
     assert!(
-        rif.desired.cells[..10].iter().all(|cell| !cell.padding),
+        rif.desired.cells[..10].iter().all(|cell| !cell.padding()),
         "no padding cell may survive at the row edge"
     );
 }
@@ -4896,5 +5066,80 @@ fn ncv_suppresses_the_underline_but_not_gnus_underline_color() {
     assert!(
         s.contains("\x1b[58:2::0:0:1m"),
         "GNU's Setulc guard does not consult ncv: {s:?}"
+    );
+}
+
+#[test]
+fn frame_redraw_writes_the_grid_separators_erased_leading_spaces_after_real_raster() {
+    let caps = TermCaps {
+        synchronized_output: false,
+        ..TermCaps::default()
+    };
+    let mut rif = TtyRif::new_with_caps(40, 1, caps);
+    let mut old = make_grid_state(1, 0, 0.0, 0.0, 40, 1, "facet-02");
+    old.faces.insert(FaceId::new(0), Face::default());
+    rif.rasterize(&old);
+    rif.diff_and_render();
+    let _ = rif.take_output();
+    assert!(
+        (8..11).all(|col| rif.current.cells[col].materialization() == CellMaterialization::Erased)
+    );
+
+    let mut grid = make_grid_state(
+        1,
+        0,
+        0.0,
+        0.0,
+        40,
+        1,
+        "facet-02   |   facet-12   |   facet-22",
+    );
+    grid.faces.insert(FaceId::new(0), Face::default());
+    let mut known = rif.clone();
+    known.rasterize(&grid);
+    assert!(
+        (8..11)
+            .all(|col| known.desired.cells[col].materialization() == CellMaterialization::Erased)
+    );
+    let known_ops = known.plan_for_test();
+    assert!(known_ops.iter().any(|op| matches!(
+        op,
+        TermOp::WriteRun {
+            row: 0,
+            start: 11,
+            ..
+        }
+    )));
+    assert!(
+        !known_ops.iter().any(|op| matches!(
+            op,
+            TermOp::WriteRun {
+                row: 0,
+                start: 0..=10,
+                ..
+            }
+        )),
+        "known canonical blanks stay eligible for GNU implicit-space matching"
+    );
+
+    // The real frontend consumes the Context-owned request after layout and
+    // calls this existing obligation. No terminal dimensions or face changed.
+    rif.force_redraw();
+    rif.rasterize(&grid);
+    assert_eq!(
+        rif.plan_for_test(),
+        vec![
+            TermOp::WriteRun {
+                row: 0,
+                start: 0,
+                end: 38
+            },
+            TermOp::EraseToEol {
+                row: 0,
+                from: 38,
+                bg: None
+            },
+        ],
+        "GNU's unknown current-row branch writes the whole meaningful prefix, including the leading separator gap"
     );
 }

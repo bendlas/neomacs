@@ -9,10 +9,39 @@
 //! because face painting can land a frame later than the text.
 
 use crate::support;
-use neomacs_tui_tests::TuiTempDirectory;
+use neomacs_tui_tests::{TuiSession, TuiTempDirectory};
 use std::fs;
 use std::time::Duration;
 use support::*;
+
+/// A bitmap-backed space indicator remains blank on a terminal, where stipples
+/// are unavailable; accepting the graphical face must not change text or color.
+#[test]
+fn space_fill_column_stipple_preserves_terminal_display() {
+    let (mut gnu, mut neo) = boot_pair("");
+    wait_for_both(&mut gnu, &mut neo, Duration::from_secs(30), scratch_ready);
+    eval_expression(
+        &mut gnu,
+        &mut neo,
+        r#"(progn
+             (switch-to-buffer (get-buffer-create "stipple-terminal"))
+             (erase-buffer)
+             (setq-default display-fill-column-indicator-character ?\s)
+             (let* ((w (window-font-width))
+                    (stipple `(,w 1 ,(apply #'unibyte-string
+                                           (append (make-list (1- (/ (+ w 7) 8)) ?\0)
+                                                   '(1))))))
+               (set-face-attribute 'fill-column-indicator nil :stipple stipple))
+             (setq-local fill-column 16 mode-line-format nil)
+             (display-fill-column-indicator-mode 1)
+             (dotimes (_ 6) (insert "stipple terminal\n"))
+             (goto-char (point-min)) nil)"#,
+    );
+    wait_for_both(&mut gnu, &mut neo, Duration::from_secs(10), |grid| {
+        grid.iter().any(|row| row.contains("stipple terminal"))
+    });
+    assert_pair_exact_display("space fill-column stipple on terminal", &gnu, &neo);
+}
 
 /// Font-lock over an Emacs Lisp buffer: keyword, function name, doc
 /// string, and comment faces are the highest-traffic faces there are.
@@ -33,9 +62,12 @@ fn font_lock_elisp_faces_match_gnu() {
          (emacs-lisp-mode) (font-lock-ensure) (goto-char (point-min)) nil)",
     );
 
-    // Wait until GNU has visibly fontified (the defun keyword row exists).
-    let fontified = |grid: &[String]| grid.iter().any(|row| row.contains("face-parity-probe"));
-    wait_for_both(&mut gnu, &mut neo, Duration::from_secs(10), fontified);
+    wait_for_font_lock_fixture(
+        &mut gnu,
+        &mut neo,
+        FontLockFixture::EmacsLisp,
+        Duration::from_secs(10),
+    );
 
     assert_pair_exact_display("elisp font-lock", &gnu, &neo);
 }
@@ -197,10 +229,63 @@ fn font_lock_c_faces_match_gnu() {
                   return counter;\\n}\\n\") \
          (c-mode) (font-lock-ensure) (goto-char (point-min)) nil)",
     );
-    let ready = |grid: &[String]| grid.iter().any(|row| row.contains("static int counter"));
-    wait_for_both(&mut gnu, &mut neo, Duration::from_secs(15), ready);
+    wait_for_font_lock_fixture(
+        &mut gnu,
+        &mut neo,
+        FontLockFixture::C,
+        Duration::from_secs(15),
+    );
 
     assert_pair_exact_display("c font-lock", &gnu, &neo);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FontLockFixture {
+    EmacsLisp,
+    C,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FontLockObservation {
+    Pending,
+    Rendered,
+}
+
+impl FontLockFixture {
+    fn observe(self, grid: &[String]) -> FontLockObservation {
+        let required_lines = match self {
+            Self::EmacsLisp => [";; leading comment", "(defun face-parity-probe (x)"],
+            Self::C => ["#include <stdio.h>", "static int counter = 0;"],
+        };
+        // The submitted Eval source also contains the fixture text. Only
+        // rendered lines together with the final result witness this command.
+        let rendered = required_lines
+            .iter()
+            .all(|expected| grid.iter().any(|row| row.trim_end() == *expected))
+            && grid.last().is_some_and(|row| row.trim() == "nil");
+        if rendered {
+            FontLockObservation::Rendered
+        } else {
+            FontLockObservation::Pending
+        }
+    }
+}
+
+fn wait_for_font_lock_fixture(
+    gnu: &mut TuiSession,
+    neo: &mut TuiSession,
+    fixture: FontLockFixture,
+    timeout: Duration,
+) {
+    let rendered = |grid: &[String]| fixture.observe(grid) == FontLockObservation::Rendered;
+    wait_for_both(gnu, neo, timeout, rendered);
+    for session in [gnu, neo] {
+        assert!(
+            rendered(&session.text_grid()),
+            "{} did not finish rendering {fixture:?}",
+            session.name
+        );
+    }
 }
 
 /// Dired: directory-listing faces (dired-directory, dired-header,

@@ -2,7 +2,52 @@
 use super::*;
 use crate::tagged::gc::SymbolWriteToken;
 
+/// The complete initial value-cell arm, classified once from the optional
+/// retained VOID descriptor before detached symbol construction.
+pub(crate) enum InitialCell {
+    PlainUnbound,
+    SharedVoid(FwdRef),
+}
+
+impl From<Option<FwdRef>> for InitialCell {
+    fn from(void: Option<FwdRef>) -> Self {
+        match void {
+            None => Self::PlainUnbound,
+            Some(header) => Self::SharedVoid(header),
+        }
+    }
+}
+
 impl LispSymbol {
+    /// Construct detached initial membership from guarded name metadata. The
+    /// ordinary constructors resolve the registry again and cannot run below
+    /// the C5 registry guard. The real slot still publishes arms before name.
+    pub(crate) fn parallel_initial_member(
+        name: NameId,
+        initial: InitialCell,
+        _: &SymbolWriteToken<'_>,
+    ) -> Self {
+        let mut symbol = Self::empty();
+        symbol.name.store(name.0, Ordering::Relaxed);
+        symbol.interned_global = true;
+        symbol.set_interned(SymbolInterned::InternedInInitial);
+        match initial {
+            InitialCell::PlainUnbound => {}
+            InitialCell::SharedVoid(header) => {
+                symbol.flags.set_redirect(SymbolRedirect::Forwarded);
+                symbol.flags.set_runtime_projected(true);
+                symbol.val = CellWord::forwarded(header);
+            }
+        }
+        symbol
+    }
+    /// Existing nonmembers retain every value/function/plist/flag arm except
+    /// the membership bits GNU intern changes. No serial write hook runs.
+    pub(crate) fn parallel_mark_initial(&mut self, _: &SymbolWriteToken<'_>) {
+        self.interned_global = true;
+        self.set_interned(SymbolInterned::InternedInInitial);
+    }
+
     pub(crate) fn parallel_store_plain(&self, value: Value, _: &SymbolWriteToken<'_>) -> bool {
         if !self.flags.is_plain_untrapped_unprojected() {
             return false;

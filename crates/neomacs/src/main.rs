@@ -4684,7 +4684,14 @@ pub fn run(mode: RuntimeMode) {
             eprintln!("{diagnostic}");
             std::process::exit(1);
         }
-        let input_reader = tty_frontend::TtyInputReader::spawn(render_comms);
+        let input_reader = match tty_frontend::TtyInputReader::spawn(render_comms) {
+            Ok(reader) => reader,
+            Err(error) => {
+                tty_init::tty_shutdown_terminal();
+                tracing::error!(%error, "Failed to start TTY input reader");
+                std::process::exit(1);
+            }
+        };
         tracing::info!("TTY frontend spawned (TtyRif single-thread redisplay)");
         FrontendHandle::TtyRifInput(input_reader)
     };
@@ -4729,11 +4736,23 @@ pub fn run(mode: RuntimeMode) {
         let secondary_input_tx = input_tx.clone();
         let secondary_input_notifier = input_notifier.clone();
         let secondary_quit_requested = quit_requested.clone();
+        let tty_input_capacity = match &frontend {
+            FrontendHandle::TtyRifInput(reader) => reader.capacity_notifier(),
+            FrontendHandle::Batch => None,
+        };
         if startup.daemon.is_none() {
             std::thread::Builder::new()
             .name("input-bridge".to_string())
             .spawn(move || {
                 while let Ok(event) = display_input_rx.recv() {
+                    // Return transport capacity independently of evaluator progress.
+                    // The reader arms this wake only after a full bounded send;
+                    // ordinary input therefore requires no extra wakeup syscall.
+                    if let Some(notifier) = &tty_input_capacity
+                        && let Err(error) = notifier.notify_capacity()
+                    {
+                        tracing::error!(%error, "TTY bridge failed to signal input capacity");
+                    }
                     let should_log = input_bridge::should_log_display_event(&event);
                     if should_log {
                         tracing::debug!("input-bridge: received display event {:?}", event);
@@ -5344,6 +5363,7 @@ fn bootstrap_buffers_with_font(
         }
         frame.sync_menu_bar_height_from_parameters();
         frame.sync_tool_bar_height_from_parameters();
+        frame.root_window_mut().reset_mode_line_base();
         if let Window::Leaf {
             buffer_id,
             window_start,
@@ -5396,6 +5416,9 @@ fn bootstrap_buffers_with_font(
         let mini_y = height as f32 - mini_h;
         if let Window::Leaf { bounds, .. } = frame.root_window_mut() {
             bounds.height = mini_y;
+        }
+        if let Some(mini_leaf) = &mut frame.minibuffer_leaf {
+            mini_leaf.reset_mode_line_base();
         }
         if let Some(mini_leaf) = &mut frame.minibuffer_leaf
             && let Window::Leaf {

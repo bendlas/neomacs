@@ -4,7 +4,9 @@
 //! source walking and generic row/source append rendering: hscroll skip,
 //! selective display, invisible text, line breaks, and end-of-buffer tails.
 
-use crate::buffer_source::loop_state::BufferSourceLoopMutableState;
+use crate::buffer_source::loop_state::{
+    BufferSourceLoopMutableState, BufferSourceRowCarryoverState,
+};
 use crate::buffer_source::walk::BufferSourceWalk;
 use crate::coords::layout_i64_char_pos_to_lisp_char_pos;
 use crate::display_cursor::{
@@ -15,8 +17,8 @@ use crate::display_row::append_context::DisplayRowAppendSurface;
 use crate::display_row::builder::DisplayRowPosition;
 use crate::display_row::face_state::DisplayRowActiveFaceState;
 use crate::display_row::geometry::{
-    DisplayRowExtendState, DisplayRowGeometryDefaults, DisplayRowGeometryState, DisplayRowLimit,
-    DisplayRowYPositions,
+    DisplayRowExtendState, DisplayRowFlags, DisplayRowGeometryDefaults, DisplayRowGeometryState,
+    DisplayRowLimit, DisplayRowYPositions,
 };
 use crate::display_row::line_end::{
     LineEndContext, LineEndExtend, LineEndFillGeometry, LineEndIndicator,
@@ -43,7 +45,9 @@ use crate::display_row::walk_state::{
 use crate::display_source::{
     DisplaySourceStepChar, DisplaySourceTextPosition, DisplaySpaceWidthPolicy,
 };
-use crate::display_source_progress::{DisplaySourceProgressState, DisplaySourceRowProgressState};
+use crate::display_source_progress::{
+    DisplaySourceProgressState, DisplaySourceRowProgressState, DisplaySourceVisualRowProgress,
+};
 use crate::frame_face_arena::FrameFaceAttempt;
 use crate::neovm_bridge::{LayoutBufferView, LayoutCharPropertyLookup, RustTextPropAccess};
 use crate::types::LayoutCharPos0;
@@ -54,6 +58,10 @@ use crate::window_output::{
 use neomacs_display_protocol::types::Color;
 use neovm_core::buffer::{EmacsBytePos, LispCharPos1};
 use neovm_core::emacs_core::value::{Value, list_to_vec};
+
+mod source_line_restart;
+use source_line_restart::CanonicalSourceLineRestart;
+pub(crate) use source_line_restart::SourceLineRestart;
 
 /// Typed numeric tail admission for one exclusive source walk. It carries
 /// no Lisp references or shared mutable state between mutator threads.
@@ -500,13 +508,14 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
         self,
         buffer: &B,
         source_render: TextRowSourceRenderState<'_, FS>,
-        row_progress: DisplaySourceRowProgressState<'_>,
+        row_progress: DisplaySourceVisualRowProgress<'_>,
         row_geometry: &mut DisplayRowGeometryState,
+        row_flags: &mut DisplayRowFlags,
         cursor_info: &mut CursorCaptureState,
         row_source_start: &mut DisplayRowSourceStart,
         row_y_positions: &mut DisplayRowYPositions,
         face_ids: &mut FrameFaceAttempt,
-        line_numbers: &mut LineNumberRenderState,
+        row_carryover: BufferSourceRowCarryoverState<'_>,
         face_scan: &mut FaceScanCheckpoint,
     ) -> BufferSourceEndOfBufferTailRenderOutcome {
         let mut row_progress = row_progress;
@@ -523,21 +532,39 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
             cursor_info,
             self.active_face_state,
             row_geometry,
-            row_progress.x(),
-            row_progress.col(),
+            row_progress.x().get(),
+            row_progress.col().get(),
         );
 
         if tail.is_at_accessible_end() {
             let face_metrics = self.active_face_state.metrics();
             source_render.output_emitter().push_text_insertion_boundary(
                 layout_i64_char_pos_to_lisp_char_pos(self.charpos),
-                row_progress.x(),
+                row_progress.x().get(),
                 row_geometry.glyph_y(0.0),
                 face_metrics.char_width(),
                 row_geometry.height().max(face_metrics.row_height()),
                 row_geometry.row(),
-                row_progress.col(),
+                row_progress.col().get(),
             );
+        }
+
+        // Source coverage at ZV does not certify an unmeasured overlay tail.
+        // If the bounded walk cannot begin that tail, preserve the distinction
+        // so motion can request a larger observation instead of settling here.
+        if tail.is_at_accessible_end()
+            && (self.overlay_policy != BufferSourceEobOverlayPolicy::Render
+                || !self.overlay_context.should_render(row_geometry))
+            && let Some(window) = self.overlay_context.string_window_id()
+            && !RustTextPropAccess::new_for_window(buffer, window)
+                .overlay_strings_at(self.charpos)
+                .is_empty()
+        {
+            source_render
+                .output_emitter()
+                .mark_eob_overlay_motion_incomplete(layout_i64_char_pos_to_lisp_char_pos(
+                    self.charpos,
+                ));
         }
 
         let mut progress = if point_is_visible_eob
@@ -556,21 +583,21 @@ impl<'a> BufferSourceEndOfBufferTailRenderContext<'a> {
         if self.overlay_policy == BufferSourceEobOverlayPolicy::Render
             && self.overlay_context.should_render(row_geometry)
         {
-            let (x, col) = row_progress.coordinates_mut();
             let continuation = self.overlay_context.render_eob_anchor_strings_at_text_row(
                 buffer,
                 OverlayStringRenderPositions::from_layout_i64(self.charpos, self.point_charpos),
                 self.active_face_state.resolved_face().box_type != 0,
                 source_render.reborrow(),
-                x,
-                col,
+                row_progress.reborrow(),
                 row_geometry,
+                row_flags,
                 cursor_info,
                 row_source_start,
                 row_y_positions,
                 face_ids,
-                line_numbers,
+                row_carryover,
                 face_scan,
+                self.active_face_state,
             );
             if point_is_visible_eob && continuation == DisplayRowTransitionContinuation::Exhausted {
                 progress = BufferSourceEobTailProgress::OverlayRowsExhausted;
@@ -2125,26 +2152,57 @@ impl<'a> BufferSourceLineBreakRenderRequest<'a> {
                 row_carryover.line_numbers,
             )
             .apply_to_progress(&mut progress);
-        // Certify the next source line only in an explicit pixel measurement.
-        // The ordinary transition above resets tabs, wrap/hscroll progress and
-        // trailing whitespace. The producer must additionally have no pushed
-        // replacement source or consumed insertion at the new anchor. Prefix,
-        // gutter and cross-row box state need a separate restart proof.
-        if source_render.output_emitter().collects_query_restarts()
-            && self.display_string_line_break.is_none()
-            && context.text.get(self.source_char.start_byte_idx()) == Some(&b'\n')
-            && progress.charpos() == self.source_char.start_charpos() + 1
-            && context.selective_display == 0
-            && !context.has_prefix
-            && !row_carryover.line_numbers.is_enabled()
-            && !row_build.box_face.is_active()
-            && self.line_height == crate::display_item::DisplayLineHeightPolicy::Default
-            && self.line_spacing == crate::display_item::DisplayLineSpacingPolicy::Inherit
-            && source_walk.can_restart_after_buffer_newline(progress.charpos())
+        // Preserve query-only short-circuiting. A normal walk asks for this
+        // proof only at a prepared earlier frontier, before any next-row work.
+        use crate::incremental_layout::edit_sync::{
+            EditSyncRowIndex, EditSyncWindowY, RestartInterest,
+        };
+        use crate::window_output::RestartSyncDecision;
+        let next = LayoutCharPos0::new(progress.charpos());
+        let query_restarts = source_render.output_emitter().collects_query_restarts();
+        let edit_restart = source_render.output_emitter().restart_sync_interest(next);
+        let candidate = match edit_restart {
+            RestartInterest::NotApplicable => false,
+            RestartInterest::Candidate => true,
+        };
+        if (query_restarts || candidate)
+            && let Ok(proof) = CanonicalSourceLineRestart::certify(
+                &self,
+                source_walk,
+                next,
+                row_carryover.line_numbers,
+                row_build.box_face,
+            )
         {
-            source_render
-                .output_emitter()
-                .note_query_restart(layout_i64_char_pos_to_lisp_char_pos(progress.charpos()));
+            if query_restarts {
+                source_render.output_emitter().note_query_restart(
+                    layout_i64_char_pos_to_lisp_char_pos(proof.source_position().get()),
+                );
+            }
+            if candidate {
+                let stopped = source_render.output_render().with_output_target_parts(
+                    |mut output, emitter, _| {
+                        let Some(window_y) = EditSyncWindowY::new(
+                            row_build.row_geometry.y()
+                                - output.builder().current_window_pixel_bounds().y,
+                        ) else {
+                            return RestartSyncDecision::Continue;
+                        };
+                        let restart = SourceLineRestart::new(
+                            proof,
+                            EditSyncRowIndex::new(emitter.current_display_text_row_index()),
+                            window_y,
+                        );
+                        emitter.try_restart_sync(restart, output)
+                    },
+                );
+                match stopped {
+                    RestartSyncDecision::Continue => {}
+                    RestartSyncDecision::Stopped => {
+                        return DisplayRowTransitionContinuation::Exhausted;
+                    }
+                }
+            }
         }
         DisplayRowTransitionContinuation::Continue
     }

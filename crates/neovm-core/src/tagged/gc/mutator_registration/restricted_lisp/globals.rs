@@ -25,12 +25,27 @@ pub(super) fn check_tape(ops: &[Op], nslots: usize, globals: Option<usize>) -> R
             | Op::HtClear { .. }
             | Op::HtMake { .. }
             | Op::HtCopy { .. }
-            | Op::HtCount { .. }
-                if globals.is_some() =>
-            {
-                return Err(Reject::Excluded("global session mutation/table"));
+            | Op::HtCount { .. } => {
+                if globals.is_some() {
+                    return Err(Reject::Excluded("global session mutation/table"));
+                }
             }
-            _ => {}
+            Op::Function(_)
+            | Op::Intern(_)
+            | Op::ConstNil { .. }
+            | Op::ConstT { .. }
+            | Op::ConstFixnum { .. }
+            | Op::Move { .. }
+            | Op::Add { .. }
+            | Op::Sub { .. }
+            | Op::Lt { .. }
+            | Op::Eq { .. }
+            | Op::BranchIfNil { .. }
+            | Op::Jump { .. }
+            | Op::Cons { .. }
+            | Op::Car { .. }
+            | Op::Cdr { .. }
+            | Op::Safepoint => {}
         }
     }
     Ok(())
@@ -99,7 +114,7 @@ impl GlobalSession {
                 source.bound,
                 STEP_CAP,
                 &[],
-                Some(ids.len()),
+                TapeCapabilities::Globals { symbols: ids.len() },
             )
             .map_err(AdmissionError::Program)?;
             programs.push(Program {
@@ -160,10 +175,9 @@ impl GlobalSession {
         owner: &mut Mutator<'era>,
         frame: &mut Frame<'era>,
     ) -> Result<Step, ExecError> {
-        frame.attempts_left = frame
-            .attempts_left
-            .checked_sub(1)
-            .ok_or(ExecError::Backedge)?;
+        if frame.attempts_left == 0 {
+            return Err(ExecError::Backedge);
+        }
         let program = self.programs.get(frame.program).ok_or(ExecError::Slot)?;
         let flow = with_run(owner, |run| {
             run.with_slice(|slice| {
@@ -184,7 +198,7 @@ impl GlobalSession {
             })
             .map_err(ExecError::from)?
         })?;
-        match flow {
+        let step = match flow {
             Flow::Done => Ok(Step::Done),
             Flow::Safepoint => Ok(Step::Safepoint),
             Flow::Lease => {
@@ -200,7 +214,24 @@ impl GlobalSession {
                     Err(error) => Err(error),
                 }
             }
+        }?;
+        match step {
+            Step::Retry => {}
+            Step::Done | Step::Safepoint | Step::Progress => frame.attempts_left -= 1,
         }
+        Ok(step)
+    }
+
+    /// Wait for protocol contention without charging the instruction budget.
+    fn wait_step<'era>(
+        &self,
+        owner: &mut Mutator<'era>,
+        frame: &mut Frame<'era>,
+    ) -> Result<Step, ExecError> {
+        retry_exec(|| match self.step(owner, frame)? {
+            Step::Retry => Err(ExecError::Registration(RegistrationError::Busy)),
+            step @ (Step::Done | Step::Safepoint | Step::Progress) => Ok(step),
+        })
     }
 
     fn apply<'era>(

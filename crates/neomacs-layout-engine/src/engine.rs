@@ -5,6 +5,11 @@
 //! grid, and publishes `FrameDisplayState` snapshots for render backends.
 
 mod diagnostic_knobs;
+mod window_input_ownership;
+use window_input_ownership::{
+    resolve_window_display_source_params, resolve_window_display_source_params_legacy,
+};
+
 mod mini_eob_scroll;
 mod mini_source_start;
 mod mini_source_stop;
@@ -564,154 +569,6 @@ impl InactiveMiniWindowSource {
     }
 }
 
-/// Resolve the buffer and range that this window actually displays.
-///
-/// GNU's `with_echo_area_buffer` temporarily installs the echo-area buffer in an
-/// inactive mini-window before redisplay measures or walks it **while a message
-/// is displayed**; resolve that semantic source once, before fontification and
-/// incremental-key creation, so every phase observes the same buffer identity,
-/// ticks, range, and point.
-fn resolve_window_display_source_params(
-    evaluator: &mut neovm_core::emacs_core::Context,
-    params: &WindowParams,
-    purpose: WindowLayoutWalkPurpose,
-) -> ResolvedWindowDisplaySource {
-    let window_id = neovm_core::window::WindowId(params.window_id as u64);
-    // Hand layout a shared handle to the image catalog: `(space :align-to …)`
-    // may embed an `(image …)` operand whose intrinsic size decides the result
-    // (GNU resolves it inline with `lookup_image`). This is the single point
-    // every window's params pass through that also holds the evaluator.
-    let mut params = params.clone();
-    if purpose == WindowLayoutWalkPurpose::MiniPreparation {
-        params.window_start = params.buffer_begv;
-        params.vscroll = 0;
-        params.force_start = true;
-        params.previous_visible_end = None;
-        params.source_extent = crate::types::WindowSourceExtent::AccessibleEnd;
-    }
-    if let WindowLayoutWalkPurpose::SynchronousQuery(scope) = purpose {
-        use neovm_core::window::WindowLayoutQueryScope;
-        let start = match scope {
-            WindowLayoutQueryScope::TextExtent {
-                start,
-                end,
-                width,
-                height,
-                ..
-            } => {
-                params.buffer_size = end
-                    .as_i64()
-                    .saturating_sub(1)
-                    .clamp(params.buffer_begv, params.buffer_size);
-                params.point = params.point.min(params.buffer_size);
-                params.source_extent = crate::types::WindowSourceExtent::AccessibleEnd;
-                params.measurement_width =
-                    Some(width.unwrap_or(i32::MAX as usize).min(i32::MAX as usize));
-                params.measurement_pixels = height;
-                params.hscroll = 0;
-                params.force_start = true;
-                Some(start)
-            }
-            WindowLayoutQueryScope::Rows { start, count } => {
-                params.measurement_rows = Some(count);
-                Some(start)
-            }
-            WindowLayoutQueryScope::Pixels { start, height } => {
-                params.measurement_pixels = Some(height);
-                Some(start)
-            }
-            WindowLayoutQueryScope::Position { target } => {
-                // A viewport can reach sparse fontification sites after a
-                // fold beyond the target. Preserve that callback extent.
-                if !window_source_has_fontification_callbacks(evaluator, params.buffer_id) {
-                    params.query_target = Some(crate::types::LayoutCharPos0::new(
-                        target.as_i64().saturating_sub(1),
-                    ));
-                }
-                None
-            }
-            WindowLayoutQueryScope::Viewport => None,
-        };
-        if let Some(start) = start {
-            params.window_start = start
-                .as_i64()
-                .saturating_sub(1)
-                .clamp(params.buffer_begv, params.buffer_size);
-            params.vscroll = 0;
-            params.previous_visible_end = None;
-        }
-    }
-    params.space_image_catalog = evaluator
-        .display_host
-        .as_ref()
-        .and_then(|host| host.image_catalog_shared())
-        .map(crate::types::SharedImageCatalog);
-    let params = &params;
-
-    if matches!(
-        purpose,
-        WindowLayoutWalkPurpose::SynchronousQuery(_) | WindowLayoutWalkPurpose::MiniPreparation
-    ) || !params.is_minibuffer()
-        || evaluator.minibuffer_window_is_active(window_id)
-    {
-        return ResolvedWindowDisplaySource {
-            params: params.clone(),
-            source: WindowDisplaySource::LiveWindow,
-        };
-    }
-
-    // The inactive mini-window renders the echo buffer only while a message
-    // is displayed; once the message clears it must fall back to its own
-    // buffer (`" *Minibuf-0*"`), which is what makes idle mini-window content
-    // — `minibuffer-line' status text — visible.  The match is exhaustive on
-    // purpose: a new source state must decide its buffer here.
-    match InactiveMiniWindowSource::for_context(evaluator) {
-        InactiveMiniWindowSource::OwnBuffer => {
-            return ResolvedWindowDisplaySource {
-                params: params.clone(),
-                source: WindowDisplaySource::LiveWindow,
-            };
-        }
-        InactiveMiniWindowSource::EchoMessage => {}
-    }
-
-    evaluator.ensure_echo_area_buffers();
-    let Some(buf_id) = evaluator.echo_area_display_buffer() else {
-        return ResolvedWindowDisplaySource {
-            params: params.clone(),
-            source: WindowDisplaySource::LiveWindow,
-        };
-    };
-    let Some(buffer_size) = evaluator
-        .buffer_manager()
-        .get(buf_id)
-        .map(|buffer| buffer.point_max_char_pos().get() as i64)
-    else {
-        return ResolvedWindowDisplaySource {
-            params: params.clone(),
-            source: WindowDisplaySource::LiveWindow,
-        };
-    };
-
-    let mut resolved = params.clone();
-    resolved.buffer_id = buf_id.0;
-    resolved.window_start = 0;
-    resolved.previous_visible_end = None;
-    resolved.point = if resolved.cursor_role.is_active() {
-        // GNU's echo-area cursor is the insertion position immediately after
-        // the displayed message, not point in the minibuffer's live buffer.
-        buffer_size
-    } else {
-        0
-    };
-    resolved.buffer_begv = 0;
-    resolved.buffer_size = buffer_size;
-    ResolvedWindowDisplaySource {
-        params: resolved,
-        source: WindowDisplaySource::InactiveEchoArea,
-    }
-}
-
 fn window_source_has_fontification_callbacks(
     evaluator: &neovm_core::emacs_core::Context,
     buffer_id: u64,
@@ -837,11 +694,20 @@ fn collect_live_window_layout_inputs(
     if let Some(metrics) = accepted_chrome.get(&DisplayWindowId::new(window.window_id)) {
         metrics.seed_params(&mut window);
     }
-    let resolved = resolve_window_display_source_params(evaluator, &window, purpose);
+    let source = match window_input_ownership::mode() {
+        window_input_ownership::WindowInputOwnership::InPlace => {
+            resolve_window_display_source_params(evaluator, &mut window, purpose)
+        }
+        window_input_ownership::WindowInputOwnership::LegacyCopies => {
+            let resolved = resolve_window_display_source_params_legacy(evaluator, &window, purpose);
+            window = resolved.params;
+            resolved.source
+        }
+    };
     Some(LiveWindowLayoutInputs {
         frame,
-        window: resolved.params,
-        source: resolved.source,
+        window,
+        source,
         main_area_bottom,
     })
 }
@@ -1530,13 +1396,20 @@ impl LayoutEngine {
         self.frame_output.latest_window_info(window_id)
     }
 
-    fn output_window_content_height_px(
+    fn output_window_automatic_mini_height_px(
         &self,
-        window_id: i64,
-        fallback_row_height: f32,
-    ) -> Option<f32> {
-        self.frame_output
-            .window_content_height_px(window_id, fallback_row_height)
+        params: &WindowParams,
+        fallback_row_height: Px,
+    ) -> Option<Px> {
+        let height = if params.window_system {
+            // Preserve legacy GUI sizing; the automatic-tail correction is TTY-only.
+            self.frame_output
+                .window_content_height_px(params.window_id, fallback_row_height.get())
+        } else {
+            self.frame_output
+                .mini_measurement_height_px(params.window_id, fallback_row_height.get())
+        };
+        height.map(Px)
     }
 
     /// Keep inactive echo-area geometry renderer-visible without admitting it
@@ -1567,16 +1440,20 @@ impl LayoutEngine {
     fn finish_frame_output(
         &mut self,
         frame_params: &FrameParams,
+        table: crate::frame_face_arena::FrameFaceTableAttempt,
     ) -> Result<
-        neomacs_display_protocol::glyph_matrix::FrameDisplayState,
-        neomacs_display_protocol::frame_chrome::ChromeLayoutError,
+        (
+            neomacs_display_protocol::glyph_matrix::FrameDisplayState,
+            crate::frame_face_arena::FrameFaceSeal,
+        ),
+        crate::display_frame_output::FrameOutputFinishError,
     > {
-        let mut state = self.frame_output.finish(frame_params)?;
+        let (mut state, seal) = self.frame_output.finish(frame_params, table)?;
         // Publish exact resolved font identities for every realized face so
         // the render thread rasterizes the same fonts layout measured with
         // (font realization / render boundary design, Phase 1).
         crate::font::metrics::realize_frame_fonts(&mut state, &mut self.font_metrics);
-        Ok(state)
+        Ok((state, seal))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2112,7 +1989,7 @@ impl LayoutEngine {
             curr_window_infos,
             retained_keys,
             accepted_window_chrome_metrics,
-            accepted_face_attempt,
+            accepted_face_table,
             accepted_window_navigation_intents,
             accepted_frame_navigation_intent,
         ) = 'frame_layout: loop {
@@ -2250,20 +2127,35 @@ impl LayoutEngine {
                 }
             }
 
-            let resolved_window_sources: Vec<_> = window_params_list
-                .iter()
-                .map(|params| {
-                    resolve_window_display_source_params(evaluator, params, layout_walk_purpose)
-                })
-                .collect();
-            let window_sources: Vec<_> = resolved_window_sources
-                .iter()
-                .map(|resolved| resolved.source)
-                .collect();
-            window_params_list = resolved_window_sources
-                .into_iter()
-                .map(|resolved| resolved.params)
-                .collect();
+            let window_sources: Vec<_> = match window_input_ownership::mode() {
+                window_input_ownership::WindowInputOwnership::InPlace => window_params_list
+                    .iter_mut()
+                    .map(|params| {
+                        resolve_window_display_source_params(evaluator, params, layout_walk_purpose)
+                    })
+                    .collect(),
+                window_input_ownership::WindowInputOwnership::LegacyCopies => {
+                    let resolved_window_sources: Vec<_> = window_params_list
+                        .iter()
+                        .map(|params| {
+                            resolve_window_display_source_params_legacy(
+                                evaluator,
+                                params,
+                                layout_walk_purpose,
+                            )
+                        })
+                        .collect();
+                    let sources = resolved_window_sources
+                        .iter()
+                        .map(|resolved| resolved.source)
+                        .collect();
+                    window_params_list = resolved_window_sources
+                        .into_iter()
+                        .map(|resolved| resolved.params)
+                        .collect();
+                    sources
+                }
+            };
             if minibuffer_measurement_needs_begv
                 && let Some(mini_params) = window_params_list
                     .iter_mut()
@@ -2330,7 +2222,8 @@ impl LayoutEngine {
             // rejected pass. The replay budget in the same ledger is per
             // logical attempt, not per pass, so it stays.
             lisp_ledger.display_when.begin_frame_pass();
-            let mut face_attempt = committed_face_arena.begin_attempt();
+            let face_table = committed_face_arena.begin_table_attempt();
+            let mut face_attempt = face_table.handle();
             self.frame_output.set_face_attempt(face_attempt.clone());
             self.frame_output.set_presentation_id(presentation_id);
             let mut curr_window_infos: rustc_hash::FxHashMap<DisplayWindowId, WindowInfo> =
@@ -3236,9 +3129,9 @@ impl LayoutEngine {
                 && evaluator.gnu_redisplay_transaction_active())
                 && let Some(mini_params) = window_params_list.last()
                 && mini_params.is_minibuffer()
-                && let Some(mini_content_height_px) = self.output_window_content_height_px(
-                    mini_params.window_id,
-                    frame_params.char_height.max(1.0),
+                && let Some(mini_content_height_px) = self.output_window_automatic_mini_height_px(
+                    mini_params,
+                    Px(frame_params.char_height.max(1.0)),
                 )
             {
                 let char_h = frame_params.char_height.max(1.0);
@@ -3258,8 +3151,9 @@ impl LayoutEngine {
                 // GNU `resize_mini_window` measures the mini-window's
                 // CONTENT height via `move_it_to (ZV)` (xdisp.c:13340) and
                 // shrinks a grow-only window when `height < old_height &&
-                // (exact_p || BEGV == ZV)` (xdisp.c:13395). An empty
-                // mini/echo buffer is exactly one line.
+                // (exact_p || BEGV == ZV)` (xdisp.c:13395). Empty accessible
+                // source permits shrinking; overlay strings still contribute
+                // their actual measured display height.
                 //
                 // The source was resolved before incremental classification,
                 // so this height and emptiness check refer to the same buffer
@@ -3277,7 +3171,7 @@ impl LayoutEngine {
                     .frame_manager()
                     .get(frame_id)
                     .and_then(|frame| {
-                        frame.plan_mini_window_resize(mini_content_height_px, max_mini_lines)
+                        frame.plan_mini_window_resize(mini_content_height_px.get(), max_mini_lines)
                     })
                     .filter(|resize| {
                         if resize.is_growth() {
@@ -3290,24 +3184,92 @@ impl LayoutEngine {
                         }
                     });
                 if let Some(resize) = resize {
-                    let request = FrameRelayoutRequest::Minibuffer {
-                        window_id: DisplayWindowId::new(mini_params.window_id),
-                        allocated_height_px: resize.previous_height_px(),
-                        required_height_px: resize.height_px(),
-                    };
-                    if !Self::accept_frame_relayout_request(
-                        &mut layout_coordinator,
-                        evaluator,
-                        &mut frame_window_end_attempts,
-                        presentation_id,
-                        request,
+                    // The native frame plan knows the mini's requested size,
+                    // but only window.el knows what its root tree can yield.
+                    // Reuse GNU's staged resize/commit rather than shrinking
+                    // every child proportionally below its own minimum.
+                    // This late sizing call may enter arbitrary Lisp. Keep
+                    // the existing complete per-window witnesses local to
+                    // this call, including the no-op/refused-resize case.
+                    let before_sizing: Vec<_> = window_params_list
+                        .iter()
+                        .map(|params| {
+                            let window = neovm_core::window::WindowId(params.window_id as u64);
+                            let buffer = neovm_core::buffer::BufferId(params.buffer_id);
+                            (
+                                window,
+                                buffer,
+                                evaluator.window_layout_attempt_freshness(frame_id, window, buffer),
+                            )
+                        })
+                        .collect();
+                    let resize_outcome = match evaluator.apply_prepared_minibuffer_resize(
+                        frame_id,
+                        neovm_core::window::WindowId(mini_params.window_id as u64),
+                        neomacs_display_protocol::types::Px(resize.height_px()),
                     ) {
-                        return None;
+                        Ok(outcome) => outcome,
+                        Err(flow) => {
+                            evaluator.defer_redisplay_hook_flow(flow);
+                            frame_window_end_attempts.reject_all(evaluator);
+                            evaluator.retire_interaction_presentation(presentation_id);
+                            self.last_frame_display_state = None;
+                            self.reset_frame_attempt_state();
+                            return None;
+                        }
+                    };
+                    match resize_outcome {
+                        neovm_core::window::PreparedMiniResizeOutcome::Unchanged => {
+                            let changed =
+                                before_sizing.iter().find_map(|(window, buffer, before)| {
+                                    let after = evaluator.window_layout_attempt_freshness(
+                                        frame_id, *window, *buffer,
+                                    );
+                                    (before.is_none() || *before != after).then_some(*window)
+                                });
+                            if let Some(window) = changed {
+                                let request = FrameRelayoutRequest::LogicalInputsChanged {
+                                    window_id: DisplayWindowId::new(window.0 as i64),
+                                };
+                                if !Self::accept_frame_relayout_request(
+                                    &mut layout_coordinator,
+                                    evaluator,
+                                    &mut frame_window_end_attempts,
+                                    presentation_id,
+                                    request,
+                                ) {
+                                    return None;
+                                }
+                                continue 'frame_layout;
+                            }
+                        }
+                        neovm_core::window::PreparedMiniResizeOutcome::Committed => {
+                            let required_height_px = evaluator
+                                .frame_manager()
+                                .get(frame_id)
+                                .and_then(|frame| {
+                                    frame.find_window(neovm_core::window::WindowId(
+                                        mini_params.window_id as u64,
+                                    ))
+                                })
+                                .map_or(resize.height_px(), |window| window.bounds().height);
+                            let request = FrameRelayoutRequest::Minibuffer {
+                                window_id: DisplayWindowId::new(mini_params.window_id),
+                                allocated_height_px: resize.previous_height_px(),
+                                required_height_px,
+                            };
+                            if !Self::accept_frame_relayout_request(
+                                &mut layout_coordinator,
+                                evaluator,
+                                &mut frame_window_end_attempts,
+                                presentation_id,
+                                request,
+                            ) {
+                                return None;
+                            }
+                            continue;
+                        }
                     }
-                    if let Some(frame) = evaluator.frame_manager_mut().get_mut(frame_id) {
-                        frame.apply_mini_window_resize(resize);
-                    }
-                    continue;
                 }
             }
 
@@ -3392,7 +3354,7 @@ impl LayoutEngine {
                 curr_window_infos,
                 retained_keys,
                 accepted_window_chrome_metrics,
-                face_attempt,
+                face_table,
                 observed_window_navigation_intents,
                 observed_frame_navigation,
             );
@@ -3513,22 +3475,22 @@ impl LayoutEngine {
             }
         }
 
-        let mut frame_display_state = match self.finish_frame_output(&frame_params) {
-            Ok(state) => state,
-            Err(error) => {
-                tracing::error!(?error, "rejecting invalid frame chrome snapshot");
-                frame_window_end_attempts.reject_all(evaluator);
-                evaluator.retire_interaction_presentation(presentation_id);
-                return None;
-            }
-        };
+        let (mut frame_display_state, face_seal) =
+            match self.finish_frame_output(&frame_params, accepted_face_table) {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::error!(%error, "rejecting invalid frame chrome snapshot");
+                    frame_window_end_attempts.reject_all(evaluator);
+                    evaluator.retire_interaction_presentation(presentation_id);
+                    return None;
+                }
+            };
         frame_display_state.scroll_input_policy.x11_delta_factor = evaluator
             .variable_value_by_name("x-scroll-event-delta-factor")
             .and_then(|value| value.as_number_f64())
             .filter(|factor| factor.is_finite())
             .unwrap_or(1.0);
-        let sealed_face_arena = match accepted_face_attempt.seal(frame_display_state.faces.clone())
-        {
+        let sealed_face_arena = match face_seal.seal(&frame_display_state.faces) {
             Ok(arena) => arena,
             Err(error) => {
                 tracing::error!(?error, "rejecting incoherent frame face namespace");

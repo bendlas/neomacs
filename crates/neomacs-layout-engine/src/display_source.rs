@@ -1,11 +1,15 @@
+//! String-source policy: `NEOMACS_LISP_STRING_RUN_TEXT=decode` retains the
+//! scalar materializer; unset or `bulk` copies validated ordinary UTF-8 runs.
+//! The selector is native immutable process configuration, read once.
+
 use crate::display_item::{
     BufferDisplayReplacementSource, DisplayGlyphless, DisplayItem, DisplayItemKind,
     DisplayItemLayout, DisplayLength, DisplayLineHeightPolicy, DisplayLineSpacingPolicy,
     DisplayMediaReplacement, DisplayPointerAppearance, DisplayPointerOccurrence,
-    DisplayPointerSourceRange, DisplayRowBreak, DisplaySourceMappedText, DisplaySourcePosition,
-    DisplayStretch, DisplayStretchWidth, DisplayStringBoxBoundaries, DisplayTextComposition,
-    DisplayTextRun, GlyphlessJoinerPolicy, GlyphlessMethod, RenderFaceRef, SourceSpan,
-    glyphless_method_for_char,
+    DisplayPointerSourceRange, DisplayRowBreak, DisplaySourceId, DisplaySourceMappedText,
+    DisplaySourcePosition, DisplayStretch, DisplayStretchWidth, DisplayStringBoxBoundaries,
+    DisplayTextComposition, DisplayTextRun, GlyphlessJoinerPolicy, GlyphlessMethod, RenderFaceRef,
+    SourceSpan, glyphless_method_for_char,
 };
 use crate::display_origin::{DisplayOrigin, DisplayPropertySource, OverlayStringKind};
 use crate::display_property::{
@@ -27,14 +31,25 @@ use crate::unicode::{EmacsTextStorage, decode_emacs_char, decode_utf8};
 use neomacs_display_protocol::face::BoxVerticalEdges;
 use neomacs_display_protocol::types::FaceId;
 use neovm_core::buffer::{
-    BufferId, CharLen, CharPos0, EmacsBytePos, text_props::TextPropertyTable,
+    BufferId, CharLen, CharPos0, CharRange, EmacsBytePos, text_props::TextPropertyTable,
 };
 use neovm_core::emacs_core::Value;
 use neovm_core::emacs_core::composite::composition_display_text_for_property;
 use neovm_core::emacs_core::composite::{AutomaticCompositionRules, AutomaticCompositionSpan};
 use neovm_core::emacs_core::emacs_char::EmacsChar;
+use neovm_core::emacs_core::intern::EpochCachedSymbol;
 use neovm_core::emacs_core::value::{get_string_text_properties_table_for_value, list_to_vec};
 use neovm_core::face::LispFaceId;
+
+// Each key is resolved lazily at its original query boundary. Cells contain
+// only epoch-validated native identities and are shared safely across mutators.
+static DISPLAY_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("display");
+static COMPOSITION_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("composition");
+static FACE_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("face");
+static FONT_LOCK_FACE_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("font-lock-face");
+static MOUSE_FACE_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("mouse-face");
+static LINE_HEIGHT_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("line-height");
+static LINE_SPACING_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("line-spacing");
 
 pub(crate) struct DisplaySourceContext<'a> {
     target: crate::display_property::DisplayPropertyTarget,
@@ -2703,6 +2718,30 @@ impl<S: DisplayItemSource> DisplayItemSource for BufferDisplayReplacementStringS
     }
 }
 
+/// Raw prefix properties of the active pushed string. Nil is deliberately
+/// preserved until the common prefix lookup applies buffer/default fallback.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LispStringPrefixProperties {
+    pub(crate) line: Option<Value>,
+    pub(crate) wrap: Option<Value>,
+}
+
+/// A pushed string coordinate, never a buffer byte offset or synthetic slot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LispStringPrefixPosition {
+    source_id: DisplaySourceId,
+    char_index: CharPos0,
+}
+
+impl LispStringPrefixPosition {
+    pub(crate) fn new(source_id: DisplaySourceId, char_index: CharPos0) -> Self {
+        Self {
+            source_id,
+            char_index,
+        }
+    }
+}
+
 pub(crate) struct LispStringSourceCursor {
     stack: LispStringSourceStack,
 }
@@ -2765,6 +2804,42 @@ impl LispStringSourceOrigin {
 }
 
 impl LispStringSourceCursor {
+    pub(crate) fn prefix_properties_at(
+        &self,
+        pending: Option<LispStringPrefixPosition>,
+    ) -> LispStringPrefixProperties {
+        let (frame, index) = match pending {
+            Some(LispStringPrefixPosition {
+                source_id,
+                char_index,
+            }) => {
+                let Some(frame) = self
+                    .stack
+                    .frames
+                    .iter()
+                    .rev()
+                    .find(|frame| frame.source_id == source_id.get())
+                else {
+                    return LispStringPrefixProperties::default();
+                };
+                (frame, char_index)
+            }
+            None => {
+                let Some(frame) = self.stack.frames.last() else {
+                    return LispStringPrefixProperties::default();
+                };
+                (frame, CharPos0::new(frame.char_index))
+            }
+        };
+        let Some(props) = frame.props.as_ref() else {
+            return LispStringPrefixProperties::default();
+        };
+        LispStringPrefixProperties {
+            line: props.get_property_at_char_pos(index, Value::symbol("line-prefix")),
+            wrap: props.get_property_at_char_pos(index, Value::symbol("wrap-prefix")),
+        }
+    }
+
     fn has_remaining_text(&self) -> bool {
         self.stack
             .frames
@@ -2899,6 +2974,45 @@ struct LispStringResolvedSpan {
     face: RenderFaceRef,
     pointer_appearance: Option<DisplayPointerAppearance>,
     item_layout: DisplayItemLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LispStringRunTextPolicy {
+    Decode,
+    ValidatedBytes,
+}
+
+impl LispStringRunTextPolicy {
+    fn selected() -> Self {
+        static POLICY: std::sync::OnceLock<LispStringRunTextPolicy> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| {
+            match std::env::var("NEOMACS_LISP_STRING_RUN_TEXT")
+                .ok()
+                .as_deref()
+            {
+                Some("decode" | "off" | "0") => Self::Decode,
+                _ => Self::ValidatedBytes,
+            }
+        })
+    }
+}
+
+/// A synchronous string-frame scan's result. It owns native text only, so it
+/// may cross threads without retaining a Lisp borrow or mutator-local state.
+#[derive(Debug)]
+struct LispStringOrdinaryRun {
+    end: CharPos0,
+    text: String,
+}
+
+static_assertions::assert_impl_all!(LispStringOrdinaryRun: Send, Sync);
+
+/// Only the scanner can certify an ordinary range. The legacy forced-one
+/// extent is distinct: UTF-8 validity alone does not make a control printable.
+#[derive(Clone, Copy, Debug)]
+enum LispStringRunExtent {
+    Ordinary(CharRange),
+    Legacy(CharRange),
 }
 
 pub(crate) struct LispStringSourceStack {
@@ -3220,28 +3334,22 @@ impl LispStringSourceFrame {
 
         if let LispStringCompositions::Unresolved(source) = &self.automatic_compositions {
             let spans = match (source, context.automatic_composition) {
-                (_, None) => Vec::new(),
+                (
+                    LispStringCompositionSource::OriginalObject
+                    | LispStringCompositionSource::FormattedRegions(_),
+                    None,
+                ) => Vec::new(),
                 (LispStringCompositionSource::OriginalObject, Some(rules)) => match self.storage {
-                    EmacsTextStorage::Multibyte => {
-                        rules.spans(&self.text_slice(0, self.char_count()))
-                    }
+                    EmacsTextStorage::Multibyte => self.automatic_compositions_in(
+                        rules,
+                        CharRange::new(CharPos0::new(0), CharPos0::new(self.char_count())),
+                    ),
                     EmacsTextStorage::Unibyte => Vec::new(),
                 },
                 (LispStringCompositionSource::FormattedRegions(regions), Some(rules)) => regions
                     .iter()
                     .filter(|region| region.end().get() <= self.char_count())
-                    .flat_map(|region| {
-                        let start = region.start().get();
-                        rules
-                            .spans(&self.text_slice(start, region.end().get()))
-                            .into_iter()
-                            .map(move |span| {
-                                AutomaticCompositionSpan::new(
-                                    start + span.start(),
-                                    start + span.end(),
-                                )
-                            })
-                    })
+                    .flat_map(|region| self.automatic_compositions_in(rules, *region))
                     .collect(),
             };
             self.automatic_compositions = LispStringCompositions::Resolved(spans);
@@ -3392,10 +3500,12 @@ impl LispStringSourceFrame {
                 );
             }
         }
-        if let Some(end) = self
-            .automatic_composition_at(start)
-            .filter(|&end| end <= property_end)
-        {
+        if let Some(end) = self.automatic_composition_end(
+            CharPos0::new(start),
+            CharPos0::new(property_end),
+            context.display_target(),
+        ) {
+            let end = end.get();
             self.char_index = end;
             return LispStringResolvedAction::Emit(
                 DisplayItem::new(
@@ -3418,17 +3528,17 @@ impl LispStringSourceFrame {
             tty_glyphless_char_display.method_for(character),
         ) {
             if let DisplayItemKind::RowBreak(row_break) = &mut kind {
-                let property = |name| {
+                let property = |name: &EpochCachedSymbol| {
                     self.props.as_ref().and_then(|props| {
                         props.get_property_at_char_pos(CharPos0::new(start), Value::symbol(name))
                     })
                 };
                 *row_break = row_break
                     .with_line_height(DisplayLineHeightPolicy::from_property(property(
-                        "line-height",
+                        &LINE_HEIGHT_PROPERTY,
                     )))
                     .with_line_spacing(DisplayLineSpacingPolicy::from_property(property(
-                        "line-spacing",
+                        &LINE_SPACING_PROPERTY,
                     )));
             }
             self.char_index = start + 1;
@@ -3447,13 +3557,18 @@ impl LispStringSourceFrame {
             .next_automatic_composition_start(start)
             .unwrap_or(property_end)
             .min(property_end);
-        let end = self.next_text_run_end(start, text_end, tty_glyphless_char_display);
+        let run = self.ordinary_text_run(
+            CharRange::new(CharPos0::new(start), CharPos0::new(text_end)),
+            tty_glyphless_char_display,
+            LispStringRunTextPolicy::selected(),
+        );
+        let end = run.end.get();
         self.char_index = end;
         LispStringResolvedAction::Emit(
             DisplayItem::new(
                 self.span(start, end),
                 face,
-                DisplayItemKind::TextRun(DisplayTextRun::independent(self.text_slice(start, end))),
+                DisplayItemKind::TextRun(DisplayTextRun::independent(run.text)),
             )
             .with_layout(item_layout)
             .with_pointer_appearance(pointer_appearance)
@@ -3466,6 +3581,94 @@ impl LispStringSourceFrame {
 
     fn char_count(&self) -> usize {
         self.char_byte_offsets.len().saturating_sub(1)
+    }
+
+    fn automatic_compositions_in(
+        &self,
+        rules: AutomaticCompositionRules,
+        range: CharRange,
+    ) -> Vec<AutomaticCompositionSpan> {
+        let start = range.start().get();
+        let end = range.end().get();
+        let mut spans = Vec::new();
+        let mut run_start = start;
+        // GNU stops its automatic-composition search at a newline. Other
+        // special source characters also retain their own ordinary handling.
+        // text_slice is only for plain runs: applying it to the complete
+        // before-string used to stop at its first newline (or assert in debug).
+        for position in start..=end {
+            if position < end
+                && self.char_at(position).is_some_and(|character| {
+                    match classify_text_source_char(character) {
+                        TextSourceCharClassification::Text(_) => true,
+                        TextSourceCharClassification::RowBreak
+                        | TextSourceCharClassification::ControlChar { .. }
+                        | TextSourceCharClassification::EscapeOctal { .. }
+                        | TextSourceCharClassification::Glyphless { .. } => false,
+                    }
+                })
+            {
+                continue;
+            }
+            if run_start < position {
+                spans.extend(
+                    rules
+                        .spans(&self.text_slice(run_start, position))
+                        .into_iter()
+                        .map(|span| {
+                            AutomaticCompositionSpan::new(
+                                run_start + span.start(),
+                                run_start + span.end(),
+                            )
+                        }),
+                );
+            }
+            run_start = position.saturating_add(1);
+        }
+        spans
+    }
+
+    #[inline]
+    fn automatic_composition_end(
+        &self,
+        start: CharPos0,
+        property_end: CharPos0,
+        target: crate::display_property::DisplayPropertyTarget,
+    ) -> Option<CharPos0> {
+        let end = CharPos0::new(self.automatic_composition_at(start.get())?);
+        if end <= property_end {
+            return Some(end);
+        }
+        // A terminal cluster belongs to its base cell's face. A face-only
+        // boundary cannot split its zero-width extenders. GUI font boundaries
+        // and every non-face property retain the existing conservative stop.
+        match target {
+            crate::display_property::DisplayPropertyTarget::Graphical => return None,
+            crate::display_property::DisplayPropertyTarget::Terminal => {}
+        }
+        if self.composition_prop_at(start.get()).is_some() {
+            return None;
+        }
+        let props = self.props.as_ref()?;
+        let face = Value::symbol(&FACE_PROPERTY);
+        let font_lock_face = Value::symbol(&FONT_LOCK_FACE_PROPERTY);
+        let mut base = props.get_properties_at_char_pos(start);
+        base.remove(&face);
+        base.remove(&font_lock_face);
+        let mut boundary = property_end;
+        while boundary < end {
+            let mut next = props.get_properties_at_char_pos(boundary);
+            next.remove(&face);
+            next.remove(&font_lock_face);
+            if next != base {
+                return None;
+            }
+            boundary = CharPos0::new(
+                self.next_property_change(boundary.get())
+                    .max(boundary.get() + 1),
+            );
+        }
+        Some(end)
     }
 
     fn automatic_composition_at(&self, start: usize) -> Option<usize> {
@@ -3550,12 +3753,14 @@ impl LispStringSourceFrame {
             .min(self.char_count())
     }
 
-    fn next_text_run_end(
+    fn ordinary_text_run(
         &self,
-        start: usize,
-        limit: usize,
+        bounds: CharRange,
         tty_glyphless_char_display: TtyGlyphlessCharDisplay,
-    ) -> usize {
+        policy: LispStringRunTextPolicy,
+    ) -> LispStringOrdinaryRun {
+        let start = bounds.start().get();
+        let limit = bounds.end().get();
         let mut end = start;
         while end < limit {
             let Some(ch) = self.char_at(end) else {
@@ -3570,19 +3775,49 @@ impl LispStringSourceFrame {
             }
             end += 1;
         }
-        end.max(start + 1).min(limit)
+        let extent = if end > start {
+            LispStringRunExtent::Ordinary(CharRange::new(bounds.start(), CharPos0::new(end)))
+        } else {
+            LispStringRunExtent::Legacy(CharRange::new(
+                bounds.start(),
+                CharPos0::new(end.max(start + 1).min(limit)),
+            ))
+        };
+        let (range, copied) = match extent {
+            LispStringRunExtent::Ordinary(range) => {
+                let copied = match policy {
+                    LispStringRunTextPolicy::Decode => None,
+                    LispStringRunTextPolicy::ValidatedBytes => self
+                        .text
+                        .get(self.byte_offset(start)..self.byte_offset(end))
+                        .filter(|bytes| match self.storage {
+                            EmacsTextStorage::Unibyte => bytes.is_ascii(),
+                            EmacsTextStorage::Multibyte => true,
+                        })
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .map(str::to_owned),
+                };
+                (range, copied)
+            }
+            LispStringRunExtent::Legacy(range) => (range, None),
+        };
+        LispStringOrdinaryRun {
+            end: range.end(),
+            text: copied.unwrap_or_else(|| self.text_slice(start, range.end().get())),
+        }
     }
 
     fn display_prop_at(&self, char_index: usize) -> Option<Value> {
         self.props
             .as_ref()?
-            .get_property_at_char_pos(CharPos0::new(char_index), Value::symbol("display"))
+            .get_property_at_char_pos(CharPos0::new(char_index), Value::symbol(&DISPLAY_PROPERTY))
     }
 
     fn composition_prop_at(&self, char_index: usize) -> Option<Value> {
-        self.props
-            .as_ref()?
-            .get_property_at_char_pos(CharPos0::new(char_index), Value::symbol("composition"))
+        self.props.as_ref()?.get_property_at_char_pos(
+            CharPos0::new(char_index),
+            Value::symbol(&COMPOSITION_PROPERTY),
+        )
     }
 
     fn display_value_extent(&self, value: Value, mut extent: usize) -> usize {
@@ -3607,8 +3842,10 @@ impl LispStringSourceFrame {
         };
         let char_pos = CharPos0::new(char_index);
         let face = props
-            .get_property_at_char_pos(char_pos, Value::symbol("face"))
-            .or_else(|| props.get_property_at_char_pos(char_pos, Value::symbol("font-lock-face")));
+            .get_property_at_char_pos(char_pos, Value::symbol(&FACE_PROPERTY))
+            .or_else(|| {
+                props.get_property_at_char_pos(char_pos, Value::symbol(&FONT_LOCK_FACE_PROPERTY))
+            });
         face.map(|value| context.resolve_face_ref(self.base_face, value))
             .unwrap_or(self.base_face)
     }
@@ -3669,7 +3906,7 @@ impl LispStringSourceFrame {
         context: &mut DisplaySourceContext<'_>,
     ) -> Option<DisplayPointerAppearance> {
         let props = self.props.as_ref()?;
-        let property = Value::symbol("mouse-face");
+        let property = Value::symbol(&MOUSE_FACE_PROPERTY);
         let char_pos = CharPos0::new(char_index);
         let value = props.get_property_at_char_pos(char_pos, property)?;
         if value.is_nil() {
@@ -4044,3 +4281,7 @@ fn is_control_char(ch: char) -> bool {
 #[cfg(test)]
 #[path = "display_source/tests/display_source_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "display_source/tests/ordinary_run_text_test.rs"]
+mod ordinary_run_text_tests;

@@ -65,7 +65,9 @@ fn find_function_via_mx_opens_lisp_definition() {
         grid.iter().any(|row| row.contains("newcomment.el"))
             && grid.iter().any(|row| row.contains("(defun comment-dwim"))
     });
-    wait_for_both_mx_suggestion(&mut gnu, &mut neo, "find-function", Duration::from_secs(8));
+    // ECE's binding suggestion is an asynchronous four-second echo transient;
+    // this test is about find-function navigation, and mx_suggestion is the
+    // dedicated oracle for the suggestion phases, so no grid here waits for it.
 
     // The two executables necessarily open their own copy of the defining
     // file, and a `make install` oracle keeps its Lisp compressed: GNU

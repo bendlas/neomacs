@@ -33,6 +33,7 @@ pub(crate) use display::WindowScrollUpdate;
 pub use display_table_input::LayoutDisplayTableInput;
 mod face_input;
 mod frame_params;
+pub(crate) use frame_params::FrameQueryParam;
 pub mod geometry;
 mod history;
 mod invisibility_input;
@@ -1415,10 +1416,12 @@ pub enum WindowOldBuffer {
     Recorded(BufferId),
 }
 
-/// What a deleted window remembers, mirroring the `old_buffer` GNU stores on
-/// the window object it keeps alive.
+/// What a deleted window remembers on the window object GNU keeps alive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeletedWindowRecord {
+    /// The window's owning frame, retained even after window deletion.
+    /// `None` means ownership was not recorded; it does not name another frame.
+    pub owner: Option<FrameId>,
     /// The buffer the window was showing when it was deleted.
     pub old_buffer: Option<BufferId>,
     /// The window's epoch at deletion, or `None` if it was never recorded --
@@ -1435,6 +1438,40 @@ pub struct WindowCellDimensions {
     lines: Option<i64>,
 }
 
+/// GNU's positive numeric line base. This is live semantic window state:
+/// nested format-mode-line calls update the same value. No Lisp roots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ModeLineBase {
+    position: CharPos0,
+    line: std::num::NonZeroUsize,
+}
+
+static_assertions::assert_impl_all!(ModeLineBase: Send, Sync, Copy, std::fmt::Debug);
+static_assertions::assert_eq_size!(ModeLineBase, Option<ModeLineBase>);
+
+impl ModeLineBase {
+    pub(crate) const fn first(position: CharPos0) -> Self {
+        Self {
+            position,
+            line: std::num::NonZeroUsize::MIN,
+        }
+    }
+
+    /// A nonpositive GNU numeric base is unusable on the next decode.
+    pub(crate) fn new(position: CharPos0, line: usize) -> Option<Self> {
+        std::num::NonZeroUsize::new(line).map(|line| Self { position, line })
+    }
+
+    pub(crate) const fn position(self) -> CharPos0 {
+        self.position
+    }
+
+    pub(crate) const fn line_number(self) -> usize {
+        self.line.get()
+    }
+}
+
 /// A window in the window tree.
 #[derive(Clone, Debug)]
 // Window nodes own their complete leaf/split state and are cloned as snapshots;
@@ -1445,6 +1482,9 @@ pub enum Window {
     Leaf {
         id: WindowId,
         buffer_id: BufferId,
+        /// Cleared at GNU freshness boundaries, never restored from a saved
+        /// configuration or shared with a newly cloned sibling.
+        mode_line_base: Option<ModeLineBase>,
         /// Pixel bounds within the frame.
         bounds: Rect,
         /// Cached byte position of the first visible character.
@@ -1614,6 +1654,7 @@ impl Window {
         Window::Leaf {
             id,
             buffer_id,
+            mode_line_base: None,
             // GNU gives a new window change_stamp 0 and a nil old_buffer, so the
             // next record can tell it did not exist before.
             old_buffer: None,
@@ -2202,6 +2243,25 @@ impl Window {
         }
     }
 
+    pub(crate) fn mode_line_base(&self) -> Option<ModeLineBase> {
+        match self {
+            Self::Leaf { mode_line_base, .. } => *mode_line_base,
+            Self::Internal { .. } => None,
+        }
+    }
+
+    pub(crate) fn set_mode_line_base(&mut self, value: Option<ModeLineBase>) {
+        if let Self::Leaf { mode_line_base, .. } = self {
+            *mode_line_base = value;
+        }
+    }
+
+    /// Invalidate GNU's numeric base when replacing a displayed buffer without
+    /// resetting the other window fields (temporary echo/startup transitions).
+    pub fn reset_mode_line_base(&mut self) {
+        self.set_mode_line_base(None);
+    }
+
     /// Set the buffer displayed in this window (leaf only).
     pub fn set_buffer(&mut self, new_id: BufferId) {
         if let Window::Leaf {
@@ -2212,9 +2272,13 @@ impl Window {
             point,
             min_hscroll,
             suspend_auto_hscroll,
+            mode_line_base,
             ..
         } = self
         {
+            // GNU wset_buffer invalidates base_line_pos even for a numeric
+            // identity round trip; do not preserve pre-switch history.
+            *mode_line_base = None;
             *buffer_id = new_id;
             *window_start = LispCharPos1::ONE;
             *position_markers = WindowPositionMarkerState::Detached;
@@ -2535,8 +2599,11 @@ pub struct DisplayRowSnapshot {
     pub row: i64,
     /// Y relative to the window's top edge, in pixels.
     pub y: i64,
-    /// Row height in pixels.
+    /// Vertical row advance in pixels, including `extra_line_spacing`.
     pub height: i64,
+    /// Extra spacing after this row, included in `height`. GNU recentering
+    /// excludes the last requested row's trailing spacing when fitting bottom.
+    pub extra_line_spacing: i64,
     /// X position where redisplay started emitting this row, relative to the
     /// text area's left edge.
     pub start_x: i64,
@@ -2581,6 +2648,56 @@ impl DisplayRowEndSource {
     pub const fn is_overlay_string(self) -> bool {
         matches!(self, Self::OverlayBeforeString | Self::OverlayAfterString)
     }
+}
+
+/// Physical distance to the end of a completely measured EOB overlay stream.
+///
+/// The distance is relative to the row where the first string at this anchor
+/// started. It survives query-row translation and includes an empty final row
+/// that the renderer need not publish. Source anchors and display-row distance
+/// therefore remain separate facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompletedEobOverlayMotionExtent {
+    anchor: LispCharPos1,
+    following_rows: usize,
+}
+
+impl CompletedEobOverlayMotionExtent {
+    /// Refuse a completion before the stream's first physical row rather than
+    /// turning an invalid interval into a large unsigned distance.
+    pub const fn from_physical_rows(
+        anchor: LispCharPos1,
+        first_row: usize,
+        completion_row: usize,
+    ) -> Option<Self> {
+        match completion_row.checked_sub(first_row) {
+            Some(following_rows) => Some(Self {
+                anchor,
+                following_rows,
+            }),
+            None => None,
+        }
+    }
+
+    pub const fn anchor(self) -> LispCharPos1 {
+        self.anchor
+    }
+
+    pub const fn following_rows(self) -> usize {
+        self.following_rows
+    }
+}
+
+/// An EOB source position does not prove that its virtual overlay tail ended.
+/// Only the producer that drains all strings can publish `Complete`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EobOverlayMotionCoverage {
+    #[default]
+    NotObserved,
+    Incomplete {
+        anchor: LispCharPos1,
+    },
+    Complete(CompletedEobOverlayMotionExtent),
 }
 
 /// Registry index of a fringe bitmap, as handed out by `define-fringe-bitmap`
@@ -2891,6 +3008,8 @@ pub struct WindowDisplaySnapshot {
     pub point_rows: Option<DisplayPointRows>,
     /// Visible row metrics, sorted by `row`.
     pub rows: Vec<DisplayRowSnapshot>,
+    /// Completion evidence for the virtual display tail at accessible EOB.
+    pub eob_overlay_motion: EobOverlayMotionCoverage,
     /// The displayed buffer's `modified_tick` when this snapshot was produced.
     /// The snapshot is a redisplay cache; a display primitive that reads it
     /// (e.g. `vertical-motion` with a column target) must treat it as valid
@@ -3731,6 +3850,7 @@ impl PartialEq for WindowDisplaySnapshot {
             && self.logical_cursor == other.logical_cursor
             && self.phys_cursor == other.phys_cursor
             && self.rows == other.rows
+            && self.eob_overlay_motion == other.eob_overlay_motion
             && self.buffer_modiff == other.buffer_modiff
             && self.layout_freshness == other.layout_freshness
             && self.window_end_record == other.window_end_record
@@ -3757,6 +3877,7 @@ impl Default for WindowDisplaySnapshot {
             points: Vec::new(),
             point_rows: None,
             rows: Vec::new(),
+            eob_overlay_motion: EobOverlayMotionCoverage::NotObserved,
             buffer_modiff: None,
             layout_freshness: None,
             posn_matrix: None,
@@ -4697,7 +4818,7 @@ impl Frame {
         self.window_system
             .filter(|value| value.is_truthy())
             .or_else(|| {
-                self.parameter("window-system")
+                self.fixed_parameter(crate::window::FrameQueryParam::WindowSystem)
                     .filter(|value| value.is_truthy())
             })
     }
@@ -4834,6 +4955,10 @@ impl Frame {
         self.set_known_parameter(FrameParam::RightFringe, Value::fixnum(8));
         self.set_known_parameter(FrameParam::InternalBorderWidth, Value::fixnum(0));
         self.set_known_parameter(FrameParam::BorderWidth, Value::fixnum(0));
+    }
+
+    pub(crate) fn fixed_parameter(&self, key: FrameQueryParam) -> Option<Value> {
+        self.parameter_key(key.into())
     }
 
     pub fn parameter(&self, key: &str) -> Option<Value> {
@@ -6017,9 +6142,36 @@ impl Frame {
             self.tty_posn_pool_can_repartition = false;
         }
         let horizontal_geometry_changed = self.width != width;
+        // GNU resize_frame_windows resets the ordinary minibuffer's text
+        // body to one line on a vertical frame resize, before redisplay
+        // regrows it through window.el's root minimum policy. Preserve the
+        // nontext geometry published by its current matrix.
+        let resized_mini_height = (self.height != height)
+            .then(|| {
+                self.minibuffer_leaf.as_ref().map(|mini| {
+                    let nontext = self.redisplay_snapshot(mini.id()).map_or(0.0, |snapshot| {
+                        if snapshot.regions_materialized {
+                            (snapshot.regions.outer.height - snapshot.regions.text_body.height)
+                                .max(0.0)
+                        } else {
+                            (snapshot.tab_line_height.max(0)
+                                + snapshot.header_line_height.max(0)
+                                + snapshot.mode_line_height.max(0))
+                                as f32
+                        }
+                    });
+                    self.char_height.max(1.0) + nontext
+                })
+            })
+            .flatten();
         self.clear_pending_gui_resize();
         self.width = width;
         self.height = height;
+        if let (Some(mini), Some(height)) = (self.minibuffer_leaf.as_mut(), resized_mini_height) {
+            let mut bounds = *mini.bounds();
+            bounds.height = height;
+            mini.set_bounds(bounds);
+        }
         self.sync_window_area_bounds();
         if horizontal_geometry_changed {
             self.tree.invalidate_automatic_hscroll_for_geometry_change();
@@ -6280,6 +6432,19 @@ impl Frame {
         }
     }
 }
+
+/// Result of a prepared minibuffer resize under one exclusive Context borrow.
+/// The copied outcome owns no Lisp values or cross-mutator state; an unchanged
+/// result is distinct from a committed geometry update and from a Flow error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "the caller must distinguish a committed resize from no change"]
+pub enum PreparedMiniResizeOutcome {
+    Unchanged,
+    Committed,
+}
+
+static_assertions::assert_impl_all!(PreparedMiniResizeOutcome: Copy, Send, Sync);
+const _: () = assert!(std::mem::size_of::<PreparedMiniResizeOutcome>() == 1);
 
 /// A nonempty geometry change tied to one live minibuffer allocation.
 #[derive(Debug, PartialEq)]
@@ -6875,6 +7040,32 @@ impl FrameManager {
             .sum()
     }
 
+    /// Number of live windows whose `buffer_id` is exactly `buffer`,
+    /// including minibuffer windows' leaf windows.
+    ///
+    /// [`Self::buffer_window_count`] resolves indirect buffers through the
+    /// live buffer table, so it reports zero for a buffer that has just been
+    /// removed from that table even while windows still reference its id.
+    /// GNU `replace_buffer_in_windows_safely` (window.c) gates its repair on
+    /// the incoming buffer's window count, which survives the buffer being
+    /// removed from `Vbuffer_alist`; this is the equivalent exact-id count.
+    pub fn window_count_showing_buffer(&self, buffer: BufferId) -> usize {
+        self.frames
+            .values()
+            .map(|frame| {
+                frame
+                    .tree()
+                    .leaf_ids()
+                    .into_iter()
+                    .filter(|id| frame.tree().find(*id).and_then(Window::buffer_id) == Some(buffer))
+                    .count()
+                    + usize::from(
+                        frame.minibuffer_leaf.as_ref().and_then(Window::buffer_id) == Some(buffer),
+                    )
+            })
+            .sum()
+    }
+
     /// GNU's `bset_redisplay` observes ordinary windows on every frame.
     /// Read only the live tree and completed display identities; detached
     /// windows and the inactive minibuffer cannot raise this predicate.
@@ -7159,7 +7350,7 @@ impl FrameManager {
                 // which is what lets `window-old-buffer` still answer for a
                 // window that no longer exists.
                 self.deleted_windows
-                    .insert(wid, Self::deletion_record(frame.find_window(wid)));
+                    .insert(wid, Self::deletion_record(Some(id), frame.find_window(wid)));
                 if let Some(window) = frame.find_window(wid) {
                     self.deleted_window_parameters
                         .insert(wid, window.parameters().clone());
@@ -7167,8 +7358,10 @@ impl FrameManager {
             }
             if let Some(minibuffer_leaf) = frame.minibuffer_leaf.as_ref() {
                 let minibuffer_wid = minibuffer_leaf.id();
-                self.deleted_windows
-                    .insert(minibuffer_wid, Self::deletion_record(Some(minibuffer_leaf)));
+                self.deleted_windows.insert(
+                    minibuffer_wid,
+                    Self::deletion_record(Some(id), Some(minibuffer_leaf)),
+                );
                 self.deleted_window_parameters
                     .insert(minibuffer_wid, minibuffer_leaf.parameters().clone());
             }
@@ -7210,9 +7403,13 @@ impl FrameManager {
         }
     }
 
-    /// List all frame IDs.
+    /// List live frames newest first, matching GNU's prepend-only frame list.
     pub fn frame_list(&self) -> Vec<FrameId> {
-        self.frames.keys().copied().collect()
+        // IDs are assigned monotonically and never reused, so their reverse
+        // order is creation order without a parallel mutable order ledger.
+        let mut frames: Vec<_> = self.frames.keys().copied().collect();
+        frames.sort_unstable_by_key(|id| std::cmp::Reverse(id.0));
+        frames
     }
 
     /// True when a live frame is absent from `affected`.
@@ -7645,19 +7842,21 @@ impl FrameManager {
             return false; // Can't delete last window
         }
 
-        let deleted_parameters = frame
-            .find_window(window_id)
-            .map(|window| window.parameters().clone());
-        // Taken before the tree drops the window: after `delete_window_in_tree`
-        // there is nothing left to read the buffer from.
-        let deletion_record = Self::deletion_record(frame.find_window(window_id));
+        let deleted_windows = &mut self.deleted_windows;
+        let deleted_parameters = &mut self.deleted_window_parameters;
         // A promotion at the very top has no grandparent to merge into, so the
         // outcome collapses to "was it removed" here.
-        let removed = delete_window_in_tree(frame.tree_mut(), window_id, resize).removed();
+        let removed = delete_window_in_tree(frame.tree_mut(), window_id, resize, |window| {
+            let id = window.id();
+            let record = Self::deletion_record(Some(frame_id), Some(&window));
+            let parameters = match window {
+                Window::Leaf { parameters, .. } | Window::Internal { parameters, .. } => parameters,
+            };
+            deleted_windows.insert(id, record);
+            deleted_parameters.insert(id, parameters);
+        })
+        .removed();
         if removed {
-            self.deleted_windows.insert(window_id, deletion_record);
-            self.deleted_window_parameters
-                .insert(window_id, deleted_parameters.unwrap_or_default());
             // No character-edge resync here either; see the note in
             // `split_window_with_combination_limit`.  GNU assigns those rows at
             // resize-apply points, so a survivor keeps its old row until
@@ -7809,6 +8008,7 @@ impl FrameManager {
             self.deleted_windows.insert(
                 id,
                 DeletedWindowRecord {
+                    owner: Some(frame_id),
                     old_buffer: None,
                     change_stamp: None,
                 },
@@ -7871,6 +8071,18 @@ impl FrameManager {
         self.frames
             .iter()
             .find_map(|(frame_id, frame)| frame.find_window(window_id).map(|_| *frame_id))
+    }
+
+    /// Return the recorded owner of a live or deleted window object.
+    ///
+    /// A retained owner identity does not imply the frame is still live.
+    /// Missing ownership remains unknown rather than naming an unrelated frame.
+    pub(crate) fn window_owner_frame_id(&self, window_id: WindowId) -> Option<FrameId> {
+        self.find_valid_window_frame_id(window_id).or_else(|| {
+            self.deleted_windows
+                .get(&window_id)
+                .and_then(|record| record.owner)
+        })
     }
 
     /// Return true when WINDOW-ID designates a live window in any frame.
@@ -7945,7 +8157,9 @@ impl FrameManager {
         window_id: WindowId,
     ) -> Option<DeletedWindowRecord> {
         self.lookup_window(window_id)
-            .map(|window| Self::deletion_record(Some(window)))
+            .map(|window| {
+                Self::deletion_record(self.find_valid_window_frame_id(window_id), Some(window))
+            })
             .or_else(|| self.deleted_windows.get(&window_id).copied())
     }
 
@@ -7954,8 +8168,9 @@ impl FrameManager {
     /// Mirrors GNU's `wset_old_buffer (w, w->contents)` in
     /// `Fdelete_window_internal`: a live leaf remembers the buffer it was
     /// showing, an internal window has none to remember.
-    fn deletion_record(window: Option<&Window>) -> DeletedWindowRecord {
+    fn deletion_record(owner: Option<FrameId>, window: Option<&Window>) -> DeletedWindowRecord {
         DeletedWindowRecord {
+            owner,
             old_buffer: window.and_then(Window::buffer_id),
             change_stamp: window.and_then(Window::change_stamp),
         }
@@ -8116,6 +8331,7 @@ fn make_split_sibling(
         id,
         buffer_id,
         bounds: sibling_bounds,
+        mode_line_base,
         parameters,
         parameters_generation,
         dedicated,
@@ -8133,6 +8349,7 @@ fn make_split_sibling(
     } = &mut sibling
     {
         *id = new_id;
+        *mode_line_base = None;
         *buffer_id = new_buffer_id;
         *sibling_bounds = bounds;
         parameters.clear();
@@ -8396,10 +8613,13 @@ fn split_window_in_tree(
 }
 
 /// Delete a window from the tree. Returns how the tree absorbed the removal.
+/// Every node that actually leaves the tree reaches `on_removed` with its
+/// metadata intact, including discarded subtrees and collapsed internal nodes.
 fn delete_window_in_tree(
     tree: &mut WindowTree,
     target: WindowId,
     resize: DeleteResize,
+    mut on_removed: impl FnMut(Window),
 ) -> DeleteOutcome {
     let Some(parent) = tree.parent_of(target) else {
         return DeleteOutcome::NotFound;
@@ -8423,7 +8643,9 @@ fn delete_window_in_tree(
     let remaining = siblings.len();
     tree.set_children(parent, siblings);
     for id in discarded {
-        tree.remove(id);
+        if let Some(window) = tree.remove(id) {
+            on_removed(window);
+        }
     }
 
     // GNU `Fdelete_window_internal` commits the staged sizes for the whole
@@ -8490,14 +8712,20 @@ fn delete_window_in_tree(
                 };
                 slots[idx] = promoted;
                 tree.set_children(grandparent, slots);
-                tree.remove(parent);
+                if let Some(window) = tree.remove(parent) {
+                    on_removed(window);
+                }
                 // GNU calls `recombine_windows` on the promoted sibling, and
                 // only there (`src/window.c:5801`).
-                recombine_child_into_parent(tree, grandparent, idx);
+                if let Some(window) = recombine_child_into_parent(tree, grandparent, idx) {
+                    on_removed(window);
+                }
             }
             None => {
                 tree.set_root(promoted);
-                tree.remove(parent);
+                if let Some(window) = tree.remove(parent) {
+                    on_removed(window);
+                }
             }
         }
         return DeleteOutcome::Removed;
@@ -8534,7 +8762,12 @@ fn delete_window_in_tree(
 /// exactly what `set-window-combination-limit` is for, and what
 /// `window--make-major-side-window` relies on to keep the main-window group
 /// from dissolving into the root (Bug#80665).
-fn recombine_child_into_parent(tree: &mut WindowTree, parent: WindowId, idx: usize) {
+/// Return the removed wrapper so its owner can retain the deleted object state.
+fn recombine_child_into_parent(
+    tree: &mut WindowTree,
+    parent: WindowId,
+    idx: usize,
+) -> Option<Window> {
     let Some(Window::Internal {
         direction: parent_direction,
         bounds: parent_bounds,
@@ -8542,13 +8775,13 @@ fn recombine_child_into_parent(tree: &mut WindowTree, parent: WindowId, idx: usi
         ..
     }) = tree.find(parent)
     else {
-        return;
+        return None;
     };
     let parent_direction = *parent_direction;
     let parent_bounds = *parent_bounds;
     let mut siblings = children.clone();
     let Some(&merged) = siblings.get(idx) else {
-        return;
+        return None;
     };
 
     // Only an unsealed combination along the same axis merges upward.
@@ -8558,14 +8791,14 @@ fn recombine_child_into_parent(tree: &mut WindowTree, parent: WindowId, idx: usi
             combination_limit,
             ..
         }) if !*combination_limit && *direction == parent_direction => {}
-        _ => return,
+        _ => return None,
     }
 
     let inner = tree.child_ids(merged).to_vec();
     siblings.remove(idx);
     // The merged node is gone from the tree, not merely unlinked: its children
     // take its place in the parent's list.
-    tree.remove(merged);
+    let removed = tree.remove(merged);
 
     let parent_size = match parent_direction {
         SplitDirection::Horizontal => parent_bounds.width,
@@ -8592,6 +8825,7 @@ fn recombine_child_into_parent(tree: &mut WindowTree, parent: WindowId, idx: usi
         siblings.insert(idx + offset, child);
     }
     tree.set_children(parent, siblings);
+    removed
 }
 
 fn find_sibling_in_tree(tree: &WindowTree, target: WindowId, next: bool) -> Option<WindowId> {
@@ -9119,3 +9353,7 @@ impl GcTrace for WindowTree {
 #[cfg(test)]
 #[path = "tests/window_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/eob_overlay_motion_test.rs"]
+mod eob_overlay_motion_tests;

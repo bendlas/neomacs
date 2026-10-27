@@ -66,33 +66,25 @@ pub struct CellAttrs {
 // TtyCell
 // ---------------------------------------------------------------------------
 
-/// A single cell in the terminal grid.
-///
-/// Normally holds one base character in `ch`. When the cell hosts a
-/// grapheme cluster (base + combining marks / ZWJ sequence), the
-/// extender codepoints are stored in `extenders` and emitted to the
-/// terminal immediately after `ch`. Mirrors GNU's `COMPOSITE_GLYPH`:
-/// the base character's cell carries the whole cluster, the combining
-/// marks never occupy their own terminal cells.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TtyCell {
-    pub ch: char,
-    pub attrs: CellAttrs,
-    /// Whether GNU's `CHAR_GLYPH_SPACE_P` may treat this blank as implicit.
-    /// A filtered TTY line-end face can have default SGR attributes while
-    /// retaining non-default face identity, so attributes alone cannot decide.
-    pub blank_erase: BlankErase,
-    /// How this visually blank-compatible cell exists on the real terminal.
-    /// GNU distinguishes a written space glyph from a cell produced by EL;
-    /// terminal snapshots and later insert/delete operations observe it too.
-    pub materialization: CellMaterialization,
-    /// True if this is a padding cell for a wide (double-width) character.
-    pub padding: bool,
-    /// Grapheme-cluster extenders stacked on `ch` (None for ordinary cells).
-    pub extenders: Option<Box<str>>,
-    /// Whether emitting this cell has a compile-time-known one-column advance
-    /// or delegates width to the connected terminal's Unicode tables.
-    pub terminal_advance: TerminalAdvance,
+#[path = "cell.rs"]
+mod cell;
+use cell::{PackedCellAttrs, PackedTtyCellValue};
+pub use cell::{TtyCell, TtyCellValue};
+// Ephemeral named raster inputs; no new field is stored in TtyRif or TtyGrid.
+#[derive(Debug)]
+struct PackedScalarCell {
+    ch: char,
+    attrs: PackedCellAttrs,
+    padding: bool,
+    blank_erase: BlankErase,
+}
+
+#[derive(Debug)]
+struct PackedClusterCell<'a> {
+    ch: char,
+    extenders: &'a str,
+    attrs: PackedCellAttrs,
+    padding: bool,
 }
 
 /// Provenance of the cursor advance caused by one logical terminal cell.
@@ -236,20 +228,6 @@ fn projected_face_fill_rect(
     }
 }
 
-impl Default for TtyCell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            attrs: CellAttrs::default(),
-            blank_erase: BlankErase::DefaultFace,
-            materialization: CellMaterialization::Erased,
-            padding: false,
-            extenders: None,
-            terminal_advance: TerminalAdvance::OneColumn,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // TtyGrid
 // ---------------------------------------------------------------------------
@@ -284,7 +262,7 @@ impl TtyGrid {
 
     /// Clear all cells to spaces with the given background color.
     pub fn clear(&mut self, bg: Option<TerminalColor>) {
-        let blank = TtyCell {
+        let blank = TtyCell::new(TtyCellValue {
             ch: ' ',
             attrs: CellAttrs {
                 bg,
@@ -295,7 +273,7 @@ impl TtyGrid {
             padding: false,
             extenders: None,
             terminal_advance: TerminalAdvance::OneColumn,
-        };
+        });
         for cell in &mut self.cells {
             *cell = blank.clone();
         }
@@ -365,7 +343,7 @@ impl TtyGrid {
                 self.neutralize_overwrite(row, col);
             }
             let idx = row * self.width + col;
-            self.cells[idx] = TtyCell {
+            self.cells[idx] = TtyCell::new(TtyCellValue {
                 ch,
                 attrs,
                 blank_erase,
@@ -373,7 +351,47 @@ impl TtyGrid {
                 padding,
                 extenders: None,
                 terminal_advance: TerminalAdvance::for_scalar(ch, padding),
+            });
+        }
+    }
+
+    /// Same ordered scalar write/neutralization, with attributes already encoded.
+    #[inline]
+    fn set_packed(&mut self, row: usize, col: usize, value: PackedTtyCellValue) {
+        if row < self.height && col < self.width {
+            if let Some(written) = self.row_written.get_mut(row) {
+                *written = true;
+            }
+            if !value.padding {
+                self.neutralize_overwrite(row, col);
+            }
+            self.cells[row * self.width + col] = TtyCell::from_packed(value);
+        }
+    }
+
+    fn set_packed_cluster(&mut self, row: usize, col: usize, value: PackedClusterCell<'_>) {
+        if row < self.height && col < self.width {
+            if let Some(written) = self.row_written.get_mut(row) {
+                *written = true;
+            }
+            let idx = row * self.width + col;
+            let extenders = if value.extenders.is_empty() {
+                None
+            } else {
+                Some(Box::<str>::from(value.extenders))
             };
+            if !value.padding {
+                self.neutralize_overwrite(row, col);
+            }
+            self.cells[idx] = TtyCell::from_packed(PackedTtyCellValue {
+                ch: value.ch,
+                attrs: value.attrs,
+                blank_erase: BlankErase::Explicit,
+                materialization: CellMaterialization::Written,
+                padding: value.padding,
+                extenders,
+                terminal_advance: TerminalAdvance::TerminalResolved,
+            });
         }
     }
 
@@ -387,17 +405,17 @@ impl TtyGrid {
     fn neutralize_overwrite(&mut self, row: usize, col: usize) {
         let row_start = row * self.width;
         let blank = |cell: &mut TtyCell| {
-            cell.ch = ' ';
-            cell.blank_erase = BlankErase::Explicit;
-            cell.materialization = CellMaterialization::Written;
-            cell.padding = false;
-            cell.extenders = None;
-            cell.terminal_advance = TerminalAdvance::OneColumn;
+            cell.set_ch(' ');
+            cell.set_blank_erase(BlankErase::Explicit);
+            cell.set_materialization(CellMaterialization::Written);
+            cell.set_padding(false);
+            cell.set_extenders(None);
+            cell.set_terminal_advance(TerminalAdvance::OneColumn);
         };
         // The old cell is a padding half: blank leftward through its base.
-        if self.cells[row_start + col].padding {
+        if self.cells[row_start + col].padding() {
             let mut base = col;
-            while base > 0 && self.cells[row_start + base].padding {
+            while base > 0 && self.cells[row_start + base].padding() {
                 base -= 1;
             }
             for cell in &mut self.cells[row_start + base..row_start + col] {
@@ -408,7 +426,7 @@ impl TtyGrid {
         // pair (a padding cell is always preceded by base-or-padding):
         // blank the orphans.
         for offset in col + 1..self.width {
-            if !self.cells[row_start + offset].padding {
+            if !self.cells[row_start + offset].padding() {
                 break;
             }
             blank(&mut self.cells[row_start + offset]);
@@ -440,7 +458,7 @@ impl TtyGrid {
             if !padding {
                 self.neutralize_overwrite(row, col);
             }
-            self.cells[idx] = TtyCell {
+            self.cells[idx] = TtyCell::new(TtyCellValue {
                 ch,
                 attrs,
                 blank_erase: BlankErase::Explicit,
@@ -448,7 +466,7 @@ impl TtyGrid {
                 padding,
                 extenders: ext,
                 terminal_advance: TerminalAdvance::TerminalResolved,
-            };
+            });
         }
     }
 
@@ -517,9 +535,26 @@ pub struct TtyRif {
     scroll_seed: Option<isize>,
     /// Force the next render to repaint every terminal cell.
     force_full_render: bool,
+    /// Resize invalidates physical wrap history as well as the cell matrices.
+    pending_physical_clear: PendingPhysicalClear,
     /// P3.5 stage-B knobs and what they remember between frames.
     damage: damage::DamageState,
 }
+
+/// Physical terminal obligation owned by one RIF and observed by its output
+/// owner. This copied value holds no Lisp roots or shared mutable state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "the output owner must preserve the physical-clear obligation"]
+pub enum PendingPhysicalClear {
+    None,
+    AfterResize,
+}
+
+const _: () = assert!(std::mem::size_of::<PendingPhysicalClear>() == 1);
+const _: fn() = || {
+    fn require_copy_send_sync<T: Copy + Send + Sync>() {}
+    require_copy_send_sync::<PendingPhysicalClear>();
+};
 
 fn terminal_cursor_cell(x: f32, y: f32, char_width: f32, char_height: f32) -> (u16, u16) {
     let char_width = char_width.max(1.0);
@@ -957,6 +992,7 @@ impl TtyRif {
             frame_stats: TtyFrameStats::default(),
             scroll_seed: None,
             force_full_render: true,
+            pending_physical_clear: PendingPhysicalClear::None,
             damage: damage::DamageState::from_knobs(),
         }
     }
@@ -989,12 +1025,27 @@ impl TtyRif {
 
     /// Resize the terminal grids. Clears both grids (forces full redraw).
     pub fn resize(&mut self, width: usize, height: usize) {
+        if self.width() != width || self.height() != height {
+            self.pending_physical_clear = PendingPhysicalClear::AfterResize;
+        }
         self.current = TtyGrid::new(width, height);
         self.desired = TtyGrid::new(width, height);
         self.force_full_render = true;
         self.damage.forget_terminal();
         self.damage.forget_painters();
         self.terminal_cursor_shape.forget_after_redraw();
+    }
+
+    /// The physical terminal obligation the next output must preserve.
+    #[inline]
+    pub fn physical_clear_requirement(&self) -> PendingPhysicalClear {
+        self.pending_physical_clear
+    }
+
+    /// Retain the resize obligation when its encoded output could not be written.
+    pub fn retry_physical_clear(&mut self) {
+        self.pending_physical_clear = PendingPhysicalClear::AfterResize;
+        self.force_full_render = true;
     }
 
     /// Force the next [`diff_and_render`](Self::diff_and_render) call to emit
@@ -1164,19 +1215,21 @@ impl TtyRif {
                         self.scroll_seed = Some(delta);
                     }
                 }
+                let anchor = WindowRowAnchor::new(
+                    state,
+                    entry,
+                    glyph_row.role,
+                    WindowMatrixRowIndex(row_idx),
+                    TerminalGridRow(origin_row),
+                );
                 let WindowRowPlacement {
                     row_bounds,
                     area_layout,
                     row_col,
                     grid_row,
-                } = WindowRowPlacement::new(
-                    state,
-                    entry,
-                    glyph_row.role,
-                    row_idx,
-                    origin_col,
-                    origin_row,
-                );
+                } = WindowRowPlacement::new(anchor, TerminalGridColumn(origin_col));
+                let row_col = row_col.get();
+                let grid_row = grid_row.get();
                 // Damage-aware carry (GNU dispnew: update_window never touches
                 // rows the desired matrix left disabled). A row the layout
                 // engine reused VERBATIM rasterizes to exactly what the
@@ -1445,15 +1498,48 @@ impl TtyRif {
         }
     }
 
+    /// One value for the current consumed face run, scoped to one area/row call.
+    #[inline]
+    fn packed_attrs_for_run(
+        &self,
+        face_id: FaceId,
+        run: &mut Option<(FaceId, PackedCellAttrs)>,
+    ) -> PackedCellAttrs {
+        if let Some((previous, attrs)) = *run
+            && previous == face_id
+        {
+            return attrs;
+        }
+        let attrs = PackedCellAttrs::new(self.resolve_attrs(face_id));
+        *run = Some((face_id, attrs));
+        attrs
+    }
+
     /// Classify a resolved face for GNU's TTY trailing-space rule.
     ///
-    /// Layout interns faces by stable presentation identity, so the resolved
-    /// default face carried by a newline is not guaranteed to retain numeric
-    /// `FaceId(0)` (the Python fixture's default newline is `FaceId(21)`). The
-    /// TTY boundary canonicalizes those identities by their terminal-facing
-    /// attributes before assigning the closed erase class.
-    fn blank_erase_for_face(&self, face_id: FaceId) -> BlankErase {
-        if self.resolve_attrs(face_id) == self.resolve_attrs(FaceId::new(0)) {
+    /// Arena ids and terminal paint do not identify GNU's default cache slot:
+    /// an equal-attribute forced margin slot is still non-default. The layout
+    /// producer carries that distinction into the existing cell erase class.
+    fn blank_erase_for_packed(
+        &self,
+        face_id: FaceId,
+        attrs: PackedCellAttrs,
+        default_face: &mut Option<PackedCellAttrs>,
+    ) -> BlankErase {
+        use neomacs_display_protocol::face::TtySpaceIdentity;
+        match self
+            .faces
+            .get(&face_id)
+            .map_or(TtySpaceIdentity::Unknown, |face| face.tty_space_identity)
+        {
+            TtySpaceIdentity::Unknown | TtySpaceIdentity::OtherRealized => {
+                return BlankErase::Explicit;
+            }
+            TtySpaceIdentity::CanonicalDefault => {}
+        }
+        let default = *default_face
+            .get_or_insert_with(|| PackedCellAttrs::new(self.resolve_attrs(FaceId::new(0))));
+        if attrs == default {
             BlankErase::DefaultFace
         } else {
             BlankErase::Explicit
@@ -1481,45 +1567,53 @@ impl TtyRif {
     /// erased/written state when GNU considers a default-face blank implicit.
     /// Non-default blanks are always written, even when their SGR attributes
     /// happen to equal the terminal defaults.
-    fn set_desired_glyph_cell(
-        &mut self,
-        row: usize,
-        col: usize,
-        ch: char,
-        attrs: CellAttrs,
-        padding: bool,
-        blank_erase: BlankErase,
-    ) {
-        let preserved_materialization =
-            (blank_erase == BlankErase::DefaultFace && ch == ' ' && !padding)
+    fn set_desired_packed_glyph_cell(&mut self, row: usize, col: usize, value: PackedScalarCell) {
+        let materialization =
+            (value.blank_erase == BlankErase::DefaultFace && value.ch == ' ' && !value.padding)
                 .then(|| self.current.cells.get(row * self.current.width + col))
                 .flatten()
-                .filter(|current| {
-                    current.ch == ' '
-                        && current.attrs == attrs
-                        && !current.padding
-                        && current.extenders.is_none()
-                        && current.blank_erase == BlankErase::DefaultFace
-                })
-                .map(|current| current.materialization);
-        self.desired
-            .set_with_blank_erase(row, col, ch, attrs, padding, blank_erase);
-        if let Some(materialization) = preserved_materialization {
-            self.desired.cells[row * self.desired.width + col].materialization = materialization;
-        }
+                .and_then(|current| current.preserved_blank_materialization(value.attrs))
+                .unwrap_or(CellMaterialization::Written);
+        self.desired.set_packed(
+            row,
+            col,
+            PackedTtyCellValue {
+                ch: value.ch,
+                attrs: value.attrs,
+                blank_erase: value.blank_erase,
+                materialization,
+                padding: value.padding,
+                extenders: None,
+                terminal_advance: TerminalAdvance::for_scalar(value.ch, value.padding),
+            },
+        );
     }
 
     /// Write one grapheme into the cell at `*col` (advancing it), as a base
     /// character plus combining extenders. Zero-width format joiners/selectors
     /// (ZWJ, ZWNJ, variation selectors) that the GUI shaper would consume are
     /// dropped — a terminal would otherwise show them as their own mark.
-    fn write_grapheme_cell(&mut self, row: usize, col: &mut i64, text: &str, attrs: CellAttrs) {
+    fn write_grapheme_cell(
+        &mut self,
+        row: usize,
+        col: &mut i64,
+        text: &str,
+        attrs: PackedCellAttrs,
+    ) {
         let mut chars = text.chars().filter(|c| !is_tty_skippable_format(*c));
         let base = chars.next().unwrap_or(' ');
         let rest: String = chars.collect();
         if let Some(col) = visible_cell(*col, self.desired.width) {
-            self.desired
-                .set_cluster(row, col, base, &rest, attrs, false);
+            self.desired.set_packed_cluster(
+                row,
+                col,
+                PackedClusterCell {
+                    ch: base,
+                    extenders: &rest,
+                    attrs,
+                    padding: false,
+                },
+            );
         }
         *col = col.saturating_add(1);
     }
@@ -1530,6 +1624,12 @@ impl TtyRif {
     /// After this call, `current` is swapped to reflect what is now on screen.
     /// Retrieve the buffered output with [`take_output`].
     pub fn diff_and_render(&mut self) {
+        self.diff_and_render_with_clear_screen(|output| {
+            with_capabilities(|caps| write_clear_screen_with(output, caps));
+        });
+    }
+
+    fn diff_and_render_with_clear_screen(&mut self, emit_clear: impl FnOnce(&mut Vec<u8>)) {
         self.output.clear();
         self.frame_stats = TtyFrameStats::default();
 
@@ -1564,6 +1664,15 @@ impl TtyRif {
         // before the frame's glyphs are written, src/term.c:763).
         write_hide_cursor(&mut self.output);
 
+        match self.physical_clear_requirement() {
+            PendingPhysicalClear::None => {}
+            PendingPhysicalClear::AfterResize => {
+                // GNU clear_frame clears a garbaged/resized terminal before the
+                // fresh glyph matrix. Repainting alone cannot remove soft wraps
+                // left by an old-width update already in flight at resize.
+                emit_clear(&mut self.output);
+            }
+        }
         self.encode_ops(&ops);
 
         // The desired grid begins as logical GNU glyph content. Reconcile the
@@ -1608,6 +1717,7 @@ impl TtyRif {
         // copies only its repainted rows).
         self.commit_frame();
         self.force_full_render = false;
+        self.pending_physical_clear = PendingPhysicalClear::None;
         self.finish_verified_frame();
     }
 
@@ -1689,9 +1799,10 @@ impl TtyRif {
                 // terminal filled them with blank cells whose exact
                 // attributes we choose not to depend on).
                 let w = self.current.width;
-                let poison = TtyCell {
-                    ch: '\0',
-                    ..TtyCell::default()
+                let poison = {
+                    let mut cell = TtyCell::default();
+                    cell.set_ch('\0');
+                    cell
                 };
                 if scroll.delta > 0 {
                     for i in scroll.top..=scroll.bottom - n {
@@ -1768,7 +1879,7 @@ impl TtyRif {
             desired_row
                 .iter()
                 .zip(current_row.iter())
-                .position(|(desired, current)| !desired.padding && desired != current)
+                .position(|(desired, current)| !desired.padding() && desired != current)
         }) else {
             return;
         };
@@ -1779,7 +1890,7 @@ impl TtyRif {
             desired_row
                 .iter()
                 .zip(current_row.iter())
-                .rposition(|(desired, current)| !desired.padding && desired != current)
+                .rposition(|(desired, current)| !desired.padding() && desired != current)
                 .expect("row with first changed cell must also have a last changed cell")
         };
 
@@ -1822,7 +1933,7 @@ impl TtyRif {
         // `nlen` stay erased.
         let current_row_is_erased = current_row
             .iter()
-            .all(|cell| cell.materialization == CellMaterialization::Erased);
+            .all(|cell| cell.materialization() == CellMaterialization::Erased);
         if current_row_is_erased {
             let write_end = self.desired_row_content_end(desired_row, first_changed);
             if first_changed < write_end {
@@ -1879,7 +1990,15 @@ impl TtyRif {
         // replays the shift and poisons the opened/revealed cells, so
         // the ordinary span diff below emits exactly the fresh content.
         let phys_width = self.desired.width;
+        // At or beyond the logical end, the old row is uniform erasable
+        // blanks. Without a background, every candidate suffix would fail
+        // carries_shiftable_content, so refuse without comparing its cells.
+        let tail_can_carry_content = current_logical_length.as_usize() > first_changed
+            || current_row
+                .last()
+                .is_some_and(|cell| cell.attrs().bg.is_some());
         if self.caps.insert_delete_char
+            && tail_can_carry_content
             && let Some((op, shifted_row)) = detect_row_shift(
                 row as u16,
                 &self.desired.cells[row_start..row_start + phys_width],
@@ -1894,14 +2013,14 @@ impl TtyRif {
             let Some(fresh_first) = desired_row
                 .iter()
                 .zip(current_row.iter())
-                .position(|(desired, current)| !desired.padding && desired != current)
+                .position(|(desired, current)| !desired.padding() && desired != current)
             else {
                 return;
             };
             let fresh_last = desired_row
                 .iter()
                 .zip(current_row.iter())
-                .rposition(|(desired, current)| !desired.padding && desired != current)
+                .rposition(|(desired, current)| !desired.padding() && desired != current)
                 .expect("shift left at least the poisoned cells changed");
             ops.push(TermOp::WriteRun {
                 row: row as u16,
@@ -1957,9 +2076,9 @@ impl TtyRif {
         // the byte-cost rule may only skip already-written cells.
         const GOTO_COST_CELLS: usize = 8;
         let changed = |col: usize| {
-            !desired_row[col].padding
+            !desired_row[col].padding()
                 && (desired_row[col] != current_row[col]
-                    || current_row[col].materialization == CellMaterialization::Erased)
+                    || current_row[col].materialization() == CellMaterialization::Erased)
         };
         let mut col = first_changed;
         let row_op_floor = ops.len();
@@ -1988,7 +2107,7 @@ impl TtyRif {
             }
         }
         if let Some(from) = erase_from {
-            let bg = desired_row[from].attrs.bg;
+            let bg = desired_row[from].attrs().bg;
             ops.push(TermOp::EraseToEol {
                 row: row as u16,
                 from: from as u16,
@@ -2022,7 +2141,7 @@ impl TtyRif {
                     let start = row * self.desired.width + start as usize;
                     let end = row * self.desired.width + end as usize;
                     for cell in &mut self.desired.cells[start..end] {
-                        cell.materialization = CellMaterialization::Written;
+                        cell.set_materialization(CellMaterialization::Written);
                     }
                 }
                 TermOp::EraseToEol { row, from, .. } => {
@@ -2030,7 +2149,7 @@ impl TtyRif {
                     let start = row * self.desired.width + from as usize;
                     let end = (row + 1) * self.desired.width;
                     for cell in &mut self.desired.cells[start..end] {
-                        cell.materialization = CellMaterialization::Erased;
+                        cell.set_materialization(CellMaterialization::Erased);
                     }
                 }
                 TermOp::ScrollRows { .. }
@@ -2172,10 +2291,10 @@ impl TtyRif {
         let row_start = row as usize * self.desired.width;
         for col in start as usize..end as usize {
             let desired = &self.desired.cells[row_start + col];
-            if desired.padding {
+            if desired.padding() {
                 continue;
             }
-            write_face_transition(&mut self.output, last_attrs, &desired.attrs);
+            write_face_transition(&mut self.output, last_attrs, &desired.attrs());
             let cell = desired.clone();
             write_cell_contents(&mut self.output, &cell);
             self.frame_stats.cells_written += 1;
@@ -2215,7 +2334,7 @@ impl TtyRif {
             return;
         };
 
-        let attrs = self.resolve_attrs(fill.face_id);
+        let attrs = PackedCellAttrs::new(self.resolve_attrs(fill.face_id));
         let visible_rows =
             visible_cell_range(cell_rect.top, cell_rect.height(), self.desired.height);
         let visible_cols =
@@ -2225,7 +2344,19 @@ impl TtyRif {
                 continue;
             }
             for col in visible_cols.clone() {
-                self.desired.set(row, col, ' ', attrs, false);
+                self.desired.set_packed(
+                    row,
+                    col,
+                    PackedTtyCellValue {
+                        ch: ' ',
+                        attrs,
+                        blank_erase: BlankErase::DefaultFace,
+                        materialization: CellMaterialization::Written,
+                        padding: false,
+                        extenders: None,
+                        terminal_advance: TerminalAdvance::OneColumn,
+                    },
+                );
             }
         }
     }
@@ -2233,16 +2364,16 @@ impl TtyRif {
     /// Resolve the background face of an implicit blank from its semantic
     /// owner, never from whatever an earlier matrix happened to paint into the
     /// shared desired grid.
-    fn blank_cell_attrs(
+    fn blank_cell_face(
         &self,
         state: &FrameDisplayState,
         owner: TtyGlyphRowOwner,
         role: GlyphRowRole,
         local_col: i64,
         local_row: i64,
-    ) -> CellAttrs {
+    ) -> FaceId {
         let TtyGlyphRowOwner::Window(window_id) = owner else {
-            return self.resolve_attrs(FaceId::new(0));
+            return FaceId::new(0);
         };
         state
             .face_fills
@@ -2254,10 +2385,7 @@ impl TtyRif {
                     && projected_face_fill_rect(fill, state.char_width, state.char_height)
                         .is_some_and(|rect| rect.contains(local_col, local_row))
             })
-            .map_or_else(
-                || self.resolve_attrs(FaceId::new(0)),
-                |fill| self.resolve_attrs(fill.face_id),
-            )
+            .map_or_else(|| FaceId::new(0), |fill| fill.face_id)
     }
 
     fn rasterize_glyph_row(
@@ -2312,6 +2440,8 @@ impl TtyRif {
             let glyphs = &glyph_row.glyphs[area.index()];
             let mut glyph_idx = 0;
             let mut preceding_wide_base_visible = None;
+            let mut face_run = None;
+            let mut default_face = None;
             while glyph_idx < glyphs.len() {
                 let glyph = &glyphs[glyph_idx];
                 if col >= screen_width {
@@ -2319,15 +2449,17 @@ impl TtyRif {
                 }
 
                 if glyph.padding {
-                    let attrs = self.resolve_attrs(glyph.face_id);
+                    let attrs = self.packed_attrs_for_run(glyph.face_id, &mut face_run);
                     if let Some(col) = visible_cell(col, self.desired.width) {
-                        self.set_desired_glyph_cell(
+                        self.set_desired_packed_glyph_cell(
                             screen_row,
                             col,
-                            ' ',
-                            attrs,
-                            preceding_wide_base_visible.take().unwrap_or(true),
-                            BlankErase::Explicit,
+                            PackedScalarCell {
+                                ch: ' ',
+                                attrs,
+                                padding: preceding_wide_base_visible.take().unwrap_or(true),
+                                blank_erase: BlankErase::Explicit,
+                            },
                         );
                     }
                     col = col.saturating_add(1);
@@ -2335,7 +2467,7 @@ impl TtyRif {
                     continue;
                 }
 
-                let attrs = self.resolve_attrs(glyph.face_id);
+                let attrs = self.packed_attrs_for_run(glyph.face_id, &mut face_run);
                 let base_visible = visible_cell(col, self.desired.width).is_some();
                 // Composite glyphs (base char + grapheme-cluster
                 // extenders) occupy one cell whose content is the full
@@ -2352,13 +2484,15 @@ impl TtyRif {
                             }
                             let base_col = col;
                             if let Some(visible_col) = visible_cell(col, self.desired.width) {
-                                self.desired.set_cluster(
+                                self.desired.set_packed_cluster(
                                     screen_row,
                                     visible_col,
-                                    cell.base,
-                                    &cell.extenders,
-                                    attrs,
-                                    false,
+                                    PackedClusterCell {
+                                        ch: cell.base,
+                                        extenders: &cell.extenders,
+                                        attrs,
+                                        padding: false,
+                                    },
                                 );
                             }
                             col = col.saturating_add(1);
@@ -2367,13 +2501,16 @@ impl TtyRif {
                                     break;
                                 }
                                 if let Some(visible_col) = visible_cell(col, self.desired.width) {
-                                    self.set_desired_glyph_cell(
+                                    self.set_desired_packed_glyph_cell(
                                         screen_row,
                                         visible_col,
-                                        ' ',
-                                        attrs,
-                                        visible_cell(base_col, self.desired.width).is_some(),
-                                        BlankErase::Explicit,
+                                        PackedScalarCell {
+                                            ch: ' ',
+                                            attrs,
+                                            padding: visible_cell(base_col, self.desired.width)
+                                                .is_some(),
+                                            blank_erase: BlankErase::Explicit,
+                                        },
                                     );
                                 }
                                 col = col.saturating_add(1);
@@ -2438,13 +2575,19 @@ impl TtyRif {
                                 break;
                             }
                             if let Some(col) = visible_cell(col, self.desired.width) {
-                                self.set_desired_glyph_cell(
+                                self.set_desired_packed_glyph_cell(
                                     screen_row,
                                     col,
-                                    ' ',
-                                    attrs,
-                                    false,
-                                    self.blank_erase_for_face(glyph.face_id),
+                                    PackedScalarCell {
+                                        ch: ' ',
+                                        attrs,
+                                        padding: false,
+                                        blank_erase: self.blank_erase_for_packed(
+                                            glyph.face_id,
+                                            attrs,
+                                            &mut default_face,
+                                        ),
+                                    },
                                 );
                             }
                             col = col.saturating_add(1);
@@ -2463,13 +2606,15 @@ impl TtyRif {
                                 break;
                             }
                             if let Some(col) = visible_cell(col, self.desired.width) {
-                                self.set_desired_glyph_cell(
+                                self.set_desired_packed_glyph_cell(
                                     screen_row,
                                     col,
-                                    ch,
-                                    attrs,
-                                    false,
-                                    BlankErase::Explicit,
+                                    PackedScalarCell {
+                                        ch,
+                                        attrs,
+                                        padding: false,
+                                        blank_erase: BlankErase::Explicit,
+                                    },
                                 );
                             }
                             col = col.saturating_add(1);
@@ -2483,13 +2628,15 @@ impl TtyRif {
                             // sub-cell space and emits one canonical blank.
                             GlyphlessPresentation::ThinSpace => {
                                 if let Some(col) = visible_cell(col, self.desired.width) {
-                                    self.set_desired_glyph_cell(
+                                    self.set_desired_packed_glyph_cell(
                                         screen_row,
                                         col,
-                                        ' ',
-                                        attrs,
-                                        false,
-                                        BlankErase::Explicit,
+                                        PackedScalarCell {
+                                            ch: ' ',
+                                            attrs,
+                                            padding: false,
+                                            blank_erase: BlankErase::Explicit,
+                                        },
                                     );
                                 }
                                 col = col.saturating_add(1);
@@ -2501,13 +2648,15 @@ impl TtyRif {
                             GlyphlessPresentation::EmptyBox | GlyphlessPresentation::HexCode => {
                                 let ch = glyph_to_char(glyph);
                                 if let Some(col) = visible_cell(col, self.desired.width) {
-                                    self.set_desired_glyph_cell(
+                                    self.set_desired_packed_glyph_cell(
                                         screen_row,
                                         col,
-                                        ch,
-                                        attrs,
-                                        false,
-                                        BlankErase::Explicit,
+                                        PackedScalarCell {
+                                            ch,
+                                            attrs,
+                                            padding: false,
+                                            blank_erase: BlankErase::Explicit,
+                                        },
                                     );
                                 }
                                 col = col.saturating_add(1);
@@ -2532,16 +2681,22 @@ impl TtyRif {
                             glyph_to_char(glyph)
                         };
                         if let Some(col) = visible_cell(col, self.desired.width) {
-                            self.set_desired_glyph_cell(
+                            self.set_desired_packed_glyph_cell(
                                 screen_row,
                                 col,
-                                ch,
-                                attrs,
-                                false,
-                                if ch == ' ' {
-                                    self.blank_erase_for_face(glyph.face_id)
-                                } else {
-                                    BlankErase::Explicit
+                                PackedScalarCell {
+                                    ch,
+                                    attrs,
+                                    padding: false,
+                                    blank_erase: if ch == ' ' {
+                                        self.blank_erase_for_packed(
+                                            glyph.face_id,
+                                            attrs,
+                                            &mut default_face,
+                                        )
+                                    } else {
+                                        BlankErase::Explicit
+                                    },
                                 },
                             );
                         }
@@ -2553,13 +2708,15 @@ impl TtyRif {
                                 .is_some_and(|next_glyph| next_glyph.padding);
                         if glyph.wide && !next_is_explicit_padding && col < screen_width {
                             if let Some(col) = visible_cell(col, self.desired.width) {
-                                self.set_desired_glyph_cell(
+                                self.set_desired_packed_glyph_cell(
                                     screen_row,
                                     col,
-                                    ' ',
-                                    attrs,
-                                    base_visible,
-                                    BlankErase::Explicit,
+                                    PackedScalarCell {
+                                        ch: ' ',
+                                        attrs,
+                                        padding: base_visible,
+                                        blank_erase: BlankErase::Explicit,
+                                    },
                                 );
                             }
                             col = col.saturating_add(1);
@@ -2617,9 +2774,16 @@ impl TtyRif {
                         glyphs
                             .iter()
                             .rfind(|glyph| !glyph.padding)
-                            .map(|glyph| self.blank_erase_for_face(glyph.face_id))
+                            .map(|glyph| {
+                                self.blank_erase_for_packed(
+                                    glyph.face_id,
+                                    PackedCellAttrs::new(self.resolve_attrs(glyph.face_id)),
+                                    &mut default_face,
+                                )
+                            })
                             .unwrap_or(BlankErase::DefaultFace)
                     };
+                    let mut tail_face_run = None;
                     while col < right_edge && col < screen_width {
                         if let Some(col) = visible_cell(col, self.desired.width) {
                             // A published FaceFillItem owns the resolved
@@ -2631,20 +2795,23 @@ impl TtyRif {
                             let local_col = i64::try_from(col)
                                 .unwrap_or(i64::MAX)
                                 .saturating_sub(frame_origin_col);
-                            let attrs = self.blank_cell_attrs(
+                            let face_id = self.blank_cell_face(
                                 state,
                                 owner,
                                 glyph_row.role,
                                 local_col,
                                 local_row,
                             );
-                            self.set_desired_glyph_cell(
+                            let attrs = self.packed_attrs_for_run(face_id, &mut tail_face_run);
+                            self.set_desired_packed_glyph_cell(
                                 screen_row,
                                 col,
-                                ' ',
-                                attrs,
-                                false,
-                                blank_erase,
+                                PackedScalarCell {
+                                    ch: ' ',
+                                    attrs,
+                                    padding: false,
+                                    blank_erase,
+                                },
                             );
                         }
                         col = col.saturating_add(1);
@@ -2659,54 +2826,123 @@ impl TtyRif {
     }
 }
 
-/// Where one window-matrix row lands on the terminal grid.
+/// An index obtained while enumerating one window's matrix rows.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+struct WindowMatrixRowIndex(usize);
+
+/// A signed terminal row coordinate, before clipping to the visible grid.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+struct TerminalGridRow(i64);
+
+impl TerminalGridRow {
+    #[inline]
+    const fn get(self) -> i64 {
+        self.0
+    }
+
+    #[inline]
+    fn visible_index(self, height: TerminalGridHeight) -> Option<usize> {
+        visible_cell(self.0, height.0)
+    }
+}
+
+/// A signed terminal column coordinate, including a child frame's origin.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+struct TerminalGridColumn(i64);
+
+impl TerminalGridColumn {
+    #[inline]
+    const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// The number of rows in the terminal grid, distinct from a matrix index.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+struct TerminalGridHeight(usize);
+
+const _: () = {
+    assert!(std::mem::size_of::<TerminalGridRow>() == std::mem::size_of::<i64>());
+    assert!(std::mem::size_of::<TerminalGridColumn>() == std::mem::size_of::<i64>());
+    assert!(std::mem::size_of::<TerminalGridHeight>() == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<WindowMatrixRowIndex>() == std::mem::size_of::<usize>());
+};
+
+/// Vertical placement borrowed from one immutable frame and window entry.
 ///
-/// One computation shared by the rasterizer and by the painter keys of
-/// `damage.rs`: a key built from a different placement than the one painted
-/// would let the damage path skip a row it should have repainted.
+/// The rasterizer and painter keys use this single projection. Keeping the
+/// source borrows and role with its result prevents horizontal placement from
+/// accidentally using a different source. Nothing is retained between frames.
+#[derive(Clone, Copy, Debug)]
+struct WindowRowAnchor<'frame> {
+    state: &'frame FrameDisplayState,
+    entry: &'frame WindowMatrixEntry,
+    role: GlyphRowRole,
+    row_bounds: Rect,
+    grid_row: TerminalGridRow,
+}
+
+impl<'frame> WindowRowAnchor<'frame> {
+    #[inline]
+    fn new(
+        state: &'frame FrameDisplayState,
+        entry: &'frame WindowMatrixEntry,
+        role: GlyphRowRole,
+        row: WindowMatrixRowIndex,
+        origin: TerminalGridRow,
+    ) -> Self {
+        let char_h = state.char_height.max(1.0);
+        let row_bounds = entry.row_pixel_bounds(role);
+        let row_base = origin.get() + (row_bounds.y / char_h).round().max(0.0) as i64;
+        // VPOS is a matrix index on a terminal. GUI pixel_y/height_px must
+        // neither stretch nor skip terminal rows.
+        let grid_row = TerminalGridRow(row_base.saturating_add(usize_to_i64_saturating(row.0)));
+        Self {
+            state,
+            entry,
+            role,
+            row_bounds,
+            grid_row,
+        }
+    }
+}
+
+/// Full placement, needed only when a row will be painted or keyed.
 #[derive(Clone, Copy, Debug)]
 struct WindowRowPlacement {
     row_bounds: Rect,
     area_layout: GlyphRowAreaLayout,
     /// The screen column the row's glyphs start from.
-    row_col: i64,
+    row_col: TerminalGridColumn,
     /// The terminal row the row is written to.
-    grid_row: i64,
+    grid_row: TerminalGridRow,
 }
 
 impl WindowRowPlacement {
     #[inline]
-    fn new(
-        state: &FrameDisplayState,
-        entry: &WindowMatrixEntry,
-        role: GlyphRowRole,
-        row_idx: usize,
-        origin_col: i64,
-        origin_row: i64,
-    ) -> Self {
-        let char_w = state.char_width.max(1.0);
-        let char_h = state.char_height.max(1.0);
+    fn new(anchor: WindowRowAnchor<'_>, origin_col: TerminalGridColumn) -> Self {
+        let char_w = anchor.state.char_width.max(1.0);
         // Mirror FrameDisplayState::materialize(): buffer text rows are
         // laid out relative to the GNU TEXT_AREA, while mode-line,
         // header-line, tab-line, and minibuffer chrome remain
         // window-wide.  This is the TTY side of GNU's glyph matrix
         // margin reservation in dispnew.c: text-area glyph pointers are
         // offset past left margin columns, chrome rows are not.
-        let row_bounds = entry.row_pixel_bounds(role);
-        let area_layout = state.glyph_row_area_layout(entry, role);
-        let row_col = origin_col + (row_bounds.x / char_w).round().max(0.0) as i64;
-        let row_base = origin_row + (row_bounds.y / char_h).round().max(0.0) as i64;
-        // GNU keeps two coordinate domains in each glyph row:
-        // VPOS/HPOS are grid coordinates, while Y/X are pixel
-        // coordinates for GUI redisplay.  TTY output is written by
-        // matrix row index, so pixel_y/height_px must not stretch or
-        // skip terminal rows.
-        let grid_row = row_base.saturating_add(usize_to_i64_saturating(row_idx));
+        let area_layout = anchor
+            .state
+            .glyph_row_area_layout(anchor.entry, anchor.role);
+        let row_col = TerminalGridColumn(
+            origin_col.get() + (anchor.row_bounds.x / char_w).round().max(0.0) as i64,
+        );
         Self {
-            row_bounds,
+            row_bounds: anchor.row_bounds,
             area_layout,
             row_col,
-            grid_row,
+            grid_row: anchor.grid_row,
         }
     }
 }
@@ -2734,30 +2970,30 @@ fn row_hash(row: &[TtyCell]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     for c in row {
-        h.write_u32(c.ch as u32);
-        c.attrs.fg.hash(&mut h);
-        c.attrs.bg.hash(&mut h);
+        h.write_u32(c.ch() as u32);
+        c.attrs().fg.hash(&mut h);
+        c.attrs().bg.hash(&mut h);
         h.write_u8(
-            (c.attrs.bold as u8)
-                | ((c.attrs.italic as u8) << 1)
-                | ((c.attrs.strikethrough as u8) << 2)
-                | ((c.attrs.inverse as u8) << 3)
-                | ((c.padding as u8) << 4),
+            (c.attrs().bold as u8)
+                | ((c.attrs().italic as u8) << 1)
+                | ((c.attrs().strikethrough as u8) << 2)
+                | ((c.attrs().inverse as u8) << 3)
+                | ((c.padding() as u8) << 4),
         );
-        h.write_u8(match c.blank_erase {
+        h.write_u8(match c.blank_erase() {
             BlankErase::DefaultFace => 0,
             BlankErase::Explicit => 1,
         });
-        h.write_u8(match c.materialization {
+        h.write_u8(match c.materialization() {
             CellMaterialization::Erased => 0,
             CellMaterialization::Written => 1,
         });
-        h.write_u8(match c.terminal_advance {
+        h.write_u8(match c.terminal_advance() {
             TerminalAdvance::OneColumn => 0,
             TerminalAdvance::TerminalResolved => 1,
         });
-        h.write_u8(c.attrs.underline);
-        if let Some(e) = &c.extenders {
+        h.write_u8(c.attrs().underline);
+        if let Some(e) = c.extenders() {
             h.write(e.as_bytes());
         }
     }
@@ -2973,9 +3209,10 @@ fn detect_row_shift(
     {
         return None;
     }
-    let poison = TtyCell {
-        ch: '\0',
-        ..TtyCell::default()
+    let poison = {
+        let mut cell = TtyCell::default();
+        cell.set_ch('\0');
+        cell
     };
     for d in 1..=MAX_SHIFT.min(width.saturating_sub(first_changed + 1)) {
         // Insertion: desired[first+d..] == current[first..width-d].
@@ -3029,16 +3266,16 @@ fn detect_row_shift(
 /// are visually inert on a blank. The background must match the erase's BCE
 /// fill, which the caller guarantees by grouping the tail by one uniform bg.
 fn erasable_blank(cell: &TtyCell) -> bool {
-    cell.ch == ' '
-        && cell.blank_erase == BlankErase::DefaultFace
-        && !cell.padding
-        && cell.extenders.is_none()
-        && cell.attrs.fg.is_none()
-        && !cell.attrs.bold
-        && !cell.attrs.italic
-        && cell.attrs.underline == 0
-        && !cell.attrs.strikethrough
-        && !cell.attrs.inverse
+    cell.ch() == ' '
+        && cell.blank_erase() == BlankErase::DefaultFace
+        && !cell.padding()
+        && cell.extenders().is_none()
+        && cell.attrs().fg.is_none()
+        && !cell.attrs().bold
+        && !cell.attrs().italic
+        && cell.attrs().underline == 0
+        && !cell.attrs().strikethrough
+        && !cell.attrs().inverse
 }
 
 /// Whether a run a horizontal shift would preserve is worth preserving.
@@ -3055,7 +3292,7 @@ fn erasable_blank(cell: &TtyCell) -> bool {
 /// shifts, matching GNU's `colored_spaces_p`.
 fn carries_shiftable_content(run: &[TtyCell]) -> bool {
     run.iter()
-        .any(|cell| !erasable_blank(cell) || cell.attrs.bg.is_some())
+        .any(|cell| !erasable_blank(cell) || cell.attrs().bg.is_some())
 }
 
 /// Return the start and background of the physical row's uniform erasable
@@ -3070,10 +3307,10 @@ fn uniform_erasable_tail(
         return None;
     }
 
-    let background = last.attrs.bg;
+    let background = last.attrs().bg;
     let mut split = search_start + last_offset;
     for (offset, cell) in cells {
-        if !erasable_blank(cell) || cell.attrs.bg != background {
+        if !erasable_blank(cell) || cell.attrs().bg != background {
             break;
         }
         split = search_start + offset;
@@ -3091,7 +3328,7 @@ fn normalize_row_blank_tail(row: &mut [TtyCell], blank_tail: BlankTailMethod) {
         return;
     }
     for cell in &mut row[split..] {
-        cell.materialization = CellMaterialization::Erased;
+        cell.set_materialization(CellMaterialization::Erased);
     }
 }
 
@@ -3111,7 +3348,7 @@ fn logical_tail_erase(
 
 fn row_has_terminal_resolved_advance(row: &[TtyCell]) -> bool {
     row.iter()
-        .any(|cell| cell.terminal_advance == TerminalAdvance::TerminalResolved)
+        .any(|cell| cell.terminal_advance() == TerminalAdvance::TerminalResolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -3130,6 +3367,14 @@ fn write_cursor_goto(buf: &mut Vec<u8>, row: u16, col: u16) {
 /// GNU).
 fn write_hide_cursor(buf: &mut Vec<u8>) {
     with_capabilities(|caps| write_hide_cursor_with(buf, caps));
+}
+
+/// GNU `tty_clear_frame` emits `TS_clr_frame` from the entry's `cl`.
+/// The padded-control renderer handles entries requiring tputs delays.
+fn write_clear_screen_with(buf: &mut Vec<u8>, caps: &TtyAttributeCapabilities) {
+    if let Some(sequence) = &caps.clear_screen {
+        buf.extend_from_slice(sequence);
+    }
 }
 
 fn write_hide_cursor_with(buf: &mut Vec<u8>, caps: &TtyAttributeCapabilities) {
@@ -3493,9 +3738,9 @@ fn write_underline_color(buf: &mut Vec<u8>, color: TerminalColor) {
 
 fn write_cell_contents(buf: &mut Vec<u8>, cell: &TtyCell) {
     let mut bytes = [0u8; 4];
-    let s = cell.ch.encode_utf8(&mut bytes);
+    let s = cell.ch().encode_utf8(&mut bytes);
     buf.extend_from_slice(s.as_bytes());
-    if let Some(ext) = cell.extenders.as_deref() {
+    if let Some(ext) = cell.extenders() {
         buf.extend_from_slice(ext.as_bytes());
     }
 }
@@ -3582,7 +3827,7 @@ impl TtyRif {
             let mut line = String::new();
             for col in 0..self.desired.width {
                 let idx = row * self.desired.width + col;
-                line.push(self.desired.cells[idx].ch);
+                line.push(self.desired.cells[idx].ch());
             }
             lines.push(line);
         }
@@ -3690,3 +3935,11 @@ fn glyph_row_debug_text(row: &GlyphRow) -> String {
     }
     text
 }
+
+#[cfg(test)]
+#[path = "rif/tests/packed_raster_test.rs"]
+mod packed_raster_tests;
+
+#[cfg(test)]
+#[path = "rif/tests/window_row_anchor_test.rs"]
+mod window_row_anchor_tests;

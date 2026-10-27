@@ -226,9 +226,7 @@ fn lisp_string_char_codes(string: &crate::heap_types::LispString) -> Vec<u32> {
     let mut pos = 0;
     let mut codes = Vec::new();
     while pos < bytes.len() {
-        codes.push(crate::emacs_core::emacs_char::string_char_advance(
-            bytes, &mut pos,
-        ));
+        codes.push(crate::emacs_core::emacs_char::string_char_advance(bytes, &mut pos).code());
     }
     codes
 }
@@ -5094,6 +5092,14 @@ fn serial_process_configure_resolves_buffer_and_port_designators() {
     crate::test_utils::init_test_tracing();
     let by_port = SerialTestPty::open();
     let by_buffer = SerialTestPty::open();
+    // This test's subject is which process each designator resolves to. A pty
+    // stands in for the UART, and its termios support is the host's: the CI
+    // runner answered one run's `tcsetattr` with EINVAL while an identical
+    // `:bytesize 7` configure passed in another shard of the same run, and
+    // GNU's serial_configure would report that host refusal the same way. A
+    // speed change is the one arm every tty driver takes, so use it to prove
+    // the configure reached each designator's own process; the bytesize and
+    // parity arms are covered by `serial_configuration_reaches_the_device`.
     let result = eval_one(&format!(
         r#"(let ((by-port (make-serial-process
                            :port "{by_port}"
@@ -5107,18 +5113,18 @@ fn serial_process_configure_resolves_buffer_and_port_designators() {
                  (progn
                    (serial-process-configure
                     :port "{by_port}"
-                    :bytesize 7)
+                    :speed 4800)
                    (serial-process-configure
                     :buffer "neo-serial-by-buffer"
-                    :parity 'even)
-                   (list (process-contact by-port :bytesize)
-                         (process-contact by-buffer :parity)))
+                    :speed 19200)
+                   (list (process-contact by-port :speed)
+                         (process-contact by-buffer :speed)))
                (ignore-errors (delete-process by-port))
                (ignore-errors (delete-process by-buffer))))"#,
         by_port = by_port.slave_path,
         by_buffer = by_buffer.slave_path,
     ));
-    assert_eq!(result, "OK (7 even)");
+    assert_eq!(result, "OK (4800 19200)");
 }
 
 #[test]
@@ -16860,24 +16866,42 @@ fn nested_tls_waits_preserve_suspension_and_deliver_queued_data() {
             :sentinel (let ((captured (copy-sequence "rooted sentinel")))
                         (lambda (_process message)
                           (when (string-prefix-p "open" message) (setq outcome captured))))))
-    (run-with-timer
-     0.025 nil
-     (lambda ()
-       ;; Only the callback captured by deferred-connect completion now owns
-       ;; its lexical string. GC must not lose it while TLS is waiting.
-       (set-process-sentinel client nil)
-       (garbage-collect)
-       (process-send-string client "queued encrypted data\n")
-       (let* ((before (current-cpu-time))
-              (ticks (car before)) (hz (cdr before)))
-         (run-with-timer 0.005 nil (lambda () (set-process-filter client t) (set-process-filter client nil) (sleep-for 0.005) (setq nested t)))
-         (sleep-for 0.4)
-         (setq slept-efficiently (< (- (car (current-cpu-time)) ticks) (* hz 0.2))))))
+    (let ((phase-deadline (+ (float-time) 30))
+          (phase nil))
+      (setq phase
+            (lambda ()
+              ;; The deferred-connect completion captures the process sentinel
+              ;; before driving the TLS handshake.  Clearing it while the
+              ;; process still reports `connect' makes that completion run a
+              ;; nil sentinel, so the open event is lost and the watchdog
+              ;; below fires.  Wait for the completion to be serviced instead
+              ;; of assuming it lands inside a fixed 25 ms window.
+              (cond
+               ((eq (process-status client) 'connect)
+                (when (< (float-time) phase-deadline)
+                  (run-with-timer 0.005 nil phase)))
+               ((process-live-p client)
+                ;; Only the callback captured by deferred-connect completion
+                ;; now owns its lexical string. GC must not lose it while TLS
+                ;; is waiting.
+                (set-process-sentinel client nil)
+                (garbage-collect)
+                (process-send-string client "queued encrypted data\n")
+                (let* ((before (current-cpu-time))
+                       (ticks (car before)) (hz (cdr before)))
+                  (run-with-timer 0.005 nil (lambda () (set-process-filter client t) (set-process-filter client nil) (sleep-for 0.005) (setq nested t)))
+                  (sleep-for 0.4)
+                  (setq slept-efficiently (< (- (car (current-cpu-time)) ticks) (* hz 0.2))))))))
+      ;; Start immediately: the callback waits for the deferred-connect
+      ;; completion to capture the sentinel, so no fixed window is assumed.
+      (run-with-timer 0 nil phase))
     (unwind-protect
         (progn
-          (with-timeout (2 (error "TLS completion watchdog"))
+          ;; These watchdogs guard against a genuine hang; progress comes from
+          ;; the completion conditions the loops wait on.
+          (with-timeout (30 (error "TLS completion watchdog"))
             (while (not outcome) (accept-process-output nil 0.05)))
-          (with-timeout (2 (error "queued TLS echo watchdog"))
+          (with-timeout (30 (error "queued TLS echo watchdog"))
             (while (with-current-buffer (process-buffer client)
                      (not (string-prefix-p "queued encrypted data\n" (buffer-string))))
               (accept-process-output client 0.05)))

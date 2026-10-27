@@ -34,7 +34,9 @@ use crate::display_row::walk_state::{
     HorizontalScrollTruncationTarget, InvisibleTextScanCheckpoint, LineNumberRenderState,
     TrailingWhitespaceRenderState, WordWrapRenderState,
 };
-use crate::display_source_progress::{DisplaySourceProgressState, DisplaySourceRowProgressState};
+use crate::display_source_progress::{
+    DisplaySourceProgressState, DisplaySourceRowProgressState, DisplaySourceVisualRowProgress,
+};
 use crate::display_status_line::ChromeRowRenderServices;
 use crate::display_text_window_row_lifecycle::{
     TextWindowAppendSurfaceRequest, TextWindowBeginRequest, TextWindowBodyInstallState,
@@ -48,6 +50,7 @@ use crate::types::{LineWrapMode, WindowParams, WindowSourceExtent};
 use crate::window_output::{
     TextWindowOutputTarget, TextWindowRedisplayPositions, WindowOutputEmitter,
 };
+use neomacs_display_protocol::types::Px;
 use neovm_core::buffer::CharLen;
 use neovm_core::emacs_core::image_catalog::ImageScaleEnvironment;
 
@@ -57,6 +60,7 @@ pub(crate) enum BufferSourceBodyRenderOutcome {
     Complete(BufferSourcePostLoopRenderOutcome),
     SyncHorizonExhausted,
     QueryHorizonExhausted,
+    SyncStateInvalid,
 }
 
 pub(crate) struct BufferSourceWalkSetupRequest<'a> {
@@ -101,6 +105,7 @@ pub(crate) struct BufferSourceWalkSetup {
     pub(crate) hscroll_skip: HorizontalScrollSkipState,
     pub(crate) word_wrap: WordWrapRenderState,
     pub(crate) physical_line_tabs: DisplayPhysicalLineTabState,
+    pub(crate) row_text_start_x: Px,
     pub(crate) prefix_request: DisplayRowPrefixRequest,
     pub(crate) text_append_surface: DisplayRowAppendSurface,
     pub(crate) row_geometry_defaults: DisplayRowGeometryDefaults,
@@ -305,6 +310,7 @@ impl<'a> BufferSourceWalkSetupRequest<'a> {
             ),
             word_wrap: WordWrapRenderState::new(self.word_wrap),
             physical_line_tabs: DisplayPhysicalLineTabState::default(),
+            row_text_start_x: Px(self.content_x),
             prefix_request: DisplayRowPrefixRequest::initial(
                 self.has_prefix,
                 self.has_line_default_prefix,
@@ -406,7 +412,8 @@ impl BufferSourceWalkSetup {
                 &mut self.x,
                 &mut self.col,
             )
-            .with_physical_line_tabs(&mut self.physical_line_tabs),
+            .with_physical_line_tabs(&mut self.physical_line_tabs)
+            .with_row_text_start(&mut self.row_text_start_x),
             state.source_render.reborrow(),
             BufferSourceRowBuildState::new(
                 &mut self.row_geometry,
@@ -465,13 +472,25 @@ impl BufferSourceWalkSetup {
         render_buffer_source_tail_and_decide_retry(
             loop_context,
             source_render,
-            DisplaySourceRowProgressState::new(&mut self.x, &mut self.col),
+            DisplaySourceVisualRowProgress::new(DisplaySourceRowProgressState::new(
+                &mut self.x,
+                &mut self.col,
+            ))
+            .with_physical_line_tabs(&mut self.physical_line_tabs)
+            .with_row_text_start(&mut self.row_text_start_x),
             &mut self.row_geometry,
+            &mut self.row_flags,
             &mut self.cursor_info,
             &mut self.row_source_start,
             &mut self.row_y_positions,
             face_ids,
-            line_numbers,
+            BufferSourceRowCarryoverState::new(
+                &mut self.prefix_request,
+                line_numbers,
+                &mut self.hscroll_skip,
+                &mut self.word_wrap,
+                &mut self.trailing_whitespace,
+            ),
             face_scan,
             overlay_context,
             tail_context,
@@ -531,12 +550,21 @@ impl BufferSourceWalkSetup {
             buffer,
         );
 
-        if loop_outcome == crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome::SyncHorizonExhausted {
-            return BufferSourceBodyRenderOutcome::SyncHorizonExhausted;
-        }
-
-        if loop_outcome == crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome::QueryHorizonExhausted {
-            return BufferSourceBodyRenderOutcome::QueryHorizonExhausted;
+        use crate::buffer_source::loop_render::BufferSourceVisibleLoopOutcome;
+        match loop_outcome {
+            BufferSourceVisibleLoopOutcome::SyncHorizonExhausted => {
+                return BufferSourceBodyRenderOutcome::SyncHorizonExhausted;
+            }
+            BufferSourceVisibleLoopOutcome::QueryHorizonExhausted => {
+                return BufferSourceBodyRenderOutcome::QueryHorizonExhausted;
+            }
+            BufferSourceVisibleLoopOutcome::SyncStateInvalid => {
+                return BufferSourceBodyRenderOutcome::SyncStateInvalid;
+            }
+            BufferSourceVisibleLoopOutcome::Complete
+            | BufferSourceVisibleLoopOutcome::MiniSourcePositionReached
+            | BufferSourceVisibleLoopOutcome::QueryTargetReached
+            | BufferSourceVisibleLoopOutcome::EarlyBoundaryReached => {}
         }
 
         BufferSourceBodyRenderOutcome::Complete(self.render_tail_and_decide_retry(
@@ -564,6 +592,7 @@ impl BufferSourceWalkSetup {
     >(
         &mut self,
         begin_request: TextWindowBeginRequest,
+        sync: Option<crate::incremental_layout::edit_sync::PreparedEditSuffix>,
         output: &mut BufferSourceOutputState<'_>,
         font_metrics: &mut Option<FontMetricsService>,
         face_resolver: &FS,
@@ -582,6 +611,9 @@ impl BufferSourceWalkSetup {
         buf_access: &RustBufferAccess<'buf, B>,
     ) -> (WindowOutputEmitter, BufferSourceBodyRenderOutcome) {
         let mut output_emitter = output.begin_text_window_output(begin_request);
+        if let Some(preparation) = sync {
+            output_emitter.arm_edit_sync(preparation);
+        }
         output_emitter.set_query_target(params.query_target);
         output_emitter.set_collect_query_restarts(
             params.measurement_pixels.is_some(),

@@ -5,9 +5,14 @@
 //! GNU implements in frame.c. The Frame/FrameManager data structures
 //! live in crate::window; window.c builtins stay in super::window_cmds.
 
+mod cycling;
 pub(crate) mod position;
 mod selection;
+pub(crate) use cycling::{builtin_next_frame, builtin_previous_frame};
 pub(crate) use selection::{builtin_handle_switch_frame, builtin_select_frame};
+#[cfg(test)]
+#[path = "tests/cycling_test.rs"]
+mod cycling_test;
 #[cfg(test)]
 #[path = "tests/selection_test.rs"]
 mod selection_test;
@@ -492,7 +497,7 @@ pub(crate) fn builtin_frame_native_width(
             frame.height,
             uses_window_system_pixels,
             frame.effective_window_system(),
-            frame.parameter("window-system")
+            frame.fixed_parameter(crate::window::FrameQueryParam::WindowSystem)
         );
     }
     Ok(Value::fixnum(if uses_window_system_pixels {
@@ -1473,14 +1478,14 @@ pub(crate) fn builtin_frame_parameters(
         Value::fixnum(frame.columns() as i64)
     } else {
         frame
-            .parameter("width")
+            .fixed_parameter(crate::window::FrameQueryParam::Width)
             .unwrap_or(Value::fixnum(frame.columns() as i64))
     };
     let height = if frame_is_top_level_non_window(frame) {
         Value::fixnum(frame_realized_lines(frame))
     } else {
         frame
-            .parameter("height")
+            .fixed_parameter(crate::window::FrameQueryParam::Height)
             .unwrap_or(Value::fixnum(frame.lines() as i64))
     };
     pairs.push(Value::cons(Value::symbol("width"), width));
@@ -2269,7 +2274,7 @@ pub(crate) fn frame_resize_request_from_params(
 
 pub(crate) fn frame_text_lines(frame: &crate::window::Frame) -> i64 {
     frame
-        .parameter(FRAME_TEXT_LINES_PARAM)
+        .fixed_parameter(crate::window::FrameQueryParam::TextLines)
         .and_then(|v| v.as_int())
         .unwrap_or_else(|| frame_total_lines(frame))
 }
@@ -2499,6 +2504,16 @@ pub(crate) fn frame_parameter_value(
         FrameParamKey::Known(FrameParam::Visibility) => {
             return frame.visibility.lisp_value();
         }
+        // GNU's scroll-bar parameter getters report the REALIZED state
+        // (x_get_vertical_scroll_bars / x_get_horizontal_scroll_bars,
+        // src/frame.c), which is nil on a frame without a window system even
+        // after `set-frame-parameter' stored a value. The tty oracle reads
+        // this back and requires nil.
+        FrameParamKey::Known(FrameParam::VerticalScrollBars | FrameParam::HorizontalScrollBars)
+            if frame.effective_window_system().is_none() =>
+        {
+            return Value::NIL;
+        }
         FrameParamKey::Known(FrameParam::Font) if frame.effective_window_system().is_none() => {
             return Value::string("tty");
         }
@@ -2532,10 +2547,10 @@ pub(crate) fn frame_parameter_value(
             Value::fixnum(frame_realized_lines(frame))
         }
         "width" => frame
-            .parameter("width")
+            .fixed_parameter(crate::window::FrameQueryParam::Width)
             .unwrap_or(Value::fixnum(frame.columns() as i64)),
         "height" => frame
-            .parameter("height")
+            .fixed_parameter(crate::window::FrameQueryParam::Height)
             .unwrap_or(Value::fixnum(frame.lines() as i64)),
         // GNU frame.c:4117 — buffer-list frame parameter stored
         // directly from f->buffer_list (most-recently-shown first).

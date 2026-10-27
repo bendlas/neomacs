@@ -1,7 +1,13 @@
 //! Sealed symbol authority; running values move only between owner root homes.
 mod globals;
+mod intern;
 pub use globals::GlobalError;
 pub(crate) use globals::{SymbolReadToken, SymbolWriteToken};
+pub use intern::InitialInternError;
+mod functions;
+#[cfg(test)]
+pub use functions::FunctionOpKind;
+pub use functions::{FunctionActivation, FunctionCallCache, FunctionError, FunctionStep};
 #[cfg(all(test, not(feature = "gc-memory-telemetry")))]
 mod closed_graph;
 mod word;
@@ -16,6 +22,7 @@ pub(super) struct SymbolSidecar {
     poisoned: AtomicBool,
     backing: SymbolBacking,
     era: NonZeroU64,
+    pub(super) functions: functions::write::FunctionState,
 }
 impl SymbolSidecar {
     pub(super) fn new(backing: SymbolBacking, era: NonZeroU64) -> Self {
@@ -24,6 +31,7 @@ impl SymbolSidecar {
             poisoned: AtomicBool::new(false),
             backing,
             era,
+            functions: functions::write::FunctionState::new(),
         }
     }
     pub(super) fn ready(&self) -> Result<(), RegistrationError> {
@@ -57,7 +65,7 @@ impl SymbolSidecar {
 
 /// Identity + admitted metadata, never a pointer or execution authority.
 /// Private fields prevent an arbitrary SymId from forging a backing admission.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SymbolHandle {
     heap: HeapIdentity,
     world: usize,

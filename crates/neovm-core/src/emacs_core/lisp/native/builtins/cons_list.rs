@@ -1361,8 +1361,61 @@ fn builtin_memq_values_scan<const OBSERVED: bool>(
     if symbols_with_pos_enabled {
         return builtin_memq_values_swp_scan::<OBSERVED>(target, list);
     }
+    memq_plain_scan::<OBSERVED>(target, list, list)
+}
+
+/// [`builtin_memq_values`]'s budgeted scan continued from `tail`, a cell a
+/// bounded caller-side walk has already reached; `list` is the original head
+/// and is used only by the exact fallback, so an improper or circular list
+/// signals exactly what it would have from the head.
+pub(crate) fn builtin_memq_values_from(
+    target: Value,
+    list: Value,
+    tail: Value,
+    symbols_with_pos_enabled: bool,
+) -> EvalResult {
+    if unobserved_list_scan() {
+        builtin_memq_values_from_scan::<false>(target, list, tail, symbols_with_pos_enabled)
+    } else {
+        builtin_memq_values_from_observed(target, list, tail, symbols_with_pos_enabled)
+    }
+}
+
+// Same split as [`builtin_memq_values_observed`]: the recorder's registers
+// stay out of the continuation's entry.
+#[cold]
+#[inline(never)]
+fn builtin_memq_values_from_observed(
+    target: Value,
+    list: Value,
+    tail: Value,
+    symbols_with_pos_enabled: bool,
+) -> EvalResult {
+    builtin_memq_values_from_scan::<true>(target, list, tail, symbols_with_pos_enabled)
+}
+
+#[inline]
+fn builtin_memq_values_from_scan<const OBSERVED: bool>(
+    target: Value,
+    list: Value,
+    tail: Value,
+    symbols_with_pos_enabled: bool,
+) -> EvalResult {
+    if symbols_with_pos_enabled {
+        return builtin_memq_values_swp_scan_from::<OBSERVED>(target, list, tail);
+    }
+    memq_plain_scan::<OBSERVED>(target, list, tail)
+}
+
+/// The flag-off budgeted scan from `tail`; `list` is the original head for
+/// the exact fallback.
+#[inline]
+fn memq_plain_scan<const OBSERVED: bool>(
+    target: Value,
+    list: Value,
+    mut tail: Value,
+) -> EvalResult {
     let target_bits = target.bits();
-    let mut tail = list;
     let mut budget = LIST_SCAN_BUDGET;
     while budget != 0 {
         if !tail.is_cons() {
@@ -1442,11 +1495,21 @@ pub(crate) fn listp_error(list: Value) -> Flow {
 // closure unwrapping both sides of every comparison (246 instructions a call,
 // 13.5% of compiling elb-smie.el). The same budgeted scan as the plain case.
 fn builtin_memq_values_swp_scan<const OBSERVED: bool>(target: Value, list: Value) -> EvalResult {
+    builtin_memq_values_swp_scan_from::<OBSERVED>(target, list, list)
+}
+
+/// [`builtin_memq_values_swp_scan`] from `tail`; `list` is the original head
+/// for the exact fallback.
+#[inline]
+fn builtin_memq_values_swp_scan_from<const OBSERVED: bool>(
+    target: Value,
+    list: Value,
+    mut tail: Value,
+) -> EvalResult {
     let bare = positioned_symbol_scan::<OBSERVED>(target).unwrap_or(target);
     if !bare.is_bare_symbol() {
-        return builtin_memq_values_scan::<OBSERVED>(target, list, false);
+        return memq_plain_scan::<OBSERVED>(target, list, tail);
     }
-    let mut tail = list;
     let mut budget = LIST_SCAN_BUDGET;
     while budget != 0 {
         if !tail.is_cons() {
@@ -2059,19 +2122,25 @@ fn builtin_delete_with_symbols(args: Vec<Value>, symbols_with_pos_enabled: bool)
             let mut kept = Vec::with_capacity(bytes.len());
             let mut removed = 0;
             let mut pos = 0;
-            while pos < bytes.len() {
+            // GNU Fdelete traverses SCHARS, unlike symbol printing's SBYTES.
+            // Supplied counts may outlive the physical payload; decode their
+            // virtual tail without copying bytes outside initialized storage.
+            for _ in 0..string.schars() {
                 let (code, len) = match storage {
                     crate::heap_types::LispStringStorageKind::Unibyte => (u32::from(bytes[pos]), 1),
                     crate::heap_types::LispStringStorageKind::Multibyte => {
-                        crate::emacs_core::emacs_char::string_char_unchecked(&bytes[pos..])
+                        let (c, n) =
+                            crate::heap_types::decode_declared_multibyte_char(&bytes[pos..]);
+                        (c.code(), n)
                     }
                 };
+                let next_pos = pos + len.min(bytes.len() - pos);
                 if i64::from(code) == target {
                     removed += 1;
                 } else {
-                    kept.extend_from_slice(&bytes[pos..pos + len]);
+                    kept.extend_from_slice(&bytes[pos..next_pos]);
                 }
-                pos += len;
+                pos = next_pos;
             }
             if removed == 0 {
                 return Ok(args[1]);
@@ -2081,10 +2150,23 @@ fn builtin_delete_with_symbols(args: Vec<Value>, symbols_with_pos_enabled: bool)
                     crate::heap_types::LispString::from_unibyte(kept)
                 }
                 crate::heap_types::LispStringStorageKind::Multibyte => {
-                    crate::heap_types::LispString::from_emacs_bytes_with_chars(
-                        kept,
-                        string.schars() - removed,
-                    )
+                    let remaining = string.schars() - removed;
+                    match string.character_count_kind() {
+                        crate::heap_types::StringCharacterCountKind::Computed => {
+                            crate::heap_types::LispString::from_emacs_bytes_with_chars(
+                                kept, remaining,
+                            )
+                        }
+                        crate::heap_types::StringCharacterCountKind::Supplied => {
+                            let count = crate::heap_types::GnuDeclaredCharacterCount::try_from(
+                                remaining as i128,
+                            )
+                            .expect("deletion cannot increase a valid supplied count");
+                            crate::heap_types::LispString::from_emacs_bytes_with_declared_chars(
+                                kept, count,
+                            )
+                        }
+                    }
                 }
             };
             Ok(Value::heap_string(rebuilt))
