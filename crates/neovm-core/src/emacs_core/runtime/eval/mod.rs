@@ -2310,6 +2310,10 @@ impl GuiFrameHostRequest {
             fullscreen: frame
                 .known_parameter(crate::window::FrameParam::Fullscreen)
                 .and_then(|value| FrameFullscreen::from_symbol_value(&value)),
+            // Override-redirect is a creation-time X property already applied
+            // when the window was created; finalizing a live frame does not
+            // recreate the native window.
+            override_redirect: false,
         }
     }
 }
