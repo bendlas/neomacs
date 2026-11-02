@@ -15,7 +15,7 @@ use super::eval::Context;
 use crate::buffer::BufferId;
 use crate::emacs_core::display_spec::{DisplayPropertySpecs, display_spec_when_parts};
 use crate::emacs_core::error::{Flow, FlowKind, FlowResultExt as _};
-use crate::emacs_core::intern::intern;
+use crate::emacs_core::intern::WellKnown;
 use crate::emacs_core::value::Value;
 use crate::window::{Window, WindowId};
 use rustc_hash::FxHashMap;
@@ -250,17 +250,29 @@ impl Context {
         }
         let count = self.specpdl.len();
         let result = (|| {
+            // GNU evaluates a display `when` form under these fixed
+            // bindings (`Qinhibit_redisplay`, `Qinhibit_quit`,
+            // `Qinhibit_debugger`, and the form's OBJECT/POSITION/
+            // BUFFER_POSITION arguments); every evaluated site previously
+            // re-interned all seven spellings.
+            static INHIBIT_REDISPLAY: WellKnown = WellKnown::InhibitRedisplay;
+            static INHIBIT_QUIT: WellKnown = WellKnown::InhibitQuit;
+            static INHIBIT_DEBUGGER: WellKnown = WellKnown::InhibitDebugger;
+            static OBJECT: WellKnown = WellKnown::Object;
+            static POSITION: WellKnown = WellKnown::Position;
+            static BUFFER_POSITION: WellKnown = WellKnown::BufferPosition;
+            static EVAL_SYMBOL: WellKnown = WellKnown::Eval;
             for (symbol, value) in [
-                (intern("inhibit-redisplay"), Value::T),
-                (intern("inhibit-quit"), Value::T),
-                (intern("inhibit-debugger"), Value::T),
-                (intern("object"), object),
-                (intern("position"), Value::fixnum(position)),
-                (intern("buffer-position"), Value::fixnum(buffer_position)),
+                (INHIBIT_REDISPLAY.id(), Value::T),
+                (INHIBIT_QUIT.id(), Value::T),
+                (INHIBIT_DEBUGGER.id(), Value::T),
+                (OBJECT.id(), object),
+                (POSITION.id(), Value::fixnum(position)),
+                (BUFFER_POSITION.id(), Value::fixnum(buffer_position)),
             ] {
                 self.try_specbind_or_unwind_to(count, symbol, value)?;
             }
-            self.funcall_general(Value::symbol("eval"), vec![form, Value::T])
+            self.funcall_general(Value::symbol(&EVAL_SYMBOL), vec![form, Value::T])
         })();
         match self.unbind_to_with_result(count, result).kinded() {
             Ok(value) => Ok(!value.is_nil()),

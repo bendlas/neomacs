@@ -441,13 +441,13 @@ pub(crate) mod misc_pure;
 pub(crate) mod strings;
 pub(crate) mod types;
 
+pub use crate::emacs_core::value::lambda_params_to_value;
+pub use crate::emacs_core::value::parse_lambda_params_from_value;
 pub(crate) use arithmetic::*;
 pub(crate) use buffer_text_backend::*;
 pub(crate) use collections::*;
 pub(crate) use cons_list::LIST_SCAN_BUDGET;
-pub use cons_list::lambda_params_to_value;
 pub use cons_list::lambda_to_closure_vector;
-pub use cons_list::parse_lambda_params_from_value;
 pub(crate) use cons_list::*;
 pub(crate) use from_value::*;
 pub(crate) use misc_pure::*;
@@ -461,13 +461,20 @@ pub(crate) use types::*;
 // `search` modules, already crate-visible).
 mod byte_code;
 mod file_notify;
+// The compiled-in backend's three primitive names; GNU's one-`#ifdef` rule
+// means a test may ask which watch primitives this build can answer without
+// naming one OS (see `file_notify/platform/mod.rs`).
+#[cfg(test)]
+pub(crate) use file_notify::{BACKEND_SUBRS, REMOVE_WATCH_SEMANTICS, RemoveWatchSemantics};
 pub(crate) mod fringe_bitmap;
 pub(crate) mod fringe_standard_bitmaps;
 pub(crate) mod gnutls;
+pub(crate) mod hash_user_callback;
 pub(crate) mod higher_order;
 mod hooks;
 pub(crate) mod keymaps;
 mod lcms;
+pub(crate) mod maphash;
 pub(crate) mod misc_eval;
 pub(crate) mod search;
 mod stubs;
@@ -486,6 +493,7 @@ pub(crate) use file_notify::*;
 pub(crate) use higher_order::*;
 pub(crate) use hooks::*;
 pub(crate) use keymaps::*;
+pub(crate) use maphash::*;
 pub(crate) use misc_eval::*;
 pub(crate) use search::*;
 pub(crate) use stubs::*;
@@ -609,6 +617,7 @@ use super::subr::{
     FixedMin1, FixedMin2, FixedMin3, FixedMin4, FixedMin5, FixedMin6, NativeFn, NoEvalPlaceholder,
     NoEvalPolicy, SubrArity, SubrSpec,
 };
+use crate::emacs_core::intern::WellKnown;
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 fn no_eval_policy_for(sym_id: SymId) -> NoEvalPolicy {
@@ -770,7 +779,7 @@ fn load_traced(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult 
     result
 }
 
-fn message_traced(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+fn message_traced(eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return builtin_message(eval, args);
     }
@@ -805,7 +814,7 @@ fn coding_system_base(eval: &mut super::eval::Context, args: Vec<Value>) -> Eval
     let mode = eval.symbol_mode();
     super::coding::builtin_coding_system_base(&eval.coding_systems, args, mode)
 }
-fn coding_system_eol_type(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+fn coding_system_eol_type(eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     let mode = eval.symbol_mode();
     super::coding::builtin_coding_system_eol_type(&eval.coding_systems, args, mode)
 }
@@ -964,14 +973,22 @@ fn rename_buffer_interactive_spec() -> Value {
     ])
 }
 
+// Fixed interactive-spec spelling set for `self-insert-command`. The registry
+// rebuilds this form per invocation; each entry previously re-interned its
+// spelling. GNU's cmds.c defsubr carries the same fixed spec.
+static SELF_INSERT_SPEC_LIST: WellKnown = WellKnown::List;
+static PREFIX_NUMERIC_VALUE: WellKnown = WellKnown::PrefixNumericValue;
+static CURRENT_PREFIX_ARG: WellKnown = WellKnown::CurrentPrefixArg;
+static LAST_COMMAND_EVENT_SPEC: WellKnown = WellKnown::LastCommandEvent;
+
 fn self_insert_command_interactive_spec() -> Value {
     Value::list(vec![
-        Value::symbol("list"),
+        Value::symbol(&SELF_INSERT_SPEC_LIST),
         Value::list(vec![
-            Value::symbol("prefix-numeric-value"),
-            Value::symbol("current-prefix-arg"),
+            Value::symbol(&PREFIX_NUMERIC_VALUE),
+            Value::symbol(&CURRENT_PREFIX_ARG),
         ]),
-        Value::symbol("last-command-event"),
+        Value::symbol(&LAST_COMMAND_EVENT_SPEC),
     ])
 }
 
@@ -1163,3 +1180,28 @@ mod gdl_format;
 #[cfg(test)]
 #[path = "tests/positioned_symbol_test.rs"]
 mod positioned_symbol_test;
+
+/// Deferred carrier reset: the integer-width policy binding is native (a
+/// `&'static` descriptor plus a `Weak`), so it may wait for reuse.
+pub(crate) fn reset_carrier_builtins_thread_locals() {
+    arithmetic::reset_carrier_tls();
+}
+
+/// Carrier park: replace the builtins registries that hold heap `Value`s
+/// (hash-table test closures, file-notify callbacks, window-configuration
+/// snapshots) with empty handles. The selection stubs and lossage size stay
+/// with the World and are never touched here.
+pub(crate) fn park_carrier_builtins_thread_locals() {
+    collections::park_collections_thread_locals();
+    file_notify::park_file_notify_thread_locals();
+    hooks::park_hooks_thread_locals();
+}
+
+/// Debug-only carrier TLS fingerprint for the non-World-carried builtins TLS.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    arithmetic::carrier_tls_fingerprint(h);
+    collections::carrier_tls_fingerprint(h);
+    file_notify::carrier_tls_fingerprint(h);
+    hooks::carrier_tls_fingerprint(h);
+}

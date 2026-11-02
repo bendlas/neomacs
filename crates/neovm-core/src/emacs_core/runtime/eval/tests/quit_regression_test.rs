@@ -143,8 +143,8 @@ fn maybe_quit_promotes_pending_frontend_input_for_while_no_input() {
     let mut ctx = runtime_startup_context();
     ctx.set_variable("noninteractive", Value::NIL);
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ctx.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ctx);
+
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('l'),
     ))
@@ -758,7 +758,7 @@ fn discard_local_binding_does_not_allocate_ambient_buffer_wrapper() {
     owner.obarray.set_symbol_value_id(symbol, Value::fixnum(10));
     crate::emacs_core::custom::builtin_make_local_variable(
         &mut owner,
-        vec![Value::from_sym_id(symbol)],
+        &vec![Value::from_sym_id(symbol)],
     )
     .expect("localized existing cell");
     let count = owner.specpdl.len();
@@ -820,7 +820,7 @@ fn discard_local_binding_keeps_existing_void_cell_without_lisp_allocation() {
     let symbol = intern("local-drop-void-cell");
     crate::emacs_core::custom::builtin_make_local_variable(
         &mut owner,
-        vec![Value::from_sym_id(symbol)],
+        &vec![Value::from_sym_id(symbol)],
     )
     .expect("void localized cell");
     let count = owner.specpdl.len();

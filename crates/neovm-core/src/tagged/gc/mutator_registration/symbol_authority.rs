@@ -1,20 +1,44 @@
 //! Sealed symbol authority; running values move only between owner root homes.
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+pub(super) mod combined_inputs;
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+pub(super) fn check_owner_home_for_test(
+    run: &RunAccess<'_, '_>,
+    home: &OwnerRootSlot<'_>,
+) -> Result<(), RegistrationError> {
+    globals::check_home(run, home)
+}
 mod globals;
+pub(super) use globals::check_home as check_symbol_home;
 mod intern;
+mod roots;
 pub use globals::GlobalError;
 pub(crate) use globals::{SymbolReadToken, SymbolWriteToken};
 pub use intern::InitialInternError;
 mod functions;
 #[cfg(test)]
 pub use functions::FunctionOpKind;
-pub use functions::{FunctionActivation, FunctionCallCache, FunctionError, FunctionStep};
+#[cfg(test)]
+pub(super) use functions::PreparedNameFunction;
+pub use functions::{
+    FunctionActivation, FunctionCallCache, FunctionError, FunctionSelection, FunctionStep,
+};
+pub(crate) use functions::{PreparedHofBuiltin, PreparedUnaryFunction};
 #[cfg(all(test, not(feature = "gc-memory-telemetry")))]
 mod closed_graph;
 mod word;
 use super::*;
 use crate::emacs_core::intern::SymId;
 pub use crate::emacs_core::symbol::parallel::PlainSymbolBacking;
-use crate::emacs_core::symbol::parallel::SymbolBacking;
+pub(super) use crate::emacs_core::symbol::parallel::{KeeperWorldDesignator, SymbolBacking};
+use crate::tagged::gc::symbol_table::SymbolSlotIndex;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TableCommitFault {
+    None,
+    AfterDescriptorPublication,
+}
 
 /// Entirely parallel-era metadata; no World, Context or symbol layout grows.
 pub(super) struct SymbolSidecar {
@@ -23,15 +47,25 @@ pub(super) struct SymbolSidecar {
     backing: SymbolBacking,
     era: NonZeroU64,
     pub(super) functions: functions::write::FunctionState,
+    pub(super) tables: super::super::symbol_table::publication::PublishedSymbolTables,
+    #[cfg(test)]
+    table_commit_fault: Mutex<TableCommitFault>,
 }
 impl SymbolSidecar {
-    pub(super) fn new(backing: SymbolBacking, era: NonZeroU64) -> Self {
+    pub(super) fn new(
+        backing: SymbolBacking,
+        era: NonZeroU64,
+        tables: super::super::symbol_table::publication::PublishedSymbolTables,
+    ) -> Self {
         Self {
             word: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             backing,
             era,
             functions: functions::write::FunctionState::new(),
+            tables,
+            #[cfg(test)]
+            table_commit_fault: Mutex::new(TableCommitFault::None),
         }
     }
     pub(super) fn ready(&self) -> Result<(), RegistrationError> {
@@ -43,6 +77,16 @@ impl SymbolSidecar {
         }
         Ok(())
     }
+    /// Descriptor-only execution may overlap symbol readers/writers, but may
+    /// never enter a backing retained after a terminal symbol transaction.
+    pub(super) fn execution_ready(&self) -> Result<(), RegistrationError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            Err(RegistrationError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn poison(&self) {
         self.poisoned.store(true, Ordering::Release);
     }
@@ -86,7 +130,21 @@ impl std::fmt::Debug for SymbolHandle {
     }
 }
 
-impl ParallelHeapEra<'_> {
+// Keep the existing symbol-vocabulary boundary in this module. Nominal era
+// wrappers do not add their own dependency on the upper interner module.
+impl<K: EraKeeper> ParallelHeapEra<'_, K> {
+    pub fn admit_plain_symbol(&self, symbol: SymId) -> Result<SymbolHandle, RegistrationError> {
+        self.core.admit_plain_symbol(symbol)
+    }
+}
+#[cfg(test)]
+impl ProofEra<'_> {
+    pub fn admit_plain_symbol(&self, symbol: SymId) -> Result<SymbolHandle, RegistrationError> {
+        self.core.admit_plain_symbol(symbol)
+    }
+}
+
+impl<K: EraKeeper> EraCore<'_, K> {
     /// Serial keeper admission only, before ANY participant is registered.
     /// Unsupported/absent cells refuse without creating or redirecting them.
     pub fn admit_plain_symbol(&self, symbol: SymId) -> Result<SymbolHandle, RegistrationError> {
@@ -140,6 +198,7 @@ pub struct SymbolMut<'lease, 'owner, 'era> {
     run: &'lease mut RunAccess<'owner, 'era>,
     key: SymbolHandle,
 }
+#[must_use = "the keeper receiver retains the exclusive stop borrow"]
 pub struct KeeperSymbols<'stop> {
     registry: &'stop Registry,
     _stop: PhantomData<&'stop mut AllStopped<'stop>>,
@@ -147,6 +206,16 @@ pub struct KeeperSymbols<'stop> {
 }
 
 impl<'owner, 'era> RunAccess<'owner, 'era> {
+    /// Validate handle identity before returning its immutable slot metadata.
+    pub(super) fn checked_symbol_slot(
+        &self,
+        key: &SymbolHandle,
+    ) -> Result<SymbolSlotIndex, RegistrationError> {
+        self.check_symbol(key)?;
+        let index = usize::try_from(key.symbol.0).map_err(|_| RegistrationError::Capacity)?;
+        Ok(SymbolSlotIndex::new(index))
+    }
+
     fn check_symbol(&self, key: &SymbolHandle) -> Result<(), RegistrationError> {
         self.owner.check_thread()?;
         if self.symbol_loan {

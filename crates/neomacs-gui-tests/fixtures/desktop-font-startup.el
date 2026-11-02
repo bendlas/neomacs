@@ -24,7 +24,7 @@
                   (frame-width)))
          (unless (and (null face-remapping-alist)
                       (equal (face-attribute 'default :family) "Ubuntu Mono")
-                      (= (window-font-width) 9) (= (window-font-height) 18))
+                      (= (window-font-width) 10) (= (window-font-height) 20))
            (error "Startup ignored desktop font: %S, cell %S, remapping %S"
                   (face-attribute 'default :family)
                   (list (window-font-width) (window-font-height)) face-remapping-alist))
@@ -32,24 +32,40 @@
                                    :height 0.71 :ascent 79
                                    :font-family "DejaVu Sans Mono" :font-size 7))
                 (data (plist-get (cdr tag) :data)))
-           ;; Independently captured from GNU at 96 DPI, Ubuntu Mono 13pt.
-           (unless (string-match "<svg width=\"36\\.63\" height=\"12\\.78\"" data)
+           ;; Independently captured from GNU at 96 DPI with the GUI job's
+           ;; fonts-ubuntu package (0.869+git20240321, noble): Ubuntu Mono 13pt
+           ;; resolves to a 10x20 cell, so the 0.71-height tag is 14.2px tall
+           ;; (the 9x18 Ubuntu Mono of the pre-0.869 font gave 12.78px).
+           (unless (string-match "<svg width=\"40\\.7\" height=\"14\\.2\"" data)
              (error "Startup SVG differs from GNU: %S" data))
            (insert-image tag)
            (insert " Desktop monospace font selected before user configuration.\n"))
          (when (fboundp 'neomacs--write-frame-snapshot)
            (neomacs--write-frame-snapshot
             (getenv "NEOMACS_GUI_FRAME_SNAPSHOT_JSON") t 'json))
-         ;; Observe the settled native resize, not just the pending Lisp request.
-         (let ((original-height (frame-pixel-height)))
+         ;; Observe the settled native resize, not just the pending Lisp
+         ;; request: a software Wayland compositor can take longer than any
+         ;; fixed delay to acknowledge the configure, so poll the settled
+         ;; geometry and fail only at a deadline.
+         (let ((original-height (frame-pixel-height))
+               (deadline (+ (float-time) 12))
+               (timer nil))
            (set-frame-width nil 91)
-           (run-at-time
-          1 nil
-          (lambda ()
-            (if (and (= (frame-width) 91)
-                     (= (frame-pixel-height) original-height))
-                (kill-emacs 0)
-              (message "Resized geometry: expected 91 columns and height %S, got %S / %S"
-                       original-height (frame-width) (frame-pixel-height))
-              (kill-emacs 1))))))
-     (error (message "Desktop font startup regression: %S" err) (kill-emacs 1)))))
+           (setq timer
+                 (run-at-time
+                  0 0.02
+                  (lambda ()
+                    (when (and (= (frame-width) 91)
+                               (= (frame-pixel-height) original-height))
+                      (cancel-timer timer)
+                      (kill-emacs 0))
+                    (when (> (float-time) deadline)
+                      (cancel-timer timer)
+                      (princ (format "DESKTOP-FONT-STARTUP-FAIL resized geometry: expected 91 columns and height %S, got %S / %S\n"
+                                     original-height (frame-width) (frame-pixel-height))
+                             'external-debugging-output)
+                      (kill-emacs 1)))))))
+     (error
+      (princ (format "DESKTOP-FONT-STARTUP-FAIL %S\n" err) 'external-debugging-output)
+      (message "Desktop font startup regression: %S" err)
+      (kill-emacs 1)))))

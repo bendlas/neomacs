@@ -1,8 +1,11 @@
 //! Keeper-only full collection over owned publications. No heap loan escapes.
-use super::super::cons_allocator::ParallelYoungLogs;
+use super::super::cons_allocator::{CapturedParallelYoung, ParallelYoungLogs};
+use super::super::generational::{
+    GenerationCycle, MinorCollectionAdmissionError, ParallelMinorAdmissionError,
+};
 use super::super::young_registry::YoungBlockLog;
 use super::super::*;
-use super::image::{CollectionHistory, CollectionWork};
+use super::image::{CollectionHistory, CollectionWork, ResponsePacing};
 use super::rendezvous::entry_state;
 use super::*;
 
@@ -10,7 +13,38 @@ use super::*;
 #[path = "weak_policy_tests.rs"]
 mod weak_policy_tests;
 
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+#[path = "threading_payload_tests.rs"]
+mod threading_payload_tests;
+
 pub type CollectionError = RendezvousError;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MinorCollectionError {
+    #[error("minor collection requires the generational collector")]
+    GenerationalDisabled,
+    #[error(transparent)]
+    Collection(#[from] CollectionError),
+}
+
+static_assertions::assert_impl_all!(MinorCollectionError: Send, Sync, Copy);
+
+fn minor_admission(error: ParallelMinorAdmissionError) -> CollectionError {
+    match error {
+        ParallelMinorAdmissionError::Admission(MinorCollectionAdmissionError::CollectorBusy) => {
+            RendezvousError::Busy
+        }
+        ParallelMinorAdmissionError::Admission(
+            MinorCollectionAdmissionError::GenerationalDisabled,
+        ) => RendezvousError::Publication,
+        ParallelMinorAdmissionError::Capture(error) => error.into(),
+    }
+}
+
+enum YoungCapture {
+    Major,
+    Minor(CapturedParallelYoung),
+}
 
 impl From<YoungRegistryError> for RendezvousError {
     fn from(error: YoungRegistryError) -> Self {
@@ -47,17 +81,17 @@ fn supported_with_weak(
     }
     if !heap.finalizer_registry.is_empty()
         || !heap.doomed_finalizer_functions.is_empty()
-        || !heap.permanent_weak_hash_tables.is_empty()
+        || !heap.always_swept_weak_tables.is_empty()
         || !heap.weak_hash_tables.is_empty()
         || !heap.pending_surface_destroys.is_empty()
         || !heap.pending_video_destroys.is_empty()
     {
         #[cfg(test)]
         eprintln!(
-            "A5 unsupported registry: finalizers={} doomed={} permanent_weak={} weak={} surfaces={} videos={}",
+            "A5 unsupported registry: finalizers={} doomed={} always_swept_weak={} weak={} surfaces={} videos={}",
             heap.finalizer_registry.len(),
             heap.doomed_finalizer_functions.len(),
-            heap.permanent_weak_hash_tables.len(),
+            heap.always_swept_weak_tables.len(),
             heap.weak_hash_tables.len(),
             heap.pending_surface_destroys.len(),
             heap.pending_video_destroys.len()
@@ -113,7 +147,37 @@ fn supported_with_weak(
                         Ok(())
                     }
                 }
-                _ => Ok(()),
+                // These own mutable Lisp edges, not just native identities.
+                // The keeper job retains its real AllStopped scope across
+                // full/minor tracing and sweep; both child dispatches use
+                // the concrete payload's exhaustive visit_children schema.
+                VecLikeType::Thread | VecLikeType::Mutex | VecLikeType::CondVar => Ok(()),
+                // Every admitted non-threading kind is named so a new tag
+                // requires an explicit stopped-collection policy decision.
+                VecLikeType::Vector
+                | VecLikeType::Bignum
+                | VecLikeType::Marker
+                | VecLikeType::Overlay
+                | VecLikeType::SymbolWithPos
+                | VecLikeType::Process
+                | VecLikeType::Frame
+                | VecLikeType::Window
+                | VecLikeType::BoolVector
+                | VecLikeType::Buffer
+                | VecLikeType::Obarray
+                | VecLikeType::Terminal
+                | VecLikeType::WindowConfiguration
+                | VecLikeType::Subr
+                | VecLikeType::Xwidget
+                | VecLikeType::XwidgetView
+                | VecLikeType::Lambda
+                | VecLikeType::CharTable
+                | VecLikeType::SubCharTable
+                | VecLikeType::Record
+                | VecLikeType::Font
+                | VecLikeType::Macro
+                | VecLikeType::ByteCode
+                | VecLikeType::Timer => Ok(()),
             }
         }
     };
@@ -126,18 +190,30 @@ fn supported_with_weak(
     Ok(())
 }
 
-impl<'heap> ParallelHeapEra<'heap> {
+impl<'heap, K: EraKeeper> EraCore<'heap, K> {
     #[cfg(test)]
-    pub(crate) fn admit_rooted_with_weak_tables_for_test(
-        mut collector: QuiescentCollector<'heap>,
-        keeper: Baton,
+    pub(super) fn admit_rooted_with_weak_tables_for_test<
+        A: construction::CoreAdmission<'heap, K>,
+    >(
+        admission: A,
         roots: FrozenLegacyRoots,
         tables: &[TaggedValue],
-    ) -> Result<Self, EraAdmissionFailure<'heap>> {
+        prepare: impl FnOnce(
+            &K,
+        ) -> Result<
+            (
+                super::super::FacadeEpochRetention,
+                symbol_authority::SymbolBacking,
+            ),
+            RegistrationError,
+        >,
+    ) -> Result<(Self, A::Evidence), EraAdmissionFailure<'heap, K>> {
+        let (mut checked, witness) = admission.into_checked();
+        let (collector, keeper) = checked.parts_mut();
         let permission = if roots.heap_identity() != collector.heap_identity() {
             Err(RegistrationError::WrongHeap)
         } else {
-            WeakSweepPermit::mint(collector.registration_heap_mut(), &keeper, tables).and_then(
+            WeakSweepPermit::mint(collector.registration_heap_mut(), keeper, tables).and_then(
                 |permit| {
                     supported_with_weak(collector.registration_heap_mut(), Some(&permit))
                         .map(|()| permit)
@@ -147,18 +223,18 @@ impl<'heap> ParallelHeapEra<'heap> {
         };
         let permit = match permission {
             Ok(permit) => permit,
-            Err(reason) => {
-                return Err(EraAdmissionFailure {
-                    reason,
-                    collector,
-                    keeper,
-                });
-            }
+            Err(reason) => return Err(checked.refuse(reason)),
         };
-        let mut era = Self::admit(collector, keeper)?;
+        let (mut era, witness) = Self::admit_checked(
+            checked,
+            witness,
+            prepare,
+            #[cfg(test)]
+            InitialTablePreparation::Actual,
+        )?;
         era.weak_sweep = Some(permit.bind(era.registry.as_ref().expect("new era registry")));
         era.legacy_roots = Some(roots);
-        Ok(era)
+        Ok((era, witness))
     }
 
     fn weak_sweep_permit(&self) -> Option<&WeakSweepPermit> {
@@ -173,28 +249,38 @@ impl<'heap> ParallelHeapEra<'heap> {
     }
 
     #[cold]
-    pub(crate) fn admit_rooted(
-        mut collector: QuiescentCollector<'heap>,
-        keeper: Baton,
+    pub(super) fn admit_rooted<A: construction::CoreAdmission<'heap, K>>(
+        admission: A,
         roots: FrozenLegacyRoots,
-    ) -> Result<Self, EraAdmissionFailure<'heap>> {
-        let error = if roots.heap_identity() != collector.heap_identity() {
-            Some(RegistrationError::WrongHeap)
-        } else if supported(collector.registration_heap_mut()).is_err() {
-            Some(RegistrationError::Publication)
+        prepare: impl FnOnce(
+            &K,
+        ) -> Result<
+            (
+                super::super::FacadeEpochRetention,
+                symbol_authority::SymbolBacking,
+            ),
+            RegistrationError,
+        >,
+    ) -> Result<(Self, A::Evidence), EraAdmissionFailure<'heap, K>> {
+        let (mut checked, witness) = admission.into_checked();
+        let (collector, _) = checked.parts_mut();
+        let validation = if roots.heap_identity() != collector.heap_identity() {
+            Err(RegistrationError::WrongHeap)
         } else {
-            None
+            supported(collector.registration_heap_mut()).map_err(|_| RegistrationError::Publication)
         };
-        if let Some(reason) = error {
-            return Err(EraAdmissionFailure {
-                reason,
-                collector,
-                keeper,
-            });
+        if let Err(reason) = validation {
+            return Err(checked.refuse(reason));
         }
-        let mut era = Self::admit(collector, keeper)?;
+        let (mut era, witness) = Self::admit_checked(
+            checked,
+            witness,
+            prepare,
+            #[cfg(test)]
+            InitialTablePreparation::Actual,
+        )?;
         era.legacy_roots = Some(roots);
-        Ok(era)
+        Ok((era, witness))
     }
 
     fn check_collection(&self, stopped: &AllStopped<'_>) -> Result<(), CollectionError> {
@@ -245,9 +331,70 @@ impl<'heap> ParallelHeapEra<'heap> {
     }
 
     #[cold]
-    pub fn collect_stopped(
+    pub(super) fn collect_stopped(
         &self,
         stopped: &mut AllStopped<'_>,
+        roots: impl FnOnce(
+            &K,
+            &mut AllStopped<'_>,
+            &mut Vec<TaggedValue>,
+        )
+            -> Result<Vec<*mut *mut crate::tagged::header::MarkerObj>, RendezvousError>,
+    ) -> Result<CollectionReport, CollectionError> {
+        self.collect_stopped_kind(stopped, GenerationCycle::Major, roots)
+    }
+
+    /// A genuine all-owner minor, with the same checked current root census,
+    /// image transfer, eager promotion/sweep and response restoration as full.
+    /// GEN0 refusal happens before entering the terminal trace callback.
+    #[cold]
+    pub(super) fn collect_stopped_minor(
+        &self,
+        stopped: &mut AllStopped<'_>,
+        roots: impl FnOnce(
+            &K,
+            &mut AllStopped<'_>,
+            &mut Vec<TaggedValue>,
+        )
+            -> Result<Vec<*mut *mut crate::tagged::header::MarkerObj>, RendezvousError>,
+    ) -> Result<CollectionReport, MinorCollectionError> {
+        self.check_collection(stopped)?;
+        {
+            let mut slot = self
+                .collector
+                .try_borrow_mut()
+                .map_err(|_| RendezvousError::Busy)?;
+            let heap = slot
+                .as_mut()
+                .ok_or(RendezvousError::Publication)?
+                .registration_heap_mut();
+            match heap.check_minor_admission() {
+                Ok(()) => {}
+                Err(MinorCollectionAdmissionError::CollectorBusy) => {
+                    return Err(RendezvousError::Busy.into());
+                }
+                Err(MinorCollectionAdmissionError::GenerationalDisabled) => {
+                    return Err(MinorCollectionError::GenerationalDisabled);
+                }
+            }
+        }
+        self.collect_stopped_kind(stopped, GenerationCycle::Minor, roots)
+            .map_err(MinorCollectionError::Collection)
+    }
+
+    #[cold]
+    fn collect_stopped_kind(
+        &self,
+        stopped: &mut AllStopped<'_>,
+        kind: GenerationCycle,
+        collect_world: impl FnOnce(
+            &K,
+            &mut AllStopped<'_>,
+            &mut Vec<TaggedValue>,
+        ) -> Result<
+            Vec<*mut *mut crate::tagged::header::MarkerObj>,
+            RendezvousError,
+        >,
     ) -> Result<CollectionReport, CollectionError> {
         self.check_collection(stopped)?;
         let registry = self.registry();
@@ -280,11 +427,11 @@ impl<'heap> ParallelHeapEra<'heap> {
             .as_ref()
             .ok_or(RendezvousError::Publication)?
             .append_words(&mut roots);
-        let heads = self
-            .keeper
-            .as_ref()
-            .ok_or(RendezvousError::Publication)?
-            .collect_parallel_world_roots(stopped, &mut roots)?;
+        let heads = collect_world(
+            self.keeper.as_ref().ok_or(RendezvousError::Publication)?,
+            stopped,
+            &mut roots,
+        )?;
         {
             let mut collector = self
                 .collector
@@ -332,6 +479,7 @@ impl<'heap> ParallelHeapEra<'heap> {
                         guard,
                         registry,
                         self.weak_sweep_permit().is_some(),
+                        kind,
                     )?;
                     let mut images = ImageSession::take(registry, &entries, &keys)?;
                     let report =
@@ -356,6 +504,7 @@ struct StoppedCollectorJob<'heap, 'stop, 'era> {
     _stopped: &'stop AllStopped<'era>,
     epoch: u64,
     weak_sweep: bool,
+    kind: GenerationCycle,
 }
 impl<'heap, 'stop, 'era> StoppedCollectorJob<'heap, 'stop, 'era> {
     fn new(
@@ -364,6 +513,7 @@ impl<'heap, 'stop, 'era> StoppedCollectorJob<'heap, 'stop, 'era> {
         stopped: &'stop AllStopped<'era>,
         registry: &Registry,
         weak_sweep: bool,
+        kind: GenerationCycle,
     ) -> Result<Self, CollectionError> {
         if !stopped.matches_registry(registry) || heap.heap_identity() != registry.heap {
             return Err(RendezvousError::Identity);
@@ -377,6 +527,7 @@ impl<'heap, 'stop, 'era> StoppedCollectorJob<'heap, 'stop, 'era> {
             _stopped: stopped,
             epoch: stopped.epoch().get(),
             weak_sweep,
+            kind,
         })
     }
     fn run(
@@ -414,13 +565,18 @@ impl<'heap, 'stop, 'era> StoppedCollectorJob<'heap, 'stop, 'era> {
                 .expect("published peer")
                 .add_collection_scalars(heap);
         }
-        capture_young(heap, images)?;
+        let captured = capture_young(heap, images, self.kind)?;
         for item in &images.work {
             heap.mapped_remembered.extend(item.mapped.iter().copied());
         }
         let bytes_before = heap.live_bytes();
         let started = std::time::Instant::now();
-        heap.begin_stw_collection();
+        match captured {
+            YoungCapture::Major => heap.begin_stw_collection(),
+            YoungCapture::Minor(capture) => heap
+                .begin_parallel_minor_collection(capture, self._proof)
+                .map_err(minor_admission)?,
+        }
         // SAFETY: the matching Baton produced stable frozen World slots;
         // all buffer/owner borrows ended before the complete stopped job.
         unsafe {
@@ -435,34 +591,47 @@ impl<'heap, 'stop, 'era> StoppedCollectorJob<'heap, 'stop, 'era> {
         for item in &images.work {
             trace_work(heap, item);
         }
-        // This scoped keeper job never sends/clones a live heap borrow.
-        // Existing worker MarkAll remains exclusively on its serial path.
-        let mark_started = std::time::Instant::now();
-        heap.mark_all();
-        if self.weak_sweep {
-            heap.mark_and_sweep_weak_tables();
+        match self.kind {
+            GenerationCycle::Major => {
+                // This scoped keeper job never sends/clones a live heap borrow.
+                // Existing worker MarkAll remains exclusively on its serial path.
+                let mark_started = std::time::Instant::now();
+                heap.mark_all();
+                if self.weak_sweep {
+                    heap.mark_and_sweep_weak_tables();
+                }
+                if !heap.weak_hash_tables.is_empty() {
+                    return Err(RendezvousError::Publication);
+                }
+                heap.finalize_collection(
+                    mark_started.elapsed().as_micros() as u64,
+                    bytes_before,
+                    started,
+                );
+            }
+            GenerationCycle::Minor => {
+                heap.complete_minor_collection();
+                heap.finish_incremental_sweep_now();
+            }
         }
-        if !heap.weak_hash_tables.is_empty() {
-            return Err(RendezvousError::Publication);
-        }
-        heap.finalize_collection(
-            mark_started.elapsed().as_micros() as u64,
-            bytes_before,
-            started,
-        );
         facade_mark::CollectorQuiescence::check(heap).map_err(|_| RendezvousError::Publication)?;
         let allocated_count = heap.current_mutator_gc().allocated_count;
         let memory_use_counts = heap.memory_use_counts_snapshot();
         let total_allocated_bytes = heap.total_allocated_bytes();
         let generational = heap.generational_enabled();
         history.restore(heap, generational);
+        let response_pacing = if generational {
+            ResponsePacing::Reset
+        } else {
+            ResponsePacing::Preserve
+        };
         images.images[0].1 =
             Some(PublishedGcImage::from_legacy(heap).map_err(RegistrationError::from)?);
         for (_, image) in &mut images.images[1..] {
             image
                 .as_mut()
                 .expect("published peer")
-                .finish_major_response(generational);
+                .finish_collection_response(response_pacing);
         }
         let image_words: usize = images
             .work
@@ -477,7 +646,10 @@ impl<'heap, 'stop, 'era> StoppedCollectorJob<'heap, 'stop, 'era> {
             .sum();
         let report = CollectionReport {
             epoch,
-            major: true,
+            major: match self.kind {
+                GenerationCycle::Major => true,
+                GenerationCycle::Minor => false,
+            },
             roots: root_count + image_words,
             frozen_owners,
             cycle: heap.gc_collections(),
@@ -604,7 +776,8 @@ impl ParallelYoungLogs for YoungImages<'_> {
 fn capture_young(
     heap: &mut TaggedHeap,
     images: &mut ImageSession<'_>,
-) -> Result<(), CollectionError> {
+    kind: GenerationCycle,
+) -> Result<YoungCapture, CollectionError> {
     let ids = images.images.iter().map(|(entry, _)| entry.young).collect();
     let identity = heap.heap_identity();
     let heap = &mut *heap;
@@ -619,7 +792,15 @@ fn capture_young(
         peers: &mut images.images[1..],
     };
     if heap.generational.enabled {
-        stopped.capture_parallel_major(&mut logs)?;
+        match kind {
+            GenerationCycle::Major => {
+                stopped.capture_parallel_major(&mut logs)?;
+                Ok(YoungCapture::Major)
+            }
+            GenerationCycle::Minor => Ok(YoungCapture::Minor(
+                stopped.capture_parallel_minor(&mut logs)?,
+            )),
+        }
     } else {
         for id in logs.ids.clone() {
             let log = logs.resolve_mut(id)?;
@@ -627,8 +808,11 @@ fn capture_young(
                 return Err(RendezvousError::Publication);
             }
         }
+        match kind {
+            GenerationCycle::Major => Ok(YoungCapture::Major),
+            GenerationCycle::Minor => Err(RendezvousError::Publication),
+        }
     }
-    Ok(())
 }
 
 fn trace_work(heap: &mut TaggedHeap, work: &CollectionWork) {
@@ -704,7 +888,7 @@ mod keeper_table_scope_tests {
             |era, table_bits| {
                 let mut stopped = era.stop().unwrap();
                 {
-                    let mut slot = era.collector.try_borrow_mut().unwrap();
+                    let mut slot = era.core.collector.try_borrow_mut().unwrap();
                     let heap = slot.as_mut().unwrap().registration_heap_mut();
                     assert!(heap._satb_layout_reserve.collector_tables().is_null());
                     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

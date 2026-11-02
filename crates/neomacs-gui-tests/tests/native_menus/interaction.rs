@@ -112,6 +112,21 @@ fn click_at(env: &[(String, String)], window: &str, x: u32, y: u32) {
         ],
     );
 }
+
+/// Tap each menu key the way a keyboard does: hold it for a moment, then
+/// release, and leave a gap before the next key.  xdotool's `key` sends the
+/// release a few milliseconds after the press; a native popup's grab and its
+/// submenu surface take longer than that to come up on a loaded machine, and
+/// a release processed while the submenu is being created retires the menu
+/// before the test can look at it.
+fn press_menu_keys(env: &[(String, String)], keys: &[&str]) {
+    for key in keys {
+        input(env, &["keydown", key]);
+        thread::sleep(Duration::from_millis(60));
+        input(env, &["keyup", key]);
+        thread::sleep(Duration::from_millis(60));
+    }
+}
 fn events(artifacts: &Path) -> Vec<String> {
     fs::read(artifacts.join("events.json"))
         .ok()
@@ -399,7 +414,7 @@ fn keyboard_opens_submenu_and_skips_disabled_item() {
         |env, window, ready, artifacts, _, _| {
             click_at(env, window, 30, ready.char_height / 2);
             let _ = stable_screen(env, artifacts, "keyboard-root");
-            input(env, &["key", "Down", "Down", "Right", "Return"]);
+            press_menu_keys(env, &["Down", "Down", "Right", "Return"]);
             wait_for("keyboard nested action", artifacts, || {
                 (events(artifacts) == ["ready", "nested"]).then_some(())
             });
@@ -428,7 +443,7 @@ fn keyboard_opens_submenu_and_skips_disabled_item() {
                 } else {
                     unchecked_indicator = Some(indicator);
                 }
-                input(env, &["key", "Down", "Down", "Down", "Return"]);
+                press_menu_keys(env, &["Down", "Down", "Down", "Return"]);
                 wait_for("skip disabled and toggle", artifacts, || {
                     (events(artifacts) == expected).then_some(())
                 });
@@ -467,7 +482,7 @@ fn pointer_switches_headings_and_disabled_click_does_not_execute() {
                 ],
             );
             let _ = stable_screen(env, artifacts, "switch-other");
-            input(env, &["key", "Down", "Return"]);
+            press_menu_keys(env, &["Down", "Return"]);
             wait_for("other heading action", artifacts, || {
                 (events(artifacts) == ["ready", "other"]).then_some(())
             });
@@ -492,11 +507,16 @@ fn popup_and_submenu_stay_on_screen_at_each_corner() {
             Corner::BottomLeft,
             Corner::BottomRight,
         ] {
+            // The right-edge clicks stay inside the window's TEXT area: GNU
+            // reserves a 16-pixel toolkit scroll bar there (src/xfns.c:2393-
+            // 2438), so the text ends at 1000 - 16 - 8 = 976 and a click at
+            // 980 lands on the scroll bar, which opens no context menu.
+            // 960 keeps the near-corner geometry that exercises flipping.
             let (x, y) = match corner {
                 Corner::TopLeft => (16, 60),
-                Corner::TopRight => (980, 60),
+                Corner::TopRight => (960, 60),
                 Corner::BottomLeft => (16, 640),
-                Corner::BottomRight => (980, 640),
+                Corner::BottomRight => (960, 640),
             };
             let before = configured_popups(artifacts).len();
             input(
@@ -517,7 +537,7 @@ fn popup_and_submenu_stay_on_screen_at_each_corner() {
             // Clear the pointer highlight so only the selected row changes.
             input(env, &["mousemove", "--window", window, "500", "400"]);
             let root_pixels = stable_screen(env, artifacts, &format!("edge-{corner:?}-root"));
-            input(env, &["key", "Home", "Down", "Right"]);
+            press_menu_keys(env, &["Home", "Down", "Right"]);
             wait_for("edge submenu", artifacts, || {
                 (configured_popups(artifacts).len() > before + 1).then_some(())
             });
@@ -582,7 +602,7 @@ fn right_edge_heading_dropdown_stays_visible_and_submenu_flips_left() {
                 (!configured_popups(artifacts).is_empty()).then_some(())
             });
             let root_pixels = stable_screen(env, artifacts, "edge-heading");
-            input(env, &["key", "Home", "Down", "Right"]);
+            press_menu_keys(env, &["Home", "Down", "Right"]);
             wait_for("left-facing submenu", artifacts, || {
                 (configured_popups(artifacts).len() >= 2).then_some(())
             });
@@ -636,7 +656,10 @@ fn tall_bottom_submenu_slides_up_and_last_item_remains_clickable() {
     with_native_menu(
         "menu-bottom-submenu.el",
         |env, window, _, artifacts, _, _| {
-            for (cycle, x) in [16, 980].into_iter().enumerate() {
+            // 960, not 980: the right-hand click must be inside the text area,
+            // which GNU's 16-pixel toolkit scroll bar ends at 976
+            // (src/xfns.c:2393-2438), while still forcing the child to flip.
+            for (cycle, x) in [16, 960].into_iter().enumerate() {
                 let before = configured_popups(artifacts).len();
                 input(
                     env,
@@ -655,7 +678,7 @@ fn tall_bottom_submenu_slides_up_and_last_item_remains_clickable() {
                 });
                 input(env, &["mousemove", "--window", window, "500", "400"]);
                 let root_pixels = stable_screen(env, artifacts, &format!("bottom-{cycle}-root"));
-                input(env, &["key", "End"]);
+                press_menu_keys(env, &["End"]);
                 // Keep the press alive until the native popup grab is accepted;
                 // this placement test does not exercise rapid key-release races.
                 input(env, &["keydown", "Right"]);

@@ -38,11 +38,11 @@ fn div_cx51_view_mode_basic() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx51_bookmark_set_jump_with_annotation() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect =
+        expect_test::expect![[r#""ERR (error \"Buffer not visiting a file or directory\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (condition-case e
@@ -59,7 +59,7 @@ fn div_cx51_bookmark_set_jump_with_annotation() {
                 (bookmark-get-filename "neo-cx51-bm")
                 (member "neo-cx51-bm" (bookmark-all-names)))))
   (error (cons 'errored (car e))))
-"##,
+)"##,
         expect,
     );
 }
@@ -230,15 +230,23 @@ fn div_cx51_process_output_decode_encode_narrow_buffer_hash_mega() {
     ]];
     crate::common::assert_oracle_parity_expect(
         r##"
-(let ((buf (get-buffer-create " *neo-cx51-rt*")))
+(let* ((buf (get-buffer-create " *neo-cx51-rt*"))
+       (ready (make-temp-file "neo-cx51-rt-gate-")))
   (with-current-buffer buf
     (insert "PRE\n")
     (narrow-to-region 1 4))
-  (let ((p (make-process :name "neo-cx51-rt" :command '("printf" "%s" "café世界")
+  (let ((p (make-process :name "neo-cx51-rt"
+                         :command (append (list "sh" "-c"
+                                                "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                                "sh" ready)
+                                          '("printf" "%s" "café世界"))
                          :buffer buf)))
     (set-process-sentinel p #'ignore)
     (set-process-query-on-exit-flag p nil)
     (set-process-coding-system p 'utf-8-unix 'utf-8-unix)
+    ;; The child writes only after READY is deleted and the coding system is
+    ;; set, while this form is waiting.
+    (delete-file ready)
     (neovm--oracle-settle-process p 600))
   (prog1 (with-current-buffer buf
            (widen)
@@ -255,11 +263,10 @@ fn div_cx51_process_output_decode_encode_narrow_buffer_hash_mega() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx51_undo_redo_textprop_overlay_evaporate_display_marker_narrow_full_mega() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""ERR (args-out-of-range 1 1)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (with-temp-buffer
@@ -288,7 +295,7 @@ fn div_cx51_undo_redo_textprop_overlay_evaporate_display_marker_narrow_full_mega
             (overlayp ov) (overlay-start ov) (overlay-end ov)
             (text-properties-at 1) (text-properties-at 5)
             (text-properties-at 9) (current-column))))
-"##,
+)"##,
         expect,
     );
 }

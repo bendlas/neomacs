@@ -430,10 +430,12 @@ pub(crate) fn fixnum_tag_test(fb: &mut FunctionBuilder, v: ClifValue) -> ClifVal
         .icmp_imm_u(IntCC::Equal, tag, FIXNUM_CHECK_VALUE as i64)
 }
 
-/// The f64 `+ - * /` for a Float site. `/` gets the negative default NaN
-/// only for an INVALID op (`0.0/0.0`, `inf/inf`) — a NaN INPUT propagates
-/// with its own sign, as GNU's `(/ 0.0e+NaN 1)` = `0.0e+NaN` shows
-/// (`builtin_div` applies the same rule).
+/// The f64 `+ - * /` for a Float site.  `/` returns Cranelift's `fdiv`
+/// result unchanged, like GNU's C division: an INVALID op (`0.0/0.0`,
+/// `inf/inf`) yields the target's default NaN (negative on x86, positive on
+/// arm64) and a NaN INPUT propagates with its own sign, as GNU's
+/// `(/ 0.0e+NaN 1)` = `0.0e+NaN` shows.  `builtin_div` follows the same
+/// rule.
 pub(crate) fn emit_float_arith(
     fb: &mut FunctionBuilder,
     op: &Op,
@@ -444,30 +446,11 @@ pub(crate) fn emit_float_arith(
         Op::Add => fb.ins().fadd(fa_val, fb_val),
         Op::Sub => fb.ins().fsub(fa_val, fb_val),
         Op::Mul => fb.ins().fmul(fa_val, fb_val),
-        _ => {
-            let q = fb.ins().fdiv(fa_val, fb_val);
-            let q_nan = fb
-                .ins()
-                .fcmp(cranelift_codegen::ir::condcodes::FloatCC::NotEqual, q, q);
-            let a_ord = fb.ins().fcmp(
-                cranelift_codegen::ir::condcodes::FloatCC::Equal,
-                fa_val,
-                fa_val,
-            );
-            let b_ord = fb.ins().fcmp(
-                cranelift_codegen::ir::condcodes::FloatCC::Equal,
-                fb_val,
-                fb_val,
-            );
-            let ordered = fb.ins().band(a_ord, b_ord);
-            let invalid = fb.ins().band(q_nan, ordered);
-            let neg_nan = fb
-                .ins()
-                .f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
-                    f64::NAN.to_bits() | (1_u64 << 63),
-                ));
-            fb.ins().select(invalid, neg_nan, q)
-        }
+        // GNU divides in C; an invalid operation gives the target's default
+        // NaN (negative on x86, positive on arm64) and a NaN input keeps its
+        // sign.  Cranelift's fdiv has the same target-defined answers, so the
+        // result is used untouched (src/data.c Fquo).
+        _ => fb.ins().fdiv(fa_val, fb_val),
     }
 }
 
@@ -2402,6 +2385,7 @@ pub(crate) fn lower_mir_inst_via_baseline(
     let mut reps: Vec<SlotRep> = vec![SlotRep::Tagged; base_len];
     let mut dispatch: Vec<PendingDispatch> = Vec::new();
     let deopts_before = pending.len();
+    let revalidations_before = release_revalidations_emitted();
     lower_simple_op(
         fb,
         inst.pc,
@@ -2434,10 +2418,17 @@ pub(crate) fn lower_mir_inst_via_baseline(
         dispatch.is_empty(),
         "a MIR leaf has no handlers to dispatch to"
     );
+    // A call-bearing arm's STATUS_OK continuation revalidates the leaf's
+    // inline dependencies (the release-point rule): that emission queues one
+    // precise-deopt site, materialized by the leaf-end `emit_pending_deopts`
+    // drain like every other MIR deopt. The invariant stays closed — an arm
+    // may queue ONLY the deopts its own revalidations created, so any other
+    // arm leaking an unaccounted deopt still trips here.
     debug_assert_eq!(
         pending.len(),
-        deopts_before,
-        "no adapter-reachable arm queues a deopt"
+        deopts_before
+            + release_revalidations_emitted().saturating_sub(revalidations_before) as usize,
+        "an adapter-reachable arm queues only its own release-revalidation deopts"
     );
     debug_assert_eq!(
         stack.len() as i64,
@@ -2448,12 +2439,75 @@ pub(crate) fn lower_mir_inst_via_baseline(
     if produces == 1 {
         cval[r] = stack.pop();
         cval_raw[r] = false;
+        let result_rep = reps.pop();
         debug_assert!(
-            matches!(reps.pop(), None | Some(SlotRep::Tagged)),
+            matches!(result_rep, None | Some(SlotRep::Tagged)),
             "results are tagged"
         );
     }
     Ok(())
+}
+
+/// How an inlined call site can re-enter Lisp — decided where the site is
+/// lowered, and the gate for the green inline-entry guard: only the
+/// may-reenter class has a guard to emit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InlineSiteReentry {
+    /// The fast path cannot run Lisp or release the Baton: pure native
+    /// arithmetic (LEVEL-B `logand`/`logior`/`logxor`/`lognot`/`mod`),
+    /// machine ops over values already in registers. Cannot call Lisp, grow
+    /// eval depth, allocate or serve attention at the site, so it emits NO
+    /// guard: quit/throw-on-input/async attention ride the back-edge poll at
+    /// GNU's own `quitcounter` cadence (`neovm_jit_backedge`, called every
+    /// 255 backward jumps), and epoch, debugger and depth revalidate after
+    /// every release point (the return-side compare) or at leaf entry (the
+    /// callee's fset evicts the leaf via `inline_deps`). GNU bytecode checks
+    /// nothing per inlined site either — it inlines nothing.
+    ///
+    /// Derived from the effect vocabulary (`effect_reentry`), never from a
+    /// hand list here; signaling (`mod`'s `arith-error`) leaves compiled
+    /// code through the slow path, so it does not make the site re-entrant.
+    FastPathCannotReenter,
+    /// An original call boundary whose inlined lowering can (re-)enter Lisp:
+    /// an inlined function entry (`MirOp::InlineEntry`), or a retained Subr
+    /// call lowered to a native payload (opt sqrt). The boundary's skipped
+    /// call would have polled quit, resolved the callee, armed the debugger
+    /// and checked depth — including after a yield or first thread
+    /// admission; the guard stands in for all of them.
+    MayReenter { epoch: u64 },
+}
+
+impl InlineSiteReentry {
+    /// The green guard this site owes. `None` exactly for the
+    /// call-free class, so an intrinsic site has no argument to hand
+    /// [`emit_mir_inline_entry_guard`] and cannot call it by accident: a
+    /// re-added guard must first claim `MayReenter { epoch }` here.
+    pub(crate) fn entry_guard(self) -> Option<InlineEntryGuard> {
+        match self {
+            Self::FastPathCannotReenter => None,
+            Self::MayReenter { epoch } => Some(InlineEntryGuard { epoch }),
+        }
+    }
+}
+
+/// Whether an inlined native intrinsic named `name` is call-free
+/// (`InlineSiteReentry::FastPathCannotReenter`) per the effect vocabulary —
+/// the gate for baking it as machine ops. A name the vocabulary does not
+/// classify as call-free keeps the call: the shim revalidates by
+/// construction, so the classification can never manufacture a stale inline.
+pub(crate) fn intrinsic_fast_path_is_call_free(name: &str) -> bool {
+    matches!(
+        crate::emacs_core::subr::effect_reentry::fast_path_reentry(name),
+        crate::emacs_core::subr::effect_reentry::FastPathReentry::CannotReenter
+    )
+}
+
+/// The green inline-entry guard's argument: the global function epoch the
+/// leaf baked its inline facts at. Only [`InlineSiteReentry::entry_guard`]
+/// constructs one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlineEntryGuard {
+    epoch: u64,
 }
 
 /// An inlined call in a reentrant body must observe state changed by the
@@ -2463,7 +2517,7 @@ pub(crate) fn lower_mir_inst_via_baseline(
 pub(crate) fn emit_mir_inline_entry_guard(
     fb: &mut FunctionBuilder,
     rt: &RtCtx,
-    epoch: u64,
+    guard: InlineEntryGuard,
     deopt: Block,
 ) -> Result<(), CompileError> {
     use super::jit_layout::CONTEXT_ATTENTION_OFFSET;
@@ -2478,7 +2532,7 @@ pub(crate) fn emit_mir_inline_entry_guard(
         dispatch,
         DISPATCH_FUNCTION_EPOCH_OFFSET as i32,
     );
-    let epoch_ok = icmp_imm_p(fb, IntCC::Equal, current, epoch as i64);
+    let epoch_ok = icmp_imm_p(fb, IntCC::Equal, current, guard.epoch as i64);
     // `quit-flag`, a bound `throw-on-input` and active compiler overrides.
     let attention = fb
         .ins()
@@ -2521,6 +2575,66 @@ pub(crate) fn emit_mir_inline_entry_guard(
     let valid = fb.ins().band(valid, depth_ok);
     emit_guard(fb, deopt, valid);
     Ok(())
+}
+
+/// Emit the release-point revalidation: ONE compare of the leaf's baked
+/// function epoch against the current one (the owner admission header —
+/// refreshed from canonical cells by every returning park
+/// `green/switch.rs` and by every same-thread write retirement
+/// `world.rs`), branching to `deopt` on a move. Emitted only in leaves
+/// that baked a redefinable definition (`RtCtx::release_epoch`: machine-op
+/// intrinsics, fused named regions, MIR-inlined callees), at the return of
+/// every MayReenter call, at every handler landing pad, and at the
+/// back-edge poll's slow-path return. No per-inline-site checks: the
+/// interpreter resume resolves through the symbol, so pickup is GNU-exact.
+pub(crate) fn emit_release_revalidation(
+    fb: &mut FunctionBuilder,
+    rt: &RtCtx,
+    epoch: u64,
+    deopt: Block,
+) {
+    use super::jit_layout::{DISPATCH_FUNCTION_EPOCH_OFFSET, emit_dispatch_cells_base};
+    #[cfg(debug_assertions)]
+    RELEASE_REVALIDATION_EMITTED.with(|c| c.set(c.get() + 1));
+    let flags = MemFlagsData::trusted();
+    let vmctx = fb.use_var(rt.vmctx_var);
+    let dispatch = emit_dispatch_cells_base(fb, vmctx);
+    let current = fb.ins().load(
+        types::I64,
+        flags,
+        dispatch,
+        DISPATCH_FUNCTION_EPOCH_OFFSET as i32,
+    );
+    let valid = icmp_imm_p(fb, IntCC::Equal, current, epoch as i64);
+    emit_guard(fb, deopt, valid);
+}
+
+// Release-point revalidation emissions across every leaf compiled on this
+// thread (debug builds only): the shape gate's measure and the accounted
+// adapter assert's delta. THREAD-LOCAL on purpose: compilation can run on
+// several threads at once, and the assert must not attribute another
+// thread's emission to this op's lowering. A leaf's expected count is one
+// per EMITTED call site plus one per emitted back-edge poll in a leaf that
+// baked a redefinable definition — and nothing anywhere else, so an inlined
+// intrinsic site (`FastPathCannotReenter`), a dependency-free loop, or a
+// HOF-only leaf (callbacks are call-free by admission; the map activation
+// is GNU-exact in continuation) contributes zero.
+#[cfg(debug_assertions)]
+thread_local! {
+    static RELEASE_REVALIDATION_EMITTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The counter above; `0` in release builds, where nothing bumps it (the
+/// consumers are debug-only measurements and the accounted adapter assert,
+/// whose branch is constant-false without debug assertions).
+#[cfg(debug_assertions)]
+pub(crate) fn release_revalidations_emitted() -> u64 {
+    RELEASE_REVALIDATION_EMITTED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn release_revalidations_emitted() -> u64 {
+    0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3610,6 +3724,7 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                 self_direct_source: super::direct_call::source_for_abi(abi),
                 poll: emit.poll(),
                 inline_entry_cache: None,
+                release_epoch: m.inline_epoch,
             })
         } else {
             None
@@ -3826,6 +3941,9 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                         // The param already holds the argument (bound above).
                     }
                     MirOp::InlineEntry => {
+                        // An inlined FUNCTION entry: the original boundary
+                        // ran arbitrary Lisp, so a green leaf revalidates
+                        // here (see InlineSiteReentry::MayReenter).
                         if precise && let Some(epoch) = m.inline_epoch {
                             if aot {
                                 return Err(CompileError::UnsupportedOp("aot-inline-epoch"));
@@ -3841,12 +3959,16 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                                 &mut deopt,
                                 &mut pending,
                             )?;
-                            emit_mir_inline_entry_guard(
-                                &mut fb,
-                                rt.as_ref().expect("precise inline runtime"),
-                                epoch,
-                                d,
-                            )?;
+                            if let Some(guard) =
+                                (InlineSiteReentry::MayReenter { epoch }).entry_guard()
+                            {
+                                emit_mir_inline_entry_guard(
+                                    &mut fb,
+                                    rt.as_ref().expect("precise inline runtime"),
+                                    guard,
+                                    d,
+                                )?;
+                            }
                         }
                     }
                     MirOp::Const(v) => {
@@ -4296,7 +4418,14 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                             &a,
                             &[],
                             &mut Vec::new(),
-                            None,
+                            // The poll's release-point revalidation resumes at
+                            // the loop head (MIR bodies carry no physical
+                            // inline frames; handlers are always empty).
+                            Some(super::BackedgeExtras {
+                                pc: m.blocks[target.0 as usize].bytecode_pc as usize,
+                                frames: None,
+                                deopts: &mut pending,
+                            }),
                         );
                     } else {
                         fb.ins().jump(clif_blocks[target.0 as usize], &a);
@@ -4344,6 +4473,8 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                     // Only a taken backward edge counts toward the poll. A
                     // trampoline carries exactly that edge's tagged stack,
                     // including ElsePop's retained condition when applicable.
+                    // The loop-head pc rides along for the poll's release
+                    // revalidation.
                     let mut trampolines = Vec::new();
                     let mut edge_target = |target: mir::MirBlockId| {
                         let dest = &m.blocks[target.0 as usize];
@@ -4355,7 +4486,7 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                         for _ in &dest.params {
                             fb.append_block_param(tramp, types::I64);
                         }
-                        trampolines.push((tramp, cb));
+                        trampolines.push((tramp, cb, dest.bytecode_pc as usize));
                         tramp
                     };
                     let tb = edge_target(*taken);
@@ -4366,7 +4497,7 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                     } else {
                         fb.ins().brif(is_nil, fbk, &fa, tb, &ta);
                     }
-                    for (tramp, target) in trampolines {
+                    for (tramp, target, dest_pc) in trampolines {
                         fb.switch_to_block(tramp);
                         fb.seal_block(tramp);
                         let values = fb.block_params(tramp).to_vec();
@@ -4383,7 +4514,13 @@ pub(crate) fn build_mir_leaf_fn<S: LeafSink>(
                             &args,
                             &[],
                             &mut Vec::new(),
-                            None,
+                            // Same loop-head release revalidation as the Goto
+                            // edge above; this trampoline's own target pc.
+                            Some(super::BackedgeExtras {
+                                pc: dest_pc,
+                                frames: None,
+                                deopts: &mut pending,
+                            }),
                         );
                     }
                 }
@@ -4500,6 +4637,17 @@ pub(crate) struct RtCtx {
     /// Compile-local protocol flags; generated state belongs to this native
     /// activation and is invalidated on successful service polls.
     pub(crate) inline_entry_cache: Option<super::inline_entry_cache::EntryCache>,
+    /// The obarray function epoch this leaf baked its inline facts at, iff
+    /// the leaf baked a redefinable definition (`Some` exactly then:
+    /// machine-op intrinsics, a fused named region, or MIR-inlined callee
+    /// bodies). Its presence is the emission scope for the release-point
+    /// revalidation: every MayReenter call return, every handler landing pad
+    /// and the back-edge poll's slow-path return compare against it and
+    /// deopt on a move; leaves that baked nothing redefinable — including
+    /// HOF-only leaves, whose in-flight map activation is GNU-exact and
+    /// whose callbacks are call-free by admission — emit nothing anywhere.
+    /// `None` for AOT (no bake, no inline epoch).
+    pub(crate) release_epoch: Option<u64>,
 }
 
 impl RtCtx {
@@ -4871,6 +5019,7 @@ struct DirectSiteWords {
 #[allow(clippy::too_many_arguments)]
 fn lower_direct_call_site(
     fb: &mut FunctionBuilder,
+    pc: usize,
     rt: &RtCtx,
     site: super::direct_call::DirectSite,
     sym_v: ClifValue,
@@ -4880,6 +5029,7 @@ fn lower_direct_call_site(
     signal_exit: &mut Option<Block>,
     handlers: &[HandlerStatic],
     pending: &mut Vec<PendingDispatch>,
+    deopt_sites: &mut Vec<PendingDeopt>,
 ) -> Result<(), CompileError> {
     let args_at = stack.len() - words.nargs;
     let args: SmallVec<[ClifValue; 6]> = stack[args_at..].iter().copied().collect();
@@ -4916,6 +5066,14 @@ fn lower_direct_call_site(
     fb.switch_to_block(cont);
     fb.seal_block(cont);
     stack.push(fb.use_var(call.result));
+    // Release-point revalidation: the callee's leaf ran with this frame
+    // suspended (it may have parked), so a leaf with inline dependencies
+    // re-establishes them before using the result — resume-AFTER at `pc + 1`,
+    // never re-executing the completed call.
+    if let Some(epoch) = rt.release_epoch {
+        let dsite = deopt_site(fb, pc + 1, handlers.len(), stack, reps, deopt_sites);
+        emit_release_revalidation(fb, rt, epoch, dsite);
+    }
     Ok(())
 }
 
@@ -4958,6 +5116,7 @@ struct BcallLeafSite {
 #[allow(clippy::too_many_arguments)]
 fn lower_bcall_leaf_site(
     fb: &mut FunctionBuilder,
+    pc: usize,
     rt: &RtCtx,
     leaf: &'static crate::emacs_core::subr::leaf::LeafSpec,
     site: BcallLeafSite,
@@ -4966,6 +5125,7 @@ fn lower_bcall_leaf_site(
     signal_exit: &mut Option<Block>,
     handlers: &[HandlerStatic],
     pending: &mut Vec<PendingDispatch>,
+    deopt_sites: &mut Vec<PendingDeopt>,
 ) -> Result<(), CompileError> {
     use super::leaf_abi;
     let n = site.nargs;
@@ -5160,6 +5320,14 @@ fn lower_bcall_leaf_site(
     fb.switch_to_block(cont);
     fb.seal_block(cont);
     stack.push(fb.use_var(res));
+    // Release-point revalidation: the hot trampoline is call-free by ABI, but
+    // the cold signal frame and the reference/generic protocol calls are not,
+    // and every history joins this continuation — so one check covers them
+    // all (resume-AFTER at `pc + 1`, never re-executing the completed call).
+    if let Some(epoch) = rt.release_epoch {
+        let dsite = deopt_site(fb, pc + 1, handlers.len(), stack, reps, deopt_sites);
+        emit_release_revalidation(fb, rt, epoch, dsite);
+    }
     leaf_abi::note_bcall_site(leaf.id);
     Ok(())
 }
@@ -5764,7 +5932,9 @@ pub(crate) fn emit_pending_dispatches(
     signal_exit: &mut Option<Block>,
     vars: &[Variable],
     block_for: &HashMap<usize, Block>,
+    entry_handlers: &HashMap<usize, Vec<HandlerStatic>>,
     pending: &mut Vec<PendingDispatch>,
+    deopt_sites: &mut Vec<PendingDeopt>,
 ) -> Result<(), CompileError> {
     let cold = super::cold_exits::ColdSpan::begin(fb);
     for pd in pending.drain(..) {
@@ -5815,6 +5985,24 @@ pub(crate) fn emit_pending_dispatches(
                 .ins()
                 .stack_load(rt.ptr_ty, types::I64, rt.call_result_slot, 0);
             fb.def_var(vars[push_depth], err);
+            // Release-point revalidation at the landing pad: the match shim
+            // (and the unwinding it performed) can run arbitrary Lisp —
+            // cleanups, handler-bind hooks, signal hooks — so a leaf with
+            // inline dependencies re-establishes them before the handler
+            // body runs. The snapshot is exactly the interpreter's landing
+            // state: the handler-entry stack + error at the handler target,
+            // with the pre-push handler count the CFG's handler edge records
+            // (the landed frame and everything above it were popped by the
+            // unwind).
+            if let Some(epoch) = rt.release_epoch {
+                let landed = (0..=push_depth)
+                    .map(|j| fb.use_var(vars[j]))
+                    .collect::<Vec<_>>();
+                let landed_reps = vec![SlotRep::Tagged; landed.len()];
+                let handler_len = entry_handlers.get(&target).map_or(0, Vec::len);
+                let dsite = deopt_site(fb, target, handler_len, &landed, &landed_reps, deopt_sites);
+                emit_release_revalidation(fb, rt, epoch, dsite);
+            }
             fb.ins().jump(block_for[&target], &[]);
             fb.switch_to_block(next);
             fb.seal_block(next);
@@ -7609,19 +7797,30 @@ fn lower_simple_op_arms(
             // a tagged fixnum yields `lognot` exactly (-a == retag(~n)). A non-fixnum
             // arg deopts to the precise-deopt block, where the interpreter re-runs
             // the REAL call from `pc` (graceful for the odd bignum; a fully mixed
-            // loop stays interpreted). Green leaves validate the function epoch
-            // at every original call boundary, including after a yield or first
-            // thread admission. Sim retains dependency eviction alone. AOT
-            // (`aot`) keeps the shim — its loader owns arm/disarm.
+            // loop stays interpreted). Site classification: pure native
+            // arithmetic cannot re-enter Lisp, so `FastPathCannotReenter`
+            // owes no green entry guard — quit/attention ride the back-edge
+            // poll (GNU's own `quitcounter` cadence), and redefinition/
+            // debugger/depth revalidate at the next real call or leaf entry
+            // (an fset of the callee evicts the leaf via `inline_deps`).
+            // The class itself is DERIVED from the effect vocabulary
+            // (`intrinsic_fast_path_is_call_free`): a name it does not
+            // classify as call-free keeps the armed shim, whose real call
+            // revalidates by construction.
+            // AOT (`aot`) keeps the shim — its loader owns arm/disarm.
             if jit_inline_arith_on()
                 && !aot
-                && let Some((_, _, _, _, SpecCalleeKind::ArithIntrinsic { op })) = spec
+                && let Some((sym, _, _, _, SpecCalleeKind::ArithIntrinsic { op })) = spec
                 && arith_op_inlines(op)
+                && intrinsic_fast_path_is_call_free(crate::emacs_core::intern::resolve_sym(
+                    crate::emacs_core::intern::SymId(sym),
+                ))
                 && super::call_site_inlinable_at(pc)
             {
                 let dsite = deopt_site(fb, pc, handlers.len(), stack, reps, deopt_sites);
-                if let Some(epoch) = super::inline_vars::green_function_epoch() {
-                    emit_mir_inline_entry_guard(fb, rt, epoch, dsite)?;
+                let site = InlineSiteReentry::FastPathCannotReenter;
+                if let Some(guard) = site.entry_guard() {
+                    emit_mir_inline_entry_guard(fb, rt, guard, dsite)?;
                 }
                 let sp = stack.len();
                 let is_lognot = op == ARITH_KIND_LOGNOT as u8;
@@ -7683,6 +7882,7 @@ fn lower_simple_op_arms(
             {
                 return lower_bcall_leaf_site(
                     fb,
+                    pc,
                     rt,
                     leaf,
                     BcallLeafSite {
@@ -7696,6 +7896,7 @@ fn lower_simple_op_arms(
                     signal_exit,
                     handlers,
                     pending,
+                    deopt_sites,
                 );
             }
             // `NEOVM_JIT_DIRECT_CALL` (JIT only): a speculated call of a
@@ -7710,6 +7911,7 @@ fn lower_simple_op_arms(
                 let sym_v = materialize_op_sym_value(fb, reloc_base, reloc_index, sym);
                 return lower_direct_call_site(
                     fb,
+                    pc,
                     rt,
                     site,
                     sym_v,
@@ -7723,6 +7925,7 @@ fn lower_simple_op_arms(
                     signal_exit,
                     handlers,
                     pending,
+                    deopt_sites,
                 );
             }
             // `NEOVM_JIT_FEEDBACK` (JIT only): a speculated mapping builtin
@@ -8226,6 +8429,18 @@ fn lower_simple_op_arms(
             let result = fb
                 .ins()
                 .stack_load(rt.ptr_ty, types::I64, rt.call_result_slot, 0);
+            // Release-point revalidation on this calling history only (the
+            // inline-pred fast path reaches its merge without a call). The
+            // snapshot is resume-AFTER: residual + result at `pc + 1`, so a
+            // completed call is never re-executed; `reps` may still carry the
+            // popped arguments' entries here, and the spill pairs by prefix
+            // exactly as the signal snapshot above does.
+            if let Some(epoch) = rt.release_epoch {
+                stack.push(result);
+                let dsite = deopt_site(fb, pc + 1, handlers.len(), stack, reps, deopt_sites);
+                emit_release_revalidation(fb, rt, epoch, dsite);
+                stack.pop();
+            }
             match inline_pred {
                 Some((merge, res, carry)) => {
                     fb.def_var(res, result);
@@ -8986,4 +9201,34 @@ pub(crate) fn emit_verified_plain_aref(
     let slot = fb.ins().iadd(slots, byte_offset);
     let element = fb.ins().load(types::I64, MemFlagsData::trusted(), slot, 0);
     Ok((element, SlotRep::Tagged))
+}
+
+/// Carrier park: reset per-function lowering scratch and counters.
+pub(crate) fn reset_carrier_tls() {
+    GUARD_COUNT.with(|slot| slot.set(0));
+    UNTAG_COUNT.with(|slot| slot.set(0));
+    RETAG_COUNT.with(|slot| slot.set(0));
+    ACTIVE_REGALLOC.with(|slot| slot.set(RegallocChoice::Full));
+    ROOTWIN_CARRY.with(|carry| {
+        carry.stored.borrow_mut().clear();
+        carry.counts.set(RootWinCounts::ZERO);
+    });
+    IMM_POOL.with(|pool| pool.borrow_mut().clear());
+    ACTIVE_REGION.with(|slot| *slot.borrow_mut() = None);
+    LAST_IR_STATS.with(|slot| slot.set((0, 0, 0, 0)));
+    FLONUM_CENSUS.with(|slot| slot.set(FlonumCensus::default()));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix_debug(h, ACTIVE_REGALLOC.with(|slot| slot.get()));
+    crate::tls_fingerprint::mix(h, ACTIVE_REGION.with(|slot| slot.borrow().is_some() as u64));
+    crate::tls_fingerprint::mix_debug(h, FLONUM_CENSUS.with(|slot| slot.get()));
+    crate::tls_fingerprint::mix(h, GUARD_COUNT.with(|slot| slot.get() as u64));
+    crate::tls_fingerprint::mix(h, IMM_POOL.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix_debug(h, LAST_IR_STATS.with(|slot| slot.get()));
+    crate::tls_fingerprint::mix(h, RETAG_COUNT.with(|slot| slot.get() as u64));
+    crate::tls_fingerprint::mix(h, ROOTWIN_CARRY.with(|c| c.stored.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, UNTAG_COUNT.with(|slot| slot.get() as u64));
 }

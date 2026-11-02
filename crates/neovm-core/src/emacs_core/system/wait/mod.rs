@@ -17,6 +17,17 @@ use super::process::{
     ProcessOutputWaitTiming, ProcessWaitBackendInterest, ProcessWaitEvents,
 };
 
+/// Upper bound on the zero-time MINIMUM drain that follows a live read.
+///
+/// GNU's loop (`process.c:6021-6032`) has no such counter; it returns when the
+/// zero-time `select` reports no ready fd. That is the right exit for a ready
+/// burst, but a producer that stays readable at every pass would keep an
+/// `accept-process-output` that has already selected its completion inside the
+/// drain indefinitely. 4096 passes is 256 MiB at the default 64 KiB
+/// `read-process-output-max`, and still covers the 128-byte burst the
+/// one-byte-read regression test builds.
+pub(crate) const MAX_MINIMUM_DRAIN_PASSES: usize = 4096;
+
 /// GNU's `status_notify` call *inside* `wait_reading_process_output`
 /// (src/process.c:5554 and :5854), as a capability that only this module can
 /// hand out.
@@ -737,9 +748,7 @@ impl WaitRequest {
         completion: WaitCompletion,
         outcome: WaitServiceOutcome,
     ) -> bool {
-        completion == WaitCompletion::ProcessActivity
-            && self.target_process().is_some()
-            && outcome.has_target_process_activity()
+        completion == WaitCompletion::ProcessActivity && outcome.has_any_process_activity()
     }
 }
 
@@ -849,6 +858,20 @@ impl WaitSpecialInputActivity {
     }
 }
 
+/// Evidence owned by this service pass, never a second input queue. Requeued
+/// Lisp events remain with their canonical reader; staged events remain with
+/// the keyboard/frontend owner. Neither case consumes the pending event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WaitCommandInput {
+    #[default]
+    None,
+    Requeued,
+    Staged,
+}
+
+static_assertions::assert_eq_size!(WaitCommandInput, bool);
+static_assertions::assert_impl_all!(WaitCommandInput: Copy, Send, Sync);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct WaitServiceOutcome {
     handshake_ready: bool,
@@ -863,7 +886,7 @@ struct WaitServiceOutcome {
     process_serviced: bool,
     special_input_activity: WaitSpecialInputActivity,
     timers_fired: bool,
-    command_input_pending: bool,
+    command_input: WaitCommandInput,
 }
 
 impl WaitServiceOutcome {
@@ -912,12 +935,18 @@ impl WaitServiceOutcome {
         self.special_input_activity.resize()
     }
 
-    fn record_command_input_pending(&mut self) {
-        self.command_input_pending = true;
+    fn record_command_input_pending(&mut self, input: WaitCommandInput) {
+        match input {
+            WaitCommandInput::None => {}
+            WaitCommandInput::Requeued | WaitCommandInput::Staged => self.command_input = input,
+        }
     }
 
     fn has_command_input_pending(self) -> bool {
-        self.command_input_pending
+        match self.command_input {
+            WaitCommandInput::None => false,
+            WaitCommandInput::Requeued | WaitCommandInput::Staged => true,
+        }
     }
 
     fn record_timer_activity(&mut self, fired: bool) {
@@ -1121,6 +1150,16 @@ impl super::eval::Context {
             // the generic notifier independent of its producers.
             let _ = self.stage_next_host_input_event_if_available()?;
         }
+        // GNU process.c:5918-5921 checks requeued command input after select,
+        // before the next timer/process-fd service pass. The outer wait has
+        // already performed its after-select status notification here.
+        let mut requeued = WaitServiceOutcome::default();
+        requeued
+            .record_command_input_pending(self.requeued_command_input_for_wait_request(request));
+        if requeued.has_command_input_pending() {
+            self.maybe_quit()?;
+            return Ok(requeued);
+        }
         let handshake_ready = match (request.processes, &activity.process_service) {
             (ProcessWaitPolicy::TlsHandshake(id), WaitProcessService::Ready(events)) => {
                 events.ready_processes_ref().contains(&id)
@@ -1145,6 +1184,12 @@ impl super::eval::Context {
         run_timers: bool,
         notify_status_after_timers: Option<WaitStatusNotifySite>,
     ) -> Result<WaitServiceOutcome, Flow> {
+        // GNU's kbd buffer is process-wide: a `THREAD_EVENT` a worker stored
+        // while this wait blocked (`src/thread.c:1012`) is already visible to
+        // the wait's command-input check below.  Stage it before that check so
+        // a main thread parked in `read-event` wakes on the event instead of
+        // sleeping to its deadline.
+        self.stage_pending_thread_events();
         let mut outcome = WaitServiceOutcome::default();
         let special_input = if request.services_special_input() {
             self.service_wait_request_special_input_events_with_idle_policy(request.idle_policy)?
@@ -1177,22 +1222,32 @@ impl super::eval::Context {
         // the caller's binding still determines whether quitting is allowed.
         self.maybe_quit()?;
 
+        // GNU process.c:5501-5504 returns after timer_check when a callback
+        // queues unread-command-events. Preserve quit priority and leave the
+        // list for read_char, rather than waiting for physical input/deadline.
+        if self.requeued_command_input_for_wait_request(request) == WaitCommandInput::Requeued {
+            // GNU's timer-triggered redisplay precedes its unread-input break
+            // (process.c:5492-5504). A display hook may consume the event, so
+            // obtain completion evidence again after that arbitrary Lisp.
+            if request.needs_redisplay_after_service(special_input, outcome) {
+                self.redisplay()?;
+            }
+            outcome.record_command_input_pending(
+                self.requeued_command_input_for_wait_request(request),
+            );
+            return Ok(outcome);
+        }
+
         if let Some(site) = notify_status_after_timers {
             let notified = self.record_and_notify_status_changes(request, site)?;
             outcome.absorb_process_activity(notified);
         }
 
-        // Drain ready process output (a non-blocking poll of already-readable
-        // fds plus filter dispatch) BEFORE yielding to pending command input.
-        // GNU's `wait_reading_process_output` reads readable process fds from
-        // the `pselect` result and runs their filters before it notices
-        // keyboard input (the keyboard `break` at the "Check for keyboard
-        // input" comment happens, but the process fds available from the prior
-        // select are read first), so the bytes are always drained.  The old
-        // order early-returned on pending command input before this poll, which
-        // starved a process that already had a full response waiting in its
-        // pipe: a re-entrant `accept-process-output` from a jsonrpc/Copilot
-        // timer would hang forever even though the child had written its reply.
+        // Requeued Lisp input was checked at GNU's earlier timer/select sites.
+        // Keep the ready-process drain before staging low-level host input.
+        // In particular, process-only requests must drain available replies
+        // despite queued command input: GNU's read_kbd == 0 does not complete
+        // on that input (process.c:5925-5937).
         let process_request = request.process_output_service_request();
         // A non-local `throw` from a process filter/sentinel callback likewise
         // propagates out of the wait to the matching outer `catch` (GNU's
@@ -1210,7 +1265,7 @@ impl super::eval::Context {
         if let Some(query) = request.keyboard.input_query()
             && self.stage_pending_command_input_for_wait_request(query)?
         {
-            outcome.record_command_input_pending();
+            outcome.record_command_input_pending(WaitCommandInput::Staged);
             if request.needs_redisplay_after_command_input(special_input) {
                 self.redisplay()?;
             }
@@ -1261,6 +1316,8 @@ impl super::eval::Context {
         request: &WaitRequest,
         mut outcome: WaitServiceOutcome,
     ) -> Result<Option<WaitCompletion>, Flow> {
+        // Redisplay can also queue Lisp input after the timer/select checks.
+        outcome.record_command_input_pending(self.requeued_command_input_for_wait_request(request));
         // The service pass checks for command input BEFORE its redisplay
         // step, so input that arrives during that redisplay (a frontend
         // completing its wake, a config whose echo traffic lands exactly
@@ -1275,27 +1332,56 @@ impl super::eval::Context {
             && let Some(query) = request.keyboard.input_query()
             && self.stage_pending_command_input_for_wait_request(query)?
         {
-            outcome.record_command_input_pending();
+            outcome.record_command_input_pending(WaitCommandInput::Staged);
         }
         let Some(completion) = request.completion_for(outcome) else {
             return Ok(None);
         };
 
-        // GNU `wait_reading_process_output` sets `wait = MINIMUM` after reading
-        // bytes from WAIT_PROC.  That makes one zero-time process wait/service
-        // pass before the function returns, so a concurrent PTY EOF/SIGCHLD can
-        // run `status_notify` and the sentinel in the same
-        // `accept-process-output` call.
-        let explicit_coding_status_deferred = request
-            .target_pid()
-            .is_some_and(|pid| self.processes.defers_minimum_status_drain_after_output(pid));
-        if request.needs_minimum_process_drain_before_completion(completion, outcome)
-            && !explicit_coding_status_deferred
-        {
-            let _ = self.service_minimum_process_drain(request)?;
+        // GNU's MINIMUM mode repeats zero-time select/read cycles until no
+        // output is ready (process.c:5477, :5867-5870, :6021-6032). A single
+        // readiness pass now yields after one read, so completing after just
+        // one follow-up would leave a buffered burst for the next accept call.
+        // Keep rotating sources and checking timers/quit between reads, for
+        // both targeted and untargeted accepts, without blocking for new bytes.
+        // Explicit PTY coding still controls output-before-status ordering in
+        // the process service layer; it must not suppress the output drain.
+        //
+        // GNU has no pass limit here; the source must go quiet for the wait to
+        // return. This port keeps the same exit for a ready burst, but bounds
+        // the vacuum so a source that is readable at every pass cannot keep an
+        // already-completed accept from yielding to timers and its caller.
+        // At the default 64 KiB read cap, the bound covers 256 MiB; the
+        // one-byte read-cap burst test still drains its whole 128-byte burst.
+        //
+        // A source left readable past the bound stays in its pipe: the next
+        // accept reads it, exactly like GNU's deferred-output path. At the
+        // default 64 KiB read cap the bound covers 256 MiB, far past a pipe's
+        // usual capacity; a deliberately tiny read cap shrinks the covered
+        // burst, and the rest still waits in the pipe instead of being dropped.
+        if request.needs_minimum_process_drain_before_completion(completion, outcome) {
+            for _ in 0..MAX_MINIMUM_DRAIN_PASSES {
+                if !self
+                    .service_minimum_process_drain(request)?
+                    .has_any_process_activity()
+                {
+                    break;
+                }
+            }
         }
 
         Ok(Some(completion))
+    }
+
+    fn requeued_command_input_for_wait_request(&self, request: &WaitRequest) -> WaitCommandInput {
+        // GNU keyboard.c:12065-12070 is CONSP(Vunread_command_events), not
+        // requeued_events_pending_p (which also includes input-method queues).
+        // The canonical peek preserves dynamic bindings and a nil first event.
+        if request.completes_on_command_input() && self.peek_unread_command_event().is_some() {
+            WaitCommandInput::Requeued
+        } else {
+            WaitCommandInput::None
+        }
     }
 
     /// GNU's `got_some_output = status_notify (NULL, wait_proc)`
@@ -1672,7 +1758,7 @@ impl super::eval::Context {
                 (true, false) => {
                     if self.processes.live_process_ids().is_empty() {
                         WaitBlock::Poller(NotificationsOnly)
-                    } else if self.input_rx.is_some() {
+                    } else if self.input_rx.as_ref().is_some() {
                         // Live process fds we won't service → channel, no spin.
                         WaitBlock::HostInputChannel
                     } else {
@@ -1696,7 +1782,7 @@ impl super::eval::Context {
         }
 
         // No poller (creation failed / headless): explicit degraded fallbacks.
-        if wants_input && self.input_rx.is_some() {
+        if wants_input && self.input_rx.as_ref().is_some() {
             WaitBlock::HostInputChannel
         } else if wants_processes {
             WaitBlock::ProcessOutputSleep

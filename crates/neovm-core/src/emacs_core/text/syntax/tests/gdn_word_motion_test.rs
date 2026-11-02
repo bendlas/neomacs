@@ -47,20 +47,9 @@ fn gnu_word_motion_fixture(name: &str, form: &str, cached: &str) -> String {
     if std::env::var("UPDATE_EXPECT").as_deref() != Ok("1") {
         return cached.trim().to_owned();
     }
-    let emacs = std::env::var_os("NEOVM_FORCE_ORACLE_PATH").unwrap_or_else(|| {
-        std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".local/bin/emacs")
-            .into_os_string()
-    });
     // Campaign refreshes supply the mandatory PID/memory sandbox. A whole
     // nextest driver may also already run inside that sandbox.
-    let mut command = if let Some(sandbox) = std::env::var_os("NEOVM_LISP_SANDBOX") {
-        let mut command = std::process::Command::new(sandbox);
-        command.arg(emacs);
-        command
-    } else {
-        std::process::Command::new(emacs)
-    };
+    let mut command = crate::test_utils::gnu_probe_command();
     let output = command
         .args(["-Q", "--batch", "--eval"])
         .arg(format!("(prin1 {form})"))

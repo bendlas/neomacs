@@ -300,7 +300,8 @@ impl ReplayRuntimeIdentity {
     pub(crate) fn preflight() -> Result<Self, String> {
         let interpreter = resolve_path_executable("python3")?.0;
         let package =
-            prepare_cached_locked_melpa_package(&EmacsRuntime::gnu_emacs(), TIDE_MELPA_PIN)?;
+            prepare_cached_locked_melpa_package(&EmacsRuntime::gnu_emacs(), TIDE_MELPA_PIN)?
+                .into_package_dir();
         let tsserver = DirectExecutable::preflight(
             package.join("tsserver/tsserver.js"),
             Some(Sha256Digest::parse(PINNED_TSSERVER_SHA256)?),
@@ -5178,25 +5179,34 @@ const PRELUDE: &str = r####"
                   failure-recovery))
     (error "Tide unknown scenario: %S" scenario))
   (let ((raw-workspace (getenv "NEOMACS_TEST_WORKSPACE_ROOT"))
-        (raw-sandbox (getenv "NEOMACS_TEST_SANDBOX_ROOT")))
-    (dolist (entry `((:workspace . ,raw-workspace) (:sandbox . ,raw-sandbox)))
-      (unless (and (stringp (cdr entry)) (file-name-absolute-p (cdr entry))
+        (raw-scratch (getenv "NEOMACS_TEST_SCRATCH_ROOT"))
+        (raw-sandbox (getenv "NEOMACS_TEST_SANDBOX_ROOT"))
+        (raw-tmp (getenv "TMPDIR")))
+    (dolist (entry `((:workspace . ,raw-workspace) (:scratch . ,raw-scratch)
+                     (:sandbox . ,raw-sandbox) (:tmp . ,raw-tmp)))
+      (unless (and (stringp (cdr entry)) (not (string-empty-p (cdr entry)))
+                   (file-name-absolute-p (cdr entry))
                    (file-directory-p (cdr entry)))
         (error "Tide unsafe oracle root: %S" entry)))
     (let* ((workspace (file-name-as-directory (file-truename raw-workspace)))
-           (workspace-tmp
-            (file-name-as-directory
-             (file-truename (expand-file-name "tmp" workspace))))
+           (scratch (file-name-as-directory (file-truename raw-scratch)))
            (sandbox (file-name-as-directory (file-truename raw-sandbox)))
+           (tmp (file-name-as-directory (file-truename raw-tmp)))
            (owner (expand-file-name
                    (format "tide368-%s-owner-%s/" scenario (emacs-pid)) sandbox))
            (root (expand-file-name "project space 界/" owner))
            (control (expand-file-name ".tide368/" owner)))
-      (unless (and (string-prefix-p workspace-tmp sandbox)
+      ;; The MELPA harness creates scenario sandboxes under the scratch root
+      ;; (`melpa_cache_root', honoring CARGO_TARGET_DIR), not under
+      ;; <workspace>/tmp.  NEOMACS_TEST_SCRATCH_ROOT is the approval channel
+      ;; for that relocation; the workspace/tmp prefix was only the default
+      ;; layout and refused every relocated target directory.
+      (unless (and (file-in-directory-p sandbox scratch)
+                   (file-in-directory-p tmp scratch)
                    (tide368-test-direct-child-p owner sandbox)
                    (not (file-exists-p owner)))
         (error "Tide refuses owned root allocation: %S"
-               (list workspace-tmp sandbox owner)))
+               (list scratch sandbox tmp owner)))
       (make-directory owner nil)
       (condition-case condition
           (progn
@@ -5383,7 +5393,15 @@ const PRELUDE: &str = r####"
           (plist-put tide368-test-world :environment environment))))
 
 (defun tide368-test-forbidden-external (symbol &rest _arguments)
-  (error "Tide attempted forbidden external boundary: %S" symbol))
+  ;; Name the caller: the boundary trip reports which package function tried
+  ;; to leave the sandbox, so a CI-only occurrence is attributable from the
+  ;; log alone.  The backtrace is best-effort; its failure must not replace
+  ;; the original diagnosis.
+  (error "Tide attempted forbidden external boundary: %S caller-backtrace=%S"
+         symbol
+         (condition-case nil
+             (mapcar (lambda (frame) (nth 1 frame)) (backtrace-frames))
+           (error nil))))
 
 (defun tide368-test-start-file-process
     (original name buffer program &rest arguments)
@@ -5542,6 +5560,20 @@ const PRELUDE: &str = r####"
     (push process tide368-test-owned-processes)
     (setq tide368-test-make-process-result process)))
 
+(defun tide368-test-await-terminal-record (session-index)
+  "Wait for SESSION-INDEX's terminal record to be completely appended.
+The replay adapter writes the READY record with one append; a client that
+checks the ledger at the same moment can observe a trailing partial line
+or none of it.  Wait for the complete record instead of racing the
+writer; the bounded deadline keeps a genuinely missing record fatal."
+  (let ((deadline (+ (float-time) 5.0))
+        record)
+    (while (and (not (setq record
+                           (tide368-test-terminal-record session-index)))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01))
+    record))
+
 (defun tide368-test-delete-process (original process)
   (let ((owned (and (processp process)
                     (memq process tide368-test-owned-processes))))
@@ -5552,7 +5584,7 @@ const PRELUDE: &str = r####"
         (error "Tide rejected an unscoped public delete: %S"
                (list :process process :owned owned
                      :route tide368-test-public-delete-route)))
-      (unless (tide368-test-terminal-record
+      (unless (tide368-test-await-terminal-record
                (process-get process 'tide368-session-index))
         (error "Tide public delete preceded its READY ledger: %S" process))
       (process-put process 'tide368-public-delete t)
@@ -5606,11 +5638,26 @@ const PRELUDE: &str = r####"
     (prog1 (funcall original process message)
       (push record tide368-test-process-terminals))))
 
+(defun tide368-test-no-tscompiler (&rest _arguments)
+  ;; `tide-project-config' shells out to `node tsc --showConfig' through
+  ;; `tide-command-to-string' when it can locate a TypeScript compiler, so
+  ;; whether the host happens to install typescript decides whether the probe
+  ;; tries to leave the sandbox.  The probe is about tide's internal workflow;
+  ;; pin the locater to "no compiler" on every host.  The recorded snapshots
+  ;; are the no-compiler behavior (a developer nix shell has no tsc; the CI
+  ;; image installs one globally).
+  nil)
+
 (defun tide368-test-install-observers ()
   (dolist (symbol tide368-test-forbidden-external-functions)
     (let ((fn (apply-partially #'tide368-test-forbidden-external symbol)))
       (advice-add symbol :override fn)
       (push (cons symbol fn) tide368-test-external-advices)))
+  (advice-add 'tide-locate-tscompiler-executable :override
+              #'tide368-test-no-tscompiler)
+  (push (cons 'tide-locate-tscompiler-executable
+              #'tide368-test-no-tscompiler)
+        tide368-test-external-advices)
   (advice-add 'start-file-process :around #'tide368-test-start-file-process)
   (push (cons 'start-file-process #'tide368-test-start-file-process)
         tide368-test-external-advices)
@@ -5658,19 +5705,34 @@ const PRELUDE: &str = r####"
     (when (or survivors errors)
       (error "Tide observer cleanup failed: %S" (list survivors errors)))))
 
-(defun tide368-test-read-json-lines (path)
+(defun tide368-test-read-json-lines (path &optional allow-partial)
+  "Read PATH's JSONL records.
+The replay adapter appends each record with one write and the client can
+run between that write and its completion, so a poller may observe a
+trailing record without its final newline.  With ALLOW-PARTIAL that
+trailing fragment is ignored (it is retried on the next poll); the final
+validation calls this without ALLOW-PARTIAL and still rejects a truncated
+ledger."
   (let ((bytes (if (file-exists-p path)
                    (let ((coding-system-for-read 'utf-8-unix))
                      (with-temp-buffer
                        (insert-file-contents path)
                        (buffer-string)))
                  "")))
-    (unless (or (string-empty-p bytes) (string-suffix-p "\n" bytes))
+    (when (and (not allow-partial)
+               (not (or (string-empty-p bytes) (string-suffix-p "\n" bytes))))
       (error "Tide JSON ledger lacks final newline: %S" path))
-    (mapcar (lambda (line)
-              (json-parse-string line :object-type 'alist :array-type 'list
-                                 :null-object nil :false-object :json-false))
-            (split-string bytes "\n" t))))
+    (delq nil
+          (mapcar (lambda (line)
+                    (unless (string-empty-p line)
+                      (json-parse-string
+                       line :object-type 'alist :array-type 'list
+                       :null-object nil :false-object :json-false)))
+                  ;; `split-string' leaves the partial trailing fragment as
+                  ;; its last element when the file does not end in a newline
+                  ;; (and "" when it does); `butlast' drops exactly that
+                  ;; fragment.
+                  (butlast (split-string bytes "\n" nil))))))
 
 (defun tide368-test-json-hash-value (key object)
   (gethash key object))
@@ -5953,8 +6015,10 @@ const PRELUDE: &str = r####"
     (_ (error "Tide unknown terminal kind: %S" kind))))
 
 (defun tide368-test-terminal-record (session-index)
+  ;; Polling predicate: a record the adapter is still appending is simply
+  ;; not there yet, so tolerate a partial trailing line.
   (let* ((records (tide368-test-read-json-lines
-                   (plist-get tide368-test-world :trace)))
+                   (plist-get tide368-test-world :trace) t))
          (session (nth (1- session-index)
                        (tide368-test-json-value
                         "sessions" (plist-get tide368-test-world :config-data))))

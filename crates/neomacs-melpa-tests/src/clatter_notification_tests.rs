@@ -2,7 +2,7 @@
 
 use crate::{EmacsRuntime, PreparedPackageSet, workspace_root};
 use neomacs_melpa_test_support::{
-    CLATTER_PIN, clatter_notification::PrivateClatterService, output_with_timeout,
+    CLATTER_PIN, clatter_notification::PrivateClatterService, output_with_timeout_pinned,
 };
 use std::{
     fs,
@@ -20,13 +20,42 @@ fn run_notification_case(
     let service =
         PrivateClatterService::start(&control).expect("start private GNU notification service");
     let script = service.write_client_script(packages).unwrap();
-    let mut runtime = service.configure_runtime(runtime);
+    let mut runtime = runtime;
     for (key, value) in packages.process_environment() {
         runtime = runtime.with_env(key, value);
     }
-    let mut command = runtime.command();
+    let home = control.join("home");
+    let tmp = control.join("tmp");
+    let run = control.join("run");
+    fs::create_dir_all(&home).expect("create clatter scenario HOME");
+    fs::create_dir_all(&tmp).expect("create clatter scenario TMPDIR");
+    fs::create_dir_all(&run).expect("create clatter scenario XDG runtime dir");
+    let environment = neomacs_infra::packages::install::package_environment_with_runtime(
+        &control, &home, &tmp, &run,
+    )
+    .expect("clatter scenario roots must be absolute");
+    let mut command = runtime.command(&environment);
+    // The service's environment restates HOME/TMPDIR at the control roots --
+    // the same values the canonical environment above pins -- and the client
+    // command is already canonically pinned.  Apply the service entries
+    // through the typed statement: pinned names are deliberate overrides,
+    // everything else (the private bus address, the control directory,
+    // RUST_LOG) is an ordinary variable.
+    for (name, value) in service.environment() {
+        match name
+            .to_str()
+            .and_then(neomacs_test_env::CanonicalPin::from_env_name)
+        {
+            Some(pin) => {
+                command.override_pin(pin, value);
+            }
+            None => {
+                command.env(name, value);
+            }
+        }
+    }
     command.args(["--batch", "-Q", "-l"]).arg(script);
-    let output = output_with_timeout(&mut command, Duration::from_secs(90))
+    let output = output_with_timeout_pinned(&mut command, Duration::from_secs(90))
         .unwrap_or_else(|error| panic!("{label} Clatter client: {error:?}; artifacts {control:?}"));
     fs::write(control.join("client.stdout"), &output.stdout).unwrap();
     fs::write(control.join("client.stderr"), &output.stderr).unwrap();

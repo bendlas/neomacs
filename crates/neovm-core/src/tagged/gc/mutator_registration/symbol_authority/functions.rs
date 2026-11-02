@@ -1,11 +1,21 @@
 //! Direct function-cell answers move into owner roots under symbol authority.
 mod call;
+mod constant;
+mod hof;
+mod name;
+pub(crate) use hof::PreparedHofBuiltin;
+mod unary;
+pub(super) use constant::{CallShape, ReturnSubset};
+#[cfg(test)]
+pub(in crate::tagged::gc::mutator_registration) use name::PreparedNameFunction;
+pub(crate) use unary::PreparedUnaryFunction;
 pub(super) mod write;
+use super::intern::OwnerRootIndex;
 use super::*;
 use crate::emacs_core::symbol::FunctionCellSnapshot;
 use crate::tagged::gc::mark_word::MarkWord;
 use crate::tagged::value::TaggedValue as Value;
-pub use call::{FunctionActivation, FunctionCallCache, FunctionStep};
+pub use call::{FunctionActivation, FunctionCallCache, FunctionSelection, FunctionStep};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FunctionError {
@@ -20,6 +30,24 @@ impl From<RegistrationError> for FunctionError {
     fn from(error: RegistrationError) -> Self {
         Self::Authority(error)
     }
+}
+
+/// Both queries copy one snapshot and install their answer under the lease.
+enum FunctionRead {
+    Definition,
+    Boundp,
+}
+
+/// The stopped mixed-input checker shares the exact running parser. The
+/// copied child stays inside symbol authority and never becomes an executor
+/// operand or an owning root in an admission receipt.
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+pub(super) fn frozen_constant(
+    value: Value,
+    lambda: SymId,
+    subset: ReturnSubset,
+) -> Result<Value, FunctionError> {
+    constant::decode(value, lambda, subset)
 }
 
 // Test-only labels for the remaining preparation bodies; no runtime opcode.
@@ -57,12 +85,29 @@ impl<'era> RunAccess<'_, 'era> {
         dst: &mut OwnerRootSlot<'era>,
     ) -> Result<(), FunctionError> {
         globals::check_home(self, dst)?;
-        self.symbol_ref(symbol)?.function_into(dst.index)
+        self.symbol_ref(symbol)?
+            .function_into(OwnerRootIndex::from(&*dst), FunctionRead::Definition)
+    }
+
+    /// Test the direct function cell without resolving aliases or executing it.
+    /// The canonical boolean reaches the resident home before reader release.
+    pub fn sym_fboundp_into(
+        &mut self,
+        symbol: &SymbolHandle,
+        dst: &mut OwnerRootSlot<'era>,
+    ) -> Result<(), FunctionError> {
+        globals::check_home(self, dst)?;
+        self.symbol_ref(symbol)?
+            .function_into(OwnerRootIndex::from(&*dst), FunctionRead::Boundp)
     }
 }
 
 impl SymbolRef<'_, '_, '_> {
-    fn function_into(&mut self, index: usize) -> Result<(), FunctionError> {
+    fn function_into(
+        &mut self,
+        index: OwnerRootIndex,
+        operation: FunctionRead,
+    ) -> Result<(), FunctionError> {
         // The ephemeral token borrows this real lease. It cannot outlive the
         // lease or escape with a cell reference; the snapshot is an owned copy.
         let snapshot = {
@@ -84,6 +129,16 @@ impl SymbolRef<'_, '_, '_> {
             FunctionCellSnapshot::Empty | FunctionCellSnapshot::ExplicitlyUnbound => Value::NIL,
             FunctionCellSnapshot::Bound(_) => return Err(FunctionError::UnsupportedDefinition),
         };
+        let answer = match operation {
+            FunctionRead::Definition => value,
+            FunctionRead::Boundp => {
+                if value.is_nil() {
+                    Value::NIL
+                } else {
+                    Value::T
+                }
+            }
+        };
         // No callback, allocation or safepoint can occur after the copy. The
         // SymbolRef still holds its word while installing the canonical home;
         // even an unexpected stale home returns a total error under that lease.
@@ -92,9 +147,9 @@ impl SymbolRef<'_, '_, '_> {
             .owner
             .local
             .as_mut()
-            .and_then(|local| local.root_scratch.get_mut(index))
+            .and_then(|local| local.root_scratch.get_mut(usize::from(index)))
             .ok_or(RegistrationError::StaleRegistration)?;
-        *dst = MarkWord::of(value);
+        *dst = MarkWord::of(answer);
         Ok(())
     }
 }

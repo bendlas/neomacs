@@ -72,12 +72,32 @@ fn wait_for_file(path: &Path, what: &str, timeout: Duration) {
 }
 
 fn capture(display_env: &[(String, String)], artifacts: &Path, name: &str) -> image::DynamicImage {
+    use std::io::Write as _;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     let output =
         Command::new(std::env::var_os("NEOMACS_GUI_GRIM").unwrap_or_else(|| "grim".into()))
             .arg(artifacts.join(name))
             .envs(display_env.iter().map(|(k, v)| (k.clone(), v.clone())))
             .output()
             .expect("install grim");
+    // A compositor round-trip can take seconds when the output goes idle
+    // between frames; record each capture's submit and completion time so a
+    // slow run's phase timing is reconstructible from the artifacts.
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        - started;
+    if let Ok(mut times) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(artifacts.join("captures.log"))
+    {
+        let _ = writeln!(times, "{started:.6} {elapsed:.3} {name}");
+    }
     assert!(
         output.status.success(),
         "grim: {}",
@@ -176,9 +196,10 @@ fn child_frame_fades_progress_across_presented_frames() {
     let _ = fs::remove_dir_all(&artifacts);
     fs::create_dir(&artifacts).unwrap();
     // The same session the grim-driven close-confirmation suite uses: sway
-    // headless implements the wlr-screencopy protocol grim needs, and the
-    // editor runs on the GL backend there — the software-compatibility mode
-    // this family is deliberately allowed to animate under.
+    // headless implements the wlr-screencopy protocol grim needs, and both
+    // sides composite in software (wlroots' pixman renderer, the editor on
+    // llvmpipe Vulkan) — the software-compatibility mode this family is
+    // deliberately allowed to animate under.
     let session = neomacs_infra::display::start_sway(
         &artifacts,
         r#"
@@ -203,7 +224,8 @@ focus_follows_mouse yes
             .envs(display_env.iter().map(|(k, v)| (k.clone(), v.clone())))
             .env_remove("DISPLAY")
             .env("WINIT_UNIX_BACKEND", "wayland")
-            .env("WGPU_BACKEND", "gl")
+            // The runner image cannot do GL (no EGL screen); see close_confirmation.rs.
+            .env("WGPU_BACKEND", "vulkan")
             .env("NEOMACS_GUI_ANIMATION_STATE_JSON", &state_path)
             .env("NEOMACS_GUI_ANIMATION_SNAPSHOT_JSON", &snapshot_path)
             .env("RUST_LOG", "warn,neomacs_display_runtime=debug")
@@ -370,11 +392,12 @@ focus_follows_mouse yes
     );
     sample_count = resized["sample"].as_u64().unwrap();
     let mut resized_strip = Vec::new();
-    // The crossfade runs 3s; llvmpipe's composited output lags the drawn
-    // state by up to ~1s under sustained animation, so the captures span
-    // the whole window plus a settled tail: the first must still be (nearly)
-    // background, the last must be covered red, and something between must
-    // sit strictly inside the ramp.
+    // The resize slot is a critically damped spring (`default_child_frame_
+    // resize`): at slowdown 20 its omega is sqrt(800)/20 ~ 1.414 rad/s, and
+    // its envelope falls to 1e-3 only after ~6.6s. Most of the mix lands in
+    // the first four seconds, which these captures span: the first must
+    // still be (nearly) background, and something between must sit strictly
+    // inside the ramp.
     for (delay, name) in [
         (300, "resize-1.png"),
         (1200, "resize-2.png"),
@@ -386,6 +409,24 @@ focus_follows_mouse yes
         resized_strip.push(region_mean(&pixels, RESIZE_STRIP));
     }
 
+    // Poll for the crossfade's settled end: the spring keeps creeping after
+    // its steep half, and llvmpipe (and a loaded runner) presents the tail
+    // well after the drawn state, so the last fixed capture can still sit
+    // inside the ramp. The ramp itself is already pinned by the captures
+    // above; this only waits for the endpoint the assertion is about.
+    let resize_background = region_mean(&background_pixels, RESIZE_STRIP);
+    let mut settled_resize = *resized_strip.last().unwrap();
+    let settled_deadline = Instant::now() + Duration::from_secs(20);
+    while settled_resize >= resize_background - 0.5 {
+        assert!(
+            Instant::now() < settled_deadline,
+            "the grown popup must cover the strip once the crossfade ends: {settled_resize} (captures {resized_strip:?})"
+        );
+        thread::sleep(Duration::from_millis(400));
+        let pixels = capture(&display_env, &artifacts, "resize-settled.png");
+        settled_resize = region_mean(&pixels, RESIZE_STRIP);
+    }
+
     let deleted = state_with_phase(
         &state_path,
         sample_count,
@@ -393,9 +434,10 @@ focus_follows_mouse yes
         Duration::from_secs(60),
     );
     sample_count = deleted["sample"].as_u64().unwrap();
-    // Four captures across the 3s close fade: opacity falls, so the region
-    // mean climbs toward the background. Capture cadence (~0.7s including
-    // the compositor round-trip) resolves the ramp at this length.
+    // Three captures across the 3s close fade (a 150ms tween at slowdown
+    // 20): opacity falls, so the region mean climbs toward the background.
+    // Capture cadence (~0.8s including the compositor round-trip) resolves
+    // the ramp at this length.
     let mut fading_strip = Vec::new();
     for name in ["fade-1.png", "fade-2.png", "fade-3.png"] {
         // Space the captures along the 3s ramp: when the compositor
@@ -585,8 +627,8 @@ focus_follows_mouse yes
     );
 
     // --- Close fade: strictly brightening toward the background. The
-    // series itself is the ramp: at +0.3s an ease-out-quad over 3s is
-    // already ~19% through (alpha ~0.81), so the first mean is expected
+    // series itself is the ramp: at +0.8s an ease-out-quad over 3s is
+    // already ~46% through (alpha ~0.54), so the first mean is expected
     // above the settled popup's, and every later one rises.
     assert!(
         fading.windows(2).all(|pair| pair[1] > pair[0]),
@@ -594,7 +636,7 @@ focus_follows_mouse yes
     );
     assert!(
         fading[0] > full + 0.01,
-        "close fade must have visibly started by 0.3s: {} vs full {full:.3}",
+        "close fade must have visibly started by the first capture: {} vs full {full:.3}",
         fading[0]
     );
     assert!(
@@ -638,9 +680,8 @@ focus_follows_mouse yes
         resized_strip[0]
     );
     assert!(
-        *resized_strip.last().unwrap() < background - 0.5,
-        "the grown popup must cover the strip once the crossfade ends: {}",
-        resized_strip.last().unwrap()
+        settled_resize < resize_background - 0.5,
+        "the grown popup must cover the strip once the crossfade ends: {settled_resize} vs background {resize_background}"
     );
     assert!(
         resized_strip
@@ -656,15 +697,14 @@ focus_follows_mouse yes
     let crossfade_mixes: Vec<f64> = log
         .lines()
         .skip(crossfade_start)
-        .filter(|line| line.contains("render_child_frame_start"))
+        .filter(|line| line.contains("render_child_frame_crossfade"))
         .take_while(|line| !line.contains("compositor_remove"))
         .filter_map(|line| {
-            line.split("alpha=")
+            line.split("mix=")
                 .nth(1)
                 .and_then(|rest| rest.split_whitespace().next())
                 .and_then(|value| value.trim_end_matches(',').parse::<f64>().ok())
         })
-        .filter(|alpha| *alpha < 1.0)
         .collect();
     assert!(
         crossfade_mixes.len() >= 3,
@@ -678,6 +718,14 @@ focus_follows_mouse yes
         *crossfade_mixes.first().unwrap() < 0.5,
         "the crossfade must start near the old picture: first {}",
         crossfade_mixes.first().unwrap()
+    );
+    // ...and end on the new picture: the last drawn mix is within one
+    // frame of the endpoint, so the ramp reaches opacity rather than
+    // stalling halfway between the two pictures.
+    assert!(
+        *crossfade_mixes.last().unwrap() > 0.9,
+        "the crossfade must reach the new picture: last {}",
+        crossfade_mixes.last().unwrap()
     );
 
     // --- Pruned: the popup is gone; the region reads as plain background ---

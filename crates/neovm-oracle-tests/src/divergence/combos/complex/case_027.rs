@@ -188,11 +188,10 @@ fn div_cx27_set_buffer_multibyte_overlay_text_prop_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx27_window_buffer_marker_point_interaction() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (5 5 5 1)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((buf (get-buffer-create " *neo-cx27-wb*")))
@@ -205,7 +204,7 @@ fn div_cx27_window_buffer_marker_point_interaction() {
     (prog1 (list wp bp (window-point) (point))
       (set-window-buffer (selected-window) (get-buffer-create "*scratch*"))
       (kill-buffer buf)))
-"##,
+)"##,
         expect,
     );
 }
@@ -242,11 +241,12 @@ fn div_cx27_coding_system_for_write_does_not_propagate() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx27_undo_redo_multiple_boundaries_precise() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((\"AAA\" \"AAABBB\" \"AAABBBCCC\" \"AAABBBCCCDDD\") \"AAABBBCCC\" nil)""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (with-temp-buffer
@@ -264,7 +264,7 @@ fn div_cx27_undo_redo_multiple_boundaries_precise() {
               (while t (redo) (push (buffer-string) redo-states))
             (error))
           (list forward after-undo (nreverse redo-states))))))
-"##,
+)"##,
         expect,
     );
 }
@@ -277,9 +277,16 @@ fn div_cx27_process_buffer_string_after_multiple_writes() {
     let form = r##"
 (let ((buf (get-buffer-create " *neo-cx27-pb*")))
   (with-current-buffer buf (erase-buffer))
-  (let ((p (make-process :name "neo-cx27-pb" :command '("printf" "%s" "hello\nworld")
-                         :buffer buf)))
+  (let* ((ready (make-temp-file "neo-cx27-pb-gate-"))
+         (p (make-process :name "neo-cx27-pb"
+                          :command (append (list "sh" "-c"
+                                                 "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                                 "sh" ready)
+                                           '("printf" "%s" "hello\nworld"))
+                          :buffer buf)))
     (set-process-query-on-exit-flag p nil)
+    ;; The child writes only after READY is deleted, while this form is waiting.
+    (delete-file ready)
     (neovm--oracle-settle-process p))
   (prog1 (with-current-buffer buf
            (list (buffer-string) (count-lines 1 (point-max))))

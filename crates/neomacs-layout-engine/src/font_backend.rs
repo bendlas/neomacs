@@ -27,6 +27,8 @@ mod windows;
 pub use linux::FontconfigBackend;
 #[cfg(target_os = "macos")]
 pub use macos::CoreTextBackend;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::ProcessFontRegistration;
 #[cfg(windows)]
 pub use windows::DirectWriteBackend;
 
@@ -523,6 +525,29 @@ pub enum FontDriverMatch {
 }
 
 pub trait FontBackend: Send {
+    #[cfg(test)]
+    fn test_catalog(&self) -> crate::font::metrics::test_catalog::TestFontCatalogSource {
+        crate::font::metrics::test_catalog::TestFontCatalogSource::System
+    }
+
+    #[cfg(test)]
+    fn test_foundry_for_file(&self, file: &str) -> Option<String> {
+        match self.test_catalog() {
+            crate::font::metrics::test_catalog::TestFontCatalogSource::System => {
+                #[cfg(target_os = "linux")]
+                return crate::font::fontconfig::foundry_for_file(file);
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = file;
+                    None
+                }
+            }
+            crate::font::metrics::test_catalog::TestFontCatalogSource::Fixture(catalog) => {
+                catalog.foundry_for_file(file)
+            }
+        }
+    }
+
     fn match_font_spec(&self, query: &FontCandidateQuery) -> FontDriverMatch {
         FontDriverMatch::Enumerated(self.list_candidates(query))
     }
@@ -552,6 +577,22 @@ pub trait FontBackend: Send {
     /// may filter by coverage but must not score weight/slant/spacing; that is
     /// [`crate::font::resolver::FontResolver`]'s responsibility.
     fn list_candidates(&self, query: &FontCandidateQuery) -> Vec<FontCandidate>;
+
+    /// Enumerate only an already chosen identity, without selecting a family
+    /// substitute. Native adapters can discard unrelated catalog entries
+    /// before opening files to establish their renderer identities.
+    /// Matching follows `ResolvedFontIdentity` equality (the stable key);
+    /// diagnostic PostScript names or backend provenance must not narrow it.
+    fn list_candidates_for_identity(
+        &self,
+        query: &FontCandidateQuery,
+        identity: &ResolvedFontIdentity,
+    ) -> Vec<FontCandidate> {
+        self.list_candidates(query)
+            .into_iter()
+            .filter(|candidate| candidate.matched.identity == *identity)
+            .collect()
+    }
 
     /// Enrich the selected candidate into an exact renderer identity.
     ///

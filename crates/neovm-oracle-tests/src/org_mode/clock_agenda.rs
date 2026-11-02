@@ -55,12 +55,11 @@ DEADLINE: <2026-05-28 Thu>
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clock_three_project_report_edit_add_remove_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 60 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -121,7 +120,7 @@ fn org_clock_three_project_report_edit_add_remove_deep() {
                           (buffer-substring-no-properties
                            (point-min) (point-max))))))))))
       (when (get-file-buffer file) (kill-buffer (get-file-buffer file)))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
@@ -312,12 +311,13 @@ fn org_clock_cancel_history_goto_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clock_resolve_open_clock_ranges_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"Open\" 0 4 (:clock-mins 20)) 20) (#(\"Closed\" 0 6 (:clock-mins 45)) 45)) 45 \"* TODO Open\\nCLOCK: [2026-05-27 Wed 09:00]--[2026-05-27 Wed 09:20] =>  0:20\\n* TODO Closed\\nCLOCK: [2026-05-27 Wed 08:00]--[2026-05-27 Wed 08:45] =>  0:45\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -346,18 +346,19 @@ fn org_clock_resolve_open_clock_ranges_combo() {
         (list (nreverse props)
               (org-clock-sum-current-item "2026-05-27")
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clocktable_shift_special_range_regenerate_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
+    let expect = expect_test::expect![[
+        r##""OK (((\"<2026-05-27 Wed 00:00>\" \"<2026-05-28 Thu 00:00>\" \"Wednesday, May 27, 2026\") (\"<2026-05-26 Tue 00:00>\" \"<2026-05-27 Wed 00:00>\" \"Tuesday, May 26, 2026\") (\"<2026-05-27 Wed 00:00>\" \"<2026-05-28 Thu 00:00>\" \"Wednesday, May 27, 2026\") (\"<2026-05-01 Fri 00:00>\" \"<2026-06-01 Mon 00:00>\" \"May 2026\") (\"<2026-05-25 Mon 00:00>\" \"<2026-06-01 Mon 00:00>\" \"week 2026-W22\") (\"<2026-04-01 Wed 00:00>\" \"<2026-07-01 Wed 00:00>\" \"2nd quarter of 2026\")) ((month-05 \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\" (t t t t t t t t) \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for May 2026.\\n| Tags          | Headline     |   Time |\\n|---------------+--------------+--------|\\n|               | *Total time* | *4:50* |\\n|---------------+--------------+--------|\\n| billable      | Client       |   4:30 |\\n| billable, dev | \\\\_  Alpha    |   1:30 |\\n| billable, qa  | \\\\_  Beta     |   1:15 |\\n| billable, ops | \\\\_  Gamma    |   1:45 |\\n| admin         | Internal     |   0:20 |\\n| admin         | \\\\_  Planning |   0:20 |\\n#+END:\") (month-06 \"#+BEGIN: clocktable :scope file :block 2026-06 :maxlevel 4 :link nil :compact t :tags t\" (nil nil nil nil nil nil nil nil) \"#+BEGIN: clocktable :scope file :block 2026-06 :maxlevel 4 :link nil :compact t :tags t\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for June 2026.\\n| Tags | Headline     | Time   |\\n|------+--------------+--------|\\n|      | *Total time* | *0:00* |\\n#+END:\") (month-07 \"#+BEGIN: clocktable :scope file :block 2026-07 :maxlevel 4 :link nil :compact t :tags t\" (nil nil nil nil nil nil nil nil) \"#+BEGIN: clocktable :scope file :block 2026-07 :maxlevel 4 :link nil :compact t :tags t\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for July 2026.\\n| Tags | Headline     | Time   |\\n|------+--------------+--------|\\n|      | *Total time* | *0:00* |\\n#+END:\") (back-05 \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\" (t t t t t t t t) \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for May 2026.\\n| Tags          | Headline     |   Time |\\n|---------------+--------------+--------|\\n|               | *Total time* | *4:50* |\\n|---------------+--------------+--------|\\n| billable      | Client       |   4:30 |\\n| billable, dev | \\\\_  Alpha    |   1:30 |\\n| billable, qa  | \\\\_  Beta     |   1:15 |\\n| billable, ops | \\\\_  Gamma    |   1:45 |\\n| admin         | Internal     |   0:20 |\\n| admin         | \\\\_  Planning |   0:20 |\\n#+END:\") (month \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\" (t t t t t t t t) \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for May 2026.\\n| Tags          | Headline     |   Time |\\n|---------------+--------------+--------|\\n|               | *Total time* | *4:50* |\\n|---------------+--------------+--------|\\n| billable      | Client       |   4:30 |\\n| billable, dev | \\\\_  Alpha    |   1:30 |\\n| billable, qa  | \\\\_  Beta     |   1:15 |\\n| billable, ops | \\\\_  Gamma    |   1:45 |\\n| admin         | Internal     |   0:20 |\\n| admin         | \\\\_  Planning |   0:20 |\\n#+END:\")) \"#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for May 2026.\\n| Tags          | Headline     |   Time |\\n|---------------+--------------+--------|\\n|               | *Total time* | *4:50* |\\n|---------------+--------------+--------|\\n| billable      | Client       |   4:30 |\\n| billable, dev | \\\\_  Alpha    |   1:30 |\\n| billable, qa  | \\\\_  Beta     |   1:15 |\\n| billable, ops | \\\\_  Gamma    |   1:45 |\\n| admin         | Internal     |   0:20 |\\n| admin         | \\\\_  Planning |   0:20 |\\n#+END:\\n\\n* Client :billable:\\n** TODO Alpha :dev:\\nCLOCK: [2026-05-27 Wed 09:00]--[2026-05-27 Wed 10:30] =>  1:30\\n** TODO Beta :qa:\\nCLOCK: [2026-05-28 Thu 11:00]--[2026-05-28 Thu 12:15] =>  1:15\\n** TODO Gamma :ops:\\nCLOCK: [2026-05-29 Fri 13:00]--[2026-05-29 Fri 14:45] =>  1:45\\n* Internal :admin:\\n** TODO Planning\\nCLOCK: [2026-05-27 Wed 16:00]--[2026-05-27 Wed 16:20] =>  0:20\\n\")""##
+    ]];
+    crate::common::assert_oracle_parity_frozen_time_expect(
         r##"(progn
   (require 'org)
   (require 'org-clock)
@@ -365,7 +366,7 @@ fn org_clocktable_shift_special_range_regenerate_combo() {
     (let ((org-extend-today-until 0)
           (org-clock-clocktable-default-properties nil))
       (org-mode)
-      (insert "#+BEGIN: clocktable :scope file :block 2026-05-27 :maxlevel 4 :link nil :compact t :tags t\n")
+      (insert "#+BEGIN: clocktable :scope file :block 2026-05 :maxlevel 4 :link nil :compact t :tags t\n")
       (insert "#+END:\n\n")
       (insert "* Client :billable:\n")
       (insert "** TODO Alpha :dev:\n")
@@ -400,19 +401,19 @@ fn org_clocktable_shift_special_range_regenerate_combo() {
             states)
         (goto-char (point-min))
         (org-update-dblock)
-        (push (funcall snapshot 'day-27) states)
+        (push (funcall snapshot 'month-05) states)
         (goto-char (point-min))
         (org-clocktable-shift 'right 1)
-        (push (funcall snapshot 'day-28) states)
+        (push (funcall snapshot 'month-06) states)
         (goto-char (point-min))
         (org-clocktable-shift 'right 1)
-        (push (funcall snapshot 'day-29) states)
+        (push (funcall snapshot 'month-07) states)
         (goto-char (point-min))
         (org-clocktable-shift 'left 2)
-        (push (funcall snapshot 'back-27) states)
+        (push (funcall snapshot 'back-05) states)
         (goto-char (point-min))
         (search-forward ":block")
-        (delete-region (point) (progn (forward-word 1) (point)))
+        (delete-region (point) (progn (skip-chars-forward " ") (skip-chars-forward "^ ") (point)))
         (insert " 2026-05")
         (goto-char (point-min))
         (org-update-dblock)
@@ -424,7 +425,7 @@ fn org_clocktable_shift_special_range_regenerate_combo() {
                         "2026-W22" "2026-Q2"))
               (nreverse states)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -644,13 +645,14 @@ fn org_clock_interrupt_resume_state_history_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clocktable_agenda_custom_formatter_regenerate_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable file-a)""#]];
-    crate::common::assert_oracle_parity_expect(
+    let expect = expect_test::expect![[
+        r##""OK (((170 agenda 2026-05-27 4 \"+billable\" t ((\"<root>/alpha.org\" 120 3 ((1 \"Client\" (\"billable\") nil 120 nil) (2 \"Build\" (\"billable\" \"dev\") nil 90 nil) (2 \"Review\" (\"billable\" \"review\") nil 30 nil))) (\"<root>/beta.org\" 40 2 ((1 \"Client\" (\"billable\") nil 40 nil) (2 \"Test\" (\"billable\" \"qa\") nil 40 nil)))))) ((170 agenda 2026-05-27 4 \"+billable\" t ((\"<root>/alpha.org\" 120 3 ((1 \"Client\" (\"billable\") nil 120 nil) (2 \"Build\" (\"billable\" \"dev\") nil 90 nil) (2 \"Review\" (\"billable\" \"review\") nil 30 nil))) (\"<root>/beta.org\" 70 2 ((1 \"Client\" (\"billable\") nil 70 nil) (2 \"Test\" (\"billable\" \"qa\") nil 70 nil)))))) \"#+TITLE: Clock Rollup\\n#+BEGIN: clocktable :scope agenda :block 2026-05-27 :maxlevel 4 :link nil :tags t :timestamp t :match \\\"+billable\\\" :formatter probe-clock-formatter\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for Wednesday, May 27, 2026.\\n| File      | Timestamp | Tags             | Headline     | Time   |      |\\n|-----------+-----------+------------------+--------------+--------+------|\\n|           | ALL       |                  | *Total time* | *2:40* |      |\\n|-----------+-----------+------------------+--------------+--------+------|\\n| alpha.org |           |                  | *File time*  | *2:00* |      |\\n|           |           | billable         | Client       | 2:00   |      |\\n|           |           | billable, dev    | \\\\_  Build    |        | 1:30 |\\n|           |           | billable, review | \\\\_  Review   |        | 0:30 |\\n|-----------+-----------+------------------+--------------+--------+------|\\n| beta.org  |           |                  | *File time*  | *0:40* |      |\\n|           |           | billable         | Client       | 0:40   |      |\\n|           |           | billable, qa     | \\\\_  Test     |        | 0:40 |\\n#+END:\\n\" \"#+TITLE: Clock Rollup\\n#+BEGIN: clocktable :scope agenda :block 2026-05-27 :maxlevel 4 :link nil :tags t :timestamp t :match \\\"+billable\\\" :formatter probe-clock-formatter\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for Wednesday, May 27, 2026.\\n| File      | Timestamp | Tags             | Headline     | Time   |      |\\n|-----------+-----------+------------------+--------------+--------+------|\\n|           | ALL       |                  | *Total time* | *3:10* |      |\\n|-----------+-----------+------------------+--------------+--------+------|\\n| alpha.org |           |                  | *File time*  | *2:00* |      |\\n|           |           | billable         | Client       | 2:00   |      |\\n|           |           | billable, dev    | \\\\_  Build    |        | 1:30 |\\n|           |           | billable, review | \\\\_  Review   |        | 0:30 |\\n|-----------+-----------+------------------+--------------+--------+------|\\n| beta.org  |           |                  | *File time*  | *1:10* |      |\\n|           |           | billable         | Client       | 1:10   |      |\\n|           |           | billable, qa     | \\\\_  Test     |        | 1:10 |\\n#+END:\\n\" (\"<root>/alpha.org\" 120 3))""##
+    ]];
+    crate::common::assert_oracle_parity_frozen_time_expect(
         r##"(progn
   (require 'org)
   (require 'org-clock)
@@ -742,10 +744,11 @@ fn org_clocktable_agenda_custom_formatter_regenerate_combo() {
                              (point-min) (point-max))))
                           (direct
                            (let ((table
-                                  (org-clock-get-table-data
-                                   file-a
-                                   '(:block "2026-05-27" :match "+billable"
-                                     :maxlevel 4 :tags t :timestamp t))))
+                                  (with-current-buffer (find-file-noselect file-a)
+                                    (org-clock-get-table-data
+                                     file-a
+                                     '(:block "2026-05-27" :match "+billable"
+                                       :maxlevel 4 :tags t :timestamp t)))))
                              (list (nth 0 table)
                                    (nth 1 table)
                                    (length (nth 2 table))))))
@@ -769,7 +772,7 @@ fn org_clocktable_agenda_custom_formatter_regenerate_combo() {
                                (nreverse formatter-calls)
                                first
                                second
-                               direct))))))))))
+                               direct))))))))
       (dolist (file (list file-a file-b))
         (when (get-file-buffer file) (kill-buffer (get-file-buffer file))))
       (when (file-directory-p root) (delete-directory root t)))))"##,
@@ -847,12 +850,13 @@ fn org_clock_get_table_data_multi_file_deep_state_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clock_log_agenda_timestamp_filter_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable agenda-text)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (3 (\"10:30\" \"12:30\" \"15:00\") \"Day-agenda (W22):\\nWednesday  27 May 2026\\n               8:00...... ----------------\\n  tasks:       9:00-10:30 Clocked:   (1:30) TODO Alpha\\n              10:00...... ----------------\\n  tasks:      11:00-12:30 Clocked:   (1:30) TODO Beta\\n              12:00...... ----------------\\n  tasks:      14:00-15:00 Clocked:   (1:00) TODO Alpha\\n              14:00...... ----------------\\n              16:00...... ----------------\\n              18:00...... ----------------\\n              20:00...... ----------------\\n  tasks:      Scheduled:  TODO Alpha\\n  tasks:      Scheduled:  TODO Beta\\n| File      | Headline         | Time   |\\n|-----------+------------------+--------|\\n|           | ALL *Total time* | *4:00* |\\n|-----------+------------------+--------|\\n| tasks.org | *File time*      | *4:00* |\\n|           | [[file:<root>/tasks.org::*Alpha][Alpha]]            | 2:30   |\\n|           | [[file:<root>/tasks.org::*Beta][Beta]]             | 1:30   |\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -864,7 +868,7 @@ fn org_clock_log_agenda_timestamp_filter_deep_state_combo() {
          (org-agenda-span 'day)
          (org-agenda-start-day "2026-05-27")
          (org-agenda-start-on-weekday nil)
-         (org-agenda-show-log t)
+         (org-agenda-start-with-log-mode '(clock))
          (org-agenda-log-mode-items '(clock)))
     (unwind-protect
         (progn
@@ -881,11 +885,11 @@ fn org_clock_log_agenda_timestamp_filter_deep_state_combo() {
             (insert "CLOCK: [2026-05-27 Wed 11:00]--[2026-05-27 Wed 12:30] =>  1:30\n")
             (insert ":END:\n"))
           ;; Clock report mode
-          (let ((org-agenda-clockreport-mode t)
+          (let ((org-agenda-start-with-clockreport-mode t)
                 (org-agenda-clock-reporting-file file))
             (org-agenda-list nil "2026-05-27" 1)
             (with-current-buffer org-agenda-buffer-name
-              (let ((agenda-text (replace-regexp-in-string
+              (let* ((agenda-text (replace-regexp-in-string
                                   (regexp-quote root) "<root>"
                                   (buffer-substring-no-properties
                                    (point-min) (point-max))))
@@ -904,7 +908,7 @@ fn org_clock_log_agenda_timestamp_filter_deep_state_combo() {
                            (setq s (match-end 0))))))
                 (list clock-count
                       (nreverse times)
-                      agenda-text))))))
+                      agenda-text)))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
       (delete-directory root t))))"##,
@@ -968,12 +972,11 @@ fn org_clock_report_custom_columns_deep_state_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clock_agenda_filter_tag_effort_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 57 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1031,17 +1034,16 @@ fn org_clock_agenda_filter_tag_effort_deep_state_combo() {
                     (list initial work-filter effort-filter clock-count))))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clock_agenda_multi_file_scope_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 46 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1088,7 +1090,7 @@ fn org_clock_agenda_multi_file_scope_deep_state_combo() {
             (list (nth 1 table-a) rows-a (nth 1 table-b) rows-b))))
       (dolist (f (list file-a file-b))
         (when (get-file-buffer f) (kill-buffer (get-file-buffer f))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
@@ -1153,12 +1155,11 @@ fn org_clock_logbook_edit_report_table_deep() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clock_multi_task_report_edit_recompute_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 56 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1215,7 +1216,7 @@ fn org_clock_multi_task_report_edit_recompute_deep() {
                           (buffer-substring-no-properties
                            (point-min) (point-max))))))))))
       (when (get-file-buffer file) (kill-buffer (get-file-buffer file)))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }

@@ -164,11 +164,10 @@ fn div_cx67_bool_vector_bit_ops_and_length() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx67_sxhash_equal_p_equal_hash() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 13 46)""#]];
+    let expect = expect_test::expect![[r#""OK (t t t (t t t) (t t) nil)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((s1 "hello")
@@ -180,10 +179,19 @@ fn div_cx67_sxhash_equal_p_equal_hash() {
   (list (= (sxhash-equal s1) (sxhash-equal s2))
         (= (sxhash-equal v1) (sxhash-equal v2))
         (= (sxhash-equal l1) (sxhash-equal l2))
-        (sxhash-eq 'sym)
-        (sxhash-eql 1.5)
-        (= (sxhash-eql 1) (sxhash-eql 1.0)))))
-"##,
+        ;; GNU's sxhash-eq hashes heap identity (ASLR moves the value
+        ;; between runs); the contract, which is what hash tables rely on,
+        ;; is same-object-same-hash and a fixnum answer.
+        (let ((h (sxhash-eq 'sym)))
+          (list (equal h (sxhash-eq 'sym))
+                (equal h (sxhash-eq (intern "sym")))
+                (fixnump h)))
+        ;; sxhash-eql's flonum encoding is host defined, so assert its
+        ;; contract rather than one build's number.
+        (let ((h (sxhash-eql 1.5)))
+          (list (equal h (sxhash-eql 1.5))
+                (fixnump h)))
+        (= (sxhash-eql 1) (sxhash-eql 1.0))))"##,
         expect,
     );
 }

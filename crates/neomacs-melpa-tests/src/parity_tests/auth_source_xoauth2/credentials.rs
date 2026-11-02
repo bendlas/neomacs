@@ -70,16 +70,34 @@ fn auth_source_xoauth2_file_creds_uses_exact_hash_table_tuple() -> ParityBatchCa
 fn auth_source_xoauth2_file_creds_requires_gpg_extension() -> ParityBatchCase {
     ParityBatchCase::value(
         "auth_source_xoauth2_file_creds_requires_gpg_extension",
-        r##"(mapcar
-         (lambda (name)
-           (auth-source-xoauth2-test-error-data
-            (lambda ()
-              (auth-source-xoauth2--file-creds
-               name "host" "user" "port"))))
-         '("/fixture/creds.el"
-           "/fixture/creds.gpg~"
-           "/fixture/no-extension"
-           "/fixture/GPG"))"##,
+        r##"(progn
+         (require 'cl-lib)
+         (require 'epg)
+         ;; The decryption attempt reaches GnuPG through `epg', and its
+         ;; failure text is a property of the host build (a host with no
+         ;; gpg reports `no usable configuration', the CI image's gpg
+         ;; reports `Can't decrypt, Exit').  Binding `epg-gpg-program' does
+         ;; not own that: `epg-context--make' asks `epg-find-configuration',
+         ;; which returns a configuration cached by an earlier probe in this
+         ;; shared process and otherwise searches $PATH itself.  Clear the
+         ;; cache and make gpg/gpg2 invisible for this probe, so the
+         ;; recorded no-GnuPG contract is reproduced on every host.
+         (setq epg--configurations nil)
+         (let ((executable-find-original (symbol-function 'executable-find)))
+           (cl-letf (((symbol-function 'executable-find)
+                      (lambda (program &optional remote)
+                        (unless (member program '("gpg" "gpg2"))
+                          (funcall executable-find-original program remote)))))
+             (mapcar
+              (lambda (name)
+                (auth-source-xoauth2-test-error-data
+                 (lambda ()
+                   (auth-source-xoauth2--file-creds
+                    name "host" "user" "port"))))
+              '("/fixture/creds.el"
+                "/fixture/creds.gpg~"
+                "/fixture/no-extension"
+                "/fixture/GPG")))))"##,
         expect![[
             r#"OK ((:error error ("The auth-source-xoauth2-creds file must be GPG encrypted")) (:ok "GPG error: \"no usable configuration\", OpenPGP") (:error error ("The auth-source-xoauth2-creds file must be GPG encrypted")) (:error error ("The auth-source-xoauth2-creds file must be GPG encrypted")))"#
         ]],

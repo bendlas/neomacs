@@ -1,12 +1,13 @@
 //! File loading and module system (require/provide/load).
 
 use super::builtins::collections::builtin_make_hash_table;
-use super::error::{EvalError, Flow, FlowRef, map_flow, signal};
+use super::error::{EvalError, Flow, FlowRef, signal};
 use super::intern::{format_symbol_name_for_diagnostic, intern, resolve_sym};
 use super::keymap::is_list_keymap;
+use super::print::map_flow;
 use super::value::{Value, ValueKind, VecLikeType, list_to_vec};
 use super::value_reader::ReadSymbolShorthands;
-use crate::emacs_core::error::LispCondition;
+use crate::emacs_core::error::{LispCondition, signal_error_with_arg};
 use crate::emacs_core::eval::VariableView;
 use crate::emacs_core::symbol::CanonicalAccess;
 use crate::heap_types::LispString;
@@ -18,6 +19,32 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
+
+/// The last bootstrap failure rendered while its evaluator heap was alive.
+///
+/// A bootstrap `EvalError::Signal` names heap strings that die with the failed
+/// evaluator, so a caller must not walk its payload afterwards. Diagnostic
+/// callers (the test bootstrap helper) take this pre-teardown rendering
+/// instead. Test-only: production callers render at the failure site into
+/// their own log.
+#[cfg(test)]
+static BOOTSTRAP_FAILURE_RENDERING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn record_bootstrap_failure_rendering(rendered: &str) {
+    if let Ok(mut slot) = BOOTSTRAP_FAILURE_RENDERING.lock() {
+        *slot = Some(rendered.to_string());
+    }
+}
+
+/// Take the last pre-teardown bootstrap failure rendering (test support).
+#[cfg(test)]
+pub(crate) fn take_bootstrap_failure_rendering() -> Option<String> {
+    BOOTSTRAP_FAILURE_RENDERING
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
 
 fn load_string_text(value: &Value) -> Option<String> {
     // Used for error display, loaddefs file-name filtering and symbol-name
@@ -303,11 +330,11 @@ fn format_eval_error_in_state(eval: &super::eval::Context, err: &EvalError) -> S
             ..
         } => {
             let payload = if let Some(raw) = raw_data {
-                crate::emacs_core::error::print_value_in_state(eval, raw)
+                crate::emacs_core::print::print_value_in_state(eval, raw)
             } else if data.is_empty() {
                 "nil".to_string()
             } else {
-                crate::emacs_core::error::print_value_in_state(eval, &Value::list(data.clone()))
+                crate::emacs_core::print::print_value_in_state(eval, &Value::list(data.clone()))
             };
             format!(
                 "({} {})",
@@ -317,8 +344,8 @@ fn format_eval_error_in_state(eval: &super::eval::Context, err: &EvalError) -> S
         }
         EvalError::UncaughtThrow { tag, value, .. } => format!(
             "(throw {} {})",
-            crate::emacs_core::error::print_value_in_state(eval, tag),
-            crate::emacs_core::error::print_value_in_state(eval, value),
+            crate::emacs_core::print::print_value_in_state(eval, tag),
+            crate::emacs_core::print::print_value_in_state(eval, value),
         ),
         EvalError::Shutdown(request) => format!("(kill-emacs {})", request.exit_code),
     }
@@ -680,13 +707,16 @@ impl LoadSuffixPlan {
             .value_by_name("jka-compr-load-suffixes")
             .unwrap_or(Value::NIL);
 
+        // GNU tests BOTH module suffixes here (MODULES_SUFFIX and, on darwin,
+        // MODULES_SECONDARY_SUFFIX), src/lread.c:971-979.
+        let module_suffixes = super::lread::module_suffixes();
         let mut required = Vec::with_capacity(suffixes.len() * representations.len());
         for suffix in &suffixes {
             for representation in &representations {
                 // GNU Fget_load_suffixes does not try compressed dynamic
                 // modules when the representation comes from jka-compr.
                 if !representation.is_empty()
-                    && suffix.ends_with(std::env::consts::DLL_SUFFIX.as_bytes())
+                    && module_suffixes.matches(suffix)
                     && super::builtins::builtin_member(vec![
                         Value::heap_string(LispString::from_unibyte(representation.clone())),
                         compressed_representations,
@@ -1991,7 +2021,7 @@ fn streaming_readevalloop_lisp_source(
         source: content_value,
         eof_source,
         pos: 0,
-        shorthands: shorthands.cloned(),
+        shorthands: super::eval::LoadReadShorthands::Snapshot(shorthands.cloned()),
     });
 
     let load_specpdl_base = eval.specpdl.len();
@@ -2388,21 +2418,27 @@ pub(crate) fn load_file_with_requested_and_found_options(
         .count();
     if load_count > 3 {
         let found_value = Value::heap_string(found.clone());
+        // `Vloads_in_progress` is a cons list: `Vloads_in_progress =
+        // Fcons (found, Vloads_in_progress)` (src/lread.c:1314) puts the
+        // most recent load at the head, while this Vec appends the newest
+        // last. Walk it backwards so the signal data lists the stack in
+        // GNU's order.
         let in_progress = Value::list(
             eval.loads_in_progress
                 .iter()
+                .rev()
                 .cloned()
                 .map(Value::heap_string)
                 .collect(),
         );
-        return Err(EvalError::signal(
-            intern("error"),
-            vec![
-                Value::string("Recursive load"),
-                Value::cons(found_value, in_progress),
-            ],
-            None,
-        ));
+        // GNU passes `Fcons (found, Vloads_in_progress)` to `signal_error`,
+        // which splices a proper list into the signal data
+        // (src/eval.c:2105-2111).  Nested data would make `(cadr err)` a
+        // list instead of the found filename.
+        return Err(map_flow(signal_error_with_arg(
+            "Recursive load",
+            Value::cons(found_value, in_progress),
+        )));
     }
     // Both pieces of load bookkeeping ride the specpdl, mirroring GNU
     // lread.c Fload (`record_unwind_protect (record_load_unwind, ...)` +
@@ -2761,7 +2797,7 @@ fn load_file_body(
 
     if is_module_path(path) {
         return crate::emacs_core::dynamic_module::load_module(eval, path.to_path_buf())
-            .map_err(crate::emacs_core::error::map_flow);
+            .map_err(crate::emacs_core::print::map_flow);
     }
 
     if !is_elc
@@ -2780,7 +2816,7 @@ fn load_file_body(
                     Value::bool_val(options.messages.as_nomessage()),
                 ],
             )
-            .map_err(crate::emacs_core::error::map_flow);
+            .map_err(crate::emacs_core::print::map_flow);
     }
 
     // GNU src/lread.c:1473, reached only once `load-source-file-function` has
@@ -5180,6 +5216,12 @@ fn normalize_bootstrap_runtime_surface(
         if is_gnu_preloaded_syntax_symbol(name) {
             continue;
         }
+        // GNU's initial obarray keeps every DEFSYM even when loadup's source
+        // surface for it is gone: C holds the symbol as a static, and
+        // `Funintern` never runs on it during dump construction.
+        if crate::emacs_core::intern::WellKnown::is_table_id(id) {
+            continue;
+        }
         if !symbol_has_runtime_surface_or_reference(eval, id, &referenced_symbol_names) {
             eval.obarray_mut().unintern_id(id);
         }
@@ -5417,6 +5459,12 @@ pub(crate) fn normalize_final_dump_runtime_surface(
             continue;
         };
         if is_gnu_preloaded_syntax_symbol(name) {
+            continue;
+        }
+        // GNU's initial obarray keeps every DEFSYM even when loadup's source
+        // surface for it is gone: C holds the symbol as a static, and
+        // `Funintern` never runs on it during dump construction.
+        if crate::emacs_core::intern::WellKnown::is_table_id(id) {
             continue;
         }
         if !symbol_has_runtime_surface_or_reference(eval, id, &referenced_symbol_names) {
@@ -6242,9 +6290,18 @@ pub fn create_bootstrap_evaluator_for_loadup(
         maybe_trace_bootstrap_step("create_bootstrap_evaluator_with_features: enter");
         let mut eval = super::eval::Context::new();
         maybe_trace_bootstrap_step("create_bootstrap_evaluator_with_features: evaluator-new");
-        // Match GNU's initialization order: Lisp startup must inherit the host
-        // environment before loadup.el can inspect HOME or any other variable.
-        super::environment::install_host_environment_snapshot(&mut eval);
+        // GNU 31.1 emacs.c skips set_initial_environment when will_dump_p().
+        match invocation {
+            LoadupInvocation::PreloadOnly => {
+                super::environment::install_host_environment_snapshot(&mut eval);
+                super::shell_file_name::install(&mut eval);
+            }
+            LoadupInvocation::Dump(dump) => {
+                eval.loadup_dump_mode = Some(dump.mode());
+                // cus-start records this initial value in standard-value.
+                super::shell_file_name::install_dump_default(&mut eval);
+            }
+        }
         let bootstrap_features = normalized_bootstrap_features(extra_features);
         for feature in &bootstrap_features {
             let _ = eval.provide_value(Value::symbol(feature), None);
@@ -6312,7 +6369,9 @@ pub fn create_bootstrap_evaluator_for_loadup(
             Value::unibyte_string(lisp_directory_name_from_host_path(&project_root)),
         );
 
-        // exec-path: list of dirs from PATH env var (C: callproc.c init_callproc_1)
+        // Keep build tools available until serialization: loadup queries Git
+        // before dumping. dump-emacs-portable omits the PATH derivative
+        // only while writing a loadup image; activation re-derives them.
         let path_dirs: Vec<Value> = exec_path_dirs_from_env()
             .into_iter()
             .map(Value::unibyte_string)
@@ -6342,10 +6401,6 @@ pub fn create_bootstrap_evaluator_for_loadup(
             eval.obarray.make_special(name);
         }
 
-        // GNU callproc.c plus w32.c: inherited $SHELL, /bin/sh on POSIX,
-        // and the private cmdproxy.exe on Windows. Bootstrap and post-image
-        // startup share the same typed platform policy.
-        super::shell_file_name::install(&mut eval);
         // shell-command-switch: GNU simple.el — defaults to "-c"
         eval.set_variable("shell-command-switch", Value::unibyte_string("-c"));
 
@@ -6399,6 +6454,8 @@ pub fn create_bootstrap_evaluator_for_loadup(
                     tracing::info!("loadup.el completed (kill-emacs after dump)");
                 } else {
                     let rendered = format_eval_error_in_state(&eval, &e);
+                    #[cfg(test)]
+                    record_bootstrap_failure_rendering(&rendered);
                     tracing::error!("loadup.el failed: {rendered}");
                     maybe_trace_bootstrap_step(format!(
                         "create_bootstrap_evaluator_with_features: loadup-failed={rendered}"
@@ -6425,6 +6482,24 @@ pub fn create_bootstrap_evaluator_for_loadup(
         eval.set_lexical_binding(true);
         eval.clear_top_level_eval_state();
         let _ = eval.frames.delete_frame(bootstrap_frame_id);
+        match invocation {
+            LoadupInvocation::PreloadOnly => {
+                eval.frames
+                    .retire_source_preload_window_sequences()
+                    .map_err(|refusal| match refusal {
+                        crate::window::SourcePreloadWindowRetirementRefusal::LiveFramesRemain => {
+                            EvalError::signal(
+                                intern("error"),
+                                vec![Value::string(
+                                    "Source preload left live frames at runtime activation",
+                                )],
+                                None,
+                            )
+                        }
+                    })?;
+            }
+            LoadupInvocation::Dump(_) => {}
+        }
         clear_runtime_loader_state(&mut eval);
 
         Ok(eval)
@@ -6463,6 +6538,8 @@ pub(crate) fn create_runtime_startup_evaluator_at_path(
         // Render while the evaluator heap is still alive: the caller's
         // cleanup purges the heap, leaving the signal payload unprintable.
         let rendered = format_eval_error_in_state(&eval, &err);
+        #[cfg(test)]
+        record_bootstrap_failure_rendering(&rendered);
         tracing::error!("runtime startup after bootstrap failed: {rendered}");
         return Err(err);
     }
@@ -6607,6 +6684,7 @@ fn activate_runtime_evaluator_at_root(
     project_root: &Path,
     role: RuntimeImageRole,
 ) -> Result<(), EvalError> {
+    eval.loadup_dump_mode = None;
     finalize_cached_bootstrap_eval(eval, project_root, role).map_err(|error| {
         tracing::error!("runtime evaluator activation failed: {error:?}");
         error
@@ -6680,6 +6758,8 @@ pub(crate) fn create_bootstrap_evaluator_cached_at_path(
             Ok(()) => Ok(()),
             Err(err) => {
                 let rendered = format_eval_error_in_state(eval, &err);
+                #[cfg(test)]
+                record_bootstrap_failure_rendering(&rendered);
                 tracing::error!("{context}: {rendered}");
                 Err(err)
             }
@@ -6889,3 +6969,14 @@ mod lazy_doc_tests;
 #[cfg(test)]
 #[path = "tests/load_test.rs"]
 mod tests;
+
+/// Carrier park: fresh eager-expansion failure policy.
+pub(crate) fn reset_carrier_tls() {
+    EAGER_EXPANSION_FAILURE.with(|slot| slot.set(EagerExpansionFailure::Propagate));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix_debug(h, EAGER_EXPANSION_FAILURE.with(|slot| slot.get()));
+}

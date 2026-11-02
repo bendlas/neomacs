@@ -39,12 +39,13 @@ fn org_custom_dynamic_block_insert_update_all_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_dblock_prepare_nested_content_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK ((:name \"probe-prepare\" :heading \"A B\" :indentation-column 0 :content \"old line\\n#+begin_src emacs-lisp\\n(+ 1 2)\\n#+end_src\\n\") nil \"#+BEGIN: probe-prepare :heading \\\"A B\\\"\\n- heading :: A B\\n  #+begin_example\\n  example\\n  #+end_example\\n\\n#+END:\\n\\n* After\\n\" ((dynamic-block 1 109) (plain-list 39 101) (example-block 56 100) (headline 109 117)))""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -60,8 +61,10 @@ fn org_dblock_prepare_nested_content_combo() {
     (insert "* After\n")
     (goto-char (point-min))
     (let ((prepared (org-prepare-dblock)))
+      (goto-char (point-min))
       (org-update-dblock)
       (let ((inside (save-excursion
+                      (goto-char (point-max))
                       (search-backward "#+BEGIN: probe")
                       (org-beginning-of-dblock)
                       (org-in-block-p '("probe-prepare")))))
@@ -74,17 +77,17 @@ fn org_dblock_prepare_nested_content_combo() {
                 (lambda (e)
                   (list (org-element-type e)
                         (org-element-property :begin e)
-                        (org-element-property :end e))))))))"##,
+                        (org-element-property :end e)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_clocktable_dblock_shift_steps_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect =
+        expect_test::expect![[r#""ERR (user-error \"Unknown ‘:step’ specification: daysteps\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -117,7 +120,7 @@ fn org_clocktable_dblock_shift_steps_combo() {
         (list steps-before
               after-update
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -192,12 +195,13 @@ fn org_columnview_dblock_filters_tblfm_links_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_custom_dblock_nested_table_rewrite_all_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((\"oracle-matrix\") t (:name \"oracle-matrix\" :label \"alpha\" :rows (1 2 3) :indentation-column 2 :content \"  old alpha\\n\") ((\"oracle-matrix\" \"alpha\" (1 2 3) \"  old alpha\\n\" 2) (\"oracle-matrix\" \"alpha\" (1 2 3) \"- label :: alpha\\n| idx | value | double |\\n|-----+-------+--------|\\n| 1 | 1 | stale |\\n| 2 | 2 | stale |\\n| 3 | 3 | stale |\\n#+TBLFM: $3=$2*2\\n\\n\" 2) (\"oracle-matrix\" \"alpha\" (1 2 3) \"  - label :: alpha\\n  | idx | value | double |\\n  |-----+-------+--------|\\n  | 1 | 1 | stale |\\n  | 2 | 2 | stale |\\n  | 3 | 3 | stale |\\n  #+TBLFM: $3=$2*2\\n  \\n\" 2) (\"oracle-matrix\" \"beta\" (7 8) \"| stale | table |\\n\" 0) (\"oracle-matrix\" \"inserted\" (4 5) \"\\n\" 0)) \"* Blocks\\n  #+BEGIN: oracle-matrix :label \\\"alpha\\\" :rows (1 2 3)\\n  - label :: alpha\\n  | idx | value | double |\\n  |-----+-------+--------|\\n  | 1 | 1 | stale |\\n  | 2 | 2 | stale |\\n  | 3 | 3 | stale |\\n  #+TBLFM: $3=$2*2\\n  \\n  #+END:\\n\\n** Child\\n#+BEGIN: oracle-matrix :label \\\"beta\\\" :rows (7 8)\\n| stale | table |\\n#+END:\\n\\n#+BEGIN: oracle-matrix :label \\\"inserted\\\" :rows (4 5)\\n\\n#+END:\\n\" \"* Blocks\\n  #+BEGIN: oracle-matrix :label \\\"alpha\\\" :rows (1 2 3)\\n  - label :: alpha\\n  | idx | value | double |\\n  |-----+-------+--------|\\n  | 1 | 1 | stale |\\n  | 2 | 2 | stale |\\n  | 3 | 3 | stale |\\n  #+TBLFM: $3=$2*2\\n  \\n  #+END:\\n\\n** Child\\n#+BEGIN: oracle-matrix :label \\\"beta\\\" :rows (7 8)\\n- label :: beta\\n| idx | value | double |\\n|-----+-------+--------|\\n| 1 | 7 | stale |\\n| 2 | 8 | stale |\\n#+TBLFM: $3=$2*2\\n\\n#+END:\\n\\n#+BEGIN: oracle-matrix :label \\\"inserted\\\" :rows (4 5)\\n- label :: inserted\\n| idx | value | double |\\n|-----+-------+--------|\\n| 1 | 4 | stale |\\n| 2 | 5 | stale |\\n#+TBLFM: $3=$2*2\\n\\n#+END:\\n\" (((#(\"idx\" 0 3 (face org-table)) #(\"value\" 0 5 (face org-table)) #(\"double\" 0 6 (face org-table))) hline (#(\"1\" 0 1 (face org-table)) #(\"1\" 0 1 (face org-table)) #(\"2\" 0 1 (face org-table))) (#(\"2\" 0 1 (face org-table)) #(\"2\" 0 1 (face org-table)) #(\"4\" 0 1 (face org-table))) (#(\"3\" 0 1 (face org-table)) #(\"3\" 0 1 (face org-table)) #(\"6\" 0 1 (face org-table)))) ((#(\"idx\" 0 3 (face org-table)) #(\"value\" 0 5 (face org-table)) #(\"double\" 0 6 (face org-table))) hline (#(\"1\" 0 1 (face org-table)) #(\"7\" 0 1 (face org-table)) #(\"14\" 0 2 (face org-table))) (#(\"2\" 0 1 (face org-table)) #(\"8\" 0 1 (face org-table)) #(\"16\" 0 2 (face org-table)))) ((#(\"idx\" 0 3 (face org-table)) #(\"value\" 0 5 (face org-table)) #(\"double\" 0 6 (face org-table))) hline (#(\"1\" 0 1 (face org-table)) #(\"4\" 0 1 (face org-table)) #(\"8\" 0 1 (face org-table))) (#(\"2\" 0 1 (face org-table)) #(\"5\" 0 1 (face org-table)) #(\"10\" 0 2 (face org-table))))) ((headline nil 1 648) (dynamic-block nil 10 250) (plain-list nil 64 83) (table nil 83 240) (table-row nil 83 110) (table-row nil 110 137) (table-row nil 137 164) (table-row nil 164 191) (table-row nil 191 218) (headline nil 250 648) (dynamic-block nil 259 450) (plain-list nil 308 324) (table nil 324 442) (table-row nil 324 349) (table-row nil 349 374) (table-row nil 374 399) (table-row nil 399 424) (dynamic-block nil 450 648) (plain-list nil 503 523) (table nil 523 641) (table-row nil 523 548) (table-row nil 548 573) (table-row nil 573 598) (table-row nil 598 623)) \"* Blocks\\n  #+BEGIN: oracle-matrix :label \\\"alpha\\\" :rows (1 2 3)\\n  - label :: alpha\\n  | idx | value | double |\\n  |-----+-------+--------|\\n  |   1 |     1 |      2 |\\n  |   2 |     2 |      4 |\\n  |   3 |     3 |      6 |\\n  #+TBLFM: $3=$2*2\\n  \\n  #+END:\\n\\n** Child\\n#+BEGIN: oracle-matrix :label \\\"beta\\\" :rows (7 8)\\n- label :: beta\\n| idx | value | double |\\n|-----+-------+--------|\\n|   1 |     7 |     14 |\\n|   2 |     8 |     16 |\\n#+TBLFM: $3=$2*2\\n\\n#+END:\\n\\n#+BEGIN: oracle-matrix :label \\\"inserted\\\" :rows (4 5)\\n- label :: inserted\\n| idx | value | double |\\n|-----+-------+--------|\\n|   1 |     4 |      8 |\\n|   2 |     5 |     10 |\\n#+TBLFM: $3=$2*2\\n\\n#+END:\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -246,11 +250,16 @@ fn org_custom_dblock_nested_table_rewrite_all_combo() {
         (setq prepared-alpha (org-prepare-dblock))
         (org-dblock-write:oracle-matrix prepared-alpha)
         (search-backward "#+BEGIN: oracle-matrix")
-        (org-update-dblock)
+        (beginning-of-line)
+        (save-window-excursion
+          (switch-to-buffer (current-buffer))
+          (org-update-dblock))
         (setq after-alpha
               (buffer-substring-no-properties
                (point-min) (point-max)))
-        (org-update-all-dblocks)
+        (save-window-excursion
+          (switch-to-buffer (current-buffer))
+          (org-update-all-dblocks))
         (setq after-all
               (buffer-substring-no-properties
                (point-min) (point-max)))
@@ -279,7 +288,7 @@ fn org_custom_dblock_nested_table_rewrite_all_combo() {
               table-summaries
               ast
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -584,14 +593,14 @@ fn org_clocktable_columnview_custom_dblock_update_regen_combo() {
         expect,
     );
 }
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_dblock_clocktable_columnview_multi_update_edit_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument stringp point-min)""#]];
-    crate::common::assert_oracle_parity_expect(
+    let expect = expect_test::expect![[
+        r#""OK (\"* Project A\\n** Task A1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:30] =>  1:30\\n:END:\\n** Task A2\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 11:00]--[2026-05-28 Wed 12:00] =>  1:00\\n:END:\\n* Project B\\n** Task B1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 14:00]--[2026-05-28 Wed 15:30] =>  1:30\\n:END:\\n#+BEGIN: clocktable :maxlevel 2 :scope nil :block 2026-05-28\\n#+END:\\n\\n#+BEGIN: columnview :maxlevel 2\\n#+END:\\n\" \"* Project A\\n** Task A1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:30] =>  1:30\\n:END:\\n** Task A2\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 11:00]--[2026-05-28 Wed 12:00] =>  1:00\\n:END:\\n* Project B\\n** Task B1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 14:00]--[2026-05-28 Wed 15:30] =>  1:30\\n:END:\\n#+BEGIN: clocktable :maxlevel 2 :scope nil :block 2026-05-28\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for Thursday, May 28, 2026.\\n| Headline     |   Time |      |\\n|--------------+--------+------|\\n| *Total time* | *4:00* |      |\\n|--------------+--------+------|\\n| Project A    |   2:30 |      |\\n| \\\\_  Task A1  |        | 1:30 |\\n| \\\\_  Task A2  |        | 1:00 |\\n| Project B    |   1:30 |      |\\n| \\\\_  Task B1  |        | 1:30 |\\n#+END:\\n\\n#+BEGIN: columnview :maxlevel 2\\n#+END:\\n\" \"* Project A\\n** Task A1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:30] =>  1:30\\n:END:\\n** Task A2\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 11:00]--[2026-05-28 Wed 12:00] =>  1:00\\n:END:\\n* Project B\\n** Task B1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 14:00]--[2026-05-28 Wed 15:30] =>  1:30\\n:END:\\n#+BEGIN: clocktable :maxlevel 2 :scope nil :block 2026-05-28\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for Thursday, May 28, 2026.\\n| Headline     |   Time |      |\\n|--------------+--------+------|\\n| *Total time* | *4:00* |      |\\n|--------------+--------+------|\\n| Project A    |   2:30 |      |\\n| \\\\_  Task A1  |        | 1:30 |\\n| \\\\_  Task A2  |        | 1:00 |\\n| Project B    |   1:30 |      |\\n| \\\\_  Task B1  |        | 1:30 |\\n#+END:\\n\\n#+BEGIN: columnview :maxlevel 2\\n| <25>    |      | <3>      |      |\\n| ITEM    | TODO | PRIORITY | TAGS |\\n|---------+------+----------+------|\\n| Task B1 |      | B        |      |\\n#+END:\\n\" \"* Project A\\n** Task A1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:30] =>  1:30\\n:END:\\n** Task A2\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 11:00]--[2026-05-28 Wed 12:00] =>  1:00\\n:END:\\n* Project B\\n** Task B1\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 16:00]--[2026-05-28 Wed 17:00] =>  1:00\\n:END:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 14:00]--[2026-05-28 Wed 15:30] =>  1:30\\n:END:\\n#+BEGIN: clocktable :maxlevel 2 :scope nil :block 2026-05-28\\n#+CAPTION: Clock summary at [2026-06-15 Mon 12:00], for Thursday, May 28, 2026.\\n| Headline     |   Time |      |\\n|--------------+--------+------|\\n| *Total time* | *5:00* |      |\\n|--------------+--------+------|\\n| Project A    |   2:30 |      |\\n| \\\\_  Task A1  |        | 1:30 |\\n| \\\\_  Task A2  |        | 1:00 |\\n| Project B    |   2:30 |      |\\n| \\\\_  Task B1  |        | 2:30 |\\n#+END:\\n\\n#+BEGIN: columnview :maxlevel 2\\n| <25>    |      | <3>      |      |\\n| ITEM    | TODO | PRIORITY | TAGS |\\n|---------+------+----------+------|\\n| Task B1 |      | B        |      |\\n#+END:\\n\")""#
+    ]];
+    crate::common::assert_oracle_parity_frozen_time_expect(
         r##"(progn
   (require 'org)
   (require 'org-clock)
@@ -606,7 +615,7 @@ fn org_dblock_clocktable_columnview_multi_update_edit_deep() {
     (insert "* Project B\n")
     (insert "** Task B1\n")
     (insert ":LOGBOOK:\nCLOCK: [2026-05-28 Wed 14:00]--[2026-05-28 Wed 15:30] =>  1:30\n:END:\n")
-    (insert "#+BEGIN: clocktable :maxlevel 2 :scope (point-min) :block today\n")
+    (insert "#+BEGIN: clocktable :maxlevel 2 :scope nil :block 2026-05-28\n")
     (insert "#+END:\n\n")
     (insert "#+BEGIN: columnview :maxlevel 2\n")
     (insert "#+END:\n")
@@ -637,7 +646,7 @@ fn org_dblock_clocktable_columnview_multi_update_edit_deep() {
               (list initial
                     after-ct
                     after-col
-                    after-mutate)))))))))"##,
+                    after-mutate))))))))"##,
         expect,
     );
 }

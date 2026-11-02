@@ -157,14 +157,17 @@ fn major_keeps_permanent_payload_and_its_ordinary_old_child() {
     let bytes = retained_bytes(code);
     crate::tagged::mutate::set_vector_slot(mapped, 0, code);
     major(&mut heap, &[]);
-    assert!(unsafe { (*header_ptr(code)).generation.permanent() });
+    // The bytecode is a runtime survivor of the first partition cycle: it is
+    // ordinary old (traced by every major), not an image resident.
+    assert!(unsafe { (*header_ptr(code)).tenured });
+    assert!(!unsafe { (*header_ptr(code)).generation.permanent() });
     roots.clear(child_root);
     roots.clear(code_root);
 
     for _ in 0..3 {
         major(&mut heap, &[]);
         assert!(heap.owns_heap_value_for_test(code));
-        assert!(unsafe { (*header_ptr(code)).generation.permanent() });
+        assert!(!unsafe { (*header_ptr(code)).generation.permanent() });
         assert_eq!(bytes.owned_storage_ref_count_for_test(), Some(2));
         assert!(heap.owns_heap_value_for_test(child));
         assert_eq!(child.cons_car(), TaggedValue::fixnum(103));
@@ -172,7 +175,12 @@ fn major_keeps_permanent_payload_and_its_ordinary_old_child() {
     minor(&mut heap, &[]);
     assert!(heap.owns_heap_value_for_test(child));
     assert_eq!(heap.generational.old_cons_count, 1);
-    assert_eq!(heap.generational.old_bytes, size_of::<ConsCell>());
+    // The bytecode is an ordinary-old runtime survivor now, so the old-byte
+    // inventory includes its page slot plus the old cons.
+    assert_eq!(
+        heap.generational.old_bytes,
+        size_of::<ConsCell>() + heap.collector_object_bytes(header_ptr(code)),
+    );
 }
 
 #[test]
@@ -230,16 +238,13 @@ fn major_unchains_an_unrooted_old_marker() {
     let mut heap = heap(true);
     set_tagged_heap(&mut heap);
     let roots = Roots::new();
-    let marker = heap.alloc_marker(LispMarker {
-        buffer: None,
-        insertion_type: false,
-        marker_id: None,
-        bytepos: 0,
-        charpos: 0,
-        last_position_valid: false,
-        next_marker: std::ptr::null_mut(),
-        chained: false,
-    });
+    let marker = heap.alloc_marker(LispMarker::new(
+        crate::heap_types::MarkerBuffer::DETACHED,
+        crate::buffer::CharPos0::new(0),
+        crate::buffer::EmacsBytePos::new(0),
+        false,
+        false,
+    ));
     let marker_root = roots.keep(marker);
     minor(&mut heap, &[marker]);
     let text = crate::buffer::buffer_text::BufferText::new();
@@ -379,9 +384,14 @@ fn late_dump_partition_visits_old_objects_and_consumes_stale_r_safely() {
     assert!(heap.owns_heap_value_for_test(live));
     assert!(heap.owns_heap_value_for_test(vector));
     assert!(heap.owns_heap_value_for_test(live_child));
-    assert!(unsafe { (*header_ptr(live)).generation.permanent() });
-    assert!(unsafe { (*header_ptr(vector)).generation.permanent() });
-    assert!(heap.generational.old_objects.is_null());
+    // Both are runtime survivors of the first partition cycle: tenured
+    // ordinary old, kept alive through the mapped vector's remembered edge,
+    // never permanent.
+    assert!(unsafe { (*header_ptr(live)).tenured });
+    assert!(unsafe { (*header_ptr(vector)).tenured });
+    assert!(!unsafe { (*header_ptr(live)).generation.permanent() });
+    assert!(!unsafe { (*header_ptr(vector)).generation.permanent() });
+    assert!(!heap.generational.old_objects.is_null());
     assert!(
         !heap
             .current_mutator_gc()
@@ -403,7 +413,14 @@ fn late_dump_partition_visits_old_objects_and_consumes_stale_r_safely() {
     assert_eq!(live_child.cons_car(), TaggedValue::fixnum(131));
     assert!(heap.owns_heap_value_for_test(live));
     assert_eq!(heap.generational.old_cons_count, 1);
-    assert_eq!(heap.generational.old_bytes, size_of::<ConsCell>());
+    // Both runtime survivors are ordinary old now: the Box table and the
+    // paged vector contribute their object bytes beside the old cons.
+    assert_eq!(
+        heap.generational.old_bytes,
+        size_of::<ConsCell>()
+            + heap.collector_object_bytes(header_ptr(live))
+            + heap.collector_object_bytes(header_ptr(vector)),
+    );
 }
 
 #[test]
@@ -768,17 +785,23 @@ fn claimed_old_cons_symbol_insertion_case(fresh: bool, table_old: bool, car: boo
             // accessing ctx. The valid owned cons guarantees that fast arm.
             // This tests the JIT slow-store adapter, not generated machine code.
             let result = if car {
-                neovm_jit_setcar(
-                    std::ptr::null_mut(),
-                    owner.bits() as i64,
-                    symbol.bits() as i64,
-                )
+                // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+                unsafe {
+                    neovm_jit_setcar(
+                        std::ptr::null_mut(),
+                        owner.bits() as i64,
+                        symbol.bits() as i64,
+                    )
+                }
             } else {
-                neovm_jit_setcdr(
-                    std::ptr::null_mut(),
-                    owner.bits() as i64,
-                    symbol.bits() as i64,
-                )
+                // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+                unsafe {
+                    neovm_jit_setcdr(
+                        std::ptr::null_mut(),
+                        owner.bits() as i64,
+                        symbol.bits() as i64,
+                    )
+                }
             };
             assert_eq!(result, symbol.bits() as i64);
         }
@@ -990,17 +1013,23 @@ fn claimed_old_cons_heap_insertion_case(
             // Valid-cons adapters return before touching ctx. This checks their
             // ordinary slow-store hook, not generated machine-code execution.
             let result = if car {
-                neovm_jit_setcar(
-                    std::ptr::null_mut(),
-                    owner.bits() as i64,
-                    inserted.bits() as i64,
-                )
+                // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+                unsafe {
+                    neovm_jit_setcar(
+                        std::ptr::null_mut(),
+                        owner.bits() as i64,
+                        inserted.bits() as i64,
+                    )
+                }
             } else {
-                neovm_jit_setcdr(
-                    std::ptr::null_mut(),
-                    owner.bits() as i64,
-                    inserted.bits() as i64,
-                )
+                // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+                unsafe {
+                    neovm_jit_setcdr(
+                        std::ptr::null_mut(),
+                        owner.bits() as i64,
+                        inserted.bits() as i64,
+                    )
+                }
             };
             assert_eq!(result, inserted.bits() as i64);
         }

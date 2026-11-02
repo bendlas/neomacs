@@ -1,5 +1,7 @@
 use super::super::intern::intern;
 use super::*;
+use crate::emacs_core::eval::signal_entry::builtin_signal;
+use crate::emacs_core::print::builtin_error_message_string;
 
 fn init_runtime_errors(context: &mut crate::emacs_core::eval::Context) {
     // SAFETY: standard-error setup only initializes native condition/message
@@ -1450,7 +1452,7 @@ fn builtin_error_message_string_formats_frame_and_window_handles() {
     assert!(frame_text.starts_with("Args out of range: #<frame"));
     assert!(frame_text.ends_with(", 0"));
 
-    let window = super::super::window_cmds::builtin_selected_window(&mut evaluator, vec![])
+    let window = super::super::window_cmds::builtin_selected_window(&mut evaluator, &vec![])
         .expect("selected-window should succeed");
     let window_err = Value::list(vec![
         Value::symbol("args-out-of-range"),
@@ -1741,7 +1743,7 @@ fn resignal_eval(src: &str) -> String {
              (put 'scan-error 'error-message "Scan error"))"#,
     )
     .expect("install scan-error conditions");
-    super::super::error::format_eval_result(&eval.eval_str(src))
+    crate::emacs_core::format_eval_result(&eval.eval_str(src))
 }
 
 #[test]

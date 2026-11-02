@@ -649,10 +649,20 @@ fn compile_osr_leaf(
     let diagnostic = stats::front_diag::begin(id, stats::CompileOrigin::Osr, None);
     let clock = stats::CompileClock::start(stats::CompileOrigin::Osr);
     let diagnostic_start = diagnostic.as_ref().map(|_| clock.started());
+    let cpu_started = super::tier2::cpu_time_us();
     let entry = compile_osr_leaf_timed(obarray, func, osr_pc, id, name_hint);
     let elapsed = clock.finish(entry.is_some());
+    let cpu_finished = super::tier2::cpu_time_us();
     if let Some(entry) = &entry {
         entry.leaf.obs.note_compile_time(elapsed);
+        if cpu_started != 0 && cpu_finished != 0 {
+            entry
+                .leaf
+                .obs
+                .note_compile_cpu_time(std::time::Duration::from_micros(
+                    cpu_finished.saturating_sub(cpu_started),
+                ));
+        }
     }
     if let (Some(diagnostic), Some(start)) = (diagnostic, diagnostic_start) {
         diagnostic.finish(start, elapsed, entry.is_some());
@@ -862,15 +872,15 @@ fn compile_osr_leaf_timed(
 ///
 /// # Safety
 /// `ctx` follows the same dormant-Context contract as [`try_run_compiled`].
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub(crate) fn try_run_osr(
+pub(crate) unsafe fn try_run_osr(
     ctx: *mut Context,
     func: &ByteCodeFunction,
     osr_pc: usize,
     stack: &[Value],
     binds: &[usize],
 ) -> Option<NativeRun> {
-    match try_run_osr_probe(ctx, func, osr_pc, stack, binds) {
+    // SAFETY: `ctx` follows the dormant-Context contract documented above.
+    match unsafe { try_run_osr_probe(ctx, func, osr_pc, stack, binds) } {
         OsrProbe::Ran(run) => Some(run),
         OsrProbe::NoTransfer | OsrProbe::Pending => None,
     }
@@ -878,8 +888,12 @@ pub(crate) fn try_run_osr(
 
 /// [`try_run_osr`], telling a background compile still in flight
 /// ([`OsrProbe::Pending`]: the caller must not latch) from no transfer.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub(crate) fn try_run_osr_probe(
+///
+/// # Safety
+/// `ctx` is the live owner `Context` the dispatch seam is executing in and
+/// stays valid for the whole call; the caller holds the dormant-Context
+/// contract described on [`try_run_compiled`].
+pub(crate) unsafe fn try_run_osr_probe(
     ctx: *mut Context,
     func: &ByteCodeFunction,
     osr_pc: usize,
@@ -1449,21 +1463,22 @@ fn compile_cache_entry(
     let defer = super::bg::DeferScope::enter(class);
     let clock = stats::CompileClock::start(request.origin);
     let diagnostic_start = diagnostic.as_ref().map(|_| clock.started());
-    let cpu_started = spine_upgrade.then(super::tier2::cpu_time_us);
+    let cpu_started = super::tier2::cpu_time_us();
     let result = compile_bytecode_function_requested(func, obarray, request);
     drop(defer);
     let mut deferred = super::bg::take_deferred();
     let elapsed = clock.finish(result.is_ok());
-    if let Some(started) = cpu_started {
-        let finished = super::tier2::cpu_time_us();
+    let cpu_finished = super::tier2::cpu_time_us();
+    // Measure CPU for every compile: the T2 compile budget is CPU-accounted,
+    // so a leaf's next upgrade estimate must not inherit a wall stall inflated
+    // by descheduling. A missing CPU clock (0 at either end) leaves `None`: the
+    // charge falls back to wall time and the estimate to the leaf's wall time.
+    let cpu_elapsed = (cpu_started != 0 && cpu_finished != 0)
+        .then(|| std::time::Duration::from_micros(cpu_finished.saturating_sub(cpu_started)));
+    if spine_upgrade {
         // A missing CPU clock must not make every upgrade free. Wall
         // elapsed conservatively charges the fixed startup budget floor.
-        let charged = if started == 0 || finished == 0 {
-            elapsed
-        } else {
-            std::time::Duration::from_micros(finished.saturating_sub(started))
-        };
-        super::tier2::charge_compile(charged);
+        super::tier2::charge_compile(cpu_elapsed.unwrap_or(elapsed));
     }
     stats::record_compile(elapsed, func.executable_ops().len(), &result);
     if let (Some(diagnostic), Some(start)) = (diagnostic, diagnostic_start) {
@@ -1479,6 +1494,9 @@ fn compile_cache_entry(
             leaf.obs.id = id;
             leaf.compiled_level = rt.reopt_level();
             leaf.obs.note_compile_time(elapsed);
+            if let Some(cpu) = cpu_elapsed {
+                leaf.obs.note_compile_cpu_time(cpu);
+            }
             // Registered when the front finishes, so a redefinition of an
             // inlined callee removes a pending leaf as it would a compiled one.
             if spine_upgrade {
@@ -2747,13 +2765,16 @@ fn max_compiled_id() -> u64 {
     })
 }
 
-// C-ABI dispatch seam: `ctx` is a raw `*mut Context` from the native-call shim
-// path; the documented dormant-Context contract (see the `unsafe` deref inside)
-// makes the read sound. The lint fires on the `pub` + raw-ptr-deref shape, same
-// as the 35 `neovm_jit_*` shims, which carry the same allow.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+// Dispatch seam: `ctx` is a raw `*mut Context` from the native-call shim
+// path; the documented dormant-Context contract (see the `unsafe` deref
+// inside) makes the read sound.
+//
+/// # Safety
+/// `ctx` is the live owner `Context` the dispatch seam is executing in and
+/// stays valid for the whole call; the caller holds the dormant-Context
+/// contract described above.
 #[inline(never)]
-pub fn try_run_compiled(
+pub unsafe fn try_run_compiled(
     ctx: *mut Context,
     func: &ByteCodeFunction,
     func_value: Value,
@@ -3759,4 +3780,41 @@ pub(crate) fn prepare_upgrade_for_test(ctx: *mut Context, func: &ByteCodeFunctio
         // SAFETY: the fixture owns this dormant Context, or uses no shims.
         drain_ready_pending(unsafe { ctx.as_ref() });
     }
+}
+
+/// Carrier park: drop the compiled-leaf caches. The world's heap stays alive,
+/// but the cached leaves' reloc Values are unrooted while the carrier is idle,
+/// so the cache must not survive into the next job.
+pub(crate) fn reset_carrier_tls() {
+    clear();
+    COMPILED_HEAP.with(|slot| slot.set(None));
+    DROPPED_LEAF_TOTALS.with(|totals| {
+        totals.set(LeafTotals {
+            leaves: 0,
+            entries: 0,
+            deopt_at: 0,
+            deopt_rerun: 0,
+            signals: 0,
+        })
+    });
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        COMPILED.with(|c| {
+            let c = c.borrow();
+            (c.len() as u64) ^ ((c.retired.len() as u64) << 32)
+        }),
+    );
+    crate::tls_fingerprint::mix(h, COMPILED_HEAP.with(|slot| slot.get().is_some() as u64));
+    crate::tls_fingerprint::mix(h, COMPILED_OBARRAY.with(|slot| slot.get().is_some() as u64));
+    crate::tls_fingerprint::mix_debug(h, DROPPED_LEAF_TOTALS.with(|slot| slot.get()));
+    crate::tls_fingerprint::mix(h, INLINE_DEPS.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, INLINE_EVICTIONS.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, OSR_CACHE.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, OSR_PENDING.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, REDEFINED_PINS.with(|slot| slot.borrow().len() as u64));
 }

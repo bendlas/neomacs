@@ -185,13 +185,28 @@ fn killing_a_terminal_buffer_terminates_its_live_process() -> ParityBatchCase {
       (neomacs-multi-term-test-wait-for-output survivor "READY\n")
       (switch-to-buffer victim)
       (set-process-query-on-exit-flag process nil)
+      ;; The sandbox driver runs with `stty -isig', so Multi-term's
+      ;; `term-quit-subjob' reaches it as the VQUIT byte (0x1c), which the
+      ;; driver logs.  This witness is appended after Multi-term's own
+      ;; `kill-buffer-hook' entry and waits for that line.  GNU runs
+      ;; `kill-buffer-hook' before `kill_buffer_processes' sends SIGHUP
+      ;; (src/buffer.c:1986 vs :2073; src/process.c:8466), so a logged
+      ;; line proves the quit request reached the pty before the hangup
+      ;; instead of racing it.
+      (add-hook 'kill-buffer-hook
+                #'neomacs-multi-term-test-quit-witness t t)
       (kill-buffer victim)
       (neomacs-multi-term-test-wait-until
        (lambda () (not (process-live-p process)))
        "killing the terminal buffer to terminate its child process")
       (list :victim-live (and (buffer-live-p victim) t)
+            :quit-request (and neomacs-multi-term-test-quit-witnessed t)
             :process (list :live (and (process-live-p process) t)
                            :status (process-status process)
+                           ;; The driver owns its input dispositions: it
+                           ;; consumes the quit byte as data, so SIGHUP is
+                           ;; the only terminator and the signal number
+                           ;; cannot depend on kernel scheduling.
                            :exit-status (process-exit-status process))
             :survivor (list :selected
                             (eq (window-buffer (selected-window)) survivor)
@@ -202,7 +217,7 @@ fn killing_a_terminal_buffer_terminates_its_live_process() -> ParityBatchCase {
             :managed (mapcar #'buffer-name multi-term-buffer-list)))))
 "####;
     let expected = expect![[
-        r#"OK (:victim-live nil :process (:live nil :status signal :exit-status 1) :survivor (:selected t :name "*terminal<2>*" :mode term-mode :process-live t) :managed ("*terminal<2>*"))"#
+        r#"OK (:victim-live nil :quit-request t :process (:live nil :status signal :exit-status 1) :survivor (:selected t :name "*terminal<2>*" :mode term-mode :process-live t) :managed ("*terminal<2>*"))"#
     ]];
     ParityBatchCase::value(
         "killing_a_terminal_buffer_terminates_its_live_process",

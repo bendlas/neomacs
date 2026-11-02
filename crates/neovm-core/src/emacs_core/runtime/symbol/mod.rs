@@ -28,9 +28,13 @@
 mod canonical_access;
 mod cell;
 mod fn_stamps;
+mod function_cell_observer;
+#[cfg(debug_assertions)]
+pub(crate) mod leaf_activity;
 pub(crate) mod parallel;
 mod projection;
 mod property_revision;
+mod roots;
 pub use canonical_access::CanonicalAccess;
 pub(crate) use property_revision::{
     swap_world_state as swap_property_revision_world_state,
@@ -47,30 +51,99 @@ pub(crate) enum CanonicalWrite {
     /// The cell is a thread projection: the owner-aware caller routes it.
     Projected,
 }
+#[cfg(test)]
+pub(crate) use cell::plist_epoch;
 use cell::{ArmMut, CellWrite, MarkGate, RevealedCell, read_symbol_children};
 pub(crate) use cell::{
     BlvPtr, DumpedCell, DumpedSymbolFlags, LISP_SYMBOL_FLAGS_OFFSET,
     LISP_SYMBOL_INTERNED_GLOBAL_OFFSET, LISP_SYMBOL_SIZE, LISP_SYMBOL_VAL_OFFSET, ValueCell,
+    store_plist_head,
 };
 pub use cell::{LispSymbol, SymbolFlags};
 #[cfg(test)]
 pub(crate) use fn_stamps::force_fn_stamps_for_test;
+pub(crate) use function_cell_observer::{
+    FunctionCellObserver, function_cell_observer, install_function_cell_observer,
+    install_function_epoch_move_sink, note_function_epoch_move,
+};
 pub(crate) use projection::{
     AdmissionPlanCell, ConcealOutcome, RevealedProjection, enter_projection_scope,
     leave_projection_scope, reserve_projection_scope,
 };
 pub use property_revision::SymbolPropertyRevision;
 
-use super::defvar_bool::ByteBooleanVars;
 use super::intern::{
     NameId, SymId, intern, intern_lisp_string, is_canonical_id, lookup_interned,
     lookup_interned_lisp_string, resolve_name, resolve_sym_lisp_string,
 };
 use super::value::{Value, ValueKind, VecLikeType};
+
+/// Whether `defvar_bool''s cons onto `byte-boolean-vars' survives to Lisp.
+///
+/// GNU does not decide this per variable -- it falls out of the order `main'
+/// runs the `syms_of_*' functions in.  Naming it is the only way Neomacs can
+/// reproduce the resulting list without reproducing GNU's whole startup
+/// sequence, and making it a field of [`GnuBoolVariable`] rather than a
+/// defaulted argument is what stops a new row from silently guessing.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ByteBooleanVars {
+    /// Declared after `Vbyte_boolean_vars = Qnil' (`src/lread.c:5774'), so the
+    /// cons survives and the byte optimizer refuses to fold `varset'/`varref'.
+    /// 116 variables in GNU 31.1.
+    Listed,
+    /// Declared before it, so the cons is thrown away again and the byte
+    /// optimizer folds the pair exactly as it would for a plain variable --
+    /// even though the slot still coerces at run time.  31 variables.
+    ErasedByLreadInit,
+}
 use crate::emacs_core::error::Flow;
 use crate::emacs_core::forward::FwdDescriptor;
-use crate::emacs_core::pdump::DumpError;
+use crate::emacs_core::value::buffer_vocab::{BufferLocalView, slot_meta};
 use crate::gc_trace::GcTrace;
+
+/// The forwarder kind a localized symbol's BLV rebuilds after a dump. GNU's
+/// `Lisp_Fwd_*` tag is process-lifetime state, so an image carries only the
+/// kind; the dump loader maps its wire tag into this layer's vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalizedForwarderKind {
+    /// GNU `Lisp_Fwd_Bool`.
+    Bool,
+    /// GNU `Lisp_Fwd_Int`.
+    Int,
+    /// GNU `Lisp_Fwd_Obj`.
+    Obj,
+    /// GNU `Lisp_Fwd_Kboard_Obj`.
+    Kboard,
+}
+
+/// A dump image's obarray rows contradict each other (a member or
+/// function-unbound entry names a slot the symbol table does not contain).
+/// The dump loader wraps this into its own deserialization error; the message
+/// text is the one the pdump layer has always reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ObarrayRestoreError {
+    GlobalMemberMissingSlot(SymId),
+    FunctionUnboundMissingSlot(SymId),
+}
+
+impl std::fmt::Display for ObarrayRestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GlobalMemberMissingSlot(id) => write!(
+                f,
+                "pdump obarray is inconsistent: global member references missing symbol slot {}",
+                id.0
+            ),
+            Self::FunctionUnboundMissingSlot(id) => write!(
+                f,
+                "pdump obarray is inconsistent: function-unbound entry references missing symbol slot {}",
+                id.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObarrayRestoreError {}
 use crate::heap_types::LispString;
 use crate::tagged::header::AtomicTaggedValue;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -313,7 +386,7 @@ pub struct LispBufferLocalValue {
     /// Written only through [`LispBufferLocalValue::set_where`], which keeps
     /// [`Self::where_buf_id`] in step.
     pub where_buf: AtomicTaggedValue,
-    /// The raw [`BufferId`](crate::buffer::BufferId) of `where_buf`, or
+    /// The raw [`BufferId`](crate::emacs_core::value::buffer_vocab::BufferId) of `where_buf`, or
     /// [`NO_WHERE_BUF`] when it is not a buffer: the read fast path's
     /// where-buffer test as one integer compare. Comparing the object meant
     /// a tag test, a header load and a field load on every read of a
@@ -601,7 +674,10 @@ impl LispSymbol {
     /// the current epoch (see [`BlvCacheHit`]); `None` for a miss or any
     /// other redirect.
     #[inline]
-    pub(crate) fn blv_cache_hit(&self, buffer: crate::buffer::BufferId) -> Option<BlvCacheHit> {
+    pub(crate) fn blv_cache_hit(
+        &self,
+        buffer: crate::emacs_core::value::buffer_vocab::BufferId,
+    ) -> Option<BlvCacheHit> {
         let blv = self.localized_blv()?;
         // SAFETY: a `Localized` cell names a record `make_symbol_localized`
         // allocated and the obarray owns for its lifetime; the evaluator
@@ -684,7 +760,9 @@ pub(crate) enum FunctionEpochBump {
 #[inline]
 fn note_function_cell_unchanged() {
     #[cfg(feature = "jit")]
-    crate::emacs_core::jit::stats::note_function_cell_unchanged();
+    if let Some(observer) = function_cell_observer() {
+        (observer.cell_unchanged)();
+    }
 }
 
 /// Detached domain for the existing function-binding publication clock.
@@ -1405,7 +1483,8 @@ impl ObarrayScanSnapshot {
     /// slot index `n_slots`.
     ///
     /// # Safety
-    /// Must run on the GC thread for a snapshot captured at the world-stopped start
+    /// Must run on the cycle's sole marker (collector thread or synchronous
+    /// requester fallback) for a snapshot captured at the world-stopped start
     /// handshake of the CURRENTLY-RUNNING concurrent mark; the chunk + seq pointers
     /// must still address live, non-moving storage. The entry's retention lease
     /// keeps chunk and side allocations valid even if their owner is dropped.
@@ -1751,7 +1830,7 @@ impl Obarray {
         }
     }
 
-    fn mark_global_member(&mut self, id: SymId) {
+    pub(crate) fn mark_global_member(&mut self, id: SymId) {
         // Fast path: already a member. Read-only — no ensure_slot, no growth
         // machinery — so the per-store caller (set_symbol_value_id ->
         // ensure_global_member_if_canonical) pays one presence-checked slot
@@ -1830,7 +1909,7 @@ impl Obarray {
     }
 
     #[inline]
-    fn ensure_global_member_if_canonical(&mut self, id: SymId) {
+    pub(crate) fn ensure_global_member_if_canonical(&mut self, id: SymId) {
         // Steady state is one presence-checked slot read: membership is a
         // slot property (GNU: `intern` sets it once), so ask the slot before
         // paying the epoch-checked interning lookup for a symbol that is
@@ -1897,6 +1976,19 @@ impl Obarray {
         }
 
         ob
+    }
+
+    /// Give this obarray GNU's initial DEFSYM membership: `init_obarray`
+    /// interns every well-known spelling at startup, so `intern-soft` and
+    /// `mapatoms` see them before Lisp names them (GNU 31.1 oracle:
+    /// tmp/jitcall15/gnu-obarray-probe.el). The predicate re-checks
+    /// canonicality, so a table spelling uninterned before this obarray was
+    /// created is not resurrected. Callers that model a pre-GNU image (the
+    /// legacy dump fixture) deliberately skip it.
+    pub(crate) fn seed_well_known_members(&mut self) {
+        for symbol in crate::emacs_core::intern::WellKnown::VARIANTS {
+            self.ensure_global_member_if_canonical(symbol.id());
+        }
     }
 
     /// Intern a symbol: look up by name, creating if absent.
@@ -2147,10 +2239,10 @@ impl Obarray {
     /// `indent::dynamic_buffer_or_global_symbol_value` is the older, identical
     /// reader; it lives in a file ledger 195 owns, so collapsing the two is
     /// owed rather than done here (ledger 196).
-    pub fn canonical_value_in_buffer(
+    pub fn canonical_value_in_buffer<B: BufferLocalView>(
         &self,
         access: CanonicalAccess,
-        buf: Option<&crate::buffer::Buffer>,
+        buf: Option<&B>,
         name: &str,
     ) -> Option<Value> {
         self.canonical_value_in_buffer_id(access, buf, intern(name))
@@ -2165,10 +2257,10 @@ impl Obarray {
     /// [`Self::symbol_value_copied`] on the overwhelmingly common global path, which
     /// matters where a caller reads a dozen names at once -- the `print-*`
     /// family, for one.
-    pub fn canonical_value_in_buffer_id(
+    pub fn canonical_value_in_buffer_id<B: BufferLocalView>(
         &self,
         _access: CanonicalAccess,
-        buf: Option<&crate::buffer::Buffer>,
+        buf: Option<&B>,
         id: SymId,
     ) -> Option<Value> {
         match self.buffer_value(buf, id) {
@@ -2181,9 +2273,9 @@ impl Obarray {
     /// answering the arms [`Self::value_with`] gives it: BUF's slot and
     /// local binding are canonical storage, which no projection changes.
     #[inline(always)]
-    pub(crate) fn value_in_buffer_with(
+    pub(crate) fn value_in_buffer_with<B: BufferLocalView>(
         &self,
-        buf: Option<&crate::buffer::Buffer>,
+        buf: Option<&B>,
         id: SymId,
         projected: impl FnOnce(&Self, SymId) -> Option<Value>,
     ) -> Option<Value> {
@@ -2196,14 +2288,14 @@ impl Obarray {
     /// [`Self::value_in_buffer_with`] once ID is known not to be one of
     /// BUF's slots: BUF's local binding, else the global read.
     #[inline(always)]
-    pub(crate) fn unslotted_value_with(
+    pub(crate) fn unslotted_value_with<B: BufferLocalView>(
         &self,
-        buf: Option<&crate::buffer::Buffer>,
+        buf: Option<&B>,
         id: SymId,
         projected: impl FnOnce(&Self, SymId) -> Option<Value>,
     ) -> Option<Value> {
         if let Some(buf) = buf
-            && let Some(value) = buf.get_buffer_local_by_sym_id_gated(id, self.is_localized(id))
+            && let Some(value) = buf.local_binding(id, self.is_localized(id))
         {
             return Some(value);
         }
@@ -2214,12 +2306,12 @@ impl Obarray {
     /// a closure for the global read: LLVM outlined that closure, storing
     /// its captures on every call.
     #[inline(always)]
-    fn buffer_value(&self, buf: Option<&crate::buffer::Buffer>, id: SymId) -> Option<Value> {
+    fn buffer_value<B: BufferLocalView>(&self, buf: Option<&B>, id: SymId) -> Option<Value> {
         let buf = buf?;
         if let Some(value) = Self::buffer_slot_value(buf, id) {
             return Some(value);
         }
-        buf.get_buffer_local_by_sym_id_gated(id, self.is_localized(id))
+        buf.local_binding(id, self.is_localized(id))
     }
 
     /// BUF's `struct buffer` slot of ID, when ID names one.
@@ -2230,9 +2322,8 @@ impl Obarray {
     /// cases, where `get_buffer_local` would answer `None` and lose it. No
     /// projection changes it: an owner's binding of a slot stays in the slot.
     #[inline(always)]
-    pub(crate) fn buffer_slot_value(buf: &crate::buffer::Buffer, id: SymId) -> Option<Value> {
-        crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id)
-            .map(|info| buf.slots[info.offset.index()])
+    pub(crate) fn buffer_slot_value<B: BufferLocalView>(buf: &B, id: SymId) -> Option<Value> {
+        slot_meta(id).map(|meta| buf.slot_value(meta.offset))
     }
 
     /// A deliberate buffer-less read, with the disagreement with GNU named.
@@ -2254,7 +2345,7 @@ impl Obarray {
         _access: CanonicalAccess,
         id: SymId,
     ) -> BufferlessValue {
-        if crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id).is_some() {
+        if slot_meta(id).is_some() {
             return BufferlessValue::PerBufferSlot;
         }
         let localized = self
@@ -2952,7 +3043,7 @@ impl Obarray {
     pub fn read_localized_for_buffer(
         &self,
         id: SymId,
-        target_buf_id: crate::buffer::BufferId,
+        target_buf_id: crate::emacs_core::value::buffer_vocab::BufferId,
         target_alist: Value,
     ) -> Option<Value> {
         let sym = self.slot(id)?;
@@ -2967,7 +3058,7 @@ impl Obarray {
         &self,
         id: SymId,
         sym: &LispSymbol,
-        target_buf_id: crate::buffer::BufferId,
+        target_buf_id: crate::emacs_core::value::buffer_vocab::BufferId,
         target_alist: Value,
     ) -> Option<Value> {
         let blv_ptr = sym.localized_blv()?.as_ptr();
@@ -3006,13 +3097,13 @@ impl Obarray {
     /// Resolve through the buffer's canonical binding index when its owner
     /// is available. A cache miss must not scan unrelated binding conses:
     /// dependency observers would otherwise subscribe to their value writes.
-    pub(crate) fn read_localized_in_buffer(
+    pub(crate) fn read_localized_in_buffer<B: BufferLocalView>(
         &self,
         id: SymId,
-        buffer: &crate::buffer::Buffer,
+        buffer: &B,
     ) -> Option<Value> {
-        self.read_localized_with_lookup(id, Value::make_buffer(buffer.id), || {
-            buffer.local_variable_binding_cell(id).unwrap_or(Value::NIL)
+        self.read_localized_with_lookup(id, Value::make_buffer(buffer.buffer_id()), || {
+            buffer.local_binding_cell(id).unwrap_or(Value::NIL)
         })
     }
 
@@ -3257,10 +3348,7 @@ impl Obarray {
             // descriptor into the BLV (`src/data.c:2112-2140`); flipping the
             // redirect back to `Forwarded` here would orphan every per-buffer
             // binding.  Declare into the BLV instead.
-            self.reattach_localized_forwarder(
-                id,
-                crate::emacs_core::pdump::types::DumpLocalizedForwarder::Bool,
-            );
+            self.reattach_localized_forwarder(id, LocalizedForwarderKind::Bool);
             self.set_canonical_value(
                 CanonicalAccess::STORAGE,
                 id,
@@ -3303,7 +3391,7 @@ impl Obarray {
     /// only reachable after loading a portable dump: the descriptor is a
     /// process-lifetime pointer, so a localized symbol's image carries its
     /// default value plus the KIND of forwarder to rebuild
-    /// ([`DumpLocalizedForwarder`](crate::emacs_core::pdump::types::DumpLocalizedForwarder)),
+    /// ([`LocalizedForwarderKind`]),
     /// never the pointer.  The new descriptor is seeded from that restored
     /// default rather than from a declaration's initial value, so a variable
     /// the bootstrap changed keeps what the dump recorded.
@@ -3313,12 +3401,8 @@ impl Obarray {
     /// Boolean slot, and for an integer slot a value that failed
     /// `LispInteger::check` is impossible to have stored, so a corrupt image
     /// falls back to the slot's zero rather than smuggling a non-integer in.
-    pub fn reattach_localized_forwarder(
-        &mut self,
-        id: SymId,
-        kind: crate::emacs_core::pdump::types::DumpLocalizedForwarder,
-    ) {
-        use crate::emacs_core::pdump::types::DumpLocalizedForwarder as Kind;
+    pub fn reattach_localized_forwarder(&mut self, id: SymId, kind: LocalizedForwarderKind) {
+        use LocalizedForwarderKind as Kind;
         let Some(blv) = self.blv_mut(id) else { return };
         if blv.fwd.is_some() {
             return;
@@ -3417,6 +3501,9 @@ impl Obarray {
         id: SymId,
         fwd: &'static crate::emacs_core::forward::LispKboardObjFwd,
     ) {
+        if id == intern("window-system") {
+            fwd.use_selected_keyboard();
+        }
         if !self.forward_cell(id, fwd.header()) {
             return;
         }
@@ -3442,10 +3529,7 @@ impl Obarray {
             // into the BLV instead -- the case `display-line-numbers-offset`
             // reaches, being both `DEFVAR_INT` and `Fmake_variable_buffer_local`
             // (`src/xdisp.c:38999-39005`).
-            self.reattach_localized_forwarder(
-                id,
-                crate::emacs_core::pdump::types::DumpLocalizedForwarder::Int,
-            );
+            self.reattach_localized_forwarder(id, LocalizedForwarderKind::Int);
             self.set_canonical_value(CanonicalAccess::STORAGE, id, value.value());
             return;
         }
@@ -3548,7 +3632,7 @@ impl Obarray {
     pub fn find_symbol_value_in_buffer(
         &mut self,
         id: SymId,
-        _current_buffer_id: Option<crate::buffer::BufferId>,
+        _current_buffer_id: Option<crate::emacs_core::value::buffer_vocab::BufferId>,
         current_buffer_value: Value,
         local_var_alist: Value,
         current_buffer_slots: Option<&[Value]>,
@@ -3961,16 +4045,19 @@ impl Obarray {
     /// before it. `why` is observability only (the JIT's epoch report counts
     /// per reason).
     pub(crate) fn invalidate_all_function_bindings(&mut self, why: FunctionEpochBump) {
-        crate::emacs_core::subr::leaf::debug_assert_no_leaf_active!("a function-epoch bump");
+        #[cfg(debug_assertions)]
+        leaf_activity::assert_no_leaf_active("a function-epoch bump");
         let epoch = self.next_function_epoch();
         // Floor first, then the clock (the publication order, `fn_stamps`).
         self.symbols.raise_fn_floor(epoch);
         self.dispatch_cells
             .function_epoch
             .store(epoch, Ordering::Release);
-        crate::emacs_core::eval::note_function_epoch_move(why, None);
+        note_function_epoch_move(why, None);
         #[cfg(feature = "jit")]
-        crate::emacs_core::jit::stats::note_function_epoch_bump(why, None);
+        if let Some(observer) = function_cell_observer() {
+            (observer.epoch_bump)(why, None);
+        }
     }
 
     /// The value `function_epoch` moves to next: one more, skipping the
@@ -4036,12 +4123,12 @@ impl Obarray {
         self.dispatch_cells
             .function_epoch
             .store(epoch, Ordering::Release);
-        crate::emacs_core::eval::note_function_epoch_move(why, Some(id));
+        note_function_epoch_move(why, Some(id));
         #[cfg(feature = "jit")]
-        {
-            crate::emacs_core::jit::stats::note_function_epoch_bump(why, Some(id));
-            crate::emacs_core::jit::cache::evict_inline_dependents(id);
-            crate::emacs_core::jit::cache::pin_redefined_function(id, previous);
+        if let Some(observer) = function_cell_observer() {
+            (observer.epoch_bump)(why, Some(id));
+            (observer.evict_inline_dependents)(id);
+            (observer.pin_redefined)(id, previous);
         }
         #[cfg(not(feature = "jit"))]
         let _ = (id, why, previous);
@@ -4326,57 +4413,6 @@ impl Obarray {
         self.get_property_id(intern(name), intern(prop))
     }
 
-    /// Get a property from the symbol's plist by identity.
-    pub fn get_property_id(&self, symbol: SymId, prop: SymId) -> Option<Value> {
-        match self.symbol_plist_snapshot_id(symbol) {
-            SymbolPlistSnapshot::NoEntries => None,
-            SymbolPlistSnapshot::Entries(plist) => {
-                crate::emacs_core::plist::plist_get(plist, &Value::from_sym_id(prop))
-            }
-        }
-    }
-
-    /// Set a property on the symbol's plist.
-    ///
-    /// Returns `Err(Flow)` if the existing plist is malformed (non-cons non-nil),
-    /// matching GNU `Fput` / `Fplist_put` semantics.
-    pub fn put_property(&mut self, name: &str, prop: &str, value: Value) -> Result<(), Flow> {
-        let symbol = intern(name);
-        self.mark_global_member(symbol);
-        let sym = self.ensure_symbol_id(symbol);
-        let (new_plist, _changed) = crate::emacs_core::plist::plist_put(
-            sym.plist.get(),
-            Value::from_sym_id(intern(prop)),
-            value,
-        )?;
-        // SATB: retain the plist cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.plist.get());
-        sym.plist.store_atomic(new_plist);
-        SymbolPropertyRevision::changed(symbol);
-        Ok(())
-    }
-
-    /// Set a property on the symbol's plist by identity.
-    ///
-    /// Returns `Err(Flow)` if the existing plist is malformed (non-cons non-nil),
-    /// matching GNU `Fput` / `Fplist_put` semantics.
-    pub fn put_property_id(
-        &mut self,
-        symbol: SymId,
-        prop: SymId,
-        value: Value,
-    ) -> Result<(), Flow> {
-        self.ensure_global_member_if_canonical(symbol);
-        let sym = self.ensure_symbol_id(symbol);
-        let (new_plist, _changed) =
-            crate::emacs_core::plist::plist_put(sym.plist.get(), Value::from_sym_id(prop), value)?;
-        // SATB: retain the plist cell's pre-image during a concurrent mark.
-        crate::tagged::gc::note_root_overwrite(sym.plist.get());
-        sym.plist.store_atomic(new_plist);
-        SymbolPropertyRevision::changed(symbol);
-        Ok(())
-    }
-
     /// Replace the complete plist for a symbol by identity.
     pub fn replace_symbol_plist_id<I>(&mut self, symbol: SymId, entries: I)
     where
@@ -4396,7 +4432,7 @@ impl Obarray {
         let sym = self.ensure_symbol_id(symbol);
         // SATB: retain the plist cell's pre-image during a concurrent mark.
         crate::tagged::gc::note_root_overwrite(sym.plist.get());
-        sym.plist.store_atomic(new_plist);
+        store_plist_head(sym, new_plist);
         SymbolPropertyRevision::changed(symbol);
     }
 
@@ -4408,7 +4444,7 @@ impl Obarray {
         let sym = self.ensure_symbol_id(symbol);
         // SATB: retain the plist cell's pre-image during a concurrent mark.
         crate::tagged::gc::note_root_overwrite(sym.plist.get());
-        sym.plist.store_atomic(plist);
+        store_plist_head(sym, plist);
         SymbolPropertyRevision::changed(symbol);
     }
 
@@ -5010,14 +5046,14 @@ impl Obarray {
     /// Reconstruct an Obarray from pdump data.
     ///
     /// A global-member or function-unbound entry whose slot has no symbol row
-    /// is a corrupt dump: return the typed [`DumpError`] instead of panicking
+    /// is a corrupt dump: return the typed [`ObarrayRestoreError`] instead of panicking
     /// (release builds run no member pre-validation).
     pub(crate) fn from_dump(
         symbols: Vec<(SymId, LispSymbol)>,
         global_members: Vec<SymId>,
         function_unbound: Vec<SymId>,
         function_epoch: u64,
-    ) -> Result<Self, DumpError> {
+    ) -> Result<Self, ObarrayRestoreError> {
         let max_slot = symbols
             .iter()
             .map(|(id, _)| Self::slot_index(*id))
@@ -5054,24 +5090,18 @@ impl Obarray {
             ob.symbols.ensure(Self::slot_index(id)).publish_fill(sym);
         }
         for id in global_members {
-            let sym = ob.slot_mut(id).ok_or_else(|| {
-                DumpError::DeserializationError(format!(
-                    "pdump obarray is inconsistent: global member references missing symbol slot {}",
-                    id.0
-                ))
-            })?;
+            let sym = ob
+                .slot_mut(id)
+                .ok_or(ObarrayRestoreError::GlobalMemberMissingSlot(id))?;
             if !sym.interned_global {
                 sym.interned_global = true;
                 ob.global_member_count += 1;
             }
         }
         for id in function_unbound {
-            let sym = ob.slot_mut(id).ok_or_else(|| {
-                DumpError::DeserializationError(format!(
-                    "pdump obarray is inconsistent: function-unbound entry references missing symbol slot {}",
-                    id.0
-                ))
-            })?;
+            let sym = ob
+                .slot_mut(id)
+                .ok_or(ObarrayRestoreError::FunctionUnboundMissingSlot(id))?;
             sym.function_unbound = true;
             // The flag/cell invariant (`LispSymbol::function_unbound`): a dump
             // may mark only a symbol whose restored cell is NIL.
@@ -5089,60 +5119,15 @@ impl Obarray {
 
 impl GcTrace for Obarray {
     fn trace_roots(&self, roots: &mut Vec<Value>) {
-        // The concurrent-mark TERMINATION re-seed skips this per-symbol
-        // val/function/plist walk: the symbol-cell SATB barrier
-        // (crate::tagged::gc::note_root_overwrite) already retained every overwrite
-        // during the mark window. The flag is false everywhere else (start seed +
-        // STW full collection) => full scan. The BLV-pool loop below ALWAYS runs —
-        // the barrier does not track BLV valcell/where_buf rebinds, so it stays a
-        // per-termination residual.
-        let skip_symbol_cells = SEED_SKIP_OBARRAY_SYMBOL_CELLS.with(|c| c.get());
-        for sym in self.symbols.iter().filter(|s| s.is_present()) {
-            if skip_symbol_cells {
-                continue;
-            }
-            // Acquire loads: a concurrent mutator may publish into the
-            // same word (`CellWrite`).
-            match sym.value_cell_acquire() {
-                ValueCell::Plain(v) => {
-                    if v != Value::UNBOUND {
-                        roots.push(v);
-                    }
-                }
-                // Alias:     a SymId, not a heap ref.
-                // Forwarded: 'static forwarder metadata (owned values are
-                //            traced from `value_fwds` below).
-                // Localized: BLV contents traced via self.blvs below.
-                ValueCell::Alias(_) | ValueCell::Forwarded(_) | ValueCell::Localized(_) => {}
-            }
-            roots.push(sym.function.load_atomic());
-            roots.push(sym.plist.load_atomic());
-        }
-        // BLV contents for LOCALIZED symbols. Unchanged.
-        for &blv_ptr in &self.blvs {
-            // SAFETY: the pool's records live as long as `self`.
-            let blv = unsafe { &*blv_ptr.as_ptr() };
-            roots.push(blv.defcell.load_atomic());
-            roots.push(blv.valcell.load_atomic());
-            roots.push(blv.where_buf.load_atomic());
-        }
-        // Value-owning forwarder slots. GNU's `DEFVAR_INT` slot is an
-        // `intmax_t` and needs no marking, but Neomacs stores the Lisp integer
-        // (a heap object once it leaves fixnum range); GNU's `DEFVAR_LISP` and
-        // `DEFVAR_KBOARD` slots live in `struct emacs_globals` / `struct
-        // KBOARD`, which `staticpro` and `mark_kboards` root, and here they
-        // live in the descriptor -- so in all three cases the descriptor is
-        // the root. Traced from this list rather than from the symbol walk
-        // because a symbol that was later localized no longer points at its
-        // descriptor while the BLV still forwards through it. Like the BLV
-        // pool, this loop always runs -- the SATB barrier in each `set`
-        // covers the mark window, and the start seed / STW collection need
-        // the full list.
-        for fwd in &self.value_fwds {
-            if let Some(value) = fwd.owned_value() {
-                roots.push(value);
-            }
-        }
+        // Preserve serial termination's existing SATB-covered cell omission.
+        // The shared leaf also has a Complete caller under KeeperSymbols;
+        // that parallel path never consults this serial policy's TLS.
+        let selection = if SEED_SKIP_OBARRAY_SYMBOL_CELLS.with(|c| c.get()) {
+            roots::SymbolRootSet::Pools
+        } else {
+            roots::SymbolRootSet::Complete
+        };
+        self.append_symbol_roots(selection, roots);
     }
 }
 
@@ -5165,14 +5150,40 @@ thread_local! {
 #[must_use = "the thread-local extent ends when this guard drops"]
 #[derive(Debug)]
 pub(crate) struct ObarraySymbolCellSkipGuard {
-    _scope: crate::tls_scope::TlsScope<bool, std::cell::Cell<bool>>,
+    _scope: SeedSkipCellsScope,
+}
+
+/// Restores [`SEED_SKIP_OBARRAY_SYMBOL_CELLS`] on drop. Best-effort during
+/// teardown, the same contract as the caller-side TLS scopes: a destroyed key
+/// must not turn unwinding into a second panic.
+#[derive(Debug)]
+struct SeedSkipCellsScope {
+    previous: bool,
+    /// Thread-confined like the scope it replaces; a guard must not cross
+    /// threads with its TLS restoration.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl SeedSkipCellsScope {
+    fn new(value: bool) -> Self {
+        Self {
+            previous: SEED_SKIP_OBARRAY_SYMBOL_CELLS.with(|slot| slot.replace(value)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for SeedSkipCellsScope {
+    fn drop(&mut self) {
+        let _ = SEED_SKIP_OBARRAY_SYMBOL_CELLS.try_with(|slot| slot.replace(self.previous));
+    }
 }
 static_assertions::assert_not_impl_any!(ObarraySymbolCellSkipGuard: Send, Sync);
 
 impl ObarraySymbolCellSkipGuard {
     pub(crate) fn new() -> Self {
         Self {
-            _scope: crate::tls_scope::TlsScope::new(&SEED_SKIP_OBARRAY_SYMBOL_CELLS, true),
+            _scope: SeedSkipCellsScope::new(true),
         }
     }
 }
@@ -5201,6 +5212,10 @@ mod copied_value_tests;
 #[cfg(test)]
 #[path = "tests/canonical_dispatch_test.rs"]
 mod canonical_dispatch_tests;
+
+#[cfg(test)]
+#[path = "tests/plist_epoch_test.rs"]
+mod plist_epoch_tests;
 
 /// The pre-`CanonicalAccess` spellings, for tests, which set up and inspect
 /// canonical storage. Production code names its reason
@@ -5260,4 +5275,18 @@ impl Obarray {
     pub fn makunbound_id(&mut self, id: SymId) {
         self.makunbound_canonical(CanonicalAccess::TEST, id);
     }
+}
+
+/// Carrier park: clear the obarray-seed skip latch (fresh-thread value).
+pub(crate) fn reset_carrier_tls() {
+    SEED_SKIP_OBARRAY_SYMBOL_CELLS.with(|slot| slot.set(false));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        SEED_SKIP_OBARRAY_SYMBOL_CELLS.with(|slot| slot.get() as u64),
+    );
 }

@@ -3,7 +3,7 @@
 use super::retry::{self as contention, Deadline, Retry, retry_owned};
 use super::*;
 use crate::emacs_core::intern::SymId;
-use crate::tagged::gc::{HeapIdentity, Mutator, MutatorPermit, ParallelHeapEra};
+use crate::tagged::gc::{HeapIdentity, Mutator, MutatorPermit, ProofEra as ParallelHeapEra};
 use crate::tagged::transport::SharedRoot;
 use crate::tagged::value::TaggedValue;
 use std::ops::ControlFlow;
@@ -242,10 +242,12 @@ pub(crate) fn exercise_function_era(
     let before = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         observe(FunctionBoundaryPoint::BeforeReconcile)
     }));
-    let reconciled = stopped
-        .symbols()
-        .map_err(|e| format!("keeper symbols: {e:?}"))?
-        .reconcile_functions()
+    let reconciled = era
+        .reconcile_functions(
+            &mut stopped
+                .symbols()
+                .map_err(|e| format!("keeper symbols: {e:?}"))?,
+        )
         .map_err(|e| format!("reconciliation: {e:?}"));
     let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         observe(FunctionBoundaryPoint::AfterReconcile)

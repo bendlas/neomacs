@@ -813,20 +813,6 @@ pub(crate) fn builtin_load(eval: &mut super::eval::Context, args: Vec<Value>) ->
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
-pub(crate) fn builtin_load_file(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    expect_args("load-file", &args, 1)?;
-    let file = crate::emacs_core::builtins::expect_lisp_string(&args[0])?.clone();
-    let path = super::fileio::lisp_file_name_to_path_buf(&file);
-    super::load::load_file_with_found_options(
-        eval,
-        &path,
-        &file,
-        super::load::LoadOptions::EXPLICIT,
-    )
-    .map_err(eval_error_to_flow)
-}
-
-#[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 pub(crate) fn builtin_eval(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_min_args("eval", &args, 1)?;
     expect_max_args("eval", &args, 2)?;
@@ -1818,10 +1804,10 @@ pub(crate) fn print_value_princ_bytes_to_multibyte_buffer(
         )
         .into_owned();
     }
-    let mut options = super::error::print_options_from_state(ctx.variables(), None);
+    let mut options = crate::emacs_core::print::print_options_from_state(ctx.variables(), None);
     options.print_noescape = true;
     options.print_escape_nonascii = true;
-    super::error::print_value_bytes_in_state_with_options(ctx, value, options)
+    crate::emacs_core::print::print_value_bytes_in_state_with_options(ctx, value, options)
 }
 
 /// One override-list cursor stays rooted while specbind invokes watchers.
@@ -2098,7 +2084,7 @@ fn prin1_string_options(
     ctx: &crate::emacs_core::eval::Context,
     escaping: ObjectEscaping,
 ) -> super::print::PrintOptions {
-    let mut options = super::error::print_options_from_state(ctx.variables(), None);
+    let mut options = crate::emacs_core::print::print_options_from_state(ctx.variables(), None);
     options.print_noescape = escaping.is_unescaped();
     // GNU's multibyte Vprin1_to_string_buffer implicitly binds this flag to t.
     // Retain the old rendering fallback if a watcher changes the real binding.
@@ -2224,7 +2210,7 @@ pub(crate) fn builtin_princ(eval: &mut super::eval::Context, args: Vec<Value>) -
                 .push(crate::emacs_core::eval::SpecBinding::SaveCurrentBuffer { buffer_id });
         }
 
-        let mut options = super::error::print_options_from_state(
+        let mut options = crate::emacs_core::print::print_options_from_state(
             eval.variables(),
             print_target_current_buffer(eval, target),
         );
@@ -2263,7 +2249,7 @@ pub(crate) fn builtin_princ_impl(
                 .push(crate::emacs_core::eval::SpecBinding::SaveCurrentBuffer { buffer_id });
         }
         apply_print_target_escape_bindings(ctx, target)?;
-        let mut options = super::error::print_options_from_state(
+        let mut options = crate::emacs_core::print::print_options_from_state(
             ctx.variables(),
             print_target_current_buffer(ctx, target),
         );
@@ -2297,7 +2283,7 @@ pub(crate) fn builtin_prin1(eval: &mut super::eval::Context, args: Vec<Value>) -
         }
         let settings_source = print_settings_source(eval, target);
 
-        let options = super::error::print_options_from_state(
+        let options = crate::emacs_core::print::print_options_from_state(
             eval.variables(),
             print_target_current_buffer(eval, target),
         );
@@ -2337,7 +2323,7 @@ pub(crate) fn builtin_prin1_impl(
                 .push(crate::emacs_core::eval::SpecBinding::SaveCurrentBuffer { buffer_id });
         }
         apply_print_target_escape_bindings(ctx, target)?;
-        let options = super::error::print_options_from_state(
+        let options = crate::emacs_core::print::print_options_from_state(
             ctx.variables(),
             print_target_current_buffer(ctx, target),
         );
@@ -2392,7 +2378,7 @@ pub(crate) fn builtin_print(eval: &mut super::eval::Context, args: Vec<Value>) -
         // A function stream performs no `set_buffer_internal`, so GNU reads its
         // `print-*` globals with the CALLER's buffer current -- the same rule
         // `builtin_prin1`'s function path follows. Ledger 196.
-        let options = super::error::print_options_from_state(
+        let options = crate::emacs_core::print::print_options_from_state(
             eval.variables(),
             print_target_current_buffer(eval, target),
         );
@@ -2434,7 +2420,7 @@ pub(crate) fn builtin_print_impl(
                 .push(crate::emacs_core::eval::SpecBinding::SaveCurrentBuffer { buffer_id });
         }
         apply_print_target_escape_bindings(ctx, target)?;
-        let options = super::error::print_options_from_state(
+        let options = crate::emacs_core::print::print_options_from_state(
             ctx.variables(),
             print_target_current_buffer(ctx, target),
         );

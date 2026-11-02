@@ -79,12 +79,7 @@ fn gnu_expect(name: &str, setup: &str, observe: &str, fixture: &str) -> String {
         ),
     )
     .expect("write GNU oracle input");
-    let emacs = std::env::var_os("EMACS").unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".local/bin/emacs")
-            .into_os_string()
-    });
-    let result = std::process::Command::new(emacs)
+    let result = crate::test_utils::gnu_probe_command()
         .args(["--batch", "-Q", "-l"])
         .arg(&script)
         .output()

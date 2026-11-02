@@ -6,6 +6,7 @@ use neomacs_gui_tests::{
     GuiTestPlan, ProcessGuiCommandRunner,
 };
 use neomacs_melpa_test_support::EmacsRuntime;
+use neomacs_test_env::CanonicalPin;
 use std::{
     fs, thread,
     time::{Duration, Instant},
@@ -76,24 +77,34 @@ fn han_fontset_rule_with_absent_registry_selects_same_face_as_unicode_registry()
         .then(|| DisplayHarness::for_backend(GuiBackend::LinuxX11).start_session(&gnu_control))
         .transpose()
         .unwrap();
-    let mut command = gnu.command();
+    let environment = neomacs_melpa_test_support::package_environment_at(&control).unwrap();
+    let mut command = gnu.command(&environment);
     command
         .args(["-Q", "-l"])
         .arg(&script)
         .env("NEOMACS_HAN_CONTROL", &gnu_control)
-        .env("FONTCONFIG_FILE", &config)
-        .env("TMPDIR", &control)
-        .envs(
-            gnu_session
-                .as_ref()
-                .unwrap_or(&session)
-                .env()
-                .iter()
-                .cloned(),
-        );
-    let output =
-        neomacs_melpa_test_support::output_with_timeout(&mut command, Duration::from_secs(30))
-            .unwrap();
+        .env("FONTCONFIG_FILE", &config);
+    // The fixture redirects both editors' TMPDIR to the shared control root
+    // (deliberately different from the canonical `control/tmp`), and the
+    // display session pins LC_ALL for its X clients; on an already pinned
+    // command both are per-case overrides of canonical pins and must be the
+    // typed, greppable statement.
+    command.override_pin(CanonicalPin::TmpDir, &control);
+    for (name, value) in gnu_session.as_ref().unwrap_or(&session).env() {
+        match CanonicalPin::from_env_name(name) {
+            Some(pin) => {
+                command.override_pin(pin, value);
+            }
+            None => {
+                command.env(name, value);
+            }
+        }
+    }
+    let output = neomacs_melpa_test_support::output_with_timeout_pinned(
+        &mut command,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     fs::write(gnu_control.join("stdout"), &output.stdout).unwrap();
     fs::write(gnu_control.join("stderr"), &output.stderr).unwrap();
     assert!(

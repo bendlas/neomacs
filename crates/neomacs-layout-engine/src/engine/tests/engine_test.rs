@@ -1,3 +1,9 @@
+#[path = "category_word_wrap_test.rs"]
+mod category_word_wrap_test;
+
+#[path = "sparse_fontify_query_test.rs"]
+mod sparse_fontify_query_test;
+
 /// A surface point in a presentation composed with nothing in motion.
 ///
 /// The production path builds the same value by mapping through the projection
@@ -34,9 +40,9 @@ fn debug_logging_renders_mode_line_with_ellipsis_across_preview_byte_limit() {
         .frame_manager_mut()
         .create_frame("issue543", 1800, 160, buffer);
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-        LayoutEngine::new().layout_frame_rust(&mut eval, frame);
+        crate::font::metrics::test_catalog::layout_engine().layout_frame_rust(&mut eval, frame);
     });
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame);
     let rendered: String = engine
         .last_frame_display_state
@@ -95,6 +101,8 @@ mod edit_sync_engine_test;
 #[cfg(test)]
 #[path = "edit_sync_prove_first_engine_test.rs"]
 mod edit_sync_prove_first_engine_test;
+#[path = "face_overlay_replay_test.rs"]
+mod face_overlay_replay_test;
 #[path = "../../tests/engine_layout_validity_test.rs"]
 mod layout_validity;
 #[path = "lazy_text_hit_test.rs"]
@@ -103,6 +111,8 @@ mod lazy_text_hit_test;
 mod mini_window_still_test;
 #[path = "mode_line_gate_engine_test.rs"]
 mod mode_line_gate_engine_test;
+#[path = "position_query_repeat_test.rs"]
+mod position_query_repeat_test;
 #[cfg(test)]
 #[path = "posn_current_matrix_clear_engine_test.rs"]
 mod posn_current_matrix_clear_engine_test;
@@ -112,6 +122,8 @@ mod posn_frame_pool_engine_test;
 #[cfg(test)]
 #[path = "posn_frame_pool_guard_test.rs"]
 mod posn_frame_pool_guard_test;
+#[path = "query_chrome_remeasure_test.rs"]
+mod query_chrome_remeasure_test;
 #[path = "query_source_horizon_test.rs"]
 mod query_source_horizon_test;
 #[path = "replay_cursor_on_tab_test.rs"]
@@ -523,7 +535,7 @@ fn buffer_text_row_overflow_decision_names_main_text_wrap_policy() {
             6.0,
             10.0,
             LineWrapMode::Truncate,
-            empty_wrap
+            empty_wrap.checkpoint()
         ),
         DisplayRowTextOverflowDecision::Fits
     );
@@ -534,7 +546,7 @@ fn buffer_text_row_overflow_decision_names_main_text_wrap_policy() {
             16.0,
             10.0,
             LineWrapMode::Truncate,
-            empty_wrap
+            empty_wrap.checkpoint()
         ),
         DisplayRowTextOverflowDecision::Fits
     );
@@ -545,7 +557,7 @@ fn buffer_text_row_overflow_decision_names_main_text_wrap_policy() {
             6.0,
             10.0,
             LineWrapMode::Truncate,
-            empty_wrap
+            empty_wrap.checkpoint()
         ),
         DisplayRowTextOverflowDecision::Truncate
     );
@@ -556,7 +568,7 @@ fn buffer_text_row_overflow_decision_names_main_text_wrap_policy() {
             6.0,
             10.0,
             LineWrapMode::Wrap,
-            empty_wrap
+            empty_wrap.checkpoint()
         ),
         DisplayRowTextOverflowDecision::CharacterWrap
     );
@@ -579,7 +591,7 @@ fn buffer_text_row_overflow_decision_names_main_text_wrap_policy() {
             6.0,
             10.0,
             LineWrapMode::Wrap,
-            word_wrap
+            word_wrap.checkpoint()
         ),
         DisplayRowTextOverflowDecision::WordWrap {
             break_candidate: word_wrap.candidate(),
@@ -1780,11 +1792,12 @@ fn test_window_params() -> WindowParams {
         vscroll: 0,
         wrap_mode: LineWrapMode::Wrap,
         word_wrap: false,
+        word_wrap_policy: Default::default(),
         tab_width: 8,
         scroll_conservatively: 0,
         scroll_step: 0,
         scroll_minibuffer_conservatively: true,
-        scroll_margin: 0,
+        scroll_margin: neovm_core::window::ScrollMargin::default(),
         tab_stop_list: vec![],
         default_fg: 0xFFFFFF,
         frame_foreground: 0xFFFFFF,
@@ -1888,7 +1901,7 @@ fn graphic_frame_publication_is_atomic_while_default_font_is_unrealized() {
     default.height = Some(FaceHeight::Absolute(0));
     eval.face_table_mut().define("default", default);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -1924,7 +1937,7 @@ fn graphic_frame_opened_size_matches_installed_face_and_realized_font() {
         frame.char_height = 16.0;
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame_size = eval
@@ -2272,7 +2285,7 @@ fn tab_line_pointer_provenance_preserves_nested_source_string() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -2382,7 +2395,7 @@ fn accepted_presentation_publishes_identical_evaluator_and_renderer_window_regio
         display.horizontal_scroll_bar_type = Value::NIL;
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let evaluator_presentation = activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -2803,7 +2816,7 @@ fn presentation_spatial_maps_blank_body_rows_to_their_buffer_position() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -2875,7 +2888,7 @@ fn skipped_zero_body_window_still_publishes_known_regions_and_cell_origin() {
         window.set_top_line(2);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -3320,7 +3333,7 @@ fn backend_layout_in_context(
         setup_window(window);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     (eval, engine, frame_id)
 }
@@ -3333,10 +3346,10 @@ fn backend_layout_in_context(
 /// pays. Reports via panic! (like the jit_bench_* family) so the line surfaces
 /// under nextest capture; the test "fails" by design. Build needs the jit feature
 /// (a bare neovm-core build is broken on this branch, pre-existing). Run:
-///   cargo nextest run -p neomacs-layout-engine --features neovm-core/jit \
-///     --release --run-ignored ignored-only --no-capture layout_bench_warm
+///   cargo nextest run -p neomacs-layout-engine --features perf-probes \
+///     --release --no-capture layout_bench_warm
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn layout_bench_warm() {
     use std::time::{Duration, Instant};
     let mut eval = Context::new();
@@ -3366,7 +3379,7 @@ fn layout_bench_warm() {
             *window_start = LispCharPos1::ONE;
         }
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let t0 = Instant::now();
     engine.layout_frame_rust(&mut eval, frame_id);
     let cold = t0.elapsed();
@@ -3430,7 +3443,7 @@ fn phase0a_layout_stats_reports_full_rebuild_baseline() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     // A single COLD layout (no retained matrix yet) is always a full rebuild —
     // every body row is laid from scratch, no reuse machinery applies. (A warm
     // no-op repaint now takes the no-change cursor-only path; see
@@ -3594,7 +3607,7 @@ fn incr_editing_frame(
 fn phase1_cursor_move_is_cursor_only() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(10));
@@ -3638,7 +3651,7 @@ fn cursor_only_replay_preserves_hidden_buffer_cursor() {
         .get_mut(buf_id)
         .unwrap()
         .set_buffer_local("cursor-type", Value::NIL);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert!(
         engine
@@ -3678,7 +3691,7 @@ fn cursor_only_move_preserves_gnu_box_cursor_glyph_foreground() {
     let text = "abcdef\n";
     let (mut eval, frame_id, buf_id, _window) = incr_editing_frame(text, 800, 600);
     realize_test_gui_frame(&mut eval, frame_id);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
 
     engine.layout_frame_rust(&mut eval, frame_id);
     let initial = engine
@@ -3742,7 +3755,7 @@ fn cursor_only_fast_path_places_cursor_on_the_row_glyph_advances() {
         .get_mut(buf_id)
         .expect("buffer")
         .set_buffer_local("display-line-numbers", Value::T);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     // Full walk with point just past the wide run: the reference placement.
     eval.buffer_manager_mut()
         .get_mut(buf_id)
@@ -3826,7 +3839,7 @@ fn cursor_only_replay_republishes_buffer_default_face_fill() {
         );
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let full_fill = engine
         .last_frame_display_state
@@ -3901,7 +3914,7 @@ fn tty_split_preserves_remapped_default_face_across_padding_and_blank_tail() {
         )
         .expect("split window onto the same buffer");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -3954,7 +3967,7 @@ fn tty_split_preserves_remapped_default_face_across_padding_and_blank_tail() {
 fn cursor_only_replay_republishes_the_window_regions_with_the_new_presentation() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, selected) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
     let (first_presentation, first_regions, first_cell_origin) = {
@@ -4020,13 +4033,13 @@ fn phase1_cursor_move_matches_full_rebuild_golden() {
             .expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(10));
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     // Incremental: warm at point 0, move to 10, second pass takes cursor-only.
     let (mut eval, frame_id, buf_id, _wi) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -4080,7 +4093,7 @@ fn relative_line_numbers_follow_point_across_incremental_redisplay() {
         buffer.set_buffer_local("display-line-numbers", Value::symbol("relative"));
         buffer.goto_emacs_byte_pos(EmacsBytePos::new(MOVED_POINT));
     }
-    let mut reference_engine = LayoutEngine::new();
+    let mut reference_engine = crate::font::metrics::test_catalog::layout_engine();
     reference_engine.layout_frame_rust(&mut reference_eval, reference_frame);
     let expected = line_number_margins(&selected_window_layout_trace(
         &reference_eval,
@@ -4098,7 +4111,7 @@ fn relative_line_numbers_follow_point_across_incremental_redisplay() {
         buffer.set_buffer_local("display-line-numbers", Value::symbol("relative"));
         buffer.goto_emacs_byte_pos(EmacsBytePos::new(INITIAL_POINT));
     }
-    let mut incremental_engine = LayoutEngine::new();
+    let mut incremental_engine = crate::font::metrics::test_catalog::layout_engine();
     incremental_engine.layout_frame_rust(&mut incremental_eval, incremental_frame);
     incremental_eval
         .buffer_manager_mut()
@@ -4118,21 +4131,23 @@ fn relative_line_numbers_follow_point_across_incremental_redisplay() {
     );
 }
 
-/// Phase 1 — an OVERLAY change (hl-line / show-paren / region) co-moving with
-/// the cursor MUST bail to a full rebuild: the overlay tick moved, so the
-/// retained rows are no longer trustworthy. This is the invalidation-completeness
-/// guarantee (spec §3) — silently staying cursor-only here would ship stale rows.
+/// A structural overlay change co-moving with the cursor must still bail to a
+/// full rebuild: `before-string` changes the displayed rows themselves, so
+/// neither a cursor-only replay nor the face-only replay can reproduce them.
+/// This is the invalidation-completeness guarantee (spec §3) — silently staying
+/// cursor-only here would ship stale rows. Face-only overlays take the narrower
+/// replay covered by `face_overlay_replay_test`.
 #[test]
-fn phase1_overlay_change_bails_to_full() {
+fn phase1_structural_overlay_change_bails_to_full() {
     // Counts the mini-window's full walk (NEOMACS_LAYOUT_MINI_STILL off).
     crate::incremental_layout::set_mini_window_still_for_test(Some(false));
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
-        // Use the Lisp `make-overlay` builtin (the path hl-line / show-paren take)
-        // so the overlay tick is bumped, exactly as real code does.
-        eval.eval_str("(overlay-put (make-overlay 1 24) 'face 'highlight)")
+        // Use the Lisp `make-overlay` builtin so the overlay content digest
+        // moves, exactly as real code does.
+        eval.eval_str(r#"(overlay-put (make-overlay 1 24) 'before-string "prefix")"#)
             .expect("make-overlay");
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(10));
@@ -4176,7 +4191,7 @@ fn phase1_split_window_frame_phys_cursor_stays_on_selected_window() {
         )
         .expect("split window onto the same buffer");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         // C-p C-p: move point in the selected window only (no text edit, no tick
         // move) so both same-buffer windows re-decorate down the cursor-only path.
@@ -4245,7 +4260,7 @@ fn phase1_split_window_frame_phys_cursor_stays_on_selected_window_reverse_order(
         "select the right window",
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(10));
@@ -4306,7 +4321,7 @@ fn phase1_split_window_cursor_replay_uses_one_inactive_display_slot() {
         .expect("buffer")
         .set_buffer_local("display-line-numbers", Value::T);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let expected_left_live = eval
         .frame_manager()
@@ -4386,7 +4401,7 @@ fn phase1_inactive_cursor_replay_retains_exact_presented_geometry() {
             .select_window(right_window)
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let first_cursor = engine
         .last_frame_display_state
@@ -4466,7 +4481,7 @@ fn phase1_inactive_cursor_replay_retains_exact_presented_geometry() {
 fn phase1_put_text_property_bails_out_of_cursor_only() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         eval.eval_str("(put-text-property 1 6 'face 'bold)")
             .expect("put-text-property");
@@ -4497,7 +4512,7 @@ fn phase1_put_text_property_bails_out_of_cursor_only() {
 fn phase1_insert_at_window_start_keeps_the_edit_replay() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, _buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         eval.eval_str("(progn (goto-char (point-min)) (insert \"x\"))")
             .expect("insert at window start");
@@ -4539,7 +4554,7 @@ fn phase1_replacement_across_window_start_falls_back() {
             *window_start = LispCharPos1::from_one_based_usize(261);
         }
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         // Replace 1-based 257..266 (0-based 256..265) with two characters:
         // the window start (0-based 260) lies inside the replaced text and the
@@ -4567,7 +4582,7 @@ fn phase1_replacement_across_window_start_falls_back() {
 fn phase1_face_attribute_change_bails_to_full() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         eval.eval_str(
             "(internal-set-lisp-face-attribute 'default :foreground \"red\" (selected-frame))",
@@ -4615,7 +4630,7 @@ fn phase2_scroll_is_pure_scroll() {
     let line = "(defun f (a b) (+ a b))\n"; // 24 bytes incl newline
     let text = line.repeat(80);
     let (mut eval, frame_id, buf_id, selected_window) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         // Scroll down 5 whole lines, point following into the visible region.
         scroll_window_to(
@@ -4665,7 +4680,7 @@ fn scroll_to_top_does_not_match_trailing_placeholder_row() {
 
     // Incremental: warm at top, scroll DOWN, then scroll back to the TOP.
     let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     scroll_window_to(
         &mut eval,
@@ -4682,7 +4697,7 @@ fn scroll_to_top_does_not_match_trailing_placeholder_row() {
 
     // Reference: fresh full rebuild at window_start 1.
     let (mut eval_ref, frame_ref, _br, _wr) = incr_editing_frame(&text, 800, 600);
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
@@ -4721,13 +4736,13 @@ fn phase2_scroll_matches_full_rebuild_golden() {
         new_window_start,
         point_byte,
     );
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     // Incremental: warm, scroll, second pass takes the pure-scroll path.
     let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     scroll_window_to(
         &mut eval,
@@ -4799,7 +4814,7 @@ fn phase2_scroll_replay_keeps_the_selected_windows_phys_cursor() {
     let scrolled_start = scroll_lines * line_len as i64 + 1;
 
     let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     scroll_window_to(&mut eval, frame_id, win, buf_id, 1, point_byte);
     engine.layout_frame_rust(&mut eval, frame_id);
     assert!(
@@ -4836,7 +4851,7 @@ fn phase2_scroll_replay_keeps_the_selected_windows_phys_cursor() {
         scrolled_start,
         point_byte,
     );
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = frame_phys_cursor(&ref_engine).expect("full rebuild publishes the cursor");
     assert_eq!(
@@ -4854,7 +4869,7 @@ fn phase2_partial_row_scroll_bails_to_full() {
     let line = "(defun f (a b) (+ a b))\n";
     let text = line.repeat(80);
     let (mut eval, frame_id, buf_id, selected_window) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         // window_start mid-line (not a row boundary).
         scroll_window_to(
@@ -4896,7 +4911,7 @@ fn phase3_fontlocked_first_row_edit_relays_only_the_span() {
         "#,
     )
     .expect("install fontification hook");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(6));
@@ -4940,7 +4955,7 @@ fn laying_out_one_frame_keeps_another_frames_retained_matrices() {
         .frame_manager_mut()
         .create_frame("second", 400, 300, buf_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_a);
     let key_a = neomacs_display_protocol::types::DisplayWindowId::new(window_a.0 as i64);
     assert_eq!(engine.retained_frame, Some(frame_a));
@@ -5001,7 +5016,7 @@ fn phase3_multi_window_same_buffer_replays_the_edit_in_both_windows() {
             neovm_core::window::SplitPlacement::AfterTarget,
         )
         .expect("split window onto the same buffer");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(10));
@@ -5149,7 +5164,7 @@ fn layout_trace_with_buffer_and_window_setup(
         setup_window(window);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     selected_window_layout_trace(&eval, &engine, frame_id)
 }
@@ -5238,7 +5253,7 @@ fn layout_frame_rust_renders_face_inherited_from_text_category() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -5353,7 +5368,7 @@ fn layout_frame_rust_truncated_row_sets_right_arrow_fringe() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -5427,7 +5442,7 @@ fn layout_frame_rust_continued_row_sets_curly_arrow_fringe() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -5540,7 +5555,7 @@ fn layout_frame_rust_list_wrapped_left_fringe_spec_draws_in_fringe_not_inline() 
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -5626,7 +5641,7 @@ fn layout_frame_rust_places_line_number_prefix_before_buffer_text() {
         .expect("line-number buffer")
         .set_buffer_local("display-line-numbers", Value::T);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let frame = engine
         .last_frame_display_state
@@ -5688,7 +5703,7 @@ fn the_published_window_info_carries_the_line_number_field_the_row_walk_reserved
         .expect("line-number buffer")
         .set_buffer_local("display-line-numbers", Value::T);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -5749,7 +5764,7 @@ fn a_window_showing_no_line_numbers_publishes_no_line_number_field_at_all() {
     let (mut eval, frame_id, _buffer_id, selected_window) =
         incr_editing_frame("alpha\nbeta\ngamma\n", 360, 180);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -5800,7 +5815,7 @@ fn a_minibuffer_window_publishes_no_line_number_field_even_when_its_buffer_enabl
     );
     eval.set_current_message(Some(LispString::from_utf8("Echo has no field")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -5832,7 +5847,7 @@ fn a_cursor_only_replay_publishes_the_same_line_number_field_as_the_walk_it_reus
         .expect("line-number buffer")
         .set_buffer_local("display-line-numbers", Value::T);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let full_walk_field = engine
         .last_frame_display_state
@@ -5890,7 +5905,7 @@ fn layout_frame_rust_fills_rows_beyond_eob_with_line_number_text_prefix() {
         );
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -6564,7 +6579,7 @@ fn layout_frame_rust_display_table_preserves_each_glyph_face() {
         Some("__display-table-left"),
         "frame face sync must retain the typed Lisp face identity"
     );
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -6822,7 +6837,7 @@ fn layout_frame_rust_display_table_newline_glyph_uses_face_and_breaks_row() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -6938,7 +6953,7 @@ fn layout_frame_rust_display_table_face_preserves_attributes_and_height() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -7381,7 +7396,7 @@ fn layout_frame_rust_keeps_ordinary_prefix_advances_inside_mixed_emoji_run() {
     realize_test_gui_frame(&mut eval, frame_id);
     bind_minibuffer_buffer(&mut eval, frame_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -7474,7 +7489,7 @@ fn layout_frame_rust_vscroll_shifts_body_rows_up_and_exposes_extra_row() {
                 *vs = vscroll;
             }
         }
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         let trace = selected_window_layout_trace(&eval, &engine, frame_id);
         let body_ys = trace
@@ -7811,7 +7826,7 @@ fn empty_line_extend_cursor(
             *window_start = LispCharPos1::ONE;
         }
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -7907,7 +7922,7 @@ fn line_break_extend_fill_reaches_tty_reserved_right_column() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8026,7 +8041,7 @@ fn split_window_line_break_extend_fill_reaches_right_column() {
         )
         .expect("split window beside the action buffer");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8094,7 +8109,7 @@ fn overlay_string_extend_fill_reaches_tty_reserved_right_column() {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.insert("anchor\n");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -8118,7 +8133,7 @@ fn overlay_string_extend_fill_reaches_tty_reserved_right_column() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -8183,7 +8198,7 @@ fn extend_fill_does_not_bleed_onto_the_following_blank_line() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8262,7 +8277,7 @@ fn extend_fill_covers_a_blank_line_whose_own_newline_is_covered() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8353,7 +8368,7 @@ fn adjacent_distinct_boxed_faces_share_an_open_internal_boundary() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8411,7 +8426,7 @@ fn boxed_extend_fill_preserves_box_with_open_vertical_edges() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8498,7 +8513,7 @@ fn boxed_extend_fill_owns_the_right_edge_when_the_run_ends_at_zv() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8555,7 +8570,7 @@ fn boxed_extend_fill_owns_the_right_edge_when_the_next_source_face_is_unboxed() 
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8613,7 +8628,7 @@ fn fill_column_indicator_shows_when_text_length_equals_the_column() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8691,7 +8706,7 @@ fn assert_fill_column_indicator_stipple_padding(setup: &str) {
     buffer.set_buffer_local("display-fill-column-indicator", Value::T);
     buffer.set_buffer_local("display-fill-column-indicator-character", Value::char(' '));
     buffer.set_buffer_local("display-fill-column-indicator-column", Value::fixnum(8));
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine.last_frame_display_state.as_ref().unwrap();
     let window = state
@@ -8810,7 +8825,7 @@ fn layout_frame_rust_line_numbers_inherit_buffer_default_face_remapping() {
         );
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8887,7 +8902,7 @@ fn layout_frame_rust_line_number_remap_contributes_to_row_height() {
         );
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -8954,7 +8969,7 @@ fn layout_frame_rust_right_edge_markers_use_remapped_window_default_face() {
         );
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -9016,7 +9031,7 @@ fn layout_frame_rust_relative_line_numbers_keep_one_text_pixel_origin() {
         buffer.goto_emacs_byte_pos(EmacsBytePos::new(19 * "row 01\n".len()));
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let frame = engine
         .last_frame_display_state
@@ -9100,7 +9115,7 @@ fn multiline_overlay_backend_layout_trace(kind: BufferTextBackendKind) -> Backen
         140,
         |buffer, buf_id, _text| {
             let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-                serial: 0,
+                serial: neovm_core::heap_types::OverlaySerialSource::Mint,
                 plist: Value::NIL,
                 buffer: Some(buf_id),
                 start: 0,
@@ -9130,7 +9145,7 @@ fn layout_frame_rust_renders_overlay_display_property() {
         let start = text.find("HIDE").expect("HIDE");
         let end = start + "HIDE".len();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start,
@@ -9374,7 +9389,7 @@ fn edit_redisplay_backend_layout_trace(
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let before = selected_window_layout_trace(&eval, &engine, frame_id);
 
@@ -9461,7 +9476,7 @@ fn fontification_edit_backend_trace(kind: BufferTextBackendKind) -> Fontificatio
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let before_layout = selected_window_layout_trace(&eval, &engine, frame_id);
     let before_props = printed_eval_result(
@@ -9588,9 +9603,9 @@ fn assert_echo_message_renders_in_minibuffer_window(use_gui_metrics: bool) {
     let echo = "Echo lives in minibuffer";
     eval.set_current_message(Some(LispString::from_utf8(echo)));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     if use_gui_metrics {
-        engine.enable_cosmic_metrics();
+        crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     }
     engine.layout_frame_rust(&mut eval, frame_id);
 
@@ -9683,7 +9698,7 @@ fn minibuffer_echo_suppresses_line_numbers_enabled_in_its_buffer() {
     let echo = "Echo has no gutter";
     eval.set_current_message(Some(LispString::from_utf8(echo)));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -9742,7 +9757,7 @@ fn layout_frame_rust_preserves_propertized_echo_message_faces() {
     );
     eval.set_current_message(echo.as_lisp_string().cloned());
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -9825,7 +9840,7 @@ fn inactive_echo_area_owns_cursor_at_message_end_when_requested() {
     eval.store_variable_by_name("cursor-in-echo-area", Value::T);
     eval.set_current_message(Some(LispString::from_utf8("prompt")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -9906,7 +9921,7 @@ fn inactive_echo_area_grows_to_contain_tall_display_image() {
     );
     eval.set_current_message(echo.as_lisp_string().cloned());
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let materialized = engine
@@ -9949,9 +9964,9 @@ fn assert_multiline_echo_message_resizes_minibuffer_rows(use_gui_metrics: bool) 
             .create_frame("layout-minibuffer-echo-lines", 640, 160, buf_id);
     eval.set_current_message(Some(LispString::from_utf8("ALPHA\nBETA")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     if use_gui_metrics {
-        engine.enable_cosmic_metrics();
+        crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     }
     engine.layout_frame_rust(&mut eval, frame_id);
 
@@ -10026,7 +10041,7 @@ fn layout_frame_rust_publishes_increasing_display_positions() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -10089,7 +10104,7 @@ fn layout_frame_rust_tracks_multibyte_sample_positions() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -10258,7 +10273,7 @@ fn point_after_large_fold_keeps_visually_valid_window_start() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     eval.buffer_manager_mut()
@@ -10330,7 +10345,7 @@ fn visibility_retry_never_places_window_start_inside_unmeasured_fold() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     eval.buffer_manager_mut()
@@ -10411,7 +10426,7 @@ fn replacing_display_measurement_preserves_conservative_bottom_scroll() {
             panic!("selected window is not a leaf");
         };
         *point = LispCharPos1::from_one_based_usize(text.len() + 1);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
 
         let insert_at = history.len();
@@ -10618,7 +10633,7 @@ fn run_describe_char_scenario(
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     super::viewport_retry_depth_probe::reset();
     engine.layout_frame_rust(&mut eval, frame_id);
     let after_initial = super::viewport_retry_depth_probe::max_depth();
@@ -10767,7 +10782,7 @@ fn run_help_window_scenario(conservatively: i64) -> usize {
         };
         *point = LispCharPos1::from_one_based_usize(help_end + 1);
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     super::viewport_retry_depth_probe::reset();
     engine.layout_frame_rust(&mut eval, frame_id);
     super::viewport_retry_depth_probe::max_depth()
@@ -10850,7 +10865,7 @@ fn distant_point_with_unrelated_overlay_does_not_exhaust_visibility_retries() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let point = text.rfind("ordinary line").expect("last line");
@@ -10927,7 +10942,7 @@ fn point_placement_with_a_foreign_current_buffer_terminates_and_shows_point() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let point = text.find("ordinary line 500").expect("line 500") + 3;
@@ -11063,7 +11078,7 @@ fn spent_visibility_budget_ends_the_leaf_at_its_start() {
                 };
                 *window_point = LispCharPos1::new((point + 1) as i64);
             }
-            let mut engine = LayoutEngine::new();
+            let mut engine = crate::font::metrics::test_catalog::layout_engine();
             engine.layout_frame_rust(&mut eval, frame_id);
             let prepared = engine.last_frame_display_state.is_some();
             let window_start = eval
@@ -11122,7 +11137,7 @@ fn layout_frame_rust_renders_invisible_ellipsis_through_row_builder() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11200,7 +11215,7 @@ fn buffer_remapped_default_gets_distinct_face_for_leading_invisible_ellipsis() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11238,7 +11253,7 @@ fn buffer_remapped_default_gets_distinct_face_for_leading_invisible_ellipsis() {
     );
     assert_eq!(
         state.faces[&ellipsis_face_id].font_family,
-        "Noto Sans CJK SC"
+        std::sync::Arc::from("Noto Sans CJK SC")
     );
 }
 
@@ -11462,7 +11477,7 @@ fn layout_frame_rust_renders_buffer_glyphless_chars_as_glyphless() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11513,7 +11528,7 @@ fn layout_frame_rust_renders_buffer_control_chars_with_caret_notation() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11587,7 +11602,7 @@ fn layout_frame_rust_control_char_caret_uses_escape_glyph_foreground() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11710,7 +11725,7 @@ fn layout_frame_rust_escape_glyph_lands_in_background_over_inverse_base() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11778,7 +11793,7 @@ fn layout_frame_rust_normal_text_keeps_base_face_not_escape_glyph() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -11886,7 +11901,7 @@ fn layout_frame_rust_nbsp_uses_nobreak_space_foreground() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12028,7 +12043,7 @@ fn layout_frame_rust_nbsp_underline_follows_nobreak_space_foreground() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12125,7 +12140,7 @@ fn layout_frame_rust_overline_strike_follow_face_foreground() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12213,7 +12228,7 @@ fn layout_frame_rust_nonprintable_char_shows_escape_glyph_octal() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12315,7 +12330,7 @@ fn layout_frame_rust_nobreak_hyphen_uses_nobreak_hyphen_foreground() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12411,7 +12426,7 @@ fn layout_frame_rust_renders_line_prefix_through_row_builder() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12538,7 +12553,7 @@ fn layout_frame_rust_remaps_named_faces_on_line_and_wrap_prefix_strings() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12651,7 +12666,7 @@ fn layout_frame_rust_preserves_nobreak_chars_when_ascii_display_is_disabled() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -12700,7 +12715,7 @@ fn layout_frame_rust_uses_ascii_nobreak_glyphs_when_explicitly_enabled() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let entry = engine
@@ -12747,7 +12762,7 @@ fn layout_frame_rust_renders_nobreak_chars_in_escape_mode_as_mapped_text() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -13274,7 +13289,7 @@ fn layout_frame_rust_publishes_face_scaled_advances_for_inline_plist_faces() {
             BaseFacePolicy::BufferFaceIncludingOverlays,
             &mut next_check,
         );
-        assert_eq!(resolved.font_family, "JetBrains Mono");
+        assert_eq!(resolved.font_family.as_ref(), "JetBrains Mono");
         assert_eq!(resolved.font_weight, 800);
         assert!(
             resolved.font_size > face_resolver.default_face().font_size * 1.5,
@@ -13283,7 +13298,7 @@ fn layout_frame_rust_publishes_face_scaled_advances_for_inline_plist_faces() {
         );
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -13309,7 +13324,7 @@ fn layout_frame_rust_publishes_face_scaled_advances_for_inline_plist_faces() {
 
     let default_font_size = frame.font_pixel_size;
     let face_font_size = default_font_size * 1.6;
-    let mut metrics = FontMetricsService::new();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
     let expected_a = expected_gui_glyph_advance(
         &mut metrics,
         'a',
@@ -13404,13 +13419,13 @@ fn layout_frame_rust_cursor_width_uses_current_glyph_advance_not_next_glyph() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
-    engine.enable_cosmic_metrics();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
     let face_font_size = frame.font_pixel_size;
-    let mut metrics = FontMetricsService::new();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
     let expected_i = metrics
         .char_width('i', "Noto Sans", 400, false, face_font_size)
         .round() as i64;
@@ -13484,7 +13499,7 @@ fn layout_frame_rust_places_cursor_at_newline_terminated_row_end() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -13529,7 +13544,7 @@ fn layout_frame_rust_emits_neomacs_visual_cursors_without_moving_phys_cursor() {
         .frame_manager_mut()
         .create_frame("layout-visual-cursor", 320, 120, buf_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -13616,7 +13631,7 @@ fn layout_frame_rust_visual_cursor_uses_display_point_geometry() {
         }
     }
 
-    let mut metrics = FontMetricsService::new();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
     let face_font_size = eval
         .frame_manager()
         .get(frame_id)
@@ -13633,8 +13648,8 @@ fn layout_frame_rust_visual_cursor_uses_display_point_geometry() {
         "test requires proportional metrics for i and W"
     );
 
-    let mut engine = LayoutEngine::new();
-    engine.enable_cosmic_metrics();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -13705,7 +13720,7 @@ fn layout_frame_rust_visual_hbar_uses_full_display_point_box() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -13749,7 +13764,7 @@ fn layout_frame_rust_records_row_metrics_for_plain_text_rows() {
         eval.frame_manager_mut()
             .create_frame("layout-plain-row-metrics", 800, 160, buf_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let text_row = engine
@@ -13808,7 +13823,7 @@ fn layout_frame_rust_uses_buffer_default_face_height_for_body_rows() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -13853,7 +13868,7 @@ fn layout_frame_rust_applies_extra_line_spacing_once_to_newline_rows() {
             .create_frame("layout-extra-line-spacing-once", 800, 160, buf_id);
     realize_test_gui_frame(&mut eval, frame_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -13902,7 +13917,7 @@ fn layout_frame_rust_applies_display_height_to_buffer_text_faces() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -13967,7 +13982,7 @@ fn layout_frame_rust_applies_display_height_to_overlay_strings() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x\n");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -14004,7 +14019,7 @@ fn layout_frame_rust_applies_display_height_to_overlay_strings() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -14043,7 +14058,7 @@ fn layout_frame_rust_advances_overlay_newline_by_measured_row_height() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -14083,7 +14098,7 @@ fn layout_frame_rust_advances_overlay_newline_by_measured_row_height() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -14172,7 +14187,7 @@ fn layout_frame_rust_captures_cursor_inside_invisible_text_without_rescan() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -14228,7 +14243,7 @@ fn layout_frame_rust_preserves_logical_cursor_when_window_cursor_is_nil() {
     eval.frame_manager_mut()
         .set_window_cursor_type(selected_window, Value::NIL);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -14315,7 +14330,7 @@ fn display_replacement_cursor_probe_at_height(height: i64) -> (i64, i64, i64, i6
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -14427,7 +14442,7 @@ fn layout_frame_rust_captures_cursor_at_display_replacement_slot_without_rescan(
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -14477,7 +14492,7 @@ fn layout_frame_rust_records_display_point_for_display_replacement_slot() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -14531,7 +14546,7 @@ fn layout_frame_rust_emits_display_string_replacement_glyphs() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -14644,7 +14659,7 @@ fn fixed_pitch_display_replacement_prefix_keeps_following_text_aligned() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15006,7 +15021,7 @@ fn wrapped_display_replacement_cursor_stays_at_opening_slot() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -15048,7 +15063,7 @@ fn layout_frame_rust_renders_display_replacement_tabs_as_stretches() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15127,7 +15142,7 @@ fn layout_frame_rust_ignores_replacing_display_properties_inside_display_replace
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15194,7 +15209,7 @@ fn layout_frame_rust_honors_display_replacement_string_face_properties() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15318,7 +15333,7 @@ fn layout_frame_rust_wraps_a_mid_row_image_onto_the_next_row() {
         .set_window_system(Some(Value::symbol("neo")));
     // First pass: the frame's own metrics, so the filler can be sized to leave
     // less than the image's width on the row it lands on.
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let probe = engine
         .last_frame_display_state
@@ -15357,7 +15372,7 @@ fn layout_frame_rust_wraps_a_mid_row_image_onto_the_next_row() {
         buf.set_buffer_local("word-wrap", Value::T);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15462,7 +15477,7 @@ fn layout_frame_rust_crops_a_mid_row_image_on_a_window_wrapping_row() {
         .get_mut(frame_id)
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let probe = engine
         .last_frame_display_state
@@ -15497,7 +15512,7 @@ fn layout_frame_rust_crops_a_mid_row_image_on_a_window_wrapping_row() {
         buf.set_buffer_local("word-wrap", Value::NIL);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15573,7 +15588,7 @@ fn layout_frame_rust_crops_a_mid_row_image_on_a_truncating_row() {
         .get_mut(frame_id)
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let probe = engine
         .last_frame_display_state
@@ -15607,7 +15622,7 @@ fn layout_frame_rust_crops_a_mid_row_image_on_a_truncating_row() {
         buf.set_buffer_local("truncate-lines", Value::T);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15674,7 +15689,7 @@ fn layout_frame_rust_word_wrap_takes_the_preceding_word_with_the_image() {
         .get_mut(frame_id)
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let probe = engine
         .last_frame_display_state
@@ -15717,7 +15732,7 @@ fn layout_frame_rust_word_wrap_takes_the_preceding_word_with_the_image() {
         buf.set_buffer_local("word-wrap", Value::T);
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15836,7 +15851,7 @@ fn layout_frame_rust_emits_inline_image_glyphs_for_display_image_specs() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -15999,7 +16014,7 @@ fn layout_frame_rust_crops_compound_display_images_to_the_requested_slice() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let presentation = engine
@@ -16151,7 +16166,7 @@ fn layout_frame_rust_emits_inline_video_glyphs_for_display_video_specs() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -16231,7 +16246,7 @@ fn layout_frame_rust_emits_inline_webkit_glyphs_for_display_webkit_specs() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -16569,8 +16584,11 @@ fn layout_frame_rust_crops_an_xwidget_in_a_right_hand_split_by_the_windows_width
 #[test]
 fn layout_frame_rust_measures_the_quarter_width_rule_from_the_text_area_not_the_line_numbers() {
     let prefix = "a".repeat(75);
-    // A 200px widget is wider than a quarter of the graphical text
-    // area (776 / 4 = 194), so overflow crops its layout slot.
+    // A 200px widget is wider than a quarter of the graphical text area, so
+    // overflow crops its layout slot.  The area itself is chrome-dependent --
+    // a GUI frame reserves GNU's toolkit scroll bar (16 px, src/xfns.c:2393-
+    // 2438), not a character cell -- so take it from the presentation clip
+    // instead of hardcoding a measurement that moves with the chrome.
     let cropped = inline_xwidget_glyph_in_right_split(1600, 120, &prefix, true, 200, 40)
         .expect("a wide xwidget after line numbers is cropped, not dropped");
     assert!(
@@ -16582,14 +16600,29 @@ fn layout_frame_rust_measures_the_quarter_width_rule_from_the_text_area_not_the_
         "the overflowing wide widget must be cropped: {cropped:?}"
     );
     assert_eq!(cropped.content.width_px(), 200.0);
+    let text_area_width = cropped
+        .clip_rect
+        .expect("the presentation is clipped to the window text area")
+        .width;
+    let quarter = text_area_width / 4.0;
+    assert!(
+        200.0 > quarter,
+        "the cropping case must exceed the quarter threshold: area={text_area_width}"
+    );
 
-    // 193px is below a quarter of the full text area, but above a
-    // quarter after deducting the line-number prefix. GNU leaves it whole.
-    let whole = inline_xwidget_glyph_in_right_split(1600, 120, &prefix, true, 193, 40)
+    // Just below that quarter: GNU leaves the advance whole, even though it
+    // is wider than a quarter of what remains after the 75-column prefix
+    // (xdisp.c:32575-32579 compares against `last_visible_x`, not the
+    // remaining width).  Exactly a quarter is not "wider than" a quarter.
+    let whole_width = quarter.floor() as i32;
+    let whole = inline_xwidget_glyph_in_right_split(1600, 120, &prefix, true, whole_width, 40)
         .expect("GNU retains a narrow overflowing xwidget and clips its presentation");
     assert_eq!(whole.x, cropped.x, "the two widgets start at the same pen");
-    assert_eq!(whole.width, 193.0, "GNU leaves the layout advance whole");
-    assert_eq!(whole.content.width_px(), 193.0);
+    assert_eq!(
+        whole.width, whole_width as f32,
+        "GNU leaves the layout advance whole"
+    );
+    assert_eq!(whole.content.width_px(), whole_width as f32);
     assert_eq!(
         whole.clip_rect, cropped.clip_rect,
         "both presentations are clipped by the same window text area"
@@ -16669,7 +16702,7 @@ fn layout_frame_rust_emits_inline_xwidget_glyphs_for_gnu_display_xwidget_specs()
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -16738,7 +16771,7 @@ fn layout_frame_rust_emits_inline_surface_glyphs_for_display_surface_specs() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -16822,7 +16855,7 @@ fn layout_frame_rust_emits_inline_surface_glyphs_for_declarative_shader_specs() 
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -16943,7 +16976,7 @@ fn declarative_surface_channel0_resolves_image_and_video_sources() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let requests = surface_requests.lock().expect("surface requests lock");
@@ -17002,7 +17035,7 @@ fn layout_frame_rust_captures_cursor_inside_hscroll_skipped_text_without_rescan(
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -17061,7 +17094,7 @@ fn assert_layout_frame_rust_tab_cursor_width(x_stretch_cursor: bool, cursor_type
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -17131,7 +17164,7 @@ fn layout_frame_rust_emits_buffer_tab_as_stretch_glyph() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17207,7 +17240,7 @@ fn layout_frame_rust_tab_stops_are_window_relative_in_split_windows() {
         )
         .expect("split window");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17305,7 +17338,7 @@ fn layout_frame_rust_display_space_align_keeps_suffix_text_in_split_windows() {
         )
         .expect("split window");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17376,7 +17409,7 @@ fn layout_frame_rust_tty_display_space_align_stays_one_cell_high() {
         frame.font_pixel_size = 16.0;
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17459,7 +17492,7 @@ fn layout_frame_rust_emits_pixel_window_divider_geometry() {
             .bounds()
     };
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17544,7 +17577,7 @@ fn layout_frame_rust_gui_zero_width_divider_uses_pixel_vertical_border() {
             .bounds()
     };
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17689,7 +17722,7 @@ fn layout_frame_rust_zero_width_border_preserves_horizontal_scroll_bar_hit_area(
         )
         .expect("split window");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17782,7 +17815,7 @@ fn layout_frame_rust_vertical_scroll_bar_keeps_mode_line_border_draggable() {
         )
         .expect("split window");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17875,7 +17908,7 @@ fn layout_frame_rust_left_scroll_bar_uses_leading_edge_resize_handle() {
         )
         .expect("split window");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -17995,7 +18028,7 @@ fn layout_frame_rust_mixed_window_scroll_bars_keep_shared_border_owned() {
             .vertical_scroll_bar_type = Value::NIL;
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -18061,7 +18094,7 @@ fn layout_frame_rust_bottom_divider_does_not_separate_root_from_minibuffer() {
         frame.set_parameter(Value::symbol("bottom-divider-width"), Value::fixnum(6));
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -18107,7 +18140,7 @@ fn layout_frame_rust_emits_display_space_as_stretch_glyph() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -18564,7 +18597,7 @@ fn assert_layout_frame_rust_display_space_cursor_width(x_stretch_cursor: bool, c
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -18639,7 +18672,7 @@ fn layout_frame_rust_display_space_width_uses_canonical_column_width() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -18700,7 +18733,7 @@ fn layout_frame_rust_records_display_point_for_display_space_slot() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -18804,7 +18837,7 @@ fn layout_frame_rust_keeps_mixed_width_advances_correct_after_mid_line_face_chan
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -18826,7 +18859,7 @@ fn layout_frame_rust_keeps_mixed_width_advances_correct_after_mid_line_face_chan
         .expect("b");
 
     let face_font_size = frame.font_pixel_size * 0.9;
-    let mut metrics = FontMetricsService::new();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
     let expected_a = expected_gui_glyph_advance(
         &mut metrics,
         'a',
@@ -18930,7 +18963,7 @@ fn layout_frame_rust_keeps_face_positions_after_truncated_multibyte_line() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -18952,7 +18985,7 @@ fn layout_frame_rust_keeps_face_positions_after_truncated_multibyte_line() {
         .expect("b");
 
     let face_font_size = frame.font_pixel_size * 0.9;
-    let mut metrics = FontMetricsService::new();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
     let expected_a = expected_gui_glyph_advance(
         &mut metrics,
         'a',
@@ -19088,8 +19121,8 @@ fn layout_frame_rust_keeps_mixed_width_positions_correct_after_sequential_window
         }
     }
 
-    let mut engine = LayoutEngine::new();
-    let mut metrics = FontMetricsService::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
 
     for target in &targets {
         let byte_pos = {
@@ -19332,8 +19365,8 @@ fn layout_frame_rust_keeps_mixed_width_positions_correct_across_family_switches(
         }
     }
 
-    let mut engine = LayoutEngine::new();
-    let mut metrics = FontMetricsService::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
 
     for target in &targets {
         let byte_pos = {
@@ -19534,7 +19567,7 @@ fn layout_frame_rust_word_wrap_snapshot_stays_sorted_after_rewind() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -19623,7 +19656,7 @@ fn layout_frame_rust_reads_far_enough_for_last_visible_truncated_line() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -19689,7 +19722,7 @@ fn layout_frame_rust_retries_window_when_point_starts_below_visible_span() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -20134,9 +20167,9 @@ fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_poin
 
 #[test]
 fn display_row_measurement_face_distinguishes_semantic_font_identity() {
-    let mut font_metrics_svc = Some(FontMetricsService::new());
+    let mut font_metrics_svc = Some(crate::font::metrics::test_catalog::metrics_service());
     let mut regular = crate::neovm_bridge::ResolvedFace::default();
-    regular.font_family = "monospace".to_string();
+    regular.font_family = std::sync::Arc::from("monospace");
     regular.font_size = 14.0;
     regular.font_weight = 400;
     regular.set_measured_char_width_px(8.0);
@@ -20168,7 +20201,7 @@ fn display_row_measurement_face_distinguishes_semantic_font_identity() {
 #[test]
 fn display_row_measurement_face_preserves_fractional_gui_cell_width_without_font_metrics() {
     let mut resolved = crate::neovm_bridge::ResolvedFace::default();
-    resolved.font_family = "JetBrainsMono Nerd Font".to_string();
+    resolved.font_family = std::sync::Arc::from("JetBrainsMono Nerd Font");
     resolved.font_size = 12.0;
     resolved.set_measured_char_width_px(7.2);
     let current_face =
@@ -20184,7 +20217,7 @@ fn display_row_measurement_face_preserves_fractional_gui_cell_width_without_font
 #[test]
 fn display_row_glyph_measurer_is_reusable_for_engine_measurements() {
     let mut resolved = crate::neovm_bridge::ResolvedFace::default();
-    resolved.font_family = "monospace".to_string();
+    resolved.font_family = std::sync::Arc::from("monospace");
     resolved.font_size = 14.0;
     resolved.set_measured_char_width_px(8.0);
     let faces = [DisplayRowFace::from_resolved(FaceId::new(42), &resolved)];
@@ -20201,7 +20234,7 @@ fn display_row_glyph_measurer_is_reusable_for_engine_measurements() {
 #[test]
 fn display_row_glyph_measurement_face_carries_engine_measurement_policy() {
     let mut resolved = crate::neovm_bridge::ResolvedFace::default();
-    resolved.font_family = "monospace".to_string();
+    resolved.font_family = std::sync::Arc::from("monospace");
     resolved.font_size = 14.0;
     resolved.set_measured_char_width_px(7.2);
     let current_face =
@@ -20279,7 +20312,7 @@ fn layout_frame_rust_converges_visibility_for_wrapped_rows_in_one_redisplay() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -20365,7 +20398,7 @@ fn layout_frame_rust_converges_visibility_for_point_line_tail_clipping() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -20422,7 +20455,7 @@ fn layout_frame_rust_keeps_visible_eob_cursor_on_short_trailing_newline_buffer()
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -20460,7 +20493,7 @@ fn incremental_newline_insert_moves_phys_cursor_to_empty_eob_row() {
         .get_mut(buf_id)
         .expect("buffer")
         .goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(initial_eob));
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
 
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
@@ -20528,7 +20561,7 @@ fn layout_frame_rust_keeps_visible_eob_cursor_across_redisplay_with_scroll_step(
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     {
         let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -20614,7 +20647,7 @@ fn layout_frame_rust_keeps_default_scratch_message_at_top_when_eob_is_visible() 
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -20688,7 +20721,7 @@ fn layout_frame_rust_formats_mode_line_from_current_redisplay_geometry() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let mode_line_text = engine
@@ -20718,7 +20751,7 @@ fn layout_frame_rust_formats_mode_line_from_current_redisplay_geometry() {
     };
     let expected_mode_line = eval_status_line_format(
         &mut eval,
-        "mode-line-format",
+        crate::display_row::WindowChromeKind::ModeLine,
         selected_window.0 as i64,
         buf_id.0,
         80,
@@ -20762,7 +20795,7 @@ fn layout_frame_rust_honors_window_mode_line_format_none() {
         Value::symbol("none"),
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let mode_line_text = engine
@@ -20825,7 +20858,7 @@ fn layout_frame_rust_uses_window_mode_line_format_override() {
         Value::string("WINDOW MODE"),
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let mode_line_text = engine
@@ -20893,7 +20926,7 @@ fn layout_frame_rust_grows_mode_line_height_for_tall_display_element() {
             .expect("frame")
             .selected_window;
 
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
 
         eval.frame_manager()
@@ -20965,7 +20998,7 @@ fn tall_chrome_publishes_the_same_body_used_by_text_and_scrollbar_rendering() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let snapshot = eval
@@ -21055,7 +21088,7 @@ fn layout_frame_rust_retries_tall_tab_line_before_publishing_body_geometry() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -21139,7 +21172,7 @@ fn layout_frame_rust_tab_line_can_be_shorter_than_default_face() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -21197,7 +21230,7 @@ fn layout_frame_rust_evaluates_mode_line_exactly_once_per_redisplay() {
         eval.frame_manager_mut()
             .create_frame("layout-mode-line-single-eval", 640, 160, buf_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     assert_eq!(
@@ -21257,7 +21290,7 @@ fn layout_frame_rust_accepts_late_chrome_window_cache_writes() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let display = engine
@@ -21314,7 +21347,7 @@ fn layout_frame_rust_abandons_stale_chrome_when_eval_kills_target_buffer() {
         .expect("target buffer")
         .set_buffer_local("mode-line-format", destructive_format);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let display = engine
@@ -21367,7 +21400,7 @@ fn layout_frame_rust_advances_live_output_through_mode_line_rows() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let display = eval
@@ -21402,7 +21435,7 @@ fn layout_frame_rust_renders_header_line_text_for_non_nil_header_line_format() {
         .frame_manager_mut()
         .create_frame("layout-header-line", 640, 160, buf_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let header_text = engine
@@ -21469,7 +21502,7 @@ fn layout_frame_rust_applies_buffer_glyphless_table_to_header_line_strings() {
         "glyphless-char face must accept a foreground, got {results:?}"
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let header_text = engine
@@ -21591,7 +21624,7 @@ fn layout_frame_rust_places_window_chrome_images_inside_each_window_clip() {
         .expect("frame")
         .set_window_system(Some(Value::symbol("neo")));
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -21662,7 +21695,7 @@ fn layout_frame_rust_uses_full_window_row_space_for_header_text_and_mode_line() 
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -21720,7 +21753,7 @@ fn layout_frame_rust_advances_live_output_through_tab_line_rows() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -21781,7 +21814,7 @@ fn lisp_string_automatic_composition_uses_live_rules_in_all_chrome_rows() {
                             (set (make-local-variable 'auto-composition-mode) nil))"##,
     )
     .expect("ambient buffer differs from the displayed buffer");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -21838,7 +21871,7 @@ fn chrome_composition_preserves_original_string_boundaries_and_storage() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -21893,7 +21926,7 @@ fn margin_string_automatic_composition_uses_the_displayed_buffer_rules() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -21939,7 +21972,7 @@ fn layout_frame_rust_tab_line_unicode_uses_shared_display_row_builder() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -22016,7 +22049,7 @@ fn layout_frame_rust_baseline_buffer_text_uses_main_buffer_wide_and_cluster_glyp
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -22075,7 +22108,7 @@ fn buffer_text_source_shadow_matches_main_buffer_simple_unicode_row() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -22152,7 +22185,7 @@ fn buffer_text_source_shadow_matches_main_buffer_tab_row() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -22238,7 +22271,7 @@ fn buffer_text_source_shadow_matches_main_buffer_trailing_whitespace_row() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -22535,7 +22568,7 @@ fn layout_main_text_rows_with_width_and_frame_kind(
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -24821,7 +24854,7 @@ fn face_boundary_on_zero_width_extender_keeps_row_glyphs() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -24896,7 +24929,7 @@ fn align_to_stretch_past_the_right_edge_truncates_like_gnu() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -25412,7 +25445,7 @@ fn layout_frame_rust_preserves_multiline_overlay_output_rows() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -25439,7 +25472,7 @@ fn layout_frame_rust_preserves_multiline_overlay_output_rows() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -25482,7 +25515,7 @@ fn layout_frame_rust_renders_overlay_string_tabs_as_stretches() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -25507,7 +25540,7 @@ fn layout_frame_rust_renders_overlay_string_tabs_as_stretches() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -25630,7 +25663,11 @@ fn layout_frame_rust_aligns_dired_filenames_after_nerd_icon_tabs() {
                 ],
             );
             let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-                serial: serial as u64,
+                serial: neovm_core::heap_types::OverlaySerialSource::Preserved(
+                    // Overlay serials are NonZeroU64 (creation order starts at 1).
+                    neovm_core::heap_types::OverlaySerial::from_u64(serial as u64 + 1)
+                        .expect("non-zero test serial"),
+                ),
                 plist: Value::NIL,
                 buffer: Some(buf_id),
                 start: filename_start - 1,
@@ -25660,7 +25697,7 @@ fn layout_frame_rust_aligns_dired_filenames_after_nerd_icon_tabs() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -25700,11 +25737,13 @@ fn layout_frame_rust_aligns_dired_filenames_after_nerd_icon_tabs() {
             .get(&tab_glyph.face_id)
             .expect("published tab face");
         assert_eq!(
-            icon_face.font_family, "Symbols Nerd Font Mono",
+            icon_face.font_family.as_ref(),
+            "Symbols Nerd Font Mono",
             "fixture must exercise the nerd-icons face"
         );
         assert_eq!(
-            tab_face.font_family, "JetBrainsMono Nerd Font",
+            tab_face.font_family.as_ref(),
+            "JetBrainsMono Nerd Font",
             "GNU ends the icon's one-character face run before the unpropertized TAB"
         );
         let binding = state
@@ -25753,9 +25792,10 @@ fn layout_frame_rust_aligns_dired_filenames_after_nerd_icon_tabs() {
 
 #[test]
 fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
-    if !neovm_core::face::realization::enabled() {
-        return;
-    }
+    assert!(
+        neovm_core::face::realization::enabled(),
+        "this native Nerd-font conformance test requires NEOVM_FACE_REALIZATION_LIFECYCLE to be enabled"
+    );
     let mut eval = Context::new();
     // A bare Context lacks fontset.el's encoding table. GNU treats an
     // unmatched family-only rule as ASCII, excluding this private-use icon.
@@ -25790,7 +25830,7 @@ fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
             ])]),
         );
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -25828,7 +25868,7 @@ fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -25859,7 +25899,8 @@ fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
     let icon_face = state.faces.get(&icon.face_id).expect("icon face");
     let tab_face = state.faces.get(&tab.face_id).expect("tab face");
     assert_eq!(
-        icon_face.font_family, "Symbols Nerd Font Mono",
+        icon_face.font_family.as_ref(),
+        "Symbols Nerd Font Mono",
         "test must exercise the Nerd Font compatibility alias"
     );
     let binding = state
@@ -25878,7 +25919,7 @@ fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
                 .eq_ignore_ascii_case("Symbols Nerd Font Mono"),
         "the explicit fontset rule must select a concrete JetBrains face instead of the inline Symbols primary; resolved={resolved_icon_font:?}"
     );
-    let mut metrics = FontMetricsService::new();
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
     let resolved_tab_space = metrics.char_width(
         ' ',
         &tab_face.font_family,
@@ -25922,7 +25963,7 @@ fn layout_frame_rust_overlay_after_string_display_replacement_renders_once() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -25977,7 +26018,7 @@ fn layout_frame_rust_overlay_after_string_display_replacement_renders_once() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -26020,7 +26061,7 @@ fn layout_frame_rust_renders_overlay_string_glyphless_chars_as_glyphless() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -26045,7 +26086,7 @@ fn layout_frame_rust_renders_overlay_string_glyphless_chars_as_glyphless() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -26086,7 +26127,7 @@ fn layout_frame_rust_places_cursor_inside_overlay_string_text_run() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -26118,7 +26159,7 @@ fn layout_frame_rust_places_cursor_inside_overlay_string_text_run() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -26158,7 +26199,7 @@ fn overlay_cursor_property_does_not_override_visible_point_outside_attachment_co
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("(+ 1 1\n  )");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -26194,7 +26235,7 @@ fn overlay_cursor_property_does_not_override_visible_point_outside_attachment_co
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -26227,7 +26268,7 @@ fn integer_overlay_cursor_property_covers_overlay_start_not_after_string_attachm
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("(+ 1 1\n  )");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 7,
@@ -26263,7 +26304,7 @@ fn integer_overlay_cursor_property_covers_overlay_start_not_after_string_attachm
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -26295,7 +26336,7 @@ fn integer_overlay_cursor_coverage_does_not_cross_the_point_row() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("a\nb");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -26330,7 +26371,7 @@ fn integer_overlay_cursor_coverage_does_not_cross_the_point_row() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -26362,7 +26403,7 @@ fn noninteger_overlay_cursor_marker_yields_to_visible_point_glyph() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("x");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -26397,7 +26438,7 @@ fn noninteger_overlay_cursor_marker_yields_to_visible_point_glyph() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let frame = eval.frame_manager().get(frame_id).expect("frame");
@@ -26427,7 +26468,7 @@ fn layout_frame_rust_renders_zero_length_eob_before_string_rows() {
         buf.insert("Find file: ~/.config/doom/");
         let eob = buf.point_max_emacs_byte_pos().get();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -26453,7 +26494,7 @@ fn layout_frame_rust_renders_zero_length_eob_before_string_rows() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -26497,7 +26538,7 @@ fn layout_frame_rust_renders_row_start_before_string_at_point_min() {
         // before-string, mirroring vertico's overlay (vertico.el:444-448/614).
         let bob = 0;
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: bob,
@@ -26533,7 +26574,7 @@ fn layout_frame_rust_renders_row_start_before_string_at_point_min() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -26609,7 +26650,7 @@ fn child_frame_redisplay_after_eob_delete_keeps_vertico_prompt_row() {
         buffer.insert(input);
 
         let count_overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(minibuffer),
             start: 0,
@@ -26626,7 +26667,7 @@ fn child_frame_redisplay_after_eob_delete_keeps_vertico_prompt_row() {
 
         let eob = buffer.point_max_emacs_byte_pos().get();
         let candidates_overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(minibuffer),
             start: eob,
@@ -26679,7 +26720,7 @@ fn child_frame_redisplay_after_eob_delete_keeps_vertico_prompt_row() {
     };
     let initial_window_start = child_window_start(&eval);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, child_frame);
     let warm_window_start = child_window_start(&eval);
     let warm_rows = enabled_window_row_texts(
@@ -26934,7 +26975,7 @@ fn layout_frame_rust_renders_magit_blame_heading_before_string_with_trailing_new
              third line for blame metadata\n",
         );
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -26962,7 +27003,7 @@ fn layout_frame_rust_renders_magit_blame_heading_before_string_with_trailing_new
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27016,7 +27057,7 @@ fn layout_frame_rust_resolves_overlay_face_through_char_property_aliases() {
             ])]),
         );
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27040,7 +27081,7 @@ fn layout_frame_rust_resolves_overlay_face_through_char_property_aliases() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27095,7 +27136,7 @@ fn layout_frame_rust_canonical_nil_overlay_face_blocks_its_alias() {
             ])]),
         );
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27125,7 +27166,7 @@ fn layout_frame_rust_canonical_nil_overlay_face_blocks_its_alias() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27180,7 +27221,7 @@ fn layout_frame_rust_line_height_t_lets_overlay_string_content_define_row_height
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.insert("source line below separator\n");
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27207,7 +27248,7 @@ fn layout_frame_rust_line_height_t_lets_overlay_string_content_define_row_height
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27358,7 +27399,7 @@ fn layout_frame_rust_extends_overlay_string_face_across_content_only_row() {
             ])]),
         );
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27385,7 +27426,7 @@ fn layout_frame_rust_extends_overlay_string_face_across_content_only_row() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27445,7 +27486,7 @@ fn overlay_newline_continuation_reserves_a_blank_line_number_text_prefix() {
         buf.insert("code\nnext\n");
         buf.set_buffer_local("display-line-numbers", Value::T);
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27474,7 +27515,7 @@ fn overlay_newline_continuation_reserves_a_blank_line_number_text_prefix() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27548,7 +27589,7 @@ fn overlay_newline_at_visible_row_limit_does_not_overflow_an_ended_row() {
         buf.insert(&format!("{}\n", "x".repeat(200)));
         buf.set_buffer_local("display-line-numbers", Value::T);
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27573,7 +27614,7 @@ fn overlay_newline_at_visible_row_limit_does_not_overflow_an_ended_row() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27634,7 +27675,7 @@ fn layout_frame_rust_suppresses_left_fringe_display_spec_before_string() {
         buf.insert("Head:");
         let bob = 0;
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: bob,
@@ -27658,7 +27699,7 @@ fn layout_frame_rust_suppresses_left_fringe_display_spec_before_string() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27729,7 +27770,7 @@ fn layout_overlay_before_string_in_left_margin_area(
             buf.set_buffer_local("display-line-numbers", Value::T);
         }
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27755,7 +27796,7 @@ fn layout_overlay_before_string_in_left_margin_area(
     eval.eval_str("(set-window-margins nil 1 0)")
         .expect("reserve one left-margin column");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27838,7 +27879,7 @@ fn layout_frame_rust_remaps_named_face_on_buffer_owned_margin_string() {
             ])]),
         );
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27874,7 +27915,7 @@ fn layout_frame_rust_remaps_named_face_on_buffer_owned_margin_string() {
     eval.eval_str("(set-window-margins nil 1 0)")
         .expect("reserve one left-margin column");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -27934,7 +27975,7 @@ fn layout_frame_rust_renders_left_margin_marker_in_nested_split_window() {
         buffer.insert("changed line\nnext line\n");
         buffer.set_buffer_local("display-line-numbers", Value::T);
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -27988,7 +28029,7 @@ fn layout_frame_rust_renders_left_margin_marker_in_nested_split_window() {
     eval.eval_str("(set-window-margins (selected-window) 1 1)")
         .expect("reserve target margins");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -28082,7 +28123,7 @@ fn layout_frame_rust_keeps_changed_margin_marker_among_dense_empty_gutter_overla
     eval.eval_str("(set-window-margins nil 1 0)")
         .expect("reserve one left-margin column");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     eval.eval_str(
         "(let ((start (save-excursion
                          (goto-char (point-min))
@@ -28208,7 +28249,7 @@ fn layout_frame_rust_resolves_standard_fringe_bitmap_spec() {
         buf.insert("Standard:");
         let bob = 0;
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: bob,
@@ -28232,7 +28273,7 @@ fn layout_frame_rust_resolves_standard_fringe_bitmap_spec() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -28314,7 +28355,7 @@ fn layout_frame_rust_fills_empty_line_fringe_below_buffer_end() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -28406,7 +28447,7 @@ fn layout_frame_rust_omits_empty_line_fringe_when_indicator_off() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -28442,7 +28483,7 @@ fn layout_frame_rust_renders_eob_overlay_strings_in_gnu_interleaved_order() {
         let eob = buf.point_max_emacs_byte_pos().get();
 
         let after_overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -28458,7 +28499,7 @@ fn layout_frame_rust_renders_eob_overlay_strings_in_gnu_interleaved_order() {
         );
 
         let before_overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -28487,7 +28528,7 @@ fn layout_frame_rust_renders_eob_overlay_strings_in_gnu_interleaved_order() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -28533,7 +28574,7 @@ fn layout_frame_rust_overlay_before_string_uses_overlay_string_base_face() {
 
         let eob = buf.point_max_emacs_byte_pos().get();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -28559,7 +28600,7 @@ fn layout_frame_rust_overlay_before_string_uses_overlay_string_base_face() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -28645,7 +28686,7 @@ fn layout_frame_rust_merges_overlay_face_with_text_property_face() {
         buf.put_text_property(0, len, Value::symbol("face"), Value::symbol("bold"));
         // Overlay face spanning the same text: distinctive BACKGROUND only.
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 0,
@@ -28670,7 +28711,7 @@ fn layout_frame_rust_merges_overlay_face_with_text_property_face() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -28802,14 +28843,14 @@ fn layout_frame_rust_paint_only_overlay_preserves_cjk_glyph_geometry() {
         GlyphGeometry {
             advance: opening.pixel_width,
             next_x: next_x.expect("following CJK glyph x"),
-            family: face.font_family.clone(),
+            family: face.font_family.to_string(),
             weight: face.font_weight,
             italic: face.is_italic(),
             size: face.font_size,
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let before = geometry(
         engine
@@ -28890,7 +28931,7 @@ fn layout_frame_rust_overlay_face_nil_cancels_text_underline() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -28944,7 +28985,7 @@ fn layout_frame_rust_applies_face_only_overlay_starting_mid_run() {
         // Face-only overlay (distinctive background) over "cd" — text before
         // ('ab') and after ('ef'), so it begins AND ends mid-run.
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: 2,
@@ -28969,7 +29010,7 @@ fn layout_frame_rust_applies_face_only_overlay_starting_mid_run() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -29032,7 +29073,7 @@ fn layout_frame_rust_continues_eob_before_string_after_overlong_line() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         let eob = buf.point_max_emacs_byte_pos().get();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -29103,7 +29144,7 @@ fn layout_frame_rust_honors_display_space_align_in_overlay_strings() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         let eob = buf.point_max_emacs_byte_pos().get();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -29149,7 +29190,7 @@ fn layout_frame_rust_honors_display_space_align_in_overlay_strings() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -29212,7 +29253,7 @@ fn layout_frame_rust_grows_minibuffer_for_eob_before_string_like_gnu() {
         buf.insert("Find file: ~/.config/doom/");
         let eob = buf.point_max_emacs_byte_pos().get();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(minibuf_id),
             start: eob,
@@ -29319,8 +29360,8 @@ fn layout_active_minibuffer_rows(
             .create_frame("layout-active-minibuffer", 640, 200, root_buf_id);
 
     let mut engine = if use_gui_metrics {
-        let mut e = LayoutEngine::new();
-        e.enable_cosmic_metrics();
+        let mut e = crate::font::metrics::test_catalog::layout_engine();
+        crate::font::metrics::test_catalog::enable_metrics(&mut e);
         e
     } else {
         let frame = eval.frame_manager_mut().get_mut(frame_id).expect("frame");
@@ -29379,8 +29420,8 @@ fn visible_gui_minibuffer_reports_positive_posn_at_point_height() {
     ]))
     .expect("select active minibuffer window");
 
-    let mut engine = LayoutEngine::new();
-    engine.enable_cosmic_metrics();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -29433,8 +29474,8 @@ fn visible_gui_minibuffer_window_end_is_bounded_by_point_max_at_eob() {
     ]))
     .expect("select active minibuffer window");
 
-    let mut engine = LayoutEngine::new();
-    engine.enable_cosmic_metrics();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -29480,7 +29521,7 @@ fn synchronous_window_end_query_observes_only_the_target_without_publishing_a_pr
         )
         .expect("split");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let prior_presentation = engine
         .last_frame_display_state
@@ -29727,7 +29768,7 @@ fn synchronous_window_end_query_preserves_redisplay_only_window_state() {
     };
     assert!(before.2, "set-window-start should arm force_start");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let end_with_point_before_start = engine
         .query_window_layout(
             &mut eval,
@@ -30149,6 +30190,12 @@ fn build_tab_bar_display_roots_transient_string_across_gc() {
 
 #[test]
 fn layout_frame_rust_renders_tab_bar_text_from_lisp_tab_bar_keymap() {
+    use neomacs_display_protocol::{GraphicalBackend, GraphicalDisplayIdentity};
+    use neovm_core::emacs_core::terminal::pure::{
+        TerminalRuntimeConfig, ensure_terminal_runtime_owner,
+    };
+    use neovm_core::window::FrameDisplayIdentity;
+
     let mut eval =
         create_bootstrap_evaluator_cached_with_features(&["x", "neomacs"]).expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
@@ -30167,9 +30214,39 @@ fn layout_frame_rust_renders_tab_bar_text_from_lisp_tab_bar_keymap() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.insert("body line\n");
     }
-    let frame_id = eval
-        .frame_manager_mut()
-        .create_frame("layout-tab-bar", 1600, 160, buf_id);
+    // Tab auto-width chooses pixel limits for graphical frames and column
+    // limits for TTYs. Give this pixel-layout fixture its own graphical owner
+    // while preserving the bootstrap terminal and its selection history.
+    let gui_terminal = eval
+        .frame_manager()
+        .frame_list()
+        .into_iter()
+        .filter_map(|id| eval.frame_manager().get(id))
+        .map(|frame| frame.terminal_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .expect("test graphical terminal id");
+    let identity = GraphicalDisplayIdentity::anonymous_connection(GraphicalBackend::X11);
+    ensure_terminal_runtime_owner(
+        gui_terminal,
+        "layout-tab-bar-display",
+        TerminalRuntimeConfig::window_system(identity.clone()),
+    );
+    let frame_id = eval.frame_manager_mut().create_frame_on_terminal(
+        "layout-tab-bar",
+        gui_terminal,
+        1600,
+        160,
+        buf_id,
+    );
+    {
+        let frame = eval.frame_manager_mut().get_mut(frame_id).expect("frame");
+        frame.set_window_system(Some(Value::symbol(
+            neovm_core::emacs_core::display::gui_window_system_symbol(),
+        )));
+        frame.set_display_identity(FrameDisplayIdentity::Graphical(identity));
+    }
     eval.store_variable_by_name("layout-target-frame", Value::make_frame(frame_id.0));
     eval.eval_str(
         r#"
@@ -30194,6 +30271,12 @@ fn layout_frame_rust_renders_tab_bar_text_from_lisp_tab_bar_keymap() {
         Value::NIL,
     ]))
     .expect("select target frame for tab-bar debug");
+    assert_eq!(
+        eval.eval_str("(list window-system (window-system))")
+            .expect("graphical tab-bar fixture"),
+        Value::list(vec![Value::symbol("neo"), Value::symbol("neo")]),
+        "tab auto-width must use graphical pixel limits",
+    );
     let keymap_debug =
         match eval.eval_form(Value::list(vec![Value::symbol("tab-bar-make-keymap-1")])) {
             Ok(value) => eval
@@ -30240,7 +30323,7 @@ fn layout_frame_rust_renders_tab_bar_text_from_lisp_tab_bar_keymap() {
         frame.sync_window_area_bounds();
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     #[cfg(debug_assertions)]
     neomacs_display_protocol::glyph_matrix::reset_materialize_call_count_for_current_thread();
     engine.layout_frame_rust(&mut eval, frame_id);
@@ -30455,7 +30538,7 @@ fn compact_bar_only_publishes_content_requested_by_the_frame() {
         frame.set_window_system(Some(Value::symbol("neomacs")));
         frame.displays_chrome = true;
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     for (menu, tool) in [(0, 1), (1, 0)] {
         eval.eval_str(&format!(
             "(progn
@@ -30529,7 +30612,7 @@ fn layout_frame_rust_publishes_authoritative_frame_chrome() {
         frame.sync_window_area_bounds();
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -30616,7 +30699,7 @@ fn layout_frame_rust_tab_bar_does_not_record_buffer_selection() {
     eval.eval_str("(setq neomacs-layout-buffer-list-hook-count 0)")
         .expect("reset hook count");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let tab_bar_rows = engine
         .last_frame_display_state
@@ -30689,7 +30772,7 @@ fn layout_frame_rust_installs_frame_tab_bar_image_media() {
     )
     .expect("configure tab-bar image format");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -30783,7 +30866,7 @@ fn layout_frame_rust_shrinks_frame_tab_bar_from_stale_reserved_height() {
     )
     .expect("configure tab-bar image format");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -30842,7 +30925,7 @@ fn layout_frame_rust_logs_invalid_named_face_references_like_gnu_emacs() {
         eval.frame_manager_mut()
             .create_frame("layout-invalid-face-reference", 320, 120, buffer_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let messages_id = eval
@@ -30892,7 +30975,7 @@ fn layout_frame_rust_suppresses_invalid_references_inside_named_face_inheritance
         "install the runtime face definition, got {face_results:?}"
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let messages = eval
@@ -31136,7 +31219,7 @@ fn child_frame_resolves_faces_and_width_independently_from_parent() {
         }),
     };
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let states = engine.layout_mock_frame(&content, char_w, char_h);
 
     assert!(states.len() >= 2, "expected a parent + child frame state");
@@ -31186,7 +31269,7 @@ fn window_info_carries_buffer_name_and_faces_carry_lisp_names() {
         .frame_manager_mut()
         .create_frame("snapshot-names", 360, 180, buf_id);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -31223,7 +31306,7 @@ fn window_info_carries_buffer_name_and_faces_carry_lisp_names() {
 fn phase3_plain_edit_is_localized() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         // Plain insert on line 10 (no fontification → props tick unchanged).
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31270,12 +31353,12 @@ fn phase3_plain_edit_matches_full_rebuild_golden() {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
         buffer.insert("x");
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     let (mut eval, frame_id, buf_id, _wi) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31314,7 +31397,7 @@ fn phase3_insert_into_empty_line_matches_full_rebuild_golden() {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
         buffer.insert("X");
     }
-    let mut reference_engine = LayoutEngine::new();
+    let mut reference_engine = crate::font::metrics::test_catalog::layout_engine();
     reference_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &reference_engine, frame_ref);
 
@@ -31323,7 +31406,7 @@ fn phase3_insert_into_empty_line_matches_full_rebuild_golden() {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     eval.buffer_manager_mut()
         .get_mut(buf_id)
@@ -31392,7 +31475,7 @@ fn phase3_newline_edit_keeps_current_line_number_face_on_cursor_row() {
         buffer.goto_emacs_byte_pos(EmacsBytePos::new(edit_at));
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let line_number_prefix_len = {
         let state = engine
@@ -31498,7 +31581,7 @@ fn phase3_delete_at_eob_does_not_relay_reused_prefix_from_buffer_start() {
     let text = ";; first scratch line\n;; second scratch line\n\n";
     let with_typed_char = format!("{text}a");
     let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&with_typed_char, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     {
@@ -31551,13 +31634,13 @@ fn edit_below_reuse_shifts_trailing_placeholder_to_new_zv() {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_byte));
         buffer.insert("X");
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     // Incremental: warm layout, edit, relay through below-reuse.
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.allow_below_reuse = true;
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31609,7 +31692,7 @@ fn empty_line_row_carries_real_buffer_position() {
     // Full rebuild: the empty line (line 2) is at 0-based charpos 6 (the second
     // newline). Its row must report start == end == 6, not the (0,0) sentinel.
     let (mut eval, frame_id, _buf_id, _win) = incr_editing_frame(text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let trace = selected_window_layout_trace(&eval, &engine, frame_id);
     let empty = trace
@@ -31655,14 +31738,14 @@ fn edit_fast_path_reuses_empty_line_and_placeholder_rows() {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_byte));
         buffer.insert("X");
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     // Incremental: warm layout, edit, relay. Must take the edit fast path and
     // relay only the edited line (the empty line and placeholder are reused).
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.allow_below_reuse = true;
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31717,14 +31800,14 @@ fn edit_fast_path_shifts_indicate_empty_lines_fillers_to_zv() {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_byte));
         buffer.insert("X");
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     // Incremental: warm layout with fillers on, edit, relay via the fast path.
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(text, 800, 600);
     enable_fillers(&mut eval);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.allow_below_reuse = true;
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31801,7 +31884,7 @@ fn phase5_fast_paths_emit_row_damage() {
     // --- cursor-only: all body rows Reused ---
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31823,7 +31906,7 @@ fn phase5_fast_paths_emit_row_damage() {
     let line = "(defun f (a b) (+ a b))\n";
     let big = line.repeat(80);
     let (mut eval2, frame2, buf2, win2) = incr_editing_frame(&big, 800, 600);
-    let mut engine2 = LayoutEngine::new();
+    let mut engine2 = crate::font::metrics::test_catalog::layout_engine();
     engine2.layout_frame_rust(&mut eval2, frame2);
     scroll_window_to(
         &mut eval2,
@@ -31884,7 +31967,7 @@ fn phase5_below_reuse_edit_marks_only_the_edited_row_relaid() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     for edit_line in [0usize, 10] {
         let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         {
             let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -31932,7 +32015,7 @@ fn phase5_forward_scroll_marks_kept_rows_shifted_and_exposed_rows_new() {
     let line = "(defun f (a b) (+ a b))\n";
     let big = line.repeat(80);
     let (mut eval, frame_id, buf_id, win) = incr_editing_frame(&big, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let scrolled_rows = 5usize;
     scroll_window_to(
@@ -31976,7 +32059,7 @@ fn phase5_forward_scroll_marks_kept_rows_shifted_and_exposed_rows_new() {
 fn phase3_below_reuse_relays_only_edited_line() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, buf_id, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.allow_below_reuse = true;
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |eval| {
         // Plain single-char insert mid-line on line 10 (no newline, no wrap).
@@ -32013,12 +32096,12 @@ fn phase3_below_reuse_matches_full_rebuild_golden() {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
         buffer.insert("x");
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     let (mut eval, frame_id, buf_id, _wi) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.allow_below_reuse = true;
     engine.layout_frame_rust(&mut eval, frame_id);
     {
@@ -32056,12 +32139,12 @@ fn below_reuse_bail_golden_stats(insert_text: &str) -> LayoutStats {
         buffer.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
         buffer.insert(insert_text);
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     let (mut eval, frame_id, buf_id, _wi) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new(); // allow_below_reuse defaults to true
+    let mut engine = crate::font::metrics::test_catalog::layout_engine(); // allow_below_reuse defaults to true
     engine.layout_frame_rust(&mut eval, frame_id);
     {
         let buffer = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
@@ -32115,7 +32198,7 @@ fn phase3_below_reuse_bails_on_wrapping_insert() {
 fn no_change_relayout_reuses_verbatim() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, _buf, _win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let m = measure_incremental_relayout(&mut engine, &mut eval, frame_id, |_eval| {
         // Nothing changes between the warm and measured passes.
     });
@@ -32144,12 +32227,12 @@ fn no_change_relayout_reuses_verbatim() {
 fn no_change_relayout_matches_full_rebuild_golden() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval_ref, frame_ref, _br, _wr) = incr_editing_frame(&text, 800, 600);
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let reference = selected_window_layout_trace(&eval_ref, &ref_engine, frame_ref);
 
     let (mut eval, frame_id, _bi, _wi) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id); // warm
     engine.layout_frame_rust(&mut eval, frame_id); // measured: nothing changed
     assert_eq!(
@@ -32225,14 +32308,14 @@ fn multi_window_edit_matches_full_rebuild_for_both_windows() {
         buf.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
         buf.insert("x");
     }
-    let mut ref_engine = LayoutEngine::new();
+    let mut ref_engine = crate::font::metrics::test_catalog::layout_engine();
     ref_engine.layout_frame_rust(&mut eval_ref, frame_ref);
     let ref_left = window_layout_trace(&eval_ref, &ref_engine, frame_ref, lw_ref);
     let ref_right = window_layout_trace(&eval_ref, &ref_engine, frame_ref, rw_ref);
 
     // Incremental: warm, edit the left buffer, measured.
     let (mut eval, frame_id, left_buf, lw, rw) = setup();
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     {
         let buf = eval.buffer_manager_mut().get_mut(left_buf).expect("left");
@@ -32261,7 +32344,7 @@ fn multi_window_edit_matches_full_rebuild_for_both_windows() {
 fn cursor_only_reused_body_face_ids_are_registered_in_frame_faces() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, _buf, win) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id); // warm (registers faces)
     engine.layout_frame_rust(&mut eval, frame_id); // no-change cursor-only
     assert_eq!(
@@ -32306,7 +32389,7 @@ fn cursor_only_reused_mouse_face_is_registered_in_frame_faces() {
     let (mut eval, frame_id, _buf, _win) = incr_editing_frame(&text, 800, 600);
     eval.eval_str("(put-text-property 1 6 'mouse-face 'highlight)")
         .expect("put mouse-face property");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
 
     engine.layout_frame_rust(&mut eval, frame_id);
     let _ = engine
@@ -32373,7 +32456,7 @@ fn fido_vertical_minibuffer_has_no_trailing_blank_display_row() {
     )
     .expect("exhibit fido candidates");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -32448,7 +32531,7 @@ fn fido_vertical_explicit_overlay_cursor_is_stable_across_unchanged_redisplay() 
     )
     .expect("exhibit fido candidates");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let first_state = engine
         .last_frame_display_state
@@ -32523,7 +32606,7 @@ fn mx_tab_completion_materializes_unique_pointer_source_identities() {
     )
     .expect("exhibit fido candidates before TAB");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert!(
         !logs_contain("layout failed to converge"),
@@ -32586,7 +32669,7 @@ fn cursor_only_reused_multiface_body_face_ids_are_registered_in_frame_faces() {
         ))
         .expect("put-text-property");
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id); // warm (allocates multi-face ids)
     {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buf");
@@ -32701,7 +32784,7 @@ fn cursor_only_two_windows_keep_fresh_tab_line_face_out_of_later_retained_body_n
         )
         .expect("split");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame); // warm retained rows + faces
     let expected_icon_face = {
         let state = engine
@@ -32816,7 +32899,7 @@ fn non_selected_unchanged_window_reuses_via_cursor_only() {
             neovm_core::window::SplitPlacement::AfterTarget,
         )
         .expect("split");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame); // warm
     engine.layout_frame_rust(&mut eval, frame); // nothing changed
     assert_eq!(
@@ -32839,7 +32922,7 @@ fn edit_below_reuse_last_line_leaves_zv_flag_to_the_placeholder() {
 
     let run = |incremental: bool| -> Vec<(usize, usize, bool, bool)> {
         let (mut eval, frame_id, buf_id, _w) = incr_editing_frame(text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.allow_below_reuse = true;
         if incremental {
             engine.layout_frame_rust(&mut eval, frame_id);
@@ -32929,7 +33012,7 @@ fn edit_below_reuse_shifts_pointer_identities_below_the_insert() {
     let run = |incremental: bool| {
         let (mut eval, frame_id, buf_id, win) = incr_editing_frame(text, 800, 600);
         eval.eval_str(put_prop).expect("put-text-property");
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.allow_below_reuse = true;
         if incremental {
             engine.layout_frame_rust(&mut eval, frame_id);
@@ -32977,7 +33060,7 @@ fn edit_below_reuse_bails_on_pointer_range_crossing_the_edit() {
     let run = |incremental: bool| {
         let (mut eval, frame_id, buf_id, win) = incr_editing_frame(text, 800, 600);
         eval.eval_str(put_prop).expect("put-text-property");
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.allow_below_reuse = true;
         if incremental {
             engine.layout_frame_rust(&mut eval, frame_id);
@@ -33051,7 +33134,7 @@ fn gui_overlay_arrow_draws_left_fringe_bitmap_not_text() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -33125,7 +33208,7 @@ fn tty_overlay_arrow_moves_cursor_past_covered_buffer_glyphs() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -33189,7 +33272,7 @@ fn tty_overlay_arrow_moves_empty_line_cursor_past_appended_arrow_cells() {
         .expect("frame")
         .selected_window;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -34049,7 +34132,7 @@ fn overlay_string_shadow_cursor_lands_on_the_buffer_char_after_an_inserted_strin
                 let start = buffer.char_pos_to_emacs_byte_pos_clamped(CharPos0::new(3));
                 let end = buffer.char_pos_to_emacs_byte_pos_clamped(CharPos0::new(8));
                 let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-                    serial: 0,
+                    serial: neovm_core::heap_types::OverlaySerialSource::Mint,
                     plist: Value::NIL,
                     buffer: Some(buf_id),
                     start: start.get(),
@@ -34300,7 +34383,7 @@ fn overlay_string_newline_leaves_row_bounds_on_the_anchor_boundary() {
                 let end =
                     buffer.char_pos_to_emacs_byte_pos_clamped(CharPos0::new(anchor_charpos0 + 1));
                 let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-                    serial: 0,
+                    serial: neovm_core::heap_types::OverlaySerialSource::Mint,
                     plist: Value::NIL,
                     buffer: Some(buf_id),
                     start: start.get(),
@@ -34770,7 +34853,7 @@ fn p52_buffer_modification_re_evaluates_the_mode_line() {
         // case pinned by `p52_in_line_edit_reuses_chrome_only_after_the_modified_star_has_settled`).
         buf.set_modified(false);
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -34809,7 +34892,7 @@ fn p52_setting_mode_line_format_re_evaluates_and_reaches_the_screen() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.set_buffer_local("mode-line-format", Value::string("BEFORE"));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
     assert!(rendered_mode_line_text(&engine).contains("BEFORE"));
@@ -34847,7 +34930,7 @@ fn p52_force_mode_line_update_re_evaluates_the_mode_line() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.set_buffer_local("mode-line-format", Value::string("ML"));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -34877,7 +34960,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
     // force-mode-line-update — GNU Fforce_mode_line_update (buffer.c).
     {
         let (mut eval, frame_id, _buf, _sel) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(
             !eval.chrome_dirty().is_any_dirty(),
@@ -34894,7 +34977,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
     // chrome formats (lisp/frame.el:3752-3779 -> xdisp.c:922-931).
     for var in ["mode-line-format", "header-line-format", "tab-line-format"] {
         let (mut eval, frame_id, _buf, _sel) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(!eval.chrome_dirty().is_any_dirty());
         eval.eval_str(&format!("(setq {var} \"X\")")).expect("eval");
@@ -34907,7 +34990,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
     // rename-buffer — GNU buffer.c:1718, the `%b` case.
     {
         let (mut eval, frame_id, _buf, _sel) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(!eval.chrome_dirty().is_any_dirty());
         eval.eval_str("(rename-buffer \"renamed-for-p52\")")
@@ -34921,7 +35004,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
     // kill-all-local-variables — GNU buffer.c:3046, the major-mode chokepoint.
     {
         let (mut eval, frame_id, _buf, _sel) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(!eval.chrome_dirty().is_any_dirty());
         eval.eval_str("(kill-all-local-variables)").expect("eval");
@@ -34934,7 +35017,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
     // set-window-buffer — GNU window.c:4383. Window-scoped.
     {
         let (mut eval, frame_id, buf_id, selected) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(!eval.chrome_dirty().is_any_dirty());
         let other = eval.buffer_manager_mut().create_buffer("p52-other-buffer");
@@ -34954,7 +35037,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
         "(progn (narrow-to-region 1 20) (widen))",
     ] {
         let (mut eval, frame_id, _buf, _sel) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(!eval.chrome_dirty().is_any_dirty());
         eval.eval_str(form).expect("eval");
@@ -34968,7 +35051,7 @@ fn p52_chrome_dirty_flag_is_raised_by_each_gnu_trigger() {
     // this is the one case that must dirty a NAMED window.
     {
         let (mut eval, frame_id, _buf, selected) = incr_editing_frame(&text, 800, 600);
-        let mut engine = LayoutEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::layout_engine();
         engine.layout_frame_rust(&mut eval, frame_id);
         assert!(!eval.chrome_dirty().is_any_dirty());
         eval.eval_str("(set-window-start (selected-window) 20)")
@@ -35006,7 +35089,7 @@ fn p52_selected_window_change_re_evaluates_both_windows_mode_lines() {
             neovm_core::window::SplitPlacement::AfterTarget,
         )
         .expect("split window");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
     assert_eq!(
@@ -35099,7 +35182,7 @@ fn selected_mode_line_realizes_active_face_and_matches_inactive_metrics() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -35203,7 +35286,7 @@ fn buffer_owned_mode_line_string_remaps_its_named_face() {
         "install mode-line probe face, got {face_results:?}"
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -35318,7 +35401,7 @@ fn buffer_default_text_scale_does_not_shrink_inactive_mode_line() {
         }
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -35385,7 +35468,7 @@ fn p52_header_and_tab_lines_are_evaluated_with_the_mode_line() {
         // regenerates all three chrome lines (see the mode-line contract).
         buf.set_modified(false);
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35436,7 +35519,7 @@ fn tab_line_that_rewrites_its_bookkeeping_parameter_converges() {
         .expect("buffer")
         .set_buffer_local("tab-line-format", format);
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -35477,7 +35560,7 @@ fn p52_cursor_only_redisplay_does_not_re_evaluate_the_mode_line() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.set_buffer_local("mode-line-format", Value::string("ML"));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35534,7 +35617,7 @@ fn p52_cursor_only_motion_to_another_line_re_evaluates_the_mode_line() {
         // number itself, so a stale eval is directly observable.
         buf.set_buffer_local("mode-line-format", Value::string("L%l"));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
     assert!(
@@ -35594,7 +35677,7 @@ fn p52_skipped_chrome_replay_still_publishes_the_chrome_faces() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.set_buffer_local("mode-line-format", Value::string("ML"));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35673,7 +35756,7 @@ fn p52_in_line_edit_reuses_chrome_only_after_the_modified_star_has_settled() {
         // make the dirty flag, not the star, the thing under test.
         buf.set_modified(false);
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35733,7 +35816,7 @@ fn p52_chrome_displaying_a_column_is_never_reused() {
         buf.set_buffer_local("mode-line-format", Value::string("C%c"));
         buf.goto_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(edit_at));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35784,7 +35867,7 @@ fn p52_scroll_re_evaluates_the_mode_line() {
         let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
         buf.set_buffer_local("mode-line-format", Value::string("ML"));
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35831,7 +35914,7 @@ fn p52_edit_that_adds_a_line_re_evaluates_the_mode_line() {
         // and this pin isolates the line-structure clause.
         buf.insert("x");
     }
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
 
@@ -35864,7 +35947,7 @@ fn p52_edit_that_adds_a_line_re_evaluates_the_mode_line() {
 fn p52_widening_an_already_wide_buffer_does_not_dirty_chrome() {
     let text = "(defun f (a b) (+ a b))\n".repeat(40);
     let (mut eval, frame_id, _buf, _selected) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert!(!eval.chrome_dirty().is_any_dirty(), "layout acknowledges");
 
@@ -35904,7 +35987,7 @@ fn p52_widening_an_already_wide_buffer_does_not_dirty_chrome() {
 fn redisplay_runs_window_scroll_functions_when_it_commits_a_start() {
     let text = "line of scroll fixture text\n".repeat(200);
     let (mut eval, frame_id, _buf, selected) = incr_editing_frame(&text, 800, 600);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     eval.eval_str(
@@ -36314,7 +36397,7 @@ fn redisplay_fontifies_visible_text_after_a_large_invisible_span() {
     };
     *force_start = true;
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let rows = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
@@ -36384,7 +36467,7 @@ fn inactive_echo_area_grows_a_sub_line_mini_window_to_one_line_of_the_font() {
     )));
 
     // Let layout settle the frame's line height from the realized font.
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let unit = eval
         .frame_manager()
@@ -36442,7 +36525,7 @@ fn buffer_display_keeps_first_replacement_while_evaluating_later_clauses() {
     )
     .expect("install competing display replacements");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let rows = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
     assert_eq!(
@@ -36497,7 +36580,7 @@ fn line_prefix_when_clauses_are_decided_by_evaluating_their_forms() {
         "the test frame must be graphic for the first clause to apply"
     );
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
 
     let state = engine
@@ -36561,7 +36644,7 @@ fn buffer_align_to_under_line_numbers_measures_from_the_field_edge() {
              (propertize \" \" 'display '(space :align-to center))))",
     )
     .expect("buffer");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let rows_of = |engine: &mut LayoutEngine, eval: &mut Context| -> Vec<String> {
         engine.layout_frame_rust(eval, frame_id);
         let state = engine
@@ -36655,7 +36738,7 @@ fn a_when_clause_whose_form_is_nil_leaves_the_prefix_out() {
     )
     .expect("buffer with a false conditional line prefix");
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -36723,7 +36806,7 @@ fn assert_display_when_replacement_reachability(spec: &str, continues: bool) {
                   '({spec} (when (progn (setq spec-followed t) t) . "Y")))))"#,
     ))
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert_eq!(
         !eval.eval_str("spec-followed").expect("flag").is_nil(),
@@ -36779,7 +36862,7 @@ fn assert_display_when_point_after_edit(outcome: &str) {
                      {outcome}) . "HIDDEN")))"#,
     ))
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert!(
         !eval.eval_str("point-edited").expect("edit flag").is_nil(),
@@ -36801,13 +36884,13 @@ fn display_when_change_invalidates_retained_body() {
     let (mut eval, frame_id, _, _) = incr_editing_frame("X\n", 640, 200);
     realize_test_gui_frame(&mut eval, frame_id);
     eval.eval_str("(progn (setq pr354-flag t pr354-calls 0) (put-text-property 1 2 'display '(when (progn (setq pr354-calls (1+ pr354-calls)) pr354-flag) . \"REPLACED\")))").expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let before = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
     eval.eval_str("(setq pr354-flag nil)").expect("toggle");
     engine.layout_frame_rust(&mut eval, frame_id);
     let incremental = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
-    let mut fresh_engine = LayoutEngine::new();
+    let mut fresh_engine = crate::font::metrics::test_catalog::layout_engine();
     fresh_engine.layout_frame_rust(&mut eval, frame_id);
     let fresh = trace_text_rows(&selected_window_layout_trace(
         &eval,
@@ -36844,7 +36927,7 @@ fn display_when_disabled_site_does_not_poison_enabled_site() {
       (put-text-property 3 4 'display '(when (= 1 1) . "Y")))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let rows = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
     assert_eq!(
@@ -36863,7 +36946,7 @@ fn display_when_string_replacement_stops_evaluation() {
         (propertize " " 'display '("X" (when (progn (setq pr354-unreachable t) nil) . "Y")))))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert!(
         eval.eval_str("pr354-unreachable").expect("flag").is_nil(),
@@ -36889,7 +36972,7 @@ fn display_when_observes_nonselected_window_point() {
     eval.set_window_point_for_redisplay(frame_id, right, LispCharPos1::new(5));
     eval.eval_str(r#"(put-text-property 1 2 'display '(when (= (point) 5) . "YES"))"#)
         .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine.last_frame_display_state.as_ref().expect("state");
     let entry = state
@@ -36919,7 +37002,7 @@ fn display_when_enabled_site_does_not_enable_disabled_site() {
       (put-text-property 5 6 'display '(disable-eval (when t . "LITERAL"))))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let rows = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
     assert_eq!(
@@ -36941,7 +37024,7 @@ fn display_when_string_stops_after_a_true_conditional_replacement() {
             (when (progn (setq when-calls (cons 'second when-calls)) t) . "Y")])))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert_eq!(
         eval.eval_str("(length when-calls)").expect("calls"),
@@ -36963,7 +37046,7 @@ fn display_when_string_continues_after_a_false_conditional_replacement() {
             (when (progn (setq when-calls (cons 'second when-calls)) t) . "Y")))))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert_eq!(
         eval.eval_str("(length when-calls)").expect("calls"),
@@ -36995,7 +37078,7 @@ fn display_when_restores_point_after_an_error_in_another_window() {
         '(when (progn (setq when-points (cons (point) when-points)) (car 1)) . "HIDDEN")))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     assert_eq!(
         eval.eval_str("when-points").expect("observed points"),
@@ -37011,7 +37094,7 @@ fn display_when_restores_point_after_an_error_in_another_window() {
 fn rtl_cursor_replay_matches_full_layout() {
     let (mut eval, frame_id, buf_id, _) = incr_editing_frame("אבגד\n", 800, 600);
     realize_test_gui_frame(&mut eval, frame_id);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     eval.buffer_manager_mut()
         .get_mut(buf_id)
         .unwrap()
@@ -37222,7 +37305,7 @@ fn wide_char_cut_at_truncation_edge_leaves_both_cells_to_the_marker() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -37291,7 +37374,7 @@ fn ligature_rule_composes_through_the_font_shape_driver() {
     // The installed font-shaping driver: a disjoint FontMetricsService the
     // runtime owns (RedisplayRuntime::shape_gstring's exact pattern).
     let metrics = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::font::metrics::FontMetricsService::new(),
+        crate::font::metrics::test_catalog::metrics_service(),
     ));
     let driver_metrics = metrics.clone();
     eval.font_shape_fn = Some(Box::new(move |_eval, mut gstring, direction| {
@@ -37313,7 +37396,7 @@ fn ligature_rule_composes_through_the_font_shape_driver() {
         .get(frame_id)
         .expect("frame")
         .selected_window;
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let state = engine
         .last_frame_display_state
@@ -37405,7 +37488,7 @@ fn unchanged_frame_layout_consults_the_image_catalog_once_per_pass() {
         assert!(buf.put_text_property(5, 6, Value::symbol("display"), image_spec));
     }
 
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let mut new_lookups = Vec::new();
     for _ in 0..5 {
         let before = requests.lock().expect("requests lock").len();
@@ -37484,7 +37567,7 @@ fn display_when_past_the_scan(
         with_b = lisp_bool(with_b),
     ))
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let rows = trace_text_rows(&selected_window_layout_trace(&eval, &engine, frame_id));
     let mut count = |name: &str| {
@@ -37556,7 +37639,7 @@ fn display_when_cursor_motion_reuses_rows_without_evaluating_like_gnu() {
                '(when (progn (setq dw-n (1+ dw-n)) dw-flag) . "REPLACED")))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let mut count = |eval: &mut Context| {
         eval.eval_str("dw-n")
             .expect("counter")
@@ -37641,7 +37724,7 @@ fn display_when_unverified_rows_are_not_reused_on_cursor_motion() {
              (goto-char (point-min)))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     let window = eval.frame_manager().get(frame_id).unwrap().selected_window;
     let history = engine
@@ -37684,7 +37767,7 @@ fn display_when_reuse_needs_a_valid_window_end_not_a_mode_line() {
                '(when (progn (setq dw-n (1+ dw-n)) dw-flag) . "REPLACED")))"#,
     )
     .expect("setup");
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     let count = |eval: &mut Context| eval.eval_str("dw-n").unwrap().as_fixnum().unwrap();
     let row5 = |eval: &Context, engine: &LayoutEngine| {
         trace_text_rows(&selected_window_layout_trace(eval, engine, frame_id))[5].clone()

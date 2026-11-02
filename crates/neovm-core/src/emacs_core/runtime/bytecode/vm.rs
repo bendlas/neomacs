@@ -15,8 +15,8 @@ use crate::emacs_core::builtins;
 use crate::emacs_core::builtins::IntegerOp;
 use crate::emacs_core::error::*;
 use crate::emacs_core::eval::{
-    BytecodeBacktraceFrame, BytecodeStackCallDispatch, ConditionFrame, LispArgVec, ResumeTarget,
-    lookup_global_subr_entry, subr_call_entry_from_value,
+    BytecodeBacktraceFrame, BytecodeStackCallDispatch, CallableRoot, ConditionFrame, LispArgVec,
+    ResumeTarget, RootedCallable, lookup_global_subr_entry, subr_call_entry_from_value,
 };
 use crate::emacs_core::intern::{SymId, intern, lookup_interned, resolve_sym};
 // storage_char_len and storage_substring no longer needed here — using emacs_char + LispString
@@ -2657,6 +2657,13 @@ impl<'a> Vm<'a> {
             self.ctx.max_depth = 100;
         }
         if self.ctx.depth > self.ctx.max_depth {
+            // GNU raises a `max-lisp-eval-depth` below 100 before signalling
+            // (`src/eval.c:2604-2608`) and writes the `DEFVAR_INT` cell, so
+            // Lisp observes 100 after the failed nesting attempt. The cached
+            // `max_depth` above is clamped to 100 on every sync and cannot
+            // answer whether the variable is still lower, so the helper reads
+            // the binding itself.
+            self.ctx.raise_lisp_eval_depth_floor();
             return Err(BytecodeDepthOverflow::Confirmed);
         }
         Ok(())
@@ -4065,10 +4072,15 @@ impl<'a> Vm<'a> {
                 ))
             }
             ResolvedStackCallTarget::Generic => {
+                let bt_base = self.ctx.specpdl.len();
                 let backtrace = self
                     .ctx
                     .push_backtrace_frame_from_bc_stack(func_val, args_start, nargs);
-                let result = self.call_function_untraced_from_stack(func_val, args_start, nargs);
+                let root = CallableRoot::Witnessed(RootedCallable::from_backtrace(
+                    &*self.ctx, bt_base, func_val,
+                ));
+                let result =
+                    self.call_function_untraced_from_stack(root, func_val, args_start, nargs);
                 let result = self.ctx.dispatch_signal_result_if_needed(result);
                 InterpreterStackCall::Complete(
                     self.ctx
@@ -4146,13 +4158,17 @@ impl<'a> Vm<'a> {
         let bind_stack = &mut aux_stack.current_mut().bind_stack;
         let entry_spec_depth = self.ctx.specpdl.len();
         let ctx_ptr: *mut crate::emacs_core::eval::Context = &mut *self.ctx;
-        let resume = match crate::emacs_core::jit::cache::try_run_osr_probe(
-            ctx_ptr,
-            func,
-            target,
-            &snapshot,
-            bind_stack.as_slice(),
-        ) {
+        // SAFETY: `ctx_ptr` is this live `Context`; the probe runs in this
+        // thread under the dormant-Context contract.
+        let resume = match unsafe {
+            crate::emacs_core::jit::cache::try_run_osr_probe(
+                ctx_ptr,
+                func,
+                target,
+                &snapshot,
+                bind_stack.as_slice(),
+            )
+        } {
             OsrProbe::Ran(NativeRun::Ok(bits)) => {
                 return OsrOutcome::Returned(Value::from_bits(bits));
             }
@@ -7970,6 +7986,10 @@ impl<'a> Vm<'a> {
             if ctx.max_depth < 100 {
                 ctx.max_depth = 100;
             }
+            // GNU raises a `max-lisp-eval-depth` below 100 before it
+            // re-checks (`src/eval.c:2604-2608`) and writes the DEFVAR_INT
+            // cell, so the raised value stays visible through the binding.
+            ctx.raise_lisp_eval_depth_floor();
             if ctx.depth > ctx.max_depth {
                 // GNU checks depth before recording the rejected callee's
                 // frame (bytecode.c:779-795). Only the calling frame is live
@@ -8237,10 +8257,14 @@ impl<'a> Vm<'a> {
         // setup_frame's PUSH loop), and the caller pops them only after the
         // call returns. No LispArgVec, no per-arg rooting: bc_buf is
         // GC-traced.
+        let bt_base = self.ctx.specpdl.len();
         let backtrace = self
             .ctx
             .push_backtrace_frame_from_bc_stack(func_val, args_start, nargs);
-        let result = self.call_function_untraced_from_stack(func_val, args_start, nargs);
+        let root = CallableRoot::Witnessed(RootedCallable::from_backtrace(
+            &*self.ctx, bt_base, func_val,
+        ));
+        let result = self.call_function_untraced_from_stack(root, func_val, args_start, nargs);
         let result = self.ctx.dispatch_signal_result_if_needed(result);
         // GNU Bcall/Breturn exit: pop this call's own backtrace entry with a
         // single-entry pop (specpdl_ptr-- shape); imbalanced/debug-on-exit
@@ -8259,6 +8283,7 @@ impl<'a> Vm<'a> {
     #[inline(never)]
     fn call_function_untraced_from_stack(
         &mut self,
+        root: CallableRoot<'_>,
         func_val: Value,
         args_start: usize,
         nargs: usize,
@@ -8285,13 +8310,13 @@ impl<'a> Vm<'a> {
                         let args = LispArgVec::from_slice(
                             &self.ctx.bc_buf[args_start..args_start + nargs],
                         );
-                        self.ctx.funcall_general_untraced(func_val, args)
+                        self.ctx.funcall_general_with_root(root, func_val, args)
                     }
                 }
             }
             _ => {
                 let args = LispArgVec::from_slice(&self.ctx.bc_buf[args_start..args_start + nargs]);
-                self.ctx.funcall_general_untraced(func_val, args)
+                self.ctx.funcall_general_with_root(root, func_val, args)
             }
         }
     }
@@ -8377,6 +8402,10 @@ impl<'a> Vm<'a> {
             if ctx.max_depth < 100 {
                 ctx.max_depth = 100;
             }
+            // GNU raises a `max-lisp-eval-depth` below 100 before it
+            // re-checks (`src/eval.c:2604-2608`) and writes the DEFVAR_INT
+            // cell, so the raised value stays visible through the binding.
+            ctx.raise_lisp_eval_depth_floor();
             if ctx.depth > ctx.max_depth {
                 return Some(Err(ctx.finish_lisp_depth_overflow(signal(
                     "error",
@@ -9180,18 +9209,35 @@ impl<'a> Vm<'a> {
                 if let FlowRef::Signal(sig) = flow.kind()
                     && let Some(value) = sig.data.get(1).copied()
                 {
-                    flow.with_bytecode_error_backtrace(op, &[value])
+                    let inline = match op {
+                        Op::Car => InlineErrorOp::Car,
+                        _ => InlineErrorOp::Cdr,
+                    };
+                    flow.with_bytecode_error_backtrace(inline, &[value])
                 } else {
                     flow
                 }
             }
             Some(op @ (Op::Nth | Op::Elt | Op::Setcar | Op::Setcdr | Op::Aref)) => {
+                let inline = match op {
+                    Op::Nth => InlineErrorOp::Nth,
+                    Op::Elt => InlineErrorOp::Elt,
+                    Op::Setcar => InlineErrorOp::Setcar,
+                    Op::Setcdr => InlineErrorOp::Setcdr,
+                    _ => InlineErrorOp::Aref,
+                };
                 let len = self.ctx.bc_buf.len();
-                flow.with_bytecode_error_backtrace(op, &self.ctx.bc_buf[len.saturating_sub(2)..])
+                flow.with_bytecode_error_backtrace(
+                    inline,
+                    &self.ctx.bc_buf[len.saturating_sub(2)..],
+                )
             }
-            Some(op @ Op::Aset) => {
+            Some(Op::Aset) => {
                 let len = self.ctx.bc_buf.len();
-                flow.with_bytecode_error_backtrace(op, &self.ctx.bc_buf[len.saturating_sub(3)..])
+                flow.with_bytecode_error_backtrace(
+                    InlineErrorOp::Aset,
+                    &self.ctx.bc_buf[len.saturating_sub(3)..],
+                )
             }
             _ => flow,
         };
@@ -9686,8 +9732,10 @@ impl<'a> Vm<'a> {
     }
 
     fn builtin_mapatoms_shared(&mut self, args: &[Value]) -> EvalResult {
-        let (func, symbols) =
-            crate::emacs_core::hashtab::collect_mapatoms_symbols(self.ctx, args.to_vec())?;
+        let (func, symbols) = crate::emacs_core::builtins::symbols::collect_mapatoms_symbols(
+            self.ctx,
+            args.to_vec(),
+        )?;
         self.with_dynamic_vm_roots(|vm| {
             vm.push_dynamic_vm_root(func);
             // `symbols` contains immediate IDs backed by the append-only
@@ -9701,7 +9749,7 @@ impl<'a> Vm<'a> {
 
     fn builtin_maphash_shared(&mut self, args: &[Value]) -> EvalResult {
         let (func, table) = crate::emacs_core::hashtab::validate_maphash_args(args)?;
-        let callee = crate::emacs_core::hashtab::MaphashCallee::resolve(func);
+        let callee = crate::emacs_core::builtins::maphash::MaphashCallee::resolve(func);
         self.with_dynamic_vm_roots(|vm| {
             vm.push_dynamic_vm_root(func);
             vm.push_dynamic_vm_root(table);
@@ -9719,15 +9767,17 @@ impl<'a> Vm<'a> {
                 vm.push_dynamic_vm_root(key);
                 vm.push_dynamic_vm_root(value);
                 match callee {
-                    crate::emacs_core::hashtab::MaphashCallee::Generic(function) => {
+                    crate::emacs_core::builtins::maphash::MaphashCallee::Generic(function) => {
                         vm.call_function2(function, key, value)?;
                     }
                     #[cfg(feature = "jit")]
-                    crate::emacs_core::hashtab::MaphashCallee::ByteCode(function) => {
+                    crate::emacs_core::builtins::maphash::MaphashCallee::ByteCode(function) => {
                         vm.call_maphash_bytecode::<true>(function, key, value)?;
                     }
                     #[cfg(feature = "jit")]
-                    crate::emacs_core::hashtab::MaphashCallee::UnobservedByteCode(function) => {
+                    crate::emacs_core::builtins::maphash::MaphashCallee::UnobservedByteCode(
+                        function,
+                    ) => {
                         vm.call_maphash_bytecode::<false>(function, key, value)?;
                     }
                 }

@@ -15,6 +15,7 @@ use super::{Context, PopupMenuEntry, PopupMenuRequest};
 use crate::emacs_core::error::LispCondition;
 pub(crate) use crate::emacs_core::error::{expect_args, expect_args_range, expect_max_args};
 use crate::emacs_core::eval::VariableView;
+use crate::emacs_core::intern::WellKnown;
 use crate::window::{FrameId, WindowId};
 use strum::{EnumString, IntoStaticStr};
 
@@ -83,17 +84,18 @@ pub(crate) fn expect_symbol_key(value: &Value) -> Result<Value, Flow> {
 /// observed. See the extended comment on the identical helper in
 /// `builtins/misc_eval.rs` (audit finding #3 in
 /// `drafts/regex-search-audit.md`).
-fn dynamic_or_global_symbol_value(eval: &super::eval::Context, name: &str) -> Option<Value> {
-    let id = crate::emacs_core::intern::intern(name);
-    eval.eval_symbol_by_id(id).ok()
+fn dynamic_or_global_symbol_value_fixed(
+    eval: &super::eval::Context,
+    symbol: WellKnown,
+) -> Option<Value> {
+    eval.eval_symbol_by_id(symbol.id()).ok()
 }
 
-fn dynamic_or_global_symbol_value_in_state(
+fn dynamic_or_global_symbol_value_in_state_fixed(
     vars: VariableView<'_>,
-    _dynamic: &[crate::emacs_core::value::OrderedRuntimeBindingMap],
-    name: &str,
+    symbol: WellKnown,
 ) -> Option<Value> {
-    vars.value_by_name(name)
+    vars.value(symbol.id())
 }
 
 fn display_string_text(value: &Value) -> Option<String> {
@@ -104,18 +106,18 @@ fn display_string_text(value: &Value) -> Option<String> {
 }
 
 fn global_window_system_symbol(eval: &super::eval::Context) -> Option<Value> {
-    dynamic_or_global_symbol_value(eval, "initial-window-system")
+    dynamic_or_global_symbol_value_fixed(eval, WellKnown::InitialWindowSystem)
         .filter(|value| !value.is_nil())
-        .or_else(|| dynamic_or_global_symbol_value(eval, "window-system"))
+        .or_else(|| dynamic_or_global_symbol_value_fixed(eval, WellKnown::WindowSystem))
 }
 
 fn global_window_system_symbol_in_state(
     vars: VariableView<'_>,
     dynamic: &[crate::emacs_core::value::OrderedRuntimeBindingMap],
 ) -> Option<Value> {
-    dynamic_or_global_symbol_value_in_state(vars, dynamic, "initial-window-system")
+    dynamic_or_global_symbol_value_in_state_fixed(vars, WellKnown::InitialWindowSystem)
         .filter(|value| !value.is_nil())
-        .or_else(|| dynamic_or_global_symbol_value_in_state(vars, dynamic, "window-system"))
+        .or_else(|| dynamic_or_global_symbol_value_in_state_fixed(vars, WellKnown::WindowSystem))
 }
 
 fn selected_frame_window_system_symbol(eval: &super::eval::Context) -> Option<Value> {
@@ -186,33 +188,14 @@ fn display_does_not_exist_error(display: &str) -> Flow {
 }
 
 fn format_get_device_terminal_arg_eval(eval: &super::eval::Context, value: &Value) -> String {
-    let window_id = match value.kind() {
-        ValueKind::Veclike(VecLikeType::Window) => Some(WindowId(value.as_window_id().unwrap())),
-        _ => None,
-    };
-
-    if let Some(window_id) = window_id
-        && let Some(frame_id) = eval.frames.find_window_frame_id(window_id)
-        && let Some(frame) = eval.frames.get(frame_id)
-        && let Some(window) = frame.find_window(window_id)
-    {
-        if let Some(buffer_id) = window.buffer_id()
-            && let Some(buffer) = eval.buffers.get(buffer_id)
-        {
-            return format!(
-                "#<window {} on {}>",
-                window_id.0,
-                buffer.name_runtime_string_owned()
-            );
-        }
-        return format!(
-            "#<window {} on {}>",
-            window_id.0,
-            frame.name_runtime_string_owned()
-        );
+    match value.as_window_id() {
+        Some(window) => crate::emacs_core::print::format_window_handle_in_state(
+            &eval.buffers,
+            &eval.frames,
+            WindowId(window),
+        ),
+        None => super::print::print_value(value),
     }
-
-    super::print::print_value(value)
 }
 
 fn invalid_get_device_terminal_error_eval(eval: &super::eval::Context, value: &Value) -> Flow {
@@ -354,7 +337,7 @@ fn x_display_query_first_arg_error(value: &Value) -> Flow {
     }
 }
 
-fn window_system_not_initialized_error() -> Flow {
+pub(crate) fn window_system_not_initialized_error() -> Flow {
     signal(
         "error",
         vec![Value::string(
@@ -932,7 +915,7 @@ pub(crate) fn builtin_window_system(
         return Ok(Value::NIL);
     }
     Ok(
-        dynamic_or_global_symbol_value_in_state(eval.variables(), &[], "window-system")
+        dynamic_or_global_symbol_value_in_state_fixed(eval.variables(), WellKnown::WindowSystem)
             .unwrap_or(Value::NIL),
     )
 }
@@ -1957,7 +1940,7 @@ impl NativePopupSession<'_> {
 pub(crate) fn builtin_x_popup_dialog(ctx: &mut Context, args: Vec<Value>) -> EvalResult {
     validate_x_popup_dialog_args(&args)?;
 
-    if ctx.input_rx.is_none() {
+    if ctx.input_rx.as_ref().is_none() {
         tracing::info!("x-popup-dialog interactive: no input receiver");
         return Ok(Value::NIL);
     }
@@ -2035,7 +2018,7 @@ fn x_popup_menu_interactive(ctx: &mut Context, position: Value, menu: Value) -> 
         tracing::info!("x-popup-menu interactive: menu has no entries");
         return Ok(Value::NIL);
     }
-    if ctx.input_rx.is_none() {
+    if ctx.input_rx.as_ref().is_none() {
         tracing::info!("x-popup-menu interactive: no input receiver");
         return Ok(Value::NIL);
     }
@@ -2599,7 +2582,7 @@ pub(crate) fn builtin_x_popup_menu(ctx: &mut Context, args: Vec<Value>) -> EvalR
     let position = args[0];
     let menu = args[1];
 
-    if ctx.display_host.is_some() && ctx.input_rx.is_some() && !position.is_nil() {
+    if ctx.display_host.is_some() && ctx.input_rx.as_ref().is_some() && !position.is_nil() {
         let map = super::keymap::get_keymap_in_runtime(ctx, &menu, false, true)?;
         if !map.is_nil() {
             return x_popup_menu_interactive(ctx, position, map);
@@ -2824,11 +2807,11 @@ pub(crate) fn builtin_x_get_resource(
             )],
         ));
     }
-    let mut name = dynamic_or_global_symbol_value(eval, "x-resource-name")
+    let mut name = dynamic_or_global_symbol_value_fixed(eval, WellKnown::XResourceName)
         .and_then(|value| display_string_text(&value))
         .unwrap_or_else(|| "emacs".into());
     name = super::display_host::GuiResourceQuery::normalize_instance_name(&name);
-    let mut class = dynamic_or_global_symbol_value(eval, "x-resource-class")
+    let mut class = dynamic_or_global_symbol_value_fixed(eval, WellKnown::XResourceClass)
         .and_then(|value| display_string_text(&value))
         .unwrap_or_else(|| "Emacs".into());
     eval.assign("x-resource-name", Value::string(&name));
@@ -2846,7 +2829,7 @@ pub(crate) fn builtin_x_get_resource(
     let query = super::display_host::GuiResourceQuery {
         name,
         class,
-        inhibit_native: dynamic_or_global_symbol_value(eval, "inhibit-x-resources")
+        inhibit_native: dynamic_or_global_symbol_value_fixed(eval, WellKnown::InhibitXResources)
             .is_some_and(|value| value.is_truthy()),
     };
     Ok(eval

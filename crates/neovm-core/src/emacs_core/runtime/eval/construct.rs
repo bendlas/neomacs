@@ -13,6 +13,32 @@ pub(super) enum ConstructionSurface {
     Full,
     #[cfg(test)]
     MinimalVm,
+    /// Full context without GNU's initial DEFSYM obarray membership: the
+    /// shape of an image dumped before the port seeded the table.
+    #[cfg(test)]
+    LegacyImageWithoutDefsyms,
+}
+
+impl ConstructionSurface {
+    /// Full bootstrap surfaces run the same final activation; only the
+    /// reduced VM harness skips it and finishes in its own constructor.
+    fn finishes_runtime_activation(self) -> bool {
+        match self {
+            Self::Full => true,
+            #[cfg(test)]
+            Self::LegacyImageWithoutDefsyms => true,
+            #[cfg(test)]
+            Self::MinimalVm => false,
+        }
+    }
+
+    fn seeds_well_known_members(self) -> bool {
+        match self {
+            Self::Full => true,
+            #[cfg(test)]
+            Self::MinimalVm | Self::LegacyImageWithoutDefsyms => false,
+        }
+    }
 }
 
 /// A Context's execution state that is not a World view: what a new owner
@@ -107,6 +133,17 @@ impl Context {
         }
     }
 
+    /// A full bootstrap that deliberately predates GNU's initial DEFSYM
+    /// obarray membership. Used by the legacy dump fixture: the image must
+    /// lack the C-owned hook declaration rather than carry an empty member.
+    #[cfg(test)]
+    pub(crate) fn new_legacy_image_without_defsym_membership() -> Self {
+        let mut ctx = Self::new_inner(ConstructionSurface::LegacyImageWithoutDefsyms);
+        builtins::init_builtins(&mut ctx);
+        ctx.pre_register_standard_fringe_bitmaps();
+        ctx
+    }
+
     #[cfg(test)]
     pub(crate) fn new_vm_runtime_harness() -> Self {
         // GNU bytecode executes inside the same callable runtime surface as the
@@ -165,7 +202,7 @@ impl Context {
         *ev.threads = ThreadManager::new();
         *ev.kmacro = KmacroManager::new();
         *ev.command_loop = crate::keyboard::CommandLoop::default();
-        ev.input_rx = None;
+        ev.input_rx.clear();
         ev.eval_task_rx = None;
         ev.redisplay_fn = None;
         ev.mode_line_display_flow = None;
@@ -1382,6 +1419,15 @@ impl Context {
         // `display-fill-column-indicator', `display-line-numbers-widen' --
         // has to be forwarded before that happens or the coercion is dropped.
         super::super::defvar_bool::register_bootstrap_vars(obarray);
+        // A `Context` is always past GNU's `main`, which is what installs
+        // `noninteractive' from argv and `text_quoting_flag' from the process
+        // locale (`src/emacs.c:1953', `:1653-1656').  The rows say so and
+        // carry the batch-shaped value a library context uses; the `neomacs`
+        // binary restates both from its own argv and locale in
+        // `configure_gnu_startup_state`, and interactive startup sets the
+        // quoting flag to t after `startup--setup-quote-display'
+        // (`lisp/startup.el:1619-1620`).
+        super::super::defvar_bool::apply_post_main_batch_defaults(obarray);
         super::super::alloc::register_bootstrap_vars(obarray);
         super::super::load::register_bootstrap_vars(obarray);
         super::super::fileio::register_bootstrap_vars(obarray);
@@ -1688,6 +1734,9 @@ impl Context {
                     obarray.install_buffer_objfwd(id, fwd);
                 }
             }
+            // Build the buffer slot schema and publish its value-layer
+            // `SlotMeta` registry before any value-layer slot reader runs.
+            crate::buffer::buffer::force_slot_schema_install();
         }
 
         // GNU lread.c registers `lexical-binding` with DEFVAR_LISP and
@@ -2168,6 +2217,7 @@ impl Context {
             minibuffer_selected_window: world.global.minibuffer_selected_window,
             active_minibuffer_window: world.global.active_minibuffer_window,
             shutdown_request: None,
+            loadup_dump_mode: None,
             shutdown_in_progress: false,
             daemon: world.global.daemon,
             _reserved_input_mode_interrupt: true,
@@ -2178,7 +2228,7 @@ impl Context {
             threads: world.global.threads,
             kmacro: world.global.kmacro,
             command_loop: world.global.command_loop,
-            input_rx: None,
+            input_rx: crate::host_input::HostInputReceiver::default(),
             eval_task_rx: None,
             quit_requested: QuitRequest::new(),
             redisplay_fn: None,
@@ -2277,10 +2327,38 @@ impl Context {
             dynamic_module_registry: seed.registries.dynamic_module,
             in_flight_registry: seed.registries.in_flight,
             cached_standard_case_table: None,
+            frame_and_buffer_state: None,
         }
     }
 
     pub(super) fn new_inner(surface: ConstructionSurface) -> Self {
+        // Byte-code structural semantics live above the value layer; install
+        // them before any byte-code value can be compared or hashed. This is
+        // the one-time hook, not a per-allocation check: the constructors stay
+        // free of it so the allocation fast path is untouched.
+        crate::emacs_core::bytecode::semantics::install();
+        // The value layer owns the function-cell observer table; the JIT
+        // installs its four observations here, before any compiled leaf can
+        // exist. An uninstalled observer is a typed no-op, so function
+        // objects written outside a Context stay unaffected.
+        #[cfg(feature = "jit")]
+        crate::emacs_core::jit::install_function_cell_observer();
+        // The text-property storage in the value layer roots its intermediate
+        // conses through the evaluator's scratch-root stack; hand it the
+        // stack operations here, at the same one-time hooks.
+        crate::emacs_core::value::scratch_bridge::install_scratch_root_hooks(
+            crate::emacs_core::value::scratch_bridge::ScratchRootHooks {
+                save: super::save_scratch_gc_roots,
+                push: super::push_scratch_gc_root,
+                restore: super::restore_scratch_gc_roots,
+            },
+        );
+        // The evaluator's observed-run log of function-epoch moves is plain
+        // process state too; install it unconditionally so non-JIT builds
+        // keep the verify-run mismatch report.
+        crate::emacs_core::symbol::install_function_epoch_move_sink(
+            crate::emacs_core::eval::note_function_epoch_move,
+        );
         // Create the heap and set thread-locals so tagged constructors work
         // during evaluator initialization. The owner carries the allocation's
         // provenance root; installation and every later access derive from it.
@@ -2296,6 +2374,9 @@ impl Context {
         );
 
         let mut obarray = Obarray::new();
+        if surface.seeds_well_known_members() {
+            obarray.seed_well_known_members();
+        }
         // Builtin names are interned by SubrSpec registration during init_builtins(),
         // which runs after Context construction.
         let default_directory = std::env::current_dir()
@@ -2479,6 +2560,8 @@ impl Context {
         let obarray = match surface {
             ConstructionSurface::Full => obarray,
             #[cfg(test)]
+            ConstructionSurface::LegacyImageWithoutDefsyms => obarray,
+            #[cfg(test)]
             ConstructionSurface::MinimalVm => Obarray::new(),
         };
         let world = world::WorldStorageBuilder {
@@ -2516,20 +2599,16 @@ impl Context {
         };
         let mut ev = Self::assemble(world, seed);
         super::super::runtime_identity::install(&mut ev);
-        match surface {
-            ConstructionSurface::Full => {
-                ev.provide_value(
-                    Value::symbol("make-network-process"),
-                    Some(super::super::process::make_network_process_subfeatures()),
-                )
-                .expect("startup make-network-process provide should succeed");
-                ev.finish_runtime_activation(false);
-            }
-            // The minimal constructor performs its final activation after its
-            // remaining test-only private-state resets and subr registration.
-            #[cfg(test)]
-            ConstructionSurface::MinimalVm => {}
+        if surface.finishes_runtime_activation() {
+            ev.provide_value(
+                Value::symbol("make-network-process"),
+                Some(super::super::process::make_network_process_subfeatures()),
+            )
+            .expect("startup make-network-process provide should succeed");
+            ev.finish_runtime_activation(false);
         }
+        // The minimal constructor performs its final activation after its
+        // remaining test-only private-state resets and subr registration.
         ev
     }
 }

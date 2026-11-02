@@ -22,9 +22,17 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+mod era;
+pub use era::WorldEra;
+pub(crate) use era::prepare_keeper_backing;
+#[cfg(test)]
+pub(crate) use era::{WorldProofEra, WorldProofEraFinishFailure};
+mod function_write_hooks;
 mod green_owner;
 mod slot;
 mod sole_owner;
+#[cfg(test)]
+pub(crate) use green_owner::OwnedProofProjection;
 #[allow(unused_imports)]
 pub(crate) use green_owner::{
     Baton, FrozenLegacyRoots, OwnedParallelError, OwnedParallelProjection,
@@ -882,7 +890,7 @@ obarray_method_proxies! {
             byte_boolean_vars: ByteBooleanVars,
         );
     pub fn reattach_localized_forwarder(id: SymId,
-            kind: crate::emacs_core::pdump::types::DumpLocalizedForwarder,
+            kind: crate::emacs_core::symbol::LocalizedForwarderKind,
         );
     pub fn install_intfwd(id: SymId,
             fwd: &'static crate::emacs_core::forward::LispIntFwd,

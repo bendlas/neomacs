@@ -299,6 +299,8 @@ pub(crate) mod os_signal;
 pub mod path_exec;
 #[path = "system/perf_trace/mod.rs"]
 pub mod perf_trace;
+#[path = "system/platform/platform_facts.rs"]
+pub(crate) mod platform_facts;
 #[path = "system/post_image_init/mod.rs"]
 pub(crate) mod post_image_init;
 #[path = "system/process/mod.rs"]
@@ -458,15 +460,16 @@ pub(crate) struct MenuBarPopupAnchor {
 // Re-export the main public API
 pub use bytecode::{ByteCodeFunction, Vm as ByteVm};
 pub use display_host::{DisplayHost, GraphicalFaceAttribute, SelectionOwner};
-pub use error::{
-    EvalError, format_eval_result, format_eval_result_bytes_with_eval,
-    format_eval_result_with_eval, print_value_bytes_with_eval, print_value_with_eval,
-};
+pub use error::EvalError;
 pub use eval::{
     Context, GuiFrameHostRequest, MenuBarRebuildGeneration, PopupMenuEntry, PopupMenuRequest,
 };
 pub use intern::SymId;
-pub use print::{print_value, print_value_bytes, print_value_with_buffers};
+pub use print::{
+    format_eval_result, format_eval_result_bytes_with_eval, format_eval_result_with_eval,
+    print_value, print_value_bytes, print_value_bytes_with_eval, print_value_with_buffers,
+    print_value_with_eval,
+};
 pub use symbol::Obarray;
 pub use value::{LambdaData, LambdaParams, Value, ValueKind, VecLikeType};
 
@@ -481,9 +484,37 @@ pub fn eval_source(input: &str) -> Result<Value, EvalError> {
 mod architecture_transmute_guard_test;
 
 #[cfg(test)]
+#[path = "tests/architecture/layering_guard_test.rs"]
+mod architecture_layering_guard_test;
+
+#[cfg(test)]
 #[path = "tests/architecture/value_ref_guard_test.rs"]
 mod architecture_value_ref_guard_test;
 
 #[cfg(test)]
 #[path = "tests/architecture/inline_boundary_test.rs"]
 mod architecture_inline_boundary_test;
+
+#[cfg(test)]
+#[path = "tests/architecture/carrier_tls_class_test.rs"]
+mod architecture_carrier_tls_class_test;
+
+#[cfg(test)]
+#[path = "tests/architecture/host_effect_guard_test.rs"]
+mod architecture_host_effect_guard_test;
+
+#[cfg(test)]
+#[path = "tests/architecture/unsafe_shim_guard_test.rs"]
+mod architecture_unsafe_shim_guard_test;
+
+#[cfg(test)]
+#[path = "tests/architecture/debug_assert_side_effect_guard_test.rs"]
+mod architecture_debug_assert_side_effect_guard_test;
+
+#[cfg(test)]
+#[path = "tests/architecture/plist_head_seam_guard_test.rs"]
+mod architecture_plist_head_seam_guard_test;
+
+#[cfg(test)]
+#[path = "tests/architecture/parallel_exec_substrate_test.rs"]
+mod architecture_parallel_exec_substrate_test;

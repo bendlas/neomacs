@@ -170,6 +170,11 @@ pub(crate) struct BufferSourceOutputSetup {
     body_install_context: BufferSourceBodyInstallContext,
     retry_bounds: BufferSourceRetryBounds,
     position_publication: WindowPositionPublication,
+    /// A Position query evaluates chrome on its first attempt. Its retry runs
+    /// with the measured metrics already seeded into `WindowParams`, so chrome
+    /// must not be evaluated a second time (GNU `pos_visible_p` evaluates once
+    /// before walking the body).
+    remeasure_chrome: bool,
 }
 
 #[cfg(test)]
@@ -216,6 +221,7 @@ impl<'a> BufferWindowBackground<'a> {
         output: &mut TextWindowOutputTarget<'_>,
         params: &WindowParams,
         geometry: &BufferWindowGeometry,
+        layout_box: &WindowLayoutBox,
     ) {
         let Self::Resolved { face_id, face } = self else {
             return;
@@ -233,7 +239,11 @@ impl<'a> BufferWindowBackground<'a> {
             clip_rect: Some(params.bounds),
             bounds: Rect::new(
                 params.bounds.x,
-                geometry.text_y,
+                // A partial walk moves geometry.text_y to the first row it
+                // walks (the edit's dirty row, or a scroll replay's first
+                // newly exposed row). The window background still covers the
+                // full viewport.
+                layout_box.body().y,
                 params.bounds.width,
                 geometry.text_height,
             ),
@@ -586,6 +596,7 @@ impl BufferSourceOutputSetup {
                 (text_y + text_height - walk_setup.window_top).round() as i64,
             ),
             position_publication: WindowPositionPublication::Redisplay,
+            remeasure_chrome: false,
         }
     }
 
@@ -595,6 +606,57 @@ impl BufferSourceOutputSetup {
     ) -> Self {
         self.position_publication = publication;
         self
+    }
+
+    pub(crate) fn with_remeasure_chrome(mut self, remeasure: bool) -> Self {
+        self.remeasure_chrome = remeasure;
+        self
+    }
+
+    /// A retained chrome partition can consume the whole body after a resize.
+    /// Its current format must still get a chance to shrink before we skip it.
+    pub(crate) fn measure_chrome_for_empty_body<FS: crate::neovm_bridge::FaceServices>(
+        self,
+        state: BufferSourceRenderAttemptContext<'_, '_, FS>,
+        request: WindowChromeRowsRenderRequest<'_, '_>,
+        params: &WindowParams,
+    ) -> BufferSourceRenderAttemptOutcome {
+        let (mut output, font_metrics, face_resolver, mut face_ids, _) = state.into_parts();
+        if !self.remeasure_chrome
+            || !self.position_publication.remeasures_chrome()
+            || neovm_core::emacs_core::xdisp::mode_line_display_active(output.evaluator())
+        {
+            return BufferSourceRenderAttemptOutcome::Skipped;
+        }
+        let freshness_before_chrome = match freshness_before_window_chrome(
+            output.evaluator(),
+            self.begin_request.frame_id(),
+            params,
+        ) {
+            Ok(freshness) => freshness,
+            Err(changed) => return changed.into(),
+        };
+        let mut emitter = output.begin_text_window_output(self.begin_request);
+        let (output, evaluator) = output.into_parts();
+        let services =
+            ChromeRowRenderServices::new(font_metrics, face_resolver.resolver(), &mut face_ids);
+        match render_or_retain_window_chrome(
+            output,
+            &mut emitter,
+            evaluator,
+            request,
+            services,
+            WindowChromeRowSource::Recompute,
+        ) {
+            Ok((measured, chrome_lisp_admission)) => {
+                BufferSourceRenderAttemptOutcome::EmptyBodyChromeMeasured {
+                    measured,
+                    freshness_before_chrome,
+                    chrome_lisp_admission,
+                }
+            }
+            Err(changed) => changed.into(),
+        }
     }
 }
 
@@ -743,6 +805,7 @@ impl BufferSourceOutputSetup {
             &mut output.output_target(),
             params,
             geometry,
+            layout_box,
         );
 
         let has_overlays = !buffer.layout_overlays().is_empty();
@@ -1357,11 +1420,73 @@ impl BufferSourceOutputSetup {
                         .is_some_and(|row| row.pixel_y + row.height_px <= visible_bottom + 0.5),
                 };
                 if !point_row_on_screen {
+                    // An above-only edit walk has already measured point and
+                    // the viewport tail. Together with its unchanged prefix it
+                    // supplies the same rows a full walk would use to choose
+                    // the next start. Synchronized tails, EOB insertion and
+                    // forced starts keep the full fallback.
+                    let outcome = if point_in_walk
+                        && !below_reused
+                        && !params.force_start
+                        && scroll.new_point < source.accessible_end()
+                        && scroll.new_window_start == params.window_start
+                    {
+                        let mut rows = scroll.reused_row_snapshots.clone();
+                        rows.extend_from_slice(output_emitter.rows());
+                        rows.sort_by_key(|row| row.row);
+                        let text_top = (layout_box.body().y - params.bounds.y).round() as i64;
+                        let text_bottom = visible_bottom.round() as i64;
+                        let retry =
+                            crate::display_text_window_row_lifecycle::TextWindowVisibilityRetryRequest::new(
+                                &rows,
+                                scroll.new_window_start,
+                                source.accessible_start(),
+                                source.accessible_end(),
+                                scroll.new_point,
+                                walk_setup.charpos,
+                                false,
+                                text_top,
+                                text_bottom,
+                                crate::scroll_policy::ScrollPolicy::from_window_params(params),
+                                params.scroll_margin,
+                                None,
+                                buf_access,
+                            )
+                            .decide();
+                        let retry_plan = BufferSourceRetryPlan::from_post_loop(
+                            params.window_id,
+                            scroll.new_window_start,
+                            scroll.new_point,
+                            walk_setup.charpos,
+                            BufferSourceRetryBounds::new(text_top, text_bottom),
+                            crate::buffer_source::tail_render::BufferSourcePostLoopRenderOutcome {
+                                retry,
+                                rendered_rows_len: rows.len(),
+                                ..post_loop
+                            },
+                        );
+                        retry_plan
+                            .viewport_resolution(remaining_visibility_retries)
+                            .map(
+                                |decision| BufferSourceRenderAttemptOutcome::ResolveViewport {
+                                    decision,
+                                },
+                            )
+                            .or_else(|| {
+                                retry_plan.should_retry(remaining_visibility_retries).map(
+                                    |window_start| BufferSourceRenderAttemptOutcome::Retry {
+                                        window_start,
+                                    },
+                                )
+                            })
+                    } else {
+                        None
+                    };
                     crate::window_output::restore_text_window_retry_checkpoint(
                         output.reborrow(),
                         retry_checkpoint,
                     );
-                    return BufferSourceRenderAttemptOutcome::ReplayMispredicted;
+                    return outcome.unwrap_or(BufferSourceRenderAttemptOutcome::ReplayMispredicted);
                 }
             }
             output_emitter.push_reused_body(
@@ -1418,7 +1543,7 @@ impl BufferSourceOutputSetup {
                 {
                     let resolved = FrameFaces::new(face_resolver)
                         .for_window(buffer)
-                        .resolve_named_face("fringe");
+                        .resolve_fixed_face(neovm_core::emacs_core::intern::WellKnown::Fringe);
                     let face_id = crate::display_row::face_state::stable_face_id_for_resolved(
                         render_services.face_ids(),
                         &resolved,
@@ -1765,7 +1890,8 @@ impl BufferSourceOutputSetup {
             params,
             geometry.display_text_row_base,
             {
-                let resolved = window_faces.resolve_named_face("fringe");
+                let resolved = window_faces
+                    .resolve_fixed_face(neovm_core::emacs_core::intern::WellKnown::Fringe);
                 let face_id = crate::display_row::face_state::stable_face_id_for_resolved(
                     render_services.face_ids(),
                     &resolved,
@@ -1784,7 +1910,20 @@ impl BufferSourceOutputSetup {
         // *measured* chrome heights so the window snapshot reports the real
         // (possibly taller, e.g. doom-modeline's bar) height rather than the
         // face-only estimate the text-area geometry was reserved from.
-        let chrome_source = if self.position_publication.is_synchronous_query() {
+        // A chrome `:eval` may itself ask for a position (GNU guards that
+        // re-entry, src/xdisp.c:1725-1731). Keep the accepted partition while
+        // a chrome formatter is already running instead of recursing.
+        let chrome_source = if self.remeasure_chrome
+            && self.position_publication.remeasures_chrome()
+            && !neovm_core::emacs_core::xdisp::mode_line_display_active(evaluator)
+        {
+            // GNU `pos_visible_p` re-evaluates and measures mode/header/tab
+            // lines on every call, before walking the body (src/xdisp.c:1732-
+            // 1770). Measure here too: a mismatch with the reserved metrics
+            // becomes `WindowLayoutOutcome::NeedsRelayout`, and the retry lays
+            // the body out under the measured text-area partition.
+            WindowChromeRowSource::Recompute
+        } else if self.position_publication.is_synchronous_query() {
             // GNU `Fwindow_end` builds a stack-local display iterator for the
             // text area.  Reuse the already accepted partition instead of
             // evaluating status-line Lisp as a side effect of a geometry

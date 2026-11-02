@@ -18,12 +18,7 @@ fn gnu_expect(name: &str, program: &str, observe: &str, fixture: &str) -> String
     std::fs::write(&script, format!(
         ";;; -*- lexical-binding: t; -*-\n(require 'bytecomp)\n{WARM}\n{program}\n(let ((print-length nil) (print-level nil)) (prin1 {observe}))\n"
     )).expect("write GNU oracle input");
-    let emacs = std::env::var_os("EMACS").unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".local/bin/emacs")
-            .into_os_string()
-    });
-    let result = std::process::Command::new(emacs)
+    let result = crate::test_utils::gnu_probe_command()
         .args(["--batch", "-Q", "-l"])
         .arg(&script)
         .output()
@@ -565,10 +560,11 @@ fn a_contained_framed_panic_detaches_three_args_before_gc_and_caller_healing() {
             unsafe { ev.push_backtrace_frame_from_native_args(Value::symbol("neovm--fp-target"), args.as_ptr(), args.len()) };
             ev.depth += 1;
             let mut output = i64::MIN;
-            let status = super::super::direct_call::neovm_jit_direct_framed(
+            // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+            let status = unsafe { super::super::direct_call::neovm_jit_direct_framed(
                 &mut ev as *mut Context as *mut u8, callee.bits() as i64,
                 leaf as *const CompiledLeaf as usize as i64, constants as usize as i64,
-                args.as_ptr(), args.len() as i64, spec0 as i64, &mut output);
+                args.as_ptr(), args.len() as i64, spec0 as i64, &mut output) };
             assert_eq!(status, STATUS_SIGNAL);
             assert_eq!(output, i64::MIN, "signal leaves the output slot unreadable");
         }

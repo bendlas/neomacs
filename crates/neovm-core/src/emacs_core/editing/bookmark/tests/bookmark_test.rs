@@ -15,6 +15,284 @@ fn bm_runtime(text: Option<&LispString>) -> Option<String> {
 }
 
 #[test]
+fn bookmark_lookup_key_cannot_retain_input_properties() {
+    use crate::buffer::CharRange;
+    use crate::emacs_core::Context;
+
+    struct DroppedProperty(usize);
+
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    eval.gc_stress = false;
+    eval.gc_collect_exact();
+    eval.tagged_heap.set_gc_threshold(usize::MAX);
+    let property = Value::symbol("bookmark-key-input-only");
+    let probes = eval.with_gc_inhibited(|eval| {
+        let mut bookmarks = HashMap::new();
+        let mut probes = Vec::new();
+        for mut text in [
+            LispString::from_utf8("é\u{e0ff}"),
+            LispString::from_unibyte(vec![0xff]),
+            LispString::from_emacs_bytes(crate::emacs_core::emacs_char::str_to_multibyte(&[0x80])),
+        ] {
+            let name = text.without_properties();
+            let payload = Value::vector(vec![Value::fixnum(71)]);
+            probes.push(DroppedProperty(payload.bits()));
+            text.intervals_mut().put_property_in_char_range(
+                CharRange::from_usize(0, 1),
+                property,
+                payload,
+            );
+            let key = BookmarkKey::from_lisp_string(&text);
+            assert!(
+                !key.as_lisp_string().has_intervals(),
+                "bookmark lookup key retained input properties"
+            );
+            assert_eq!(key, BookmarkKey::from_lisp_string(&name));
+            assert!(key.as_lisp_string().is_multibyte());
+            bookmarks.insert(
+                key,
+                Bookmark {
+                    name,
+                    filename: None,
+                    position: LispCharPos1::new(1),
+                    front_context: None,
+                    rear_context: None,
+                    annotation: None,
+                    handler: None,
+                },
+            );
+        }
+        // Exercise the real World's restore boundary with independent plain
+        // records. Only the derived keys could retain these property graphs.
+        *eval.bookmarks = BookmarkManager::from_dump(bookmarks, Vec::new());
+        assert_eq!(eval.bookmarks.dump_bookmarks().len(), 3);
+        probes
+    });
+    let check_dropped = |eval: &Context| {
+        for DroppedProperty(bits) in &probes {
+            assert!(
+                !eval.tagged_heap.retains_veclike(Value::from_bits(*bits)),
+                "bookmark key input-only property remained rooted"
+            );
+        }
+        for (key, record) in eval.bookmarks.dump_bookmarks() {
+            assert!(!key.as_lisp_string().has_intervals());
+            assert_eq!(*key, BookmarkKey::from_lisp_string(&record.name));
+            assert!(eval.bookmarks.get(&record.name).is_some());
+        }
+    };
+    let completed = eval.gc_count;
+    if eval.tagged_heap.generational_enabled() {
+        assert!(eval.tagged_heap.should_run_minor(false, false));
+        eval.gc_pending = true;
+        eval.gc_safe_point_exact();
+        assert!(eval.tagged_heap.sweep_in_progress(), "expected minor sweep");
+        assert!(!eval.tagged_heap.concurrent_mark_running());
+        for _ in 0..10_000 {
+            if !eval.tagged_heap.sweep_in_progress() {
+                break;
+            }
+            eval.gc_safe_point_exact();
+        }
+        assert!(!eval.tagged_heap.sweep_in_progress());
+        assert!(!eval.tagged_heap.mark_in_progress());
+    } else {
+        eval.gc_collect_exact();
+    }
+    assert_eq!(eval.gc_count, completed + 1);
+    check_dropped(&eval);
+    let completed = eval.gc_count;
+    eval.gc_collect_exact();
+    assert_eq!(eval.gc_count, completed + 1);
+    check_dropped(&eval);
+}
+
+#[test]
+fn bookmark_lookup_projection_preserves_semantic_name_properties() {
+    use crate::buffer::{CharPos0, CharRange};
+
+    crate::test_utils::init_test_tracing();
+    let property = Value::symbol("bookmark-semantic-name");
+    let mut name = bm_str("original-é");
+    name.intervals_mut().put_property_in_char_range(
+        CharRange::from_usize(0, 1),
+        property,
+        Value::fixnum(11),
+    );
+    let mut manager = BookmarkManager::new();
+    manager.set(
+        name.clone(),
+        Bookmark {
+            name: name.clone(),
+            filename: None,
+            position: LispCharPos1::new(1),
+            front_context: None,
+            rear_context: None,
+            annotation: None,
+            handler: None,
+        },
+    );
+    let check_name = |manager: &BookmarkManager, expected: &LispString| {
+        for text in [
+            &manager.get(expected).expect("stored bookmark").name,
+            &manager.recent_names()[0],
+        ] {
+            assert_eq!(
+                text.intervals()
+                    .get_property_at_char_pos(CharPos0::ZERO, property),
+                Some(Value::fixnum(11))
+            );
+        }
+        assert!(
+            manager
+                .dump_bookmarks()
+                .keys()
+                .all(|key| !key.as_lisp_string().has_intervals())
+        );
+    };
+    check_name(&manager, &name);
+    let mut renamed = bm_str("renamed-é");
+    renamed.intervals_mut().put_property_in_char_range(
+        CharRange::from_usize(0, 1),
+        property,
+        Value::fixnum(11),
+    );
+    assert!(manager.rename(&name, renamed.clone()));
+    check_name(&manager, &renamed);
+}
+
+#[test]
+fn bookmark_copied_properties_have_only_manager_roots() {
+    use crate::buffer::{CharPos0, CharRange};
+    use crate::emacs_core::Context;
+
+    struct Probe(usize);
+    fn text(probes: &mut Vec<Probe>, property: Value, mut text: LispString) -> LispString {
+        let payload = Value::vector(vec![Value::fixnum(probes.len() as i64)]);
+        probes.push(Probe(payload.bits()));
+        text.intervals_mut().put_property_in_char_range(
+            CharRange::from_usize(0, 1),
+            property,
+            payload,
+        );
+        text
+    }
+
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    eval.gc_stress = false;
+    eval.gc_collect_exact();
+    eval.tagged_heap.set_gc_threshold(usize::MAX);
+    let property = Value::symbol("bookmark-owner-only");
+    let probes = eval.with_gc_inhibited(|eval| {
+        let mut probes = Vec::new();
+        let record = Bookmark {
+            name: text(&mut probes, property, bm_str("root-record-é")),
+            filename: Some(text(
+                &mut probes,
+                property,
+                LispString::from_unibyte(b"/tmp/owned".to_vec()),
+            )),
+            position: LispCharPos1::new(1),
+            front_context: Some(text(&mut probes, property, bm_str("front-é"))),
+            rear_context: Some(text(
+                &mut probes,
+                property,
+                LispString::from_unibyte(vec![0xff]),
+            )),
+            annotation: Some(text(&mut probes, property, bm_str("annotation-é"))),
+            handler: Some(text(
+                &mut probes,
+                property,
+                LispString::from_unibyte(b"owned-handler".to_vec()),
+            )),
+        };
+        let key = BookmarkKey::from_lisp_string(&record.name);
+        assert!(!key.as_lisp_string().has_intervals());
+        // Imported recents need not alias any record. Use a distinct graph so
+        // an incomplete visitor cannot pass by relying on record-name aliases.
+        let recent = text(&mut probes, property, bm_str("independent-recent-é"));
+        *eval.bookmarks = BookmarkManager::from_dump(HashMap::from([(key, record)]), vec![recent]);
+        assert_eq!(probes.len(), 7);
+        probes
+    });
+    let check_live = |eval: &Context| {
+        for Probe(bits) in &probes {
+            assert!(
+                eval.tagged_heap.retains_veclike(Value::from_bits(*bits)),
+                "bookmark-only property vector was reclaimed"
+            );
+        }
+        for (index, Probe(bits)) in probes.iter().enumerate() {
+            assert_eq!(
+                Value::from_bits(*bits)
+                    .as_vector_data()
+                    .expect("live bookmark property vector")
+                    .as_slice(),
+                &[Value::fixnum(index as i64)]
+            );
+        }
+        let record = eval
+            .bookmarks
+            .get(&bm_str("root-record-é"))
+            .expect("retained bookmark");
+        assert_eq!(
+            record
+                .annotation
+                .as_ref()
+                .expect("retained annotation")
+                .intervals()
+                .get_property_at_char_pos(CharPos0::ZERO, property)
+                .expect("retained annotation property")
+                .bits(),
+            probes[4].0
+        );
+        assert_eq!(
+            eval.bookmarks.recent_names()[0]
+                .intervals()
+                .get_property_at_char_pos(CharPos0::ZERO, property)
+                .expect("retained independent recent property")
+                .bits(),
+            probes[6].0
+        );
+    };
+    let completed = eval.gc_count;
+    if eval.tagged_heap.generational_enabled() {
+        assert!(eval.tagged_heap.should_run_minor(false, false));
+        eval.gc_pending = true;
+        eval.gc_safe_point_exact();
+        assert!(eval.tagged_heap.sweep_in_progress(), "expected minor sweep");
+        assert!(!eval.tagged_heap.concurrent_mark_running());
+        for _ in 0..10_000 {
+            if !eval.tagged_heap.sweep_in_progress() {
+                break;
+            }
+            eval.gc_safe_point_exact();
+        }
+        assert!(!eval.tagged_heap.sweep_in_progress());
+        assert!(!eval.tagged_heap.mark_in_progress());
+    } else {
+        eval.gc_collect_exact();
+    }
+    assert_eq!(eval.gc_count, completed + 1);
+    check_live(&eval);
+    let completed = eval.gc_count;
+    eval.gc_collect_exact();
+    assert_eq!(eval.gc_count, completed + 1);
+    check_live(&eval);
+
+    *eval.bookmarks = BookmarkManager::new();
+    eval.gc_collect_exact();
+    for Probe(bits) in probes {
+        assert!(
+            !eval.tagged_heap.retains_veclike(Value::from_bits(bits)),
+            "retired bookmark graph remained permanently rooted"
+        );
+    }
+}
+
+#[test]
 fn set_get_delete() {
     crate::test_utils::init_test_tracing();
     let mut mgr = BookmarkManager::new();
@@ -624,6 +902,24 @@ fn bookmark_save_load_preserves_raw_unibyte_file_path() {
 
     set_current_buffer_file(&mut eval, "/raw-file.el");
     builtin_bookmark_set(&mut eval, vec![Value::string("raw-bm")]).unwrap();
+
+    if crate::emacs_core::platform_facts::RAW_BYTE_FILENAMES
+        == crate::emacs_core::platform_facts::RawByteFilenames::Rejected
+    {
+        // GNU bookmark-save wraps `write-file` in
+        // `(condition-case nil ... (file-error (message "Can't write %s" file)))`
+        // (lisp/bookmark.el:1708-1735), so a file system that refuses the
+        // raw-byte name leaves the observable Lisp result nil and writes
+        // nothing; measured with GNU 31.1 on macOS.
+        let result = builtin_bookmark_save(&mut eval, vec![Value::NIL, path_val])
+            .expect("bookmark-save catches the file-error like GNU");
+        assert!(result.is_nil());
+        assert!(
+            !os_path.exists(),
+            "no file may appear at the raw-byte path {os_path:?}"
+        );
+        return;
+    }
 
     builtin_bookmark_save(&mut eval, vec![Value::NIL, path_val]).expect("save to raw path");
     assert!(

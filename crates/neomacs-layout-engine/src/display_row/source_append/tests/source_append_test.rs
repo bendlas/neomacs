@@ -4043,7 +4043,7 @@ fn buffer_text_overflow_render_request_handles_character_wrap_transition() {
             80.0,
             crate::display_row::append_context::RightEdgeMarkerColumn::NotReserved,
             LineWrapMode::Wrap,
-            word_wrap,
+            word_wrap.checkpoint(),
             DisplayRowVisibilityLimit {
                 allow_partial: false,
                 max_rows: 4,
@@ -6938,7 +6938,7 @@ fn buffer_text_source_append_context_appends_source_char() {
             'a',
             80.0,
             LineWrapMode::Wrap,
-            WordWrapRenderState::new(false)
+            WordWrapRenderState::new(false).checkpoint()
         ),
         DisplayRowTextOverflowDecision::Fits
     );
@@ -6947,7 +6947,7 @@ fn buffer_text_source_append_context_appends_source_char() {
             'a',
             80.0,
             LineWrapMode::Wrap,
-            WordWrapRenderState::new(false)
+            WordWrapRenderState::new(false).checkpoint()
         ),
         DisplaySourceTextCharOverflowAction::Fits
     ));
@@ -6956,7 +6956,7 @@ fn buffer_text_source_append_context_appends_source_char() {
             'a',
             4.0,
             LineWrapMode::Truncate,
-            WordWrapRenderState::new(false)
+            WordWrapRenderState::new(false).checkpoint()
         ),
         DisplaySourceTextCharOverflowAction::Truncate { .. }
     ));
@@ -6965,7 +6965,7 @@ fn buffer_text_source_append_context_appends_source_char() {
             'a',
             4.0,
             LineWrapMode::Wrap,
-            WordWrapRenderState::new(false)
+            WordWrapRenderState::new(false).checkpoint()
         ),
         DisplaySourceTextCharOverflowAction::CharacterWrap { .. }
     ));
@@ -6980,7 +6980,7 @@ fn buffer_text_source_append_context_appends_source_char() {
         DisplayRowGlyphCheckpoint::default(),
     );
     assert!(matches!(
-        prepared_append.overflow_action('a', 4.0, LineWrapMode::Wrap, word_wrap),
+        prepared_append.overflow_action('a', 4.0, LineWrapMode::Wrap, word_wrap.checkpoint()),
         DisplaySourceTextCharOverflowAction::WordWrap { break_candidate, .. }
             if break_candidate.byte_idx() == 0
                 && break_candidate.charpos() == 0
@@ -7746,7 +7746,7 @@ fn buffer_text_source_append_context_prepares_current_text_row_source_char() {
             'a',
             80.0,
             LineWrapMode::Wrap,
-            WordWrapRenderState::new(false)
+            WordWrapRenderState::new(false).checkpoint()
         ),
         DisplayRowTextOverflowDecision::Fits
     );
@@ -7849,7 +7849,7 @@ fn buffer_end_of_buffer_tail_render_request_captures_cursor_and_renders_overlay(
         buffer.insert("abc");
         let eob = buffer.point_max_emacs_byte_pos().get();
         let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
-            serial: 0,
+            serial: neovm_core::heap_types::OverlaySerialSource::Mint,
             plist: Value::NIL,
             buffer: Some(buf_id),
             start: eob,
@@ -8671,7 +8671,7 @@ fn string_only_display_rows_do_not_shrink_the_visible_viewport() {
         0,
         48,
         ScrollPolicy::Unlimited,
-        0,
+        neovm_core::window::ScrollMargin::default(),
         None,
         &access,
     )
@@ -8713,7 +8713,7 @@ fn buffer_text_window_visibility_retry_request_scrolls_down_from_visible_rows() 
         0,
         48,
         ScrollPolicy::Unlimited,
-        0,
+        neovm_core::window::ScrollMargin::default(),
         None,
         &access,
     )
@@ -8761,7 +8761,7 @@ fn buffer_text_window_visibility_retry_request_detects_partially_visible_point_r
         0,
         60,
         ScrollPolicy::Unlimited,
-        0,
+        neovm_core::window::ScrollMargin::default(),
         None,
         &access,
     )
@@ -8804,7 +8804,7 @@ fn buffer_text_window_visibility_retry_keeps_a_fully_visible_continued_point_row
         0,
         48,
         ScrollPolicy::Unlimited,
-        0,
+        neovm_core::window::ScrollMargin::default(),
         None,
         &access,
     )
@@ -10490,7 +10490,7 @@ fn display_replacement_string_append_item_measures_source_text_from_active_face(
         8.0,
     )
     .expect("display property string item");
-    let mut font_metrics = Some(crate::font::metrics::FontMetricsService::new());
+    let mut font_metrics = Some(crate::font::metrics::test_catalog::metrics_service());
     let source_item = crate::display_item::DisplayItem::new(
         crate::display_item::SourceSpan::synthetic(11, 0, 3),
         RenderFaceRef::FaceId(FaceId::new(7)),
@@ -11297,11 +11297,12 @@ fn test_display_space_window_params() -> WindowParams {
         vscroll: 0,
         wrap_mode: LineWrapMode::Wrap,
         word_wrap: false,
+        word_wrap_policy: Default::default(),
         tab_width: 8,
         scroll_conservatively: 0,
         scroll_step: 0,
         scroll_minibuffer_conservatively: true,
-        scroll_margin: 0,
+        scroll_margin: neovm_core::window::ScrollMargin::default(),
         tab_stop_list: vec![],
         default_fg: 0xFFFFFF,
         frame_foreground: 0xFFFFFF,

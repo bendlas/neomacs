@@ -172,6 +172,9 @@ use crate::emacs_core::intern::SymId;
 #[cfg(feature = "jit")]
 pub mod backend;
 
+/// Separate bounded parallel ABI; backend absence is a typed refusal.
+pub(crate) mod parallel;
+
 /// Baseline bytecode → native lowering (Phase 3b+). Compiles the leaf,
 /// straight-line opcode subset to machine code and bails to the interpreter on
 /// anything else. Only built with the `jit` feature. See `jit/compile.rs`.
@@ -1738,6 +1741,26 @@ impl Clone for Runtime {
     }
 }
 
+/// Install the value layer's function-cell observer. `Context::new_inner`
+/// calls this with the other one-time hooks, before any compiled leaf can
+/// exist; the observer is a typed no-op until then. The observer only
+/// forwards function-cell writes to the existing JIT metering and cache
+/// invalidation, so function objects outside a `Context` stay unaffected.
+/// Only built with the `jit` feature, like the `stats` and `cache` modules it
+/// forwards to; without it the observer table stays uninstalled and every
+/// function-cell write takes the typed no-op path.
+#[cfg(feature = "jit")]
+pub(crate) fn install_function_cell_observer() {
+    crate::emacs_core::symbol::install_function_cell_observer(
+        crate::emacs_core::symbol::FunctionCellObserver {
+            epoch_bump: stats::note_function_epoch_bump,
+            cell_unchanged: stats::note_function_cell_unchanged,
+            evict_inline_dependents: cache::evict_inline_dependents,
+            pin_redefined: cache::pin_redefined_function,
+        },
+    );
+}
+
 #[cfg(test)]
 #[path = "tests/jit_test.rs"]
 mod tests;
@@ -1750,6 +1773,27 @@ mod green_owner_tests;
 #[path = "tests/green_arith.rs"]
 mod green_arith_tests;
 
+#[cfg(all(test, feature = "jit"))]
+#[path = "tests/green_release.rs"]
+mod green_release_tests;
+
 #[cfg(all(test, feature = "jit", not(feature = "gc-memory-telemetry")))]
 #[path = "tests/p3sym_functions_test.rs"]
 mod p3sym_functions_tests;
+
+/// Debug-only carrier TLS fingerprint for the JIT subsystem.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    #[cfg(feature = "jit")]
+    {
+        aot::carrier_tls_fingerprint(h);
+        bg::carrier_tls_fingerprint(h);
+        cache::carrier_tls_fingerprint(h);
+        compile::carrier_tls_fingerprint(h);
+        inline::carrier_tls_fingerprint(h);
+        stats::carrier_tls_fingerprint(h);
+        tier2::carrier_tls_fingerprint(h);
+    }
+    #[cfg(not(feature = "jit"))]
+    let _ = h;
+}

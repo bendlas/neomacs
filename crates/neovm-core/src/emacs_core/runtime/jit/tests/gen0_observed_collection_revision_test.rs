@@ -148,19 +148,25 @@ fn gen0_cons_shim_rejects_outside_mutator_observations_before_exact_query() {
     let revision = LispCollectionRevision::current();
     let vmctx = (&mut context as *mut Context).cast::<u8>();
     assert_eq!(
-        super::super::dispatch::neovm_jit_setcar_collection(
-            vmctx,
-            target.bits() as i64,
-            Value::NIL.bits() as i64
-        ),
+        // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+        unsafe {
+            super::super::dispatch::neovm_jit_setcar_collection(
+                vmctx,
+                target.bits() as i64,
+                Value::NIL.bits() as i64,
+            )
+        },
         Value::NIL.bits() as i64,
     );
     assert_eq!(
-        super::super::dispatch::neovm_jit_setcdr_collection(
-            vmctx,
-            target.bits() as i64,
-            Value::NIL.bits() as i64
-        ),
+        // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+        unsafe {
+            super::super::dispatch::neovm_jit_setcdr_collection(
+                vmctx,
+                target.bits() as i64,
+                Value::NIL.bits() as i64,
+            )
+        },
         Value::NIL.bits() as i64,
     );
     assert!(
@@ -177,7 +183,8 @@ fn gen0_cons_shim_rejects_outside_mutator_observations_before_exact_query() {
         super::super::dispatch::neovm_jit_setcdr_collection,
     ] {
         assert_eq!(
-            setter(vmctx, target.bits() as i64, old_child.bits() as i64),
+            // SAFETY: the test frame supplies the live vmctx and argument words.
+            unsafe { setter(vmctx, target.bits() as i64, old_child.bits() as i64) },
             old_child.bits() as i64,
         );
     }
@@ -954,7 +961,7 @@ fn probe_leaf(kind: StoreKind, context: &Context) -> CompiledLeaf {
 }
 
 #[test]
-#[ignore = "supplementary instruction slopes; runner controls kind/count/observation"]
+#[cfg(feature = "perf-probes")]
 fn gen0_observed_collection_store_cost_probe() {
     let name = std::env::var("FX1_STORE_KIND").expect("FX1_STORE_KIND");
     let kind = probe_kind(&name);

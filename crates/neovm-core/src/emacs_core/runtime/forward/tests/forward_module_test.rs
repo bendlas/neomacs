@@ -3,8 +3,8 @@
 //! Every expectation here was produced by running the same form under GNU
 //! Emacs 31.0.90 (`emacs -Q --batch`), never derived from the C source.
 
-use crate::emacs_core::error::format_eval_result;
 use crate::emacs_core::eval::Context;
+use crate::emacs_core::format_eval_result;
 
 fn ev() -> Context {
     crate::test_utils::init_test_tracing();
@@ -435,7 +435,9 @@ fn defvar_bool_coerces_every_variable_in_the_table_like_gnu() {
 /// Every row of the table is registered, is `special`, and still holds the
 /// value the table gives it once the rest of the bootstrap has run -- which is
 /// what stops a leftover plain-cell seed elsewhere from quietly deciding a
-/// `DEFVAR_BOOL` variable's default.
+/// `DEFVAR_BOOL` variable's default.  The two rows GNU's `main` installs after
+/// the declaration (`main_value`: argv and the process locale) hold that
+/// running value, not the pre-main declared one.
 #[test]
 fn every_gnu_defvar_bool_variable_is_bound_and_reads_back_canonically() {
     use crate::emacs_core::defvar_bool::GNU_BOOL_VARIABLES;
@@ -453,9 +455,16 @@ fn every_gnu_defvar_bool_variable_is_bound_and_reads_back_canonically() {
             "OK t",
             "{name} should be special"
         );
+        // `main_value' is the running value GNU's `main' installs after a
+        // declaration that does not decide it (argv, the process locale); a
+        // `Context` is past that point, so it is the expected default there.
         assert_eq!(
             format_eval_result(&eval.eval_str(&format!("(default-value '{name})"))),
-            if var.initial { "OK t" } else { "OK nil" },
+            if var.main_value.unwrap_or(var.initial) {
+                "OK t"
+            } else {
+                "OK nil"
+            },
             "{name} default"
         );
     }
@@ -736,6 +745,12 @@ fn every_cus_start_platform_row_matches_its_declaration_claim() {
 /// x-auto-preserve-selections     ;; => (CLIPBOARD PRIMARY)
 /// ```
 ///
+/// `x-bitmap-file-path` comes from the configure `bitmapdir` substitution, so
+/// its value follows the platform's reference build: `/usr/include/X11/bitmaps`
+/// where GNU uses the system X11, `(".")` on a macOS reference built against
+/// Homebrew's X tree, whose include directories carry no bitmap directory.
+/// The expectation is taken from the same platform fact the initializer uses.
+///
 /// `vertical-centering-font-regexp` and `x-gtk-use-system-tooltips` get their
 /// values from preloaded Lisp (`international/fontset.el:1266` and the
 /// `defvaralias` in `term/neo-preload.el`), so a bare [`Context`] sees the C
@@ -744,8 +759,14 @@ fn every_cus_start_platform_row_matches_its_declaration_claim() {
 fn the_x_platform_variables_hold_gnus_defaults_and_bind_dynamically() {
     let mut eval = ev();
 
+    let bitmap_path = crate::emacs_core::platform_facts::X_BITMAP_FILE_PATH;
+    let bitmap_printed = if bitmap_path.is_empty() {
+        r#"(".")"#.to_string()
+    } else {
+        format!("(\"{bitmap_path}\")")
+    };
     for (name, value) in [
-        ("x-bitmap-file-path", r#"("/usr/include/X11/bitmaps")"#),
+        ("x-bitmap-file-path", bitmap_printed.as_str()),
         ("x-scroll-event-delta-factor", "1.0"),
         ("x-auto-preserve-selections", "(CLIPBOARD PRIMARY)"),
     ] {

@@ -62,7 +62,7 @@ use neomacs_display_protocol::glyph_matrix::{
     GlyphPointerOccurrenceIdentity, GlyphPointerSourceKind, GlyphRow, MatrixRow,
 };
 use neovm_core::buffer::position::LispCharPos1;
-use neovm_core::window::{DisplayPointSnapshot, DisplayRowSnapshot};
+use neovm_core::window::{DisplayPointSnapshot, DisplayRowSnapshot, ScrollMargin};
 
 /// Pure process-selector parser: absence selects ON; explicit empty, invalid
 /// and nonUnicode values select OFF. It reads no Lisp state and does not
@@ -330,7 +330,8 @@ pub(crate) fn backward_scroll_plan(
     body: &[(usize, &MatrixRow)],
 ) -> Option<EditSyncPlan> {
     let &(first_index, first_row) = body.first()?;
-    let mut indices = rustc_hash::FxHashSet::default();
+    let mut indices =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(body.len(), Default::default());
     let rows = body
         .iter()
         .map(|&(index, row)| {
@@ -573,7 +574,10 @@ impl EditSyncPlan {
             };
         }
         let dy_px = dy.round() as i64;
-        let mut kept = rustc_hash::FxHashMap::<i64, i64>::default();
+        let mut kept = rustc_hash::FxHashMap::<i64, i64>::with_capacity_and_hasher(
+            candidate_rows.len(),
+            Default::default(),
+        );
         let mut rows = Vec::with_capacity(candidate_rows.len());
         for (old_index, row) in candidate_rows {
             let new_y = row.pixel_y + if shift_y { dy } else { 0.0 };
@@ -786,16 +790,31 @@ pub(crate) fn row_has_boxed_glyph(row: &GlyphRow) -> bool {
 /// scroll, which a replay never does.
 pub(crate) fn sync_allowed(
     curr: &super::RetainedWindowKey,
-    scroll_margin: i64,
+    scroll_margin: ScrollMargin,
     buffer: &neovm_core::buffer::Buffer,
+) -> bool {
+    // An edit can rewrite the rest of a paragraph, changing its automatic
+    // direction; a face-only overlay change cannot. Both of the edit-only
+    // refusals therefore live here, not in the shared set below.
+    curr.extra_line_spacing == 0.0
+        && !super::mode_line_gate::bidi_auto_paragraph(buffer)
+        && sync_layout_conditions(curr, scroll_margin)
+}
+
+/// Structural refusals shared by every synchronized replay, whatever moved:
+/// wrapped rows need a full rewalk, numbered gutters carry point-dependent
+/// prefixes, trailing whitespace adds buffer-dependent glyphs, and a
+/// horizontal scroll or scroll margin would make the full layout shift rows
+/// that a replay leaves in place.
+pub(crate) fn sync_layout_conditions(
+    curr: &super::RetainedWindowKey,
+    scroll_margin: ScrollMargin,
 ) -> bool {
     !curr.word_wrap
         && !curr.display_line_numbers.enabled()
-        && curr.extra_line_spacing == 0.0
         && !curr.show_trailing_whitespace
         && curr.hscroll == 0
-        && scroll_margin <= 0
-        && !super::mode_line_gate::bidi_auto_paragraph(buffer)
+        && scroll_margin.is_zero()
 }
 
 /// Build the synchronization plan for an edit, or `None` when no old row
@@ -1033,7 +1052,8 @@ fn materialize_suffix(
     }
     #[cfg(test)]
     dense_index_test_support::note_legacy_plan();
-    let mut indices = rustc_hash::FxHashSet::default();
+    let mut indices =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(candidates.len(), Default::default());
     let rows = CandidateRows::prepare(
         candidates.iter().map(|&(index, row)| {
             indices.insert(index as i64);

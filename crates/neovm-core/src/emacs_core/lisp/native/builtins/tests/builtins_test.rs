@@ -454,21 +454,35 @@ fn pure_dispatch_typed_div_float_zero_uses_ieee_results() {
         other => panic!("expected float, got {other:?}"),
     }
 
-    let neg_nan = dispatch_builtin_pure("/", vec![Value::make_float(0.0), Value::make_float(0.0)])
-        .expect("builtin / should resolve")
-        .expect("float division should evaluate");
-    match neg_nan.kind() {
+    let invalid_nan =
+        dispatch_builtin_pure("/", vec![Value::make_float(0.0), Value::make_float(0.0)])
+            .expect("builtin / should resolve")
+            .expect("float division should evaluate");
+    match invalid_nan.kind() {
         ValueKind::Float => {
-            let f = neg_nan.as_float().unwrap();
-            assert!(f.is_nan() && f.is_sign_negative());
+            let f = invalid_nan.as_float().unwrap();
+            assert!(f.is_nan());
+            // GNU divides in C and prints the NaN the hardware produced: the
+            // x86 default NaN is negative, arm64's is positive.  The engine
+            // must propagate the target's answer, not a build-host constant.
+            // `black_box` keeps Rust from constant-folding the division:
+            // a folded `0.0 / 0.0` is the compiler's canonical NaN, while
+            // the runtime instruction produces the target's default NaN.
+            let zero = std::hint::black_box(0.0f64);
+            assert_eq!(
+                f.is_sign_negative(),
+                (zero / zero).is_sign_negative(),
+                "0.0/0.0 must keep the host hardware's default NaN sign"
+            );
         }
         other => panic!("expected float, got {other:?}"),
     }
 }
 
-/// GNU keeps an INPUT NaN's sign — x86 `divsd` propagates it — and only an
-/// invalid op (`0.0/0.0`) yields the negative default NaN. `(/ 0.0e+NaN 1)`
-/// prints `0.0e+NaN` in GNU; forcing every NaN negative diverged there.
+/// GNU keeps an INPUT NaN's sign — `divsd`/`fdiv` propagate it — and an
+/// invalid op (`0.0/0.0`) yields the hardware default NaN (negative on x86,
+/// positive on arm64). `(/ 0.0e+NaN 1)` prints `0.0e+NaN` in GNU; forcing
+/// every NaN negative diverged there.
 #[test]
 fn float_division_propagates_an_input_nan_with_its_sign() {
     for args in [
@@ -1812,11 +1826,11 @@ fn eval_buffer_live_p_tracks_killed_buffers() {
     crate::test_utils::init_test_tracing();
     let mut eval = super::super::eval::Context::new();
     let buf = builtin_get_buffer_create(&mut eval, vec![Value::string("*blp*")]).unwrap();
-    let live = builtin_buffer_live_p(&mut eval, vec![buf]).unwrap();
+    let live = builtin_buffer_live_p(&mut eval, &vec![buf]).unwrap();
     assert_eq!(live, Value::T);
 
     let _ = builtin_kill_buffer(&mut eval, vec![buf]).unwrap();
-    let dead = builtin_buffer_live_p(&mut eval, vec![buf]).unwrap();
+    let dead = builtin_buffer_live_p(&mut eval, &vec![buf]).unwrap();
     assert_eq!(dead, Value::NIL);
 }
 
@@ -1832,7 +1846,7 @@ fn kill_buffer_optional_arg_and_error_semantics() {
     let killed_current = builtin_kill_buffer(&mut eval, vec![]).unwrap();
     assert_eq!(killed_current, Value::T);
     assert_eq!(
-        builtin_buffer_live_p(&mut eval, vec![a]).unwrap(),
+        builtin_buffer_live_p(&mut eval, &vec![a]).unwrap(),
         Value::NIL
     );
     assert!(
@@ -1952,9 +1966,9 @@ fn set_buffer_does_not_record_buffer_list_order_like_gnu() {
 fn eval_buffer_live_p_non_buffer_objects_return_nil() {
     crate::test_utils::init_test_tracing();
     let mut eval = super::super::eval::Context::new();
-    let by_name = builtin_buffer_live_p(&mut eval, vec![Value::string("*scratch*")]).unwrap();
+    let by_name = builtin_buffer_live_p(&mut eval, &vec![Value::string("*scratch*")]).unwrap();
     assert_eq!(by_name, Value::NIL);
-    let nil_arg = builtin_buffer_live_p(&mut eval, vec![Value::NIL]).unwrap();
+    let nil_arg = builtin_buffer_live_p(&mut eval, &vec![Value::NIL]).unwrap();
     assert_eq!(nil_arg, Value::NIL);
 }
 
@@ -2181,7 +2195,7 @@ fn buffer_base_buffer_and_last_name_semantics() {
     );
 
     let created = create_unique_test_buffer(&mut eval, "*bln-created*");
-    let created_name = builtin_buffer_name(&mut eval, vec![created]).unwrap();
+    let created_name = builtin_buffer_name(&mut eval, &vec![created]).unwrap();
     assert_eq!(
         builtin_buffer_last_name(&mut eval, vec![created]).unwrap(),
         created_name,
@@ -2235,7 +2249,7 @@ fn buffer_base_buffer_and_last_name_semantics() {
     }
 
     let dead = create_unique_test_buffer(&mut eval, "*bln-dead*");
-    let live_name = builtin_buffer_name(&mut eval, vec![dead]).unwrap();
+    let live_name = builtin_buffer_name(&mut eval, &vec![dead]).unwrap();
     let _ = builtin_kill_buffer(&mut eval, vec![dead]).unwrap();
 
     assert_eq!(
@@ -4402,9 +4416,7 @@ fn split_window_internal_validates_core_argument_types() {
     .unwrap_or_else(|flow| {
         panic!(
             "split-window-internal must not type-check SIDE: {}",
-            crate::emacs_core::error::format_eval_result(&Err(crate::emacs_core::error::map_flow(
-                flow
-            )))
+            crate::emacs_core::format_eval_result(&Err(crate::emacs_core::print::map_flow(flow)))
         )
     });
     assert!(side_not_checked.is_window());
@@ -7015,14 +7027,29 @@ fn pure_dispatch_record_placeholders_match_compat_contracts() {
     assert!(recordp.is_nil());
 
     super::symbols::reset_symbols_thread_locals();
-    let query_fontset =
-        dispatch_builtin_pure("query-fontset", vec![Value::string("fontset-default")])
-            .expect("builtin query-fontset should resolve")
-            .expect("builtin query-fontset should evaluate");
-    assert_eq!(
-        query_fontset,
-        Value::string("-*-*-*-*-*-*-*-*-*-*-*-*-fontset-default")
-    );
+    // GNU `Fquery_fontset` calls `check_window_system (NULL)` first
+    // (src/fontset.c:1248), so a headless context signals instead of
+    // resolving the registry.
+    let mut eval = crate::emacs_core::eval::Context::new();
+    let query_fontset = dispatch_builtin(
+        &mut eval,
+        "query-fontset",
+        vec![Value::string("fontset-default")],
+    )
+    .expect("builtin query-fontset should resolve")
+    .expect_err("headless query-fontset should signal like GNU");
+    match query_fontset.into_kind() {
+        FlowKind::Signal(sig) => {
+            assert_eq!(sig.symbol_name(), "error");
+            assert_eq!(
+                sig.data,
+                vec![Value::string(
+                    "Window system is not in use or not initialized"
+                )]
+            );
+        }
+        other => panic!("unexpected flow: {other:?}"),
+    }
 
     let read_pos = dispatch_builtin_pure("read-positioning-symbols", vec![Value::string("x")])
         .expect("builtin read-positioning-symbols should resolve")
@@ -7046,7 +7073,15 @@ fn query_fontset_matches_emacs_regexp_syntax() {
 
     // `[([]` is the character class emitted by GNU `rx` for `[` or `(`.
     // The second Emacs-regexp alternative matches the default fontset.
-    let query_fontset = dispatch_builtin_pure(
+    // GNU `Fquery_fontset` requires a window system (src/fontset.c:1248), so
+    // the regexp contract is exercised on a window-system frame.
+    let mut eval = crate::emacs_core::Context::new();
+    eval.set_variable(
+        "window-system",
+        Value::symbol(crate::emacs_core::display::gui_window_system_symbol()),
+    );
+    let query_fontset = dispatch_builtin(
+        &mut eval,
         "query-fontset",
         vec![Value::string("[([]\\|fontset-default"), Value::T],
     )
@@ -8477,9 +8512,15 @@ fn pure_dispatch_make_placeholder_cluster_matches_compat_contracts() {
         "make-closure with nil should signal error"
     );
 
-    let make_finalizer = dispatch_builtin_pure("make-finalizer", vec![Value::symbol("ignore")])
-        .expect("builtin make-finalizer should resolve")
-        .expect("builtin make-finalizer should evaluate");
+    // GNU `Fmake_finalizer' type-checks FUNCTIONP at creation.  Pure dispatch
+    // has no obarray, so a SYMBOL such as `ignore' is not a function here;
+    // pass a lambda form, which FUNCTIONP accepts without evaluator state.
+    let make_finalizer = dispatch_builtin_pure(
+        "make-finalizer",
+        vec![Value::list(vec![Value::symbol("lambda"), Value::NIL])],
+    )
+    .expect("builtin make-finalizer should resolve")
+    .expect("builtin make-finalizer should evaluate");
     assert_eq!(
         make_finalizer.veclike_type(),
         Some(crate::tagged::header::VecLikeType::Finalizer),
@@ -11255,33 +11296,95 @@ fn gnu_treesit_el_high_level_helpers_work_with_runtime_json_grammar() {
 }
 
 #[test]
-fn dispatch_builtin_pure_handles_inotify_watch_lifecycle() {
+fn dispatch_builtin_pure_handles_native_watch_lifecycle() {
     crate::test_utils::init_test_tracing();
+    // GNU compiles exactly one local file-notification backend; its three
+    // DEFUNs and its Fprovide share one #ifdef (src/inotify.c:370,490,511 and
+    // :589; src/kqueue.c:338,475,505 and :545; src/w32notify.c:515,640,681 and
+    // :739).  Ask the build which set it compiled instead of naming one OS.
+    let Some([add_watch, rm_watch, valid_p]) = BACKEND_SUBRS else {
+        // No native backend here, exactly as on a GNU build configured without
+        // one: another platform's primitives must not resolve either.
+        assert!(
+            dispatch_builtin_pure(
+                "inotify-add-watch",
+                vec![Value::string("."), Value::NIL, Value::symbol("ignore")],
+            )
+            .is_none(),
+            "a build without a native file-notification backend answered inotify-add-watch"
+        );
+        return;
+    };
+    // GNU's kqueue-add-watch checks `FUNCTIONP (callback)' eagerly
+    // (src/kqueue.c:389-390), so the callback must be a real function even in
+    // a bare Context, where Lisp-level definitions such as `ignore' are not
+    // installed yet.  The lifecycle below never fires an event.
     let watch = dispatch_builtin_pure(
-        "inotify-add-watch",
-        vec![Value::string("."), Value::NIL, Value::symbol("ignore")],
+        add_watch,
+        vec![Value::string("."), Value::NIL, Value::symbol("car")],
     )
-    .expect("inotify-add-watch should resolve")
-    .expect("inotify-add-watch should evaluate");
-    let active = dispatch_builtin_pure("inotify-valid-p", vec![watch])
-        .expect("inotify-valid-p should resolve")
-        .expect("inotify-valid-p should evaluate");
+    .expect("add-watch should resolve")
+    .expect("add-watch should evaluate");
+    let active = dispatch_builtin_pure(valid_p, vec![watch])
+        .expect("valid-p should resolve")
+        .expect("valid-p should evaluate");
     assert_eq!(active, Value::T);
 
-    let removed = dispatch_builtin_pure("inotify-rm-watch", vec![watch])
-        .expect("inotify-rm-watch should resolve")
-        .expect("inotify-rm-watch should evaluate");
-    assert_eq!(removed, Value::T);
+    let semantics =
+        REMOVE_WATCH_SEMANTICS.expect("a backend that registers subrs has remove semantics");
+    let expect_file_notify_error = |result: Option<EvalResult>, message: &str| {
+        let flow = result
+            .expect("the subr resolves")
+            .expect_err("the backend must signal file-notify-error");
+        match flow.into_kind() {
+            FlowKind::Signal(signal) => {
+                assert_eq!(signal.symbol_name(), "file-notify-error");
+                assert_eq!(
+                    signal.data.first().and_then(|value| value.as_utf8_str()),
+                    Some(message)
+                );
+            }
+            other => panic!("expected a file-notify-error, got {other:?}"),
+        }
+    };
 
-    let inactive = dispatch_builtin_pure("inotify-valid-p", vec![watch])
-        .expect("inotify-valid-p should resolve")
-        .expect("inotify-valid-p should evaluate");
+    let removed = dispatch_builtin_pure(rm_watch, vec![watch]).expect("rm-watch should resolve");
+    match semantics {
+        // inotify: success is t.
+        RemoveWatchSemantics::Inotify => {
+            assert_eq!(removed.expect("inotify rm-watch evaluates"), Value::T);
+        }
+        // kqueue: success is t.
+        RemoveWatchSemantics::Kqueue => {
+            assert_eq!(removed.expect("kqueue rm-watch evaluates"), Value::T);
+        }
+        // w32notify: success is nil (src/w32notify.c:665-667).
+        RemoveWatchSemantics::W32Notify => {
+            assert_eq!(removed.expect("w32notify rm-watch evaluates"), Value::NIL);
+        }
+    }
+
+    let inactive = dispatch_builtin_pure(valid_p, vec![watch])
+        .expect("valid-p should resolve")
+        .expect("valid-p should evaluate");
     assert_eq!(inactive, Value::NIL);
 
-    let removed_again = dispatch_builtin_pure("inotify-rm-watch", vec![watch])
-        .expect("inotify-rm-watch should resolve")
-        .expect("inotify-rm-watch should evaluate");
-    assert_eq!(removed_again, Value::T);
+    let removed_again =
+        dispatch_builtin_pure(rm_watch, vec![watch]).expect("rm-watch should resolve");
+    match semantics {
+        // inotify validates only the descriptor shape, so a repeat is t.
+        RemoveWatchSemantics::Inotify => {
+            assert_eq!(removed_again.expect("inotify rm-watch evaluates"), Value::T);
+        }
+        // kqueue looks the descriptor up in its list.
+        RemoveWatchSemantics::Kqueue => {
+            expect_file_notify_error(Some(removed_again), "Not a watch descriptor");
+        }
+        // w32notify's invalid descriptor signals with its own wording.
+        RemoveWatchSemantics::W32Notify => {
+            expect_file_notify_error(Some(removed_again), "Invalid watch descriptor");
+        }
+    }
 }
 
 #[test]
@@ -11573,6 +11676,148 @@ fn display_update_for_mouse_movement_updates_shared_mouse_state() {
 }
 
 #[test]
+fn mouse_position_in_root_frame_adds_frame_offsets_to_mouse_position() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval::Context::new();
+    let frame = dispatch_builtin(&mut eval, "selected-frame", vec![])
+        .expect("selected-frame should resolve")
+        .expect("selected-frame should evaluate");
+    let frame_id = frame.as_frame_id().unwrap();
+
+    if let Some(frame) = eval.frames.get_mut(crate::window::FrameId(frame_id)) {
+        frame.char_width = 1.0;
+        frame.char_height = 1.0;
+        frame.left_pos = 3;
+        frame.top_pos = 4;
+    }
+
+    // No mouse position yet: mouse-position is (FRAME nil . nil).  GNU's
+    // XFIXNUM reads nil as zero, so only the frame offsets remain.
+    let none = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(none, Value::cons(Value::fixnum(3), Value::fixnum(4)));
+
+    dispatch_builtin(
+        &mut eval,
+        "display--update-for-mouse-movement",
+        vec![frame, Value::fixnum(19), Value::fixnum(45)],
+    )
+    .expect("display--update-for-mouse-movement should resolve")
+    .expect("display--update-for-mouse-movement should evaluate");
+
+    let pos = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(pos, Value::cons(Value::fixnum(22), Value::fixnum(49)));
+}
+
+#[test]
+fn mouse_position_in_root_frame_walks_parent_frames() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval::Context::new();
+    let parent = dispatch_builtin(&mut eval, "selected-frame", vec![])
+        .expect("selected-frame should resolve")
+        .expect("selected-frame should evaluate");
+    let parent_id = parent.as_frame_id().unwrap();
+    if let Some(frame) = eval.frames.get_mut(crate::window::FrameId(parent_id)) {
+        frame.left_pos = 3;
+        frame.top_pos = 4;
+    }
+    let buffer = eval.buffers.current_buffer_id().expect("current buffer");
+    let child_id = eval.frames.create_frame("issue660-child", 80, 24, buffer);
+    if let Some(frame) = eval.frames.get_mut(child_id) {
+        frame.left_pos = 5;
+        frame.top_pos = 6;
+        frame.parent_frame = Value::make_frame(parent_id);
+    }
+    eval.store_variable_by_name("issue660-child-frame", Value::make_frame(child_id.0));
+    eval.eval_str(
+        "(setq mouse-position-function
+               (lambda (_pos) (cons issue660-child-frame (cons 19 45))))",
+    )
+    .expect("install mouse-position-function");
+
+    let pos = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(
+        pos,
+        Value::cons(Value::fixnum(3 + 5 + 19), Value::fixnum(4 + 6 + 45))
+    );
+}
+
+#[test]
+fn mouse_position_in_root_frame_rejects_a_frame_that_no_longer_exists() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval::Context::new();
+    eval.store_variable_by_name("issue660-dead-frame", Value::make_frame(999_999));
+    eval.eval_str(
+        "(setq mouse-position-function
+               (lambda (_pos) (cons issue660-dead-frame (cons 5 6))))",
+    )
+    .expect("install mouse-position-function");
+
+    let pos = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(pos, Value::NIL);
+}
+
+#[test]
+fn mouse_position_in_root_frame_rejects_a_missing_ancestor_frame() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval::Context::new();
+    let buffer = eval.buffers.current_buffer_id().expect("current buffer");
+    let child_id = eval.frames.create_frame("issue660-orphan", 80, 24, buffer);
+    if let Some(frame) = eval.frames.get_mut(child_id) {
+        frame.left_pos = 5;
+        frame.top_pos = 6;
+        // Neomacs delete-frame does not yet soft-delete a parent's children
+        // the way GNU does (src/frame.c:2645-2664), so a surviving child can
+        // still reference a frame that is no longer in the store.
+        frame.parent_frame = Value::make_frame(999_999);
+    }
+    eval.store_variable_by_name("issue660-orphan-frame", Value::make_frame(child_id.0));
+    eval.eval_str(
+        "(setq mouse-position-function
+               (lambda (_pos) (cons issue660-orphan-frame (cons 19 45))))",
+    )
+    .expect("install mouse-position-function");
+
+    let pos = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(pos, Value::NIL);
+}
+
+#[test]
+fn mouse_position_in_root_frame_returns_nil_for_malformed_positions() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = crate::emacs_core::eval::Context::new();
+
+    // GNU reads these shapes without validation: the reference build
+    // segfaults on a non-cons cdr and on a non-list position.  Neomacs must
+    // answer nil instead of reproducing the crash.
+    eval.eval_str(
+        "(setq mouse-position-function
+               (lambda (_pos) (cons (selected-frame) nil)))",
+    )
+    .expect("install malformed cdr");
+    let cdr = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(cdr, Value::NIL);
+
+    eval.eval_str("(setq mouse-position-function (lambda (_pos) 7))")
+        .expect("install non-list position");
+    let position = dispatch_builtin(&mut eval, "mouse-position-in-root-frame", vec![])
+        .expect("mouse-position-in-root-frame should resolve")
+        .expect("mouse-position-in-root-frame should evaluate");
+    assert_eq!(position, Value::NIL);
+}
+
+#[test]
 fn set_mouse_position_builtins_update_shared_mouse_state() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::eval::Context::new();
@@ -11845,16 +12090,6 @@ fn dispatch_builtin_pure_handles_frame_placeholder_accessors() {
             .expect("frame--set-was-invisible should evaluate");
     assert_eq!(was_invisible, Value::T);
 
-    let changed = dispatch_builtin_pure("frame-or-buffer-changed-p", vec![])
-        .expect("frame-or-buffer-changed-p should resolve")
-        .expect("frame-or-buffer-changed-p should evaluate");
-    assert_eq!(changed, Value::T);
-
-    let changed_nil = dispatch_builtin_pure("frame-or-buffer-changed-p", vec![Value::NIL])
-        .expect("frame-or-buffer-changed-p should resolve")
-        .expect("frame-or-buffer-changed-p should evaluate");
-    assert_eq!(changed_nil, Value::NIL);
-
     let scale = dispatch_builtin_pure("frame-scale-factor", vec![])
         .expect("frame-scale-factor should resolve")
         .expect("frame-scale-factor should evaluate");
@@ -11864,14 +12099,6 @@ fn dispatch_builtin_pure_handles_frame_placeholder_accessors() {
         .expect("frame-pointer-visible-p should resolve")
         .expect("frame-pointer-visible-p should evaluate");
     assert_eq!(pointer, Value::T);
-
-    let err = dispatch_builtin_pure("frame-or-buffer-changed-p", vec![Value::fixnum(1)])
-        .expect("frame-or-buffer-changed-p should resolve")
-        .unwrap_err();
-    match err.into_kind() {
-        FlowKind::Signal(sig) => assert_eq!(sig.symbol_name(), "wrong-type-argument"),
-        other => panic!("expected signal, got {other:?}"),
-    }
 }
 
 #[test]
@@ -13917,20 +14144,20 @@ fn message_nil_returns_nil() {
     eval.set_variable("noninteractive", Value::NIL);
 
     let eval_result =
-        builtin_message(&mut eval, vec![Value::NIL]).expect("message eval should accept nil");
+        builtin_message(&mut eval, &vec![Value::NIL]).expect("message eval should accept nil");
     assert!(eval_result.is_nil());
 
-    let displayed = builtin_message(&mut eval, vec![Value::string("hello echo")])
+    let displayed = builtin_message(&mut eval, &vec![Value::string("hello echo")])
         .expect("message eval should store echo text");
     assert_eq!(displayed, Value::string("hello echo"));
-    let current = builtin_current_message(&mut eval, vec![])
+    let current = builtin_current_message(&mut eval, &vec![])
         .expect("current-message should read stored echo text");
     assert_eq!(current, Value::string("hello echo"));
 
-    let cleared = builtin_message(&mut eval, vec![Value::NIL]).expect("message eval should clear");
+    let cleared = builtin_message(&mut eval, &vec![Value::NIL]).expect("message eval should clear");
     assert!(cleared.is_nil());
     let current_after_clear =
-        builtin_current_message(&mut eval, vec![]).expect("current-message should clear");
+        builtin_current_message(&mut eval, &vec![]).expect("current-message should clear");
     assert!(current_after_clear.is_nil());
 }
 
@@ -13945,7 +14172,7 @@ fn message_logs_to_visible_messages_buffer_name_like_gnu() {
         Value::list(vec![Value::T, Value::string("*Messages*")])
     );
 
-    builtin_message(&mut eval, vec![Value::string("hello echo")])
+    builtin_message(&mut eval, &vec![Value::string("hello echo")])
         .expect("message eval should log to *Messages*");
 
     let messages_id = eval
@@ -13979,7 +14206,7 @@ fn native_add_to_log_coalesces_without_changing_the_echo_area() {
         "Invalid face reference: missing-face [2 times]\n"
     );
     assert!(
-        builtin_current_message(&mut eval, vec![])
+        builtin_current_message(&mut eval, &vec![])
             .expect("current-message should remain readable")
             .is_nil(),
         "GNU add_to_log records a diagnostic without displaying it in the echo area"
@@ -13991,9 +14218,9 @@ fn message_progress_completion_replaces_previous_log_entry_like_gnu() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::eval::Context::new();
 
-    builtin_message(&mut eval, vec![Value::string("Indexing project...")])
+    builtin_message(&mut eval, &vec![Value::string("Indexing project...")])
         .expect("initial progress message should be logged");
-    builtin_message(&mut eval, vec![Value::string("Indexing project...done")])
+    builtin_message(&mut eval, &vec![Value::string("Indexing project...done")])
         .expect("completed progress message should be logged");
 
     let messages_id = eval
@@ -14010,9 +14237,9 @@ fn message_progress_update_scans_from_previous_line_start_like_gnu() {
     let mut eval = crate::emacs_core::eval::Context::new();
     let long_progress = format!("Indexing project...{}", "working".repeat(32));
 
-    builtin_message(&mut eval, vec![Value::string(long_progress)])
+    builtin_message(&mut eval, &vec![Value::string(long_progress)])
         .expect("long progress message should be logged");
-    builtin_message(&mut eval, vec![Value::string("Indexing project...done")])
+    builtin_message(&mut eval, &vec![Value::string("Indexing project...done")])
         .expect("progress update should be logged");
 
     let messages_id = eval
@@ -14041,7 +14268,7 @@ fn message_log_appends_after_full_messages_buffer_when_narrowed() {
         messages.goto_emacs_byte_pos(crate::buffer::EmacsBytePos::new(2));
     }
 
-    builtin_message(&mut eval, vec![Value::string("hello")])
+    builtin_message(&mut eval, &vec![Value::string("hello")])
         .expect("message should append to *Messages*");
 
     let messages = eval.buffers.get(messages_id).expect("*Messages* buffer");
@@ -14082,7 +14309,7 @@ fn interactive_message_materializes_echo_area_buffers_after_messages_like_gnu() 
     let mut eval = crate::emacs_core::eval::Context::new();
     eval.set_variable("noninteractive", Value::NIL);
 
-    builtin_message(&mut eval, vec![Value::string("hello echo")])
+    builtin_message(&mut eval, &vec![Value::string("hello echo")])
         .expect("interactive message should install echo area buffers");
 
     let names: Vec<String> = eval
@@ -14132,7 +14359,7 @@ fn echo_area_follows_its_buffer_across_a_rename_like_gnu() {
     let mut eval = crate::emacs_core::eval::Context::new();
     eval.set_variable("noninteractive", Value::NIL);
 
-    builtin_message(&mut eval, vec![Value::string("first")]).expect("message");
+    builtin_message(&mut eval, &vec![Value::string("first")]).expect("message");
     let echo0 = eval
         .buffers
         .find_buffer_by_name(" *Echo Area 0*")
@@ -14141,7 +14368,7 @@ fn echo_area_follows_its_buffer_across_a_rename_like_gnu() {
         .rename_buffer(echo0, Value::string(" *Echo Area RENAMED*"))
         .expect("rename echo area buffer");
 
-    builtin_message(&mut eval, vec![Value::string("second")]).expect("message");
+    builtin_message(&mut eval, &vec![Value::string("second")]).expect("message");
     assert_eq!(
         eval.buffers
             .get(echo0)
@@ -14159,7 +14386,7 @@ fn echo_area_follows_its_buffer_across_a_rename_like_gnu() {
     eval.buffers
         .replace_buffer_contents(user, "PRECIOUS USER CONTENT")
         .expect("seed user buffer");
-    builtin_message(&mut eval, vec![Value::string("third")]).expect("message");
+    builtin_message(&mut eval, &vec![Value::string("third")]).expect("message");
     assert_eq!(
         eval.buffers.get(user).expect("user buffer").buffer_string(),
         "PRECIOUS USER CONTENT",
@@ -14184,7 +14411,7 @@ fn echo_area_buffer_is_re_created_only_after_it_dies_like_gnu() {
     let mut eval = crate::emacs_core::eval::Context::new();
     eval.set_variable("noninteractive", Value::NIL);
 
-    builtin_message(&mut eval, vec![Value::string("first")]).expect("message");
+    builtin_message(&mut eval, &vec![Value::string("first")]).expect("message");
     let echo0 = eval
         .buffers
         .find_buffer_by_name(" *Echo Area 0*")
@@ -14192,7 +14419,7 @@ fn echo_area_buffer_is_re_created_only_after_it_dies_like_gnu() {
     eval.buffers.kill_buffer(echo0);
     assert!(eval.buffers.get(echo0).is_none(), "echo buffer killed");
 
-    builtin_message(&mut eval, vec![Value::string("second")]).expect("message");
+    builtin_message(&mut eval, &vec![Value::string("second")]).expect("message");
     let replacement = eval
         .buffers
         .find_buffer_by_name(" *Echo Area 0*")
@@ -14249,12 +14476,12 @@ fn current_message_promotes_a_raw_unibyte_payload_like_gnu() {
     let raw = Value::heap_string(crate::heap_types::LispString::from_unibyte(vec![0xFF]));
 
     let displayed =
-        builtin_message(&mut eval, vec![raw]).expect("message should preserve raw unibyte echo");
+        builtin_message(&mut eval, &vec![raw]).expect("message should preserve raw unibyte echo");
     let displayed = displayed.as_lisp_string().expect("message result string");
     assert!(!displayed.is_multibyte());
     assert_eq!(displayed.as_bytes(), &[0xFF]);
 
-    let current = builtin_current_message(&mut eval, vec![])
+    let current = builtin_current_message(&mut eval, &vec![])
         .expect("current-message should answer after an interactive message");
     let current = current.as_lisp_string().expect("current-message string");
     assert!(
@@ -14368,7 +14595,7 @@ fn inhibited_message_preserves_the_current_echo_area_like_gnu() {
     // in batch mode, xdisp.c `message3_frame_nolog`).
     eval.set_variable("noninteractive", Value::NIL);
 
-    builtin_message(&mut eval, vec![Value::string("visible")]).expect("seed visible message");
+    builtin_message(&mut eval, &vec![Value::string("visible")]).expect("seed visible message");
     assert_eq!(eval.current_message_text(), Some("visible".to_string()));
 
     eval.eval_str("(let ((inhibit-message t)) (message \"hidden\"))")
@@ -14402,7 +14629,7 @@ fn message_uses_set_message_function_string_and_suppression_results() {
         "set-message-function",
         Value::symbol("neomacs-test-message-prefix"),
     );
-    builtin_message(&mut eval, vec![Value::string("hello")])
+    builtin_message(&mut eval, &vec![Value::string("hello")])
         .expect("message should use string rewriting set-message-function");
     assert_eq!(
         eval.current_message_text(),
@@ -14413,7 +14640,7 @@ fn message_uses_set_message_function_string_and_suppression_results() {
         "set-message-function",
         Value::symbol("neomacs-test-message-suppress"),
     );
-    builtin_message(&mut eval, vec![Value::string("suppressed")])
+    builtin_message(&mut eval, &vec![Value::string("suppressed")])
         .expect("message should allow set-message-function to suppress echo");
     assert_eq!(eval.current_message_text(), None);
 }
@@ -14451,7 +14678,7 @@ fn message_nil_runs_clear_message_function_after_suppressed_minibuffer_message()
     )
     .expect("install message hooks");
 
-    builtin_message(&mut eval, vec![Value::string("Making completion list...")])
+    builtin_message(&mut eval, &vec![Value::string("Making completion list...")])
         .expect("set-message-function should handle message");
     assert_eq!(eval.current_message_text(), None);
     assert!(
@@ -14461,7 +14688,7 @@ fn message_nil_runs_clear_message_function_after_suppressed_minibuffer_message()
             .is_nil()
     );
 
-    builtin_message(&mut eval, vec![Value::NIL]).expect("message nil should clear");
+    builtin_message(&mut eval, &vec![Value::NIL]).expect("message nil should clear");
 
     assert_eq!(
         eval.eval_str("neomacs-clear-message-count")
@@ -14484,7 +14711,7 @@ fn message_ignores_non_function_set_message_function_like_gnu() {
     eval.set_variable("noninteractive", Value::NIL);
 
     eval.assign("set-message-function", Value::T);
-    builtin_message(&mut eval, vec![Value::string("plain")])
+    builtin_message(&mut eval, &vec![Value::string("plain")])
         .expect("GNU ignores non-function set-message-function");
 
     assert_eq!(eval.current_message_text(), Some("plain".to_string()));
@@ -14507,7 +14734,7 @@ fn message_demotes_set_message_function_errors_like_gnu_dsafe_call() {
         Value::symbol("neomacs-test-message-error"),
     );
 
-    builtin_message(&mut eval, vec![Value::string("still visible")])
+    builtin_message(&mut eval, &vec![Value::string("still visible")])
         .expect("GNU dsafe_call1 demotes set-message-function errors");
 
     assert_eq!(
@@ -14547,10 +14774,10 @@ fn message_eval_stores_echo_text_without_immediate_redisplay() {
         redisplay_count_capture.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
 
-    builtin_message(&mut eval, vec![Value::string("hello echo")])
+    builtin_message(&mut eval, &vec![Value::string("hello echo")])
         .expect("message eval should store echo text");
     assert_eq!(eval.current_message_text(), Some("hello echo".to_string()));
-    builtin_message(&mut eval, vec![Value::NIL]).expect("message eval should clear");
+    builtin_message(&mut eval, &vec![Value::NIL]).expect("message eval should clear");
     assert_eq!(eval.current_message_text(), None);
 
     // GNU semantic: message() must NOT invoke redisplay.
@@ -15280,7 +15507,7 @@ fn delete_char_handles_nonunicode_storage_units() {
     builtin_insert_char(&mut eval, vec![Value::fixnum(0x20_0000), Value::fixnum(1)]).unwrap();
     builtin_insert(&mut eval, vec![Value::string("A")]).unwrap();
     builtin_goto_char(&mut eval, vec![Value::fixnum(1)]).unwrap();
-    crate::emacs_core::editfns::builtin_delete_char(&mut eval, vec![Value::fixnum(1)]).unwrap();
+    crate::emacs_core::editfns::builtin_delete_char(&mut eval, &vec![Value::fixnum(1)]).unwrap();
 
     let result = builtin_buffer_string(&mut eval, vec![]).unwrap();
     assert_eq!(decode_value_char_codes(&result), vec![b'A' as u32]);
@@ -15301,7 +15528,7 @@ fn delete_char_handles_unibyte_high_bytes() {
     builtin_insert_byte(&mut eval, vec![Value::fixnum(200), Value::fixnum(1)]).unwrap();
     builtin_insert_byte(&mut eval, vec![Value::fixnum(65), Value::fixnum(1)]).unwrap();
     builtin_goto_char(&mut eval, vec![Value::fixnum(1)]).unwrap();
-    crate::emacs_core::editfns::builtin_delete_char(&mut eval, vec![Value::fixnum(1)]).unwrap();
+    crate::emacs_core::editfns::builtin_delete_char(&mut eval, &vec![Value::fixnum(1)]).unwrap();
 
     let result = builtin_buffer_string(&mut eval, vec![]).unwrap();
     let ls = result.as_lisp_string().expect("buffer-string result");

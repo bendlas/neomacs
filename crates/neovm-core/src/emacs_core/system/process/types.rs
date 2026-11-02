@@ -4,6 +4,9 @@
 //! parent's view of its private items (`use super::*`).
 
 use super::*;
+use crate::host_effect::wake::{
+    ControlDestination, ControlNudge, ControlNudgeOutcome, NotificationLatch,
+};
 use crate::tagged::value::SymbolMode;
 
 /// Unique identifier for a process.
@@ -157,6 +160,12 @@ pub(crate) enum ProcessOutputServiceRequest {
     None,
     Any { target: Option<ProcessId> },
     TargetOnly(ProcessId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessOutputServicePass {
+    Readiness,
+    StatusNotification,
 }
 
 impl ProcessOutputServiceRequest {
@@ -762,13 +771,6 @@ impl Drop for LiveProcessIo {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum SentinelExecution {
-    #[default]
-    Idle,
-    Running,
-}
-
 /// A tracked process record.
 pub struct Process {
     pub id: ProcessId,
@@ -808,7 +810,6 @@ pub struct Process {
     pub filter: Value,
     /// Process sentinel callback (or default marker symbol).
     pub sentinel: Value,
-    sentinel_execution: SentinelExecution,
     /// Server process log callback.
     pub log: Value,
     /// Process plist state.
@@ -925,7 +926,10 @@ impl std::fmt::Debug for Process {
 pub struct ProcessManager {
     pub(super) processes: HashMap<ProcessId, Process>,
     pub(super) deleted_processes: HashMap<ProcessId, Process>,
-    pub(super) next_id: ProcessId,
+    // WorldSlot reserves ProcessManager's original size in Context. Keep the
+    // new read cursor behind the word formerly occupied by next_id so adding
+    // scheduling state does not shift Context's pinned offsets/JIT ABI.
+    ids: Box<ProcessIdState>,
     /// GNU's file-scope `process_tick` (src/process.c:232-233), *"Number of
     /// events of change of status of a process"*.  GNU's `update_tick`
     /// counterpart (:234-235) has no field here on purpose: it is only ever
@@ -938,6 +942,13 @@ pub struct ProcessManager {
     /// Environment variable overrides (for `setenv`/`getenv`).
     pub(super) env_overrides: HashMap<LispString, Option<LispString>>,
     pub(super) wait_backend: ProcessWaitBackend,
+}
+
+/// Process allocation and round-robin discovery share one manager lifetime.
+struct ProcessIdState {
+    next_id: ProcessId,
+    /// Resume live reads after this source, like GNU's last_read_channel.
+    last_read_process: ProcessId,
 }
 
 /// Transactional ownership of a `make-pipe-process` writer while a child is
@@ -1018,15 +1029,28 @@ impl Drop for StderrPipeWriterTransfer<'_> {
 #[derive(Clone)]
 pub struct WaitNotifier {
     pub(super) poller: Arc<polling::Poller>,
-    pub(super) notification_pending: Arc<AtomicBool>,
+    pub(super) notification_pending: Arc<NotificationLatch>,
 }
 
 impl WaitNotifier {
-    pub(super) fn new(poller: Arc<polling::Poller>, notification_pending: Arc<AtomicBool>) -> Self {
+    pub(super) fn new(
+        poller: Arc<polling::Poller>,
+        notification_pending: Arc<NotificationLatch>,
+    ) -> Self {
         Self {
             poller,
             notification_pending,
         }
+    }
+
+    /// Metadata-only notification. The caller publishes its durable request
+    /// before this hint; failed wakeup never returns an accepted obligation.
+    pub(crate) fn nudge_control(
+        &self,
+        destination: ControlDestination,
+        reason: ControlNudge,
+    ) -> ControlNudgeOutcome {
+        self.notification_pending.nudge(destination, reason)
     }
 
     /// Wake the current (or next) `poller.wait()` so the evaluator services
@@ -1042,11 +1066,104 @@ impl WaitNotifier {
     }
 }
 
+static_assertions::assert_eq_size!(WaitNotifier, [usize; 2]);
+
+/// Refusal to observe this fixture's actual pending TCP owner state.
+#[cfg(test)]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PendingConnectObservationError {
+    #[error("pending connect process missing")]
+    MissingProcess,
+    #[error("Main reached Select after connect was already decoded")]
+    AlreadyDecoded,
+    #[error("expected pending TCP connect")]
+    NotPendingTcp,
+    #[error("pending connect socket missing")]
+    MissingSocket,
+    #[error("expected TCP stream")]
+    NotTcpStream,
+    #[error("pending connect poller missing")]
+    MissingBackend,
+}
+#[cfg(test)]
+static_assertions::assert_impl_all!(PendingConnectObservationError: std::error::Error, Send, Sync);
+
+/// Native-only proof for the one pending TCP connect in a Green test.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MainConnectPending {
+    process: ProcessId,
+}
+#[cfg(test)]
+impl MainConnectPending {
+    pub(crate) fn process(&self) -> ProcessId {
+        self.process
+    }
+}
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeConnectWritable {
+    process: ProcessId,
+    owner: std::thread::ThreadId,
+}
+#[cfg(test)]
+impl NativeConnectWritable {
+    pub(crate) fn process(&self) -> ProcessId {
+        self.process
+    }
+    pub(crate) fn owner(&self) -> std::thread::ThreadId {
+        self.owner
+    }
+}
+#[cfg(test)]
+struct NativeConnectObserver {
+    process: ProcessId,
+    owner: std::thread::ThreadId,
+    callback: Box<dyn FnOnce(NativeConnectWritable) + Send>,
+}
+#[cfg(test)]
+impl std::fmt::Debug for NativeConnectObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeConnectObserver")
+            .field("process", &self.process)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+#[cfg(test)]
+static_assertions::assert_impl_all!(NativeConnectObserver: Send, std::fmt::Debug);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(NativeConnectObserver: Clone, Copy);
+#[cfg(test)]
+static_assertions::assert_impl_all!(MainConnectPending: Send, std::fmt::Debug);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(MainConnectPending: Clone, Copy);
+#[cfg(test)]
+static_assertions::assert_impl_all!(NativeConnectWritable: Send, std::fmt::Debug);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(NativeConnectWritable: Clone, Copy);
+
+/// Test-only storage for a consumed native-connect observation.
+/// The layout contract accounts for this slot separately from production state.
+#[cfg(test)]
+#[derive(Default, Debug)]
+#[repr(transparent)]
+pub(crate) struct NativeConnectObservationSlot(std::sync::Mutex<Option<NativeConnectObserver>>);
+
+#[cfg(test)]
+static_assertions::assert_impl_all!(NativeConnectObservationSlot: Send, Sync, std::fmt::Debug);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(NativeConnectObservationSlot: Clone, Copy);
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+static_assertions::const_assert_eq!(std::mem::size_of::<NativeConnectObservationSlot>(), 40);
+
 pub(super) struct ProcessWaitBackend {
     /// A per-backend, one-shot scheduling gate for input-wakeup regressions.
     /// Installation and consumption are synchronized; callbacks own no Lisp state.
     #[cfg(test)]
-    before_next_wait: std::sync::Mutex<Option<Box<dyn FnOnce(Duration) + Send>>>,
+    before_next_wait: std::sync::Mutex<Option<Box<dyn FnOnce(BackendWaitEntry) + Send>>>,
+    #[cfg(test)]
+    native_connect_observer: NativeConnectObservationSlot,
     #[cfg(unix)]
     pub(super) signal_fd: Option<std::os::fd::RawFd>,
     /// I/O multiplexer for process descriptors and cross-thread notifications.
@@ -1059,14 +1176,48 @@ pub(super) struct ProcessWaitBackend {
     ///
     /// A bool is sufficient because notifications are coalescing readiness,
     /// not a count: one wake tells the evaluator to service published work.
-    pub(super) notification_pending: Arc<AtomicBool>,
+    pub(super) notification_pending: Arc<NotificationLatch>,
 }
+
+// Frozen x86-64 Linux baseline: replacing only the Arc pointee must not
+// enlarge the process manager reserved inside Context/World storage.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(test)))]
+static_assertions::const_assert_eq!(std::mem::size_of::<ProcessWaitBackend>(), 24);
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(test)))]
+static_assertions::const_assert_eq!(std::mem::size_of::<ProcessManager>(), 200);
+#[cfg(all(target_arch = "x86_64", target_os = "linux", test))]
+static_assertions::const_assert_eq!(std::mem::size_of::<ProcessWaitBackend>(), 88);
+#[cfg(all(target_arch = "x86_64", target_os = "linux", test))]
+static_assertions::const_assert_eq!(std::mem::size_of::<ProcessManager>(), 264);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessWaitBackendInterest {
     ProcessesOnly,
     NotificationsOnly,
     NotificationsAndProcesses,
+}
+
+/// A native pre-Poller observation, after pending signal/notification checks.
+/// This reports entry to the wait boundary, not proof of a kernel-blocked task.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackendWaitEntry {
+    requested_timeout: Duration,
+    interest: ProcessWaitBackendInterest,
+}
+
+#[cfg(test)]
+static_assertions::assert_impl_all!(BackendWaitEntry: Send, Sync, Copy, std::fmt::Debug);
+
+#[cfg(test)]
+impl BackendWaitEntry {
+    pub(crate) fn requested_timeout(self) -> Duration {
+        self.requested_timeout
+    }
+
+    pub(crate) fn interest(self) -> ProcessWaitBackendInterest {
+        self.interest
+    }
 }
 
 /// A validated monotonic deadline. An overflowing duration denotes an
@@ -1127,6 +1278,16 @@ impl ProcessWaitBackendInterest {
     }
 }
 
+// The process backend is the control source's lifetime authority. A notifier
+// or temporary Green selector may outlive it, but cannot reopen its session.
+impl Drop for ProcessWaitBackend {
+    fn drop(&mut self) {
+        if let Some(wake) = self.notification_pending.control() {
+            wake.retire();
+        }
+    }
+}
+
 impl ProcessWaitBackend {
     pub(super) fn new() -> Self {
         // Miri implements no `timerfd_create`, which `polling::Poller::new`
@@ -1151,9 +1312,11 @@ impl ProcessWaitBackend {
             poller,
             #[cfg(test)]
             before_next_wait: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            native_connect_observer: NativeConnectObservationSlot::default(),
             #[cfg(unix)]
             signal_fd,
-            notification_pending: Arc::new(AtomicBool::new(false)),
+            notification_pending: Arc::new(NotificationLatch::new()),
         }
     }
 
@@ -1201,10 +1364,14 @@ impl ProcessWaitBackend {
             }
 
             #[cfg(test)]
-            {
+            if !timeout.is_zero() {
+                // Nonblocking service polls are not reader wait-entry witnesses.
                 let before_wait = self.before_next_wait.lock().expect("wait gate lock").take();
                 if let Some(before_wait) = before_wait {
-                    before_wait(timeout);
+                    before_wait(BackendWaitEntry {
+                        requested_timeout: timeout,
+                        interest,
+                    });
                 }
             }
 
@@ -1413,7 +1580,7 @@ impl std::fmt::Debug for ProcessManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessManager")
             .field("processes", &self.processes)
-            .field("next_id", &self.next_id)
+            .field("next_id", &self.ids.next_id)
             .finish()
     }
 }
@@ -2951,6 +3118,17 @@ pub(super) fn process_child_status_change_from_wait(wait: sys::ChildWait) -> Chi
         sys::ChildWait::Stopped(sig) => {
             ChildStatusChange::StillOurs(process_status_stop_value(sig as i64))
         }
+        // GNU only ever sees a continuation through the `SIGCHLD` its handler
+        // runs on (src/process.c:7691-7749).  A kernel that does not signal
+        // continuations -- Darwin, which also reports a spurious
+        // `WCONTINUED` for a bare `SIGCONT` -- would have GNU stay silent,
+        // so the poll-driven port must stay silent too or every
+        // `continue-process` runs the sentinel twice.
+        sys::ChildWait::Continued
+            if !crate::emacs_core::platform_facts::SIGCHLD_ON_CHILD_CONTINUE =>
+        {
+            ChildStatusChange::NoChange
+        }
         sys::ChildWait::Continued => ChildStatusChange::StillOurs(process_status_run_value()),
         sys::ChildWait::Error => ChildStatusChange::Reaped(process_status_exit_value(1)),
     }
@@ -4140,6 +4318,14 @@ pub(super) enum ProcessOutputDrainDisposition {
     Output,
     Blocked,
     Terminal,
+}
+
+/// Live streams yield after one read; terminal notification must preserve all
+/// final output before the sentinel observes the process buffer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessOutputReadPolicy {
+    Live,
+    FinalDrain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5680,7 +5866,10 @@ impl ProcessManager {
         Self {
             processes: HashMap::new(),
             deleted_processes: HashMap::new(),
-            next_id: 1,
+            ids: Box::new(ProcessIdState {
+                next_id: 1,
+                last_read_process: 0,
+            }),
             process_tick: 0,
             default_read_config: ProcessReadConfig::default(),
             env_overrides: HashMap::new(),
@@ -5874,8 +6063,8 @@ impl ProcessManager {
         // kind.  Probe the live process registry and append the smallest free
         // `<N>` suffix before the new record becomes visible.
         let name = self.allocate_process_name(name);
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.ids.next_id;
+        self.ids.next_id += 1;
         let (tty_name, tty_stdin, tty_stdout, tty_stderr) = match kind {
             ProcessKind::Real => {
                 let tty_name = Value::string(default_process_tty_name());
@@ -5913,7 +6102,6 @@ impl ProcessManager {
             exit_query_policy: ExitQueryPolicy::GNU_MAKE_PROCESS,
             filter: Value::symbol(DEFAULT_PROCESS_FILTER_SYMBOL),
             sentinel: Value::symbol(DEFAULT_PROCESS_SENTINEL_SYMBOL),
-            sentinel_execution: SentinelExecution::Idle,
             log: Value::NIL,
             plist: Value::NIL,
             stderrproc: Value::NIL,
@@ -6478,11 +6666,6 @@ impl ProcessManager {
         true
     }
 
-    pub(crate) fn defers_minimum_status_drain_after_output(&self, id: ProcessId) -> bool {
-        self.get(id)
-            .is_some_and(process_defers_pty_status_after_explicit_coding)
-    }
-
     pub(super) fn deactivate_child_status_source(&mut self, id: ProcessId) {
         if let Some(proc) = self.processes.get_mut(&id)
             && let Some(status_source) = proc.live_io.child_status_source.take()
@@ -6803,10 +6986,14 @@ impl ProcessManager {
         self.wait_backend.notify_handle()
     }
 
+    pub(crate) fn host_control_latch(&self) -> Arc<NotificationLatch> {
+        Arc::clone(&self.wait_backend.notification_pending)
+    }
+
     #[cfg(test)]
     pub(crate) fn before_next_backend_wait_for_test(
         &mut self,
-        hook: impl FnOnce(Duration) + Send + 'static,
+        hook: impl FnOnce(BackendWaitEntry) + Send + 'static,
     ) {
         let slot = self
             .wait_backend
@@ -6826,8 +7013,14 @@ impl ProcessManager {
         timeout: std::time::Duration,
         interest: ProcessWaitBackendInterest,
     ) -> Option<ProcessWaitEvents> {
-        self.wait_backend
-            .wait_for_events(&self.processes, timeout, interest)
+        let events = self
+            .wait_backend
+            .wait_for_events(&self.processes, timeout, interest);
+        #[cfg(test)]
+        if let Some(events) = &events {
+            self.observe_native_connect_writable_for_test(events);
+        }
+        events
     }
 
     /// Remove only the filesystem node captured at bind, not a replacement
@@ -7148,6 +7341,254 @@ impl ProcessManager {
             .or_else(|| self.deleted_processes.get(&id).map(|p| &p.status))
     }
 
+    /// Project only the live owner's actual pending TCP state. This neither
+    /// changes nor claims to inspect the native poller's registration. The
+    /// fixture separately requires the real canonical writable backend event.
+    #[cfg(test)]
+    pub(crate) fn main_connect_pending_for_test(
+        &self,
+        id: ProcessId,
+    ) -> Result<MainConnectPending, PendingConnectObservationError> {
+        let process = self
+            .get(id)
+            .ok_or(PendingConnectObservationError::MissingProcess)?;
+        if ProcessStatusSymbol::from_status_value(process.status)
+            != Some(ProcessStatusSymbol::Connect)
+        {
+            return Err(PendingConnectObservationError::AlreadyDecoded);
+        }
+        match process.live_io.pending_network_connect.as_ref() {
+            Some(PendingNetworkConnect::Tcp { .. }) => {}
+            Some(PendingNetworkConnect::Dns(_)) | None => {
+                return Err(PendingConnectObservationError::NotPendingTcp);
+            }
+            #[cfg(unix)]
+            Some(PendingNetworkConnect::Local) => {
+                return Err(PendingConnectObservationError::NotPendingTcp);
+            }
+        }
+        let socket = process
+            .live_io
+            .network_socket
+            .as_ref()
+            .ok_or(PendingConnectObservationError::MissingSocket)?;
+        match socket {
+            NetworkSocket::TcpStream(_) => {}
+            NetworkSocket::TcpListener(_) | NetworkSocket::UdpSocket(_) => {
+                return Err(PendingConnectObservationError::NotTcpStream);
+            }
+            #[cfg(unix)]
+            NetworkSocket::SeqpacketStream(_)
+            | NetworkSocket::SeqpacketListener(_)
+            | NetworkSocket::UnixStream(_)
+            | NetworkSocket::UnixListener(_)
+            | NetworkSocket::UnixDatagram(_) => {
+                return Err(PendingConnectObservationError::NotTcpStream);
+            }
+        }
+        self.wait_backend
+            .poller()
+            .ok_or(PendingConnectObservationError::MissingBackend)?;
+        Ok(MainConnectPending { process: id })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_next_native_connect_writable_for_test(
+        &mut self,
+        id: ProcessId,
+        callback: impl FnOnce(NativeConnectWritable) + Send + 'static,
+    ) {
+        let slot = self
+            .wait_backend
+            .native_connect_observer
+            .0
+            .get_mut()
+            .expect("connect observer lock");
+        assert!(slot.is_none(), "native connect observer already installed");
+        *slot = Some(NativeConnectObserver {
+            process: id,
+            owner: std::thread::current().id(),
+            callback: Box::new(callback),
+        });
+    }
+
+    #[cfg(test)]
+    fn observe_native_connect_writable_for_test(&self, events: &ProcessWaitEvents) {
+        let observer = {
+            let mut slot = self
+                .wait_backend
+                .native_connect_observer
+                .0
+                .lock()
+                .expect("connect observer lock");
+            match slot.as_ref() {
+                Some(observer)
+                    if observer.owner == std::thread::current().id()
+                        && events.writable_processes_ref().contains(&observer.process)
+                        && self.get(observer.process).is_some_and(|process| {
+                            process.live_io.pending_network_connect.is_some()
+                                && ProcessStatusSymbol::from_status_value(process.status)
+                                    == Some(ProcessStatusSymbol::Connect)
+                        }) =>
+                {
+                    slot.take()
+                }
+                Some(_) | None => None,
+            }
+        };
+        if let Some(observer) = observer {
+            (observer.callback)(NativeConnectWritable {
+                process: observer.process,
+                owner: std::thread::current().id(),
+            });
+        }
+    }
+
+    /// Observe buffered real child stdout without reading, filtering or reaping it.
+    /// Unix waits on the actual pipe. Windows waits on this retained child's
+    /// process object, then uses the existing non-consuming PeekNamedPipe owner.
+    #[cfg(test)]
+    pub(crate) fn wait_for_child_stdout_readable_for_test(
+        &self,
+        id: ProcessId,
+        timeout: Duration,
+    ) -> std::io::Result<()> {
+        let process = self.get(id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "readiness child no longer exists",
+            )
+        })?;
+        let stdout = process.live_io.child_stdout.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "readiness child has no owned stdout",
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let deadline = Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "child stdout readiness witness missing",
+                    ));
+                }
+                let milliseconds = i32::try_from(remaining.as_millis()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "readiness bound exceeds poll domain",
+                    )
+                })?;
+                let mut descriptor = libc::pollfd {
+                    fd: stdout.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: stdout remains borrowed from its owner for the full
+                // poll; descriptor is initialized, exclusive local storage.
+                let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+                if result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if result == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "child stdout readiness witness missing",
+                    ));
+                }
+                if descriptor.revents & libc::POLLIN == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "child pipe closed or failed without readable output",
+                    ));
+                }
+                let mut available: libc::c_int = 0;
+                // SAFETY: the same owned live pipe is borrowed; available is
+                // writable native integer storage. FIONREAD consumes no bytes.
+                if unsafe { libc::ioctl(stdout.as_raw_fd(), libc::FIONREAD, &mut available) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                return if available > 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "readable child pipe contained no buffered output",
+                    ))
+                };
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            };
+            let pid = process.live_io.child.pid_if_unreaped().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "readiness child ownership missing",
+                )
+            })?;
+            // The still-owned Windows child handle pins this process object
+            // and PID during the shared ProcessManager borrow. This opens only
+            // SYNCHRONIZE access, never termination or status/reap authority.
+            // SAFETY: native scalar arguments; the returned handle is checked.
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if raw.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: OpenProcess returned one successful, exclusively owned handle.
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+            let milliseconds = u32::try_from(timeout.as_millis()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "readiness bound exceeds Windows wait domain",
+                )
+            })?;
+            // SAFETY: handle stays owned through this bounded, non-reaping wait.
+            match unsafe { WaitForSingleObject(handle.as_raw_handle(), milliseconds) } {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "child exit/readiness witness missing",
+                    ));
+                }
+                WAIT_FAILED => return Err(std::io::Error::last_os_error()),
+                _ => {
+                    return Err(std::io::Error::other(
+                        "unexpected process-object wait result",
+                    ));
+                }
+            }
+            match peek_child_output_readiness(stdout)? {
+                Some(available) if available > 0 => Ok(()),
+                Some(_) | None => Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "completed child had no buffered stdout",
+                )),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (stdout, timeout);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no native child-output readiness witness on this platform",
+            ))
+        }
+    }
+
     /// Get a process by id.
     pub fn get(&self, id: ProcessId) -> Option<&Process> {
         self.processes.get(&id)
@@ -7264,7 +7705,7 @@ impl ProcessManager {
 
     /// Returns true if this id has been allocated at least once.
     pub fn was_issued_id(&self, id: ProcessId) -> bool {
-        id > 0 && id < self.next_id
+        id > 0 && id < self.ids.next_id
     }
 
     /// Find a process by name.
@@ -7429,28 +7870,47 @@ impl ProcessManager {
                 Ok(ProcessWriteAttempt::WouldBlock)
             }
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
-                // GNU `send_process`'s EPIPE arm on master
-                // (src/process.c:6941-6947, since e381cf1fc97, 2025-08-15):
+                // GNU `send_process` has two EPIPE arms in this lineage.
                 //
-                //   close_process_fd (&p->open_fd[WRITE_TO_SUBPROCESS]);
-                //   p->outfd = -1;
-                //   error ("Process %s no longer connected to pipe; closed it", ...);
-                //
-                // and NOTHING else -- the status is not touched, so the child
-                // stays sweepable and the next wait's `status_notify` hands
-                // the sentinel the child's REAL exit status.  The emacs-31.1
-                // release still has the older arm (:6923-6931): GNU commit
-                // 4d7e6e51dd4 (2012) made it synthesize `(exit . 256)` and
-                // bump the tick, and e381cf1fc97 removed that on master.
-                // This port follows master.  Writing `(exit . 256)` here made
-                // the status terminal before the reap, which no later sweep
-                // may overwrite
+                // GNU master (e381cf1fc97, since 2025-08-15;
+                // src/process.c:6941-6947) closes the write fd, sets
+                // `p->outfd = -1`, and signals -- NOTHING else.  A child's
+                // status is untouched, so it remains sweepable and the next
+                // wait's `status_notify` hands the sentinel the child's REAL
+                // exit status.  This port follows that arm for a real child:
+                // writing `(exit . 256)` here made the status terminal before
+                // the reap, which no later sweep may overwrite
                 // (`SweepableChild::of` admits only `run`/`stop`) and which
-                // set no `status_notify_pending` -- so the sentinel never
-                // ran.  Measured with lsp-mode against a crashing nixd:
-                // `lsp--handle-process-exit` never fired, the dead
-                // workspace stayed in the session, and every later send
-                // reported "not running: exited abnormally with code 256".
+                // set no `status_notify_pending` -- so the sentinel never ran.
+                // Measured with lsp-mode against a crashing nixd:
+                // `lsp--handle-process-exit` never fired, the dead workspace
+                // stayed in the session, and every later send reported "not
+                // running: exited abnormally with code 256".
+                //
+                // The emacs-31.1 release (the parity reference) has the older
+                // arm (src/process.c:6923-6931, tick at :6927): it also
+                // settles `(exit . 256)`, bumps `p->tick`, and calls
+                // `deactivate_process` BEFORE signalling.  A network
+                // connection has no child to reap, and Lisp clients test
+                // `process-live-p` in the send-error handler: dsh-emacs
+                // reports a still-live sender as an unexpected WebSocket frame
+                // error on every peer close, and a process left listed after
+                // the failure leaks one socket per reconnect.  Keep the
+                // release arm for sockets: publish the terminal status and its
+                // notification, retire the I/O, then signal.  The tick is what
+                // lets the next wait run the "connection broken by remote
+                // peer" sentinel even while the consumer has suspended reads
+                // with a filter of `t`.
+                let network_epipe = matches!(
+                    endpoint,
+                    ProcessInputEndpoint::Network | ProcessInputEndpoint::Tls
+                ) && process_status_allows_send(&proc.status);
+                if network_epipe {
+                    let terminal = process_status_exit_value(256);
+                    proc.status = terminal;
+                    proc.pending_status = terminal;
+                    proc.status_notify_pending = true;
+                }
                 let name = process_name_runtime(proc.name);
                 endpoint.disconnect(self.wait_backend.poller(), proc);
                 let error = signal(
@@ -7459,7 +7919,12 @@ impl ProcessManager {
                         "Process {name} no longer connected to pipe; closed it"
                     ))],
                 );
-                self.update_process_write_interest(id, ProcessWriteInterest::Readable);
+                if network_epipe {
+                    self.record_status_change(StatusChangeSite::SendProcessEpipe, id);
+                    self.deactivate_network_process_io(id);
+                } else {
+                    self.update_process_write_interest(id, ProcessWriteInterest::Readable);
+                }
                 Err(error)
             }
             Err(err) => Err(signal_process_io("Writing to process", None, err)),
@@ -7955,8 +8420,12 @@ impl ProcessManager {
             #[cfg(unix)]
             Unix {
                 stream: UnixStream,
-                remote_name: String,
-                local_name: String,
+                /// `conv_sockaddr_to_lisp` of the peer (GNU uses accept's
+                /// address; getpeername reads the same kernel value).
+                remote: Option<Value>,
+                /// The same for the local end, present only when
+                /// `getsockname` succeeded (src/process.c:5112-5116).
+                local: Option<Value>,
             },
         }
 
@@ -7989,15 +8458,20 @@ impl ProcessManager {
                     },
                     #[cfg(unix)]
                     Some(NetworkSocket::UnixListener(listener)) => match listener.accept() {
-                        Ok((stream, _)) => Ok(Some(AcceptedSocket::Unix {
-                            remote_name: unix_socket_addr_to_runtime_string(
-                                stream.peer_addr().ok(),
-                            ),
-                            local_name: unix_socket_addr_to_runtime_string(
-                                stream.local_addr().ok(),
-                            ),
-                            stream,
-                        })),
+                        Ok((stream, _)) => {
+                            let fd = stream.as_raw_fd();
+                            Ok(Some(AcceptedSocket::Unix {
+                                remote: super::bootstrap_vars::unix_socket_endpoint_value(
+                                    fd,
+                                    super::sys::net::SocketEnd::Peer,
+                                ),
+                                local: super::bootstrap_vars::unix_socket_endpoint_value(
+                                    fd,
+                                    super::sys::net::SocketEnd::Local,
+                                ),
+                                stream,
+                            }))
+                        }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
                         Err(_) => Ok(None),
                     },
@@ -8181,8 +8655,8 @@ impl ProcessManager {
                 #[cfg(unix)]
                 AcceptedSocket::Unix {
                     stream,
-                    remote_name,
-                    local_name,
+                    remote,
+                    local,
                 } => {
                     let _ = stream.set_nonblocking(true);
                     contact = process_contact_plist_put(
@@ -8191,18 +8665,22 @@ impl ProcessManager {
                         Value::NIL,
                     )
                     .unwrap_or(contact);
-                    contact = process_contact_plist_put(
-                        contact,
-                        ProcessKeyword::Remote.value(),
-                        Value::string(&remote_name),
-                    )
-                    .unwrap_or(contact);
-                    contact = process_contact_plist_put(
-                        contact,
-                        ProcessKeyword::Local.value(),
-                        Value::string(&local_name),
-                    )
-                    .unwrap_or(contact);
+                    if let Some(remote) = remote {
+                        contact = process_contact_plist_put(
+                            contact,
+                            ProcessKeyword::Remote.value(),
+                            remote,
+                        )
+                        .unwrap_or(contact);
+                    }
+                    if let Some(local) = local {
+                        contact = process_contact_plist_put(
+                            contact,
+                            ProcessKeyword::Local.value(),
+                            local,
+                        )
+                        .unwrap_or(contact);
+                    }
 
                     let prefix = format!("{} <", server_name);
                     let sequence = self
@@ -8211,15 +8689,13 @@ impl ProcessManager {
                         .filter(|process| process_name_runtime(process.name).starts_with(&prefix))
                         .count()
                         + 1;
-                    let host_for_message = if remote_name.is_empty() {
-                        "-".to_string()
-                    } else {
-                        remote_name
-                    };
+                    // GNU's `host` for an AF_LOCAL accept is the contact's
+                    // QChost, which is nil, so the message is always
+                    // "accept from -" (src/process.c:5170-5176).
                     (
                         format!("{} <{}>", server_name, sequence),
                         NetworkSocket::UnixStream(stream),
-                        host_for_message,
+                        "-".to_string(),
                     )
                 }
             };
@@ -8643,7 +9119,7 @@ impl super::super::eval::Context {
         match result {
             Ok(_) => Ok(()),
             Err(err) if err.is_signal() => {
-                let rendered = super::super::error::format_flow_with_eval(self, &err);
+                let rendered = crate::emacs_core::print::format_flow_with_eval(self, &err);
                 tracing::warn!("{} callback error: {}", kind.label(), rendered);
                 let Some(sig) = err.as_signal() else {
                     unreachable!("matched Flow::Signal above")
@@ -9031,6 +9507,7 @@ impl super::super::eval::Context {
         &mut self,
         stderr_id: ProcessId,
         target_process: Option<ProcessId>,
+        policy: ProcessOutputReadPolicy,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut outcome = ProcessOutputServiceOutcome::default();
         let is_target = target_process.is_none_or(|target| target == stderr_id);
@@ -9049,6 +9526,9 @@ impl super::super::eval::Context {
                             .map(|p| p.filter)
                             .unwrap_or(Value::NIL);
                         self.run_process_filter_callback(stderr_id, filter, &data)?;
+                    }
+                    if policy == ProcessOutputReadPolicy::Live {
+                        return Ok(outcome);
                     }
                 }
                 ProcessOutputRead::Eof | ProcessOutputRead::NoSource => {
@@ -9070,48 +9550,39 @@ impl super::super::eval::Context {
         target_process: Option<ProcessId>,
     ) -> Result<(ProcessOutputServiceOutcome, ProcessOutputDrainDisposition), Flow> {
         let mut outcome = ProcessOutputServiceOutcome::default();
-        let mut saw_output = false;
         let is_target = target_process == Some(pid);
-
-        loop {
-            let sink = self.process_output_sink(pid);
-            match self.read_process_output_recording_coding(pid, sink)? {
-                ProcessOutputRead::Data { data, bytes_read } => {
-                    if bytes_read > 0 {
-                        saw_output = true;
-                        outcome.record_activity(is_target);
-                    }
-                    if !data.is_empty() {
-                        let filter = self
-                            .processes
-                            .get(pid)
-                            .map(|p| p.filter)
-                            .unwrap_or(Value::NIL);
-                        self.run_process_filter_callback(pid, filter, &data)?;
-                    }
+        let sink = self.process_output_sink(pid);
+        // This probe also runs for a live owner when its stderr reaches EOF.
+        // Yield after one read just like the normal readiness service path.
+        let disposition = match self.read_process_output_recording_coding(pid, sink)? {
+            ProcessOutputRead::Data { data, bytes_read } => {
+                if bytes_read > 0 {
+                    outcome.record_activity(is_target);
                 }
-                ProcessOutputRead::WouldBlock => {
-                    let disposition = if saw_output {
-                        ProcessOutputDrainDisposition::Output
-                    } else {
-                        ProcessOutputDrainDisposition::Blocked
-                    };
-                    return Ok((outcome, disposition));
+                if !data.is_empty() {
+                    let filter = self
+                        .processes
+                        .get(pid)
+                        .map(|p| p.filter)
+                        .unwrap_or(Value::NIL);
+                    self.run_process_filter_callback(pid, filter, &data)?;
                 }
-                ProcessOutputRead::Eof | ProcessOutputRead::NoSource => {
-                    let disposition = if saw_output {
-                        ProcessOutputDrainDisposition::Output
-                    } else {
-                        ProcessOutputDrainDisposition::Terminal
-                    };
-                    return Ok((outcome, disposition));
-                }
-                ProcessOutputRead::Failed => {
-                    self.processes.retire_process_at_read_failure(pid);
-                    return Ok((outcome, ProcessOutputDrainDisposition::Terminal));
+                if bytes_read > 0 {
+                    ProcessOutputDrainDisposition::Output
+                } else {
+                    ProcessOutputDrainDisposition::Blocked
                 }
             }
-        }
+            ProcessOutputRead::WouldBlock => ProcessOutputDrainDisposition::Blocked,
+            ProcessOutputRead::Eof | ProcessOutputRead::NoSource => {
+                ProcessOutputDrainDisposition::Terminal
+            }
+            ProcessOutputRead::Failed => {
+                self.processes.retire_process_at_read_failure(pid);
+                ProcessOutputDrainDisposition::Terminal
+            }
+        };
+        Ok((outcome, disposition))
     }
 
     pub(super) fn poll_process_stdout_output_without_status(
@@ -9136,23 +9607,21 @@ impl super::super::eval::Context {
         if sentinel.is_nil() {
             return Ok(());
         }
-        // A sentinel may enter a wait and delete its own process from a timer.
-        // Keep its recursion guard with the record, including after retirement.
-        if let Some(process) = self.processes.get_any_mut(pid) {
-            if process.sentinel_execution == SentinelExecution::Running {
-                return Ok(());
-            }
-            process.sentinel_execution = SentinelExecution::Running;
-        }
-        let result = self.run_async_process_callback_preserving_state(
+        // GNU has no per-process sentinel recursion guard: `exec_sentinel`
+        // (src/process.c:7800) only checks the global `inhibit_sentinels`,
+        // which is set during shutdown (emacs.c:3155).  Nested invocations are
+        // real: a sentinel that kills its own buffer runs `Fdelete_process` ->
+        // `status_notify (p, NULL)` (:1129), which stamps a fresh tick (:1128)
+        // and calls this sentinel again while the outer call is still on the
+        // stack -- url-http's retry depends on it.  The tick discipline
+        // (`update_tick = tick` before `exec_sentinel`, :7894, :7935) is what
+        // prevents a *notification* from running twice; a recursion guard here
+        // would instead drop a legitimately new status change.
+        self.run_async_process_callback_preserving_state(
             sentinel,
             vec![Value::make_process(pid), Value::string(message)],
             AsyncCallbackKind::ProcessSentinel,
-        );
-        if let Some(process) = self.processes.get_any_mut(pid) {
-            process.sentinel_execution = SentinelExecution::Idle;
-        }
-        result
+        )
     }
 
     /// GNU `exec_sentinel` (src/process.c:7800), driven from a
@@ -9272,7 +9741,12 @@ impl super::super::eval::Context {
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let target_process = request.target_process();
         let proc_ids = request.live_processes(self.processes.live_process_ids());
-        self.poll_process_output_for_ids(proc_ids, target_process, true)
+        self.service_process_output_for_ids(
+            proc_ids,
+            target_process,
+            true,
+            ProcessOutputServicePass::Readiness,
+        )
     }
 
     /// GNU `status_notify (NULL, WAIT_PROC)` (src/process.c:5554, :5854), with
@@ -9315,7 +9789,7 @@ impl super::super::eval::Context {
         // `status_notify` itself: it drains the process's remaining output
         // (:7896-7909) and then runs the sentinel, so the status is what the
         // visit is FOR.
-        self.poll_process_output_for_ids(visit, target_process, true)
+        self.poll_process_output_for_status_notification(visit, target_process, true)
     }
 
     pub(super) fn finish_process_tls_handshake(
@@ -9430,24 +9904,75 @@ impl super::super::eval::Context {
         }
 
         let proc_ids = request.ready_processes(events.ready_processes_ref().to_vec());
-        outcome.absorb(self.poll_process_output_for_ids(proc_ids, target_process, false)?);
+        outcome.absorb(self.service_process_output_for_ids(
+            proc_ids,
+            target_process,
+            false,
+            ProcessOutputServicePass::Readiness,
+        )?);
 
         Ok(outcome)
     }
 
-    pub(super) fn poll_process_output_for_ids(
+    /// Service every visited source, including the full final output drain
+    /// before a terminal sentinel. Unlike a readiness pass, this walk never
+    /// yields between sources or advances the round-robin cursor.
+    pub(super) fn poll_process_output_for_status_notification(
         &mut self,
         proc_ids: Vec<ProcessId>,
         target_process: Option<ProcessId>,
         publish_status_before_readable_output: bool,
+    ) -> Result<ProcessOutputServiceOutcome, Flow> {
+        self.service_process_output_for_ids(
+            proc_ids,
+            target_process,
+            publish_status_before_readable_output,
+            ProcessOutputServicePass::StatusNotification,
+        )
+    }
+
+    /// Test-only entry point for the readiness pass. Production enters it via
+    /// `poll_process_output_for_service_request` / the wait events.
+    #[cfg(test)]
+    pub(super) fn poll_process_output_for_readiness(
+        &mut self,
+        proc_ids: Vec<ProcessId>,
+        target_process: Option<ProcessId>,
+        publish_status_before_readable_output: bool,
+    ) -> Result<ProcessOutputServiceOutcome, Flow> {
+        self.service_process_output_for_ids(
+            proc_ids,
+            target_process,
+            publish_status_before_readable_output,
+            ProcessOutputServicePass::Readiness,
+        )
+    }
+
+    fn service_process_output_for_ids(
+        &mut self,
+        proc_ids: Vec<ProcessId>,
+        target_process: Option<ProcessId>,
+        publish_status_before_readable_output: bool,
+        pass: ProcessOutputServicePass,
     ) -> Result<ProcessOutputServiceOutcome, Flow> {
         let mut proc_ids = dedupe_process_ids(proc_ids);
 
         if proc_ids.is_empty() {
             return Ok(ProcessOutputServiceOutcome::default());
         }
+        if pass == ProcessOutputServicePass::Readiness {
+            // GNU starts each select pass after `last_read_channel`
+            // (src/process.c:5975-5985). Sorting makes the cursor a stable
+            // rotation. A wait target controls completion, not read priority:
+            // hoisting a continuously ready target would starve its peers.
+            // JUST-THIS-ONE already restricts the request's process set.
+            proc_ids.sort_unstable();
+            let start = proc_ids.partition_point(|id| *id <= self.processes.ids.last_read_process);
+            proc_ids.rotate_left(start);
+        }
         order_pending_status_notifications_newest_first(&self.processes, &mut proc_ids);
-        if let Some(target) = target_process
+        if pass == ProcessOutputServicePass::StatusNotification
+            && let Some(target) = target_process
             && let Some(index) = proc_ids.iter().position(|pid| *pid == target)
         {
             proc_ids.remove(index);
@@ -9458,6 +9983,22 @@ impl super::super::eval::Context {
         let mut split_stderr_owners_with_output = Vec::new();
 
         for pid in proc_ids {
+            if pass == ProcessOutputServicePass::Readiness {
+                // GNU clears Available after a successful read: a filter can
+                // run arbitrary Lisp, including a recursive process wait.
+                // Return to the wait loop to check timers/input and obtain
+                // fresh readiness before dispatching another source. Keep
+                // status_notify's full final-output/sentinel walk separate.
+                if outcome.has_any_process_activity() {
+                    break;
+                }
+                // Advance before callbacks so recursive waits rotate too.
+                // GNU advances `last_read_channel` only after a successful
+                // read; advancing for every scanned id is an approximation,
+                // but the cursor wraps once it passes the largest live id, so
+                // no source can be skipped forever.
+                self.processes.ids.last_read_process = pid;
+            }
             let is_target = target_process.is_none_or(|target| target == pid);
             if self
                 .processes
@@ -9658,130 +10199,118 @@ impl super::super::eval::Context {
                 .get(pid)
                 .is_some_and(is_standalone_pipe_process);
 
-            let mut read_result = {
+            // Service one read per ready source, then return to the wait loop.
+            // Draining until WouldBlock lets a continuously writing bash process
+            // or WebSocket monopolize the evaluator: timers, keyboard input and
+            // redisplay cannot run until the producer stops. The wait layer owns
+            // the zero-time MINIMUM follow-up pass; terminal status notification
+            // below still drains final output before invoking the sentinel.
+            let read_result = {
                 let sink = self.process_output_sink(pid);
                 self.read_process_output_recording_coding(pid, sink)?
             };
             let mut saw_output = false;
             let mut saw_pty_eof = false;
             let mut handled_terminal_eof = false;
-            loop {
-                match read_result {
-                    ProcessOutputRead::Data { data, bytes_read } => {
-                        if bytes_read > 0 {
-                            saw_output = true;
-                            outcome.record_activity(is_target);
-                        }
-                        if !data.is_empty() {
-                            let filter = self
-                                .processes
-                                .get(pid)
-                                .map(|p| p.filter)
-                                .unwrap_or(Value::NIL);
-                            self.run_process_filter_callback(pid, filter, &data)?;
-                        }
-                        if bytes_read == 0 && data.is_empty() {
-                            break;
-                        }
+            match read_result {
+                ProcessOutputRead::Data { data, bytes_read } => {
+                    if bytes_read > 0 {
+                        saw_output = true;
+                        outcome.record_activity(is_target);
                     }
-                    ProcessOutputRead::Eof if is_stderr_pipe => {
-                        if let Some(owner_id) = self.processes.stderr_pipe_owner(pid)
-                            && target_process == Some(owner_id)
-                        {
-                            if !split_stderr_owners_with_output.contains(&owner_id) {
-                                // The poller can report the split-stderr fd
-                                // before the owner's stdout fd.  GNU's
-                                // targeted wait still reports stdout/stderr
-                                // bytes first and leaves the stderr EOF
-                                // sentinel for a later notification pass.
-                                let (owner_outcome, owner_saw_output) = self
-                                    .poll_process_stdout_output_without_status(
-                                        owner_id,
-                                        target_process,
-                                    )?;
-                                outcome.absorb(owner_outcome);
-                                if owner_saw_output {
-                                    split_stderr_owners_with_output.push(owner_id);
-                                }
-                            }
-                            if split_stderr_owners_with_output.contains(&owner_id) {
-                                break;
-                            }
-                        }
-                        outcome.record_serviced();
-
-                        // The pipe finishes HERE (exit 0, so `process-status`
-                        // reports `closed`) and is notified LATER, which is
-                        // where GNU draws the line: the fd loop retires it
-                        // (src/process.c:6072-6080) and `status_notify`
-                        // (src/process.c:7873) runs the sentinel that inserts
-                        // "Process NAME stderr finished" and removes it from
-                        // the alist. Running both halves here published the
-                        // pipe's death to Lisp -- sentinel first, then gone
-                        // from `get-buffer-process' -- ahead of the OWNER's
-                        // sentinel, where GNU's newest-first alist walk always
-                        // puts the owner first (ledger entry 54).
-                        self.processes.retire_pipe_process_at_read_eof(pid);
-                        handled_terminal_eof = true;
-                        break;
+                    if !data.is_empty() {
+                        let filter = self
+                            .processes
+                            .get(pid)
+                            .map(|p| p.filter)
+                            .unwrap_or(Value::NIL);
+                        self.run_process_filter_callback(pid, filter, &data)?;
                     }
-                    ProcessOutputRead::Eof | ProcessOutputRead::Failed if is_network => {
-                        // GNU: EOF is not output; the wait continues (or the
-                        // terminated-target break ends it at the loop top).
-                        outcome.record_serviced();
-
-                        // GNU: EOF on a running network connection sets
-                        // `(exit . 256)` (process.c:6090, "Preserve status of
-                        // processes already terminated" branch) -- exit code 0
-                        // means "deleted\n", non-zero "connection broken by
-                        // remote peer\n" (`status_message`). Derive the
-                        // sentinel text from the status so the two can never
-                        // disagree.
-                        if let Some(proc) = self.processes.get_mut(pid)
-                            && (process_status_is_run(&proc.status)
-                                || ProcessStatusSymbol::from_status_value(proc.status)
-                                    == Some(ProcessStatusSymbol::Open))
-                        {
-                            proc.status = process_status_exit_value(256);
-                        }
-                        // Same `status_notify` ordering as the child exit path
-                        // below: the removal decision (src/process.c:7926-7929)
-                        // precedes `exec_sentinel' (:7937), and the type is what
-                        // makes that the only expressible order.
-                        let disposition = self.exited_process_disposition();
-                        let notification = ProcessStatusNotification::settle_status_and_retire(
-                            &mut self.processes,
-                            pid,
-                            ProcessIoTeardown::Network,
-                            disposition,
-                        );
-                        if let Some(notification) = notification {
-                            self.run_status_notification_sentinel(notification)?;
-                        }
-                        handled_terminal_eof = true;
-                        break;
-                    }
-                    ProcessOutputRead::Failed => {
-                        outcome.record_serviced();
-                        self.processes.retire_process_at_read_failure(pid);
-                        handled_terminal_eof = true;
-                        break;
-                    }
-                    ProcessOutputRead::Eof => {
-                        saw_pty_eof = true;
-                        break;
-                    }
-                    ProcessOutputRead::WouldBlock | ProcessOutputRead::NoSource => break,
                 }
+                ProcessOutputRead::Eof if is_stderr_pipe => {
+                    if let Some(owner_id) = self.processes.stderr_pipe_owner(pid)
+                        && target_process == Some(owner_id)
+                    {
+                        if !split_stderr_owners_with_output.contains(&owner_id) {
+                            // The poller can report the split-stderr fd
+                            // before the owner's stdout fd.  GNU's
+                            // targeted wait still reports stdout/stderr
+                            // bytes first and leaves the stderr EOF
+                            // sentinel for a later notification pass.
+                            let (owner_outcome, owner_saw_output) = self
+                                .poll_process_stdout_output_without_status(
+                                    owner_id,
+                                    target_process,
+                                )?;
+                            outcome.absorb(owner_outcome);
+                            if owner_saw_output {
+                                split_stderr_owners_with_output.push(owner_id);
+                            }
+                        }
+                        if split_stderr_owners_with_output.contains(&owner_id) {
+                            continue;
+                        }
+                    }
+                    outcome.record_serviced();
 
-                // GNU's wait loop does a no-wait follow-up pass after reading
-                // target output (`wait = MINIMUM`), which vacuums up immediately
-                // available bytes and EOF/status transitions before returning.
-                // Keep this non-blocking: stop as soon as the source would block.
-                read_result = {
-                    let sink = self.process_output_sink(pid);
-                    self.read_process_output_recording_coding(pid, sink)?
-                };
+                    // The pipe finishes HERE (exit 0, so `process-status`
+                    // reports `closed`) and is notified LATER, which is
+                    // where GNU draws the line: the fd loop retires it
+                    // (src/process.c:6072-6080) and `status_notify`
+                    // (src/process.c:7873) runs the sentinel that inserts
+                    // "Process NAME stderr finished" and removes it from
+                    // the alist. Running both halves here published the
+                    // pipe's death to Lisp -- sentinel first, then gone
+                    // from `get-buffer-process' -- ahead of the OWNER's
+                    // sentinel, where GNU's newest-first alist walk always
+                    // puts the owner first (ledger entry 54).
+                    self.processes.retire_pipe_process_at_read_eof(pid);
+                    handled_terminal_eof = true;
+                }
+                ProcessOutputRead::Eof | ProcessOutputRead::Failed if is_network => {
+                    // GNU: EOF is not output; the wait continues (or the
+                    // terminated-target break ends it at the loop top).
+                    outcome.record_serviced();
+
+                    // GNU: EOF on a running network connection sets
+                    // `(exit . 256)` (process.c:6090, "Preserve status of
+                    // processes already terminated" branch) -- exit code 0
+                    // means "deleted\n", non-zero "connection broken by
+                    // remote peer\n" (`status_message`). Derive the
+                    // sentinel text from the status so the two can never
+                    // disagree.
+                    if let Some(proc) = self.processes.get_mut(pid)
+                        && (process_status_is_run(&proc.status)
+                            || ProcessStatusSymbol::from_status_value(proc.status)
+                                == Some(ProcessStatusSymbol::Open))
+                    {
+                        proc.status = process_status_exit_value(256);
+                    }
+                    // Same `status_notify` ordering as the child exit path
+                    // below: the removal decision (src/process.c:7926-7929)
+                    // precedes `exec_sentinel' (:7937), and the type is what
+                    // makes that the only expressible order.
+                    let disposition = self.exited_process_disposition();
+                    let notification = ProcessStatusNotification::settle_status_and_retire(
+                        &mut self.processes,
+                        pid,
+                        ProcessIoTeardown::Network,
+                        disposition,
+                    );
+                    if let Some(notification) = notification {
+                        self.run_status_notification_sentinel(notification)?;
+                    }
+                    handled_terminal_eof = true;
+                }
+                ProcessOutputRead::Failed => {
+                    outcome.record_serviced();
+                    self.processes.retire_process_at_read_failure(pid);
+                    handled_terminal_eof = true;
+                }
+                ProcessOutputRead::Eof => {
+                    saw_pty_eof = true;
+                }
+                ProcessOutputRead::WouldBlock | ProcessOutputRead::NoSource => {}
             }
 
             if handled_terminal_eof {
@@ -9816,6 +10345,7 @@ impl super::super::eval::Context {
                     let stderr_outcome = self.drain_associated_stderr_output_without_notifying(
                         stderr_id,
                         target_process,
+                        ProcessOutputReadPolicy::Live,
                     )?;
                     outcome.absorb(stderr_outcome);
                 }
@@ -9959,9 +10489,11 @@ impl super::super::eval::Context {
             .get(pid)
             .and_then(|proc| process_value_to_id(&proc.stderrproc));
         if let Some(stderr_id) = stderr_id.filter(|id| self.processes.get(*id).is_some()) {
-            outcome.absorb(
-                self.drain_associated_stderr_output_without_notifying(stderr_id, target_process)?,
-            );
+            outcome.absorb(self.drain_associated_stderr_output_without_notifying(
+                stderr_id,
+                target_process,
+                ProcessOutputReadPolicy::FinalDrain,
+            )?);
         }
 
         // GNU `status_notify` settles the status, builds the message and takes

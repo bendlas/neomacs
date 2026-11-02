@@ -23,10 +23,11 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 use rustc_hash::{FxHashMap, FxHasher};
 use strum::{EnumString, IntoStaticStr};
 
+use self::buffer_vocab::BufferId;
+use self::positions::{CharPos0, CharRange};
+use self::text_props::{PropertyInterval, TextPropertyPlistRun, TextPropertyTable};
 use super::error::{Flow, LispCondition, signal};
 use super::intern::{SymId, intern};
-use crate::buffer::text_props::{PropertyInterval, TextPropertyPlistRun, TextPropertyTable};
-use crate::buffer::{CharPos0, CharRange, EmacsBytePos};
 use crate::heap_types::LispString;
 use crate::tagged::gc::{
     HeapWriteKind, MEMORY_USE_COUNT_LEN, MemoryUseCountSlot, note_heap_write, with_tagged_heap,
@@ -56,8 +57,57 @@ pub(crate) enum FunctionSourceIdentity {
     ByteCode(u64),
 }
 
+pub mod buffer_vocab;
+pub mod flow_vocab;
+pub mod positions;
+pub(crate) mod scratch_bridge;
+pub mod text_props;
+
 // Re-export tagged types for downstream use.
 pub use crate::tagged::header::VecLikeType;
+
+/// The logical fields `equal` compares for a marker: the owning buffer (raw
+/// id) and, when attached, the byte position. A detached marker compares
+/// equal to every other detached marker regardless of its stale position.
+/// Reading the raw fields here keeps the bottom layer free of the editing
+/// layer's marker helpers; `editing::marker` delegates to this.
+pub(crate) fn marker_equal_logical_fields(value: &Value) -> Option<(Option<u64>, usize)> {
+    let data = value.as_marker_data()?;
+    let bytepos = if data.buffer_id().is_some() {
+        data.bytepos.get()
+    } else {
+        0
+    };
+    Some((data.buffer_id().map(|buffer| buffer.0), bytepos))
+}
+
+/// [`HashKey`] for a marker, derived from the same logical fields.
+pub(crate) fn marker_equal_hash_key_value(value: &Value) -> HashKey {
+    match marker_equal_logical_fields(value) {
+        Some(parts) => HashKey::Marker(Box::new(parts)),
+        None => HashKey::Ptr(value.bits()),
+    }
+}
+
+/// Bumped by every char-table mutation (allocation included). Consumers that
+/// cache derived per-table state (the syntax parser's flat ASCII entry
+/// table) key their cache on (table identity, this tick): any char-table
+/// write anywhere invalidates all such caches, which is coarse but cheap -
+/// syntax tables are effectively immutable during editing, and a refill is
+/// ~18K Ir amortized over thousands of parses. Lives here because Value's
+/// char-table allocation mints a new table identity; the text layer reads it
+/// downward.
+static CHAR_TABLE_WRITE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn char_table_write_tick() -> u64 {
+    CHAR_TABLE_WRITE_TICK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn bump_char_table_write_tick() {
+    CHAR_TABLE_WRITE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 pub use crate::tagged::value::ValueKind;
 
 // ---------------------------------------------------------------------------
@@ -298,6 +348,14 @@ pub(crate) struct BytecodeInteractiveProbe {
 #[cfg(test)]
 pub(crate) fn bytecode_data_access_count() -> usize {
     BYTECODE_DATA_ACCESS_COUNT.with(Cell::get)
+}
+
+/// Count one byte-code data projection in test builds. The projections
+/// themselves live in `bytecode::value_api`; the counter stays with the
+/// module's test accessors so tests that reset/read it keep one home.
+#[cfg(test)]
+pub(crate) fn note_bytecode_data_access() {
+    BYTECODE_DATA_ACCESS_COUNT.with(|count| count.set(count.get() + 1));
 }
 
 #[inline(always)]
@@ -653,6 +711,78 @@ use crate::tagged::header::{
     CLOSURE_ARGLIST, CLOSURE_CODE, CLOSURE_CONSTANTS, CLOSURE_DOC_STRING, CLOSURE_INTERACTIVE,
 };
 
+/// The symbol identity of a Lisp value, treating an unbound symbol-with-position
+/// wrapper as absent (GNU's `SYMBOLP` plus the unbound check the obarray paths
+/// share). Lives here so the bottom layer's own users -- error-condition
+/// matching included -- need no obarray builtins for it.
+pub(crate) fn symbol_id(value: &Value, mode: crate::tagged::SymbolMode) -> Option<SymId> {
+    value.as_symbol_id(mode).filter(|_| !value.is_unbound())
+}
+
+/// Parse a Lisp arglist Value into LambdaParams.
+pub fn parse_lambda_params_from_value(arglist: &Value) -> Result<LambdaParams, Flow> {
+    use crate::emacs_core::intern::intern;
+    let items = list_to_vec(arglist).unwrap_or_default();
+    let mut required = Vec::new();
+    let mut optional = Vec::new();
+    let mut rest = None;
+    let mut mode = 0; // 0=required, 1=optional, 2=rest
+    for item in &items {
+        let item = if item.is_symbol_with_pos() {
+            item.as_symbol_with_pos_sym().unwrap()
+        } else {
+            *item
+        };
+        if let Some(name) = item.as_bare_symbol_name() {
+            match name {
+                "&optional" => {
+                    mode = 1;
+                    continue;
+                }
+                "&rest" => {
+                    mode = 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let sym_id = item.as_bare_symbol_id().unwrap_or_else(|| intern("_"));
+        match mode {
+            0 => required.push(sym_id),
+            1 => optional.push(sym_id),
+            2 => {
+                rest = Some(sym_id);
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(LambdaParams {
+        required,
+        optional,
+        rest,
+    })
+}
+
+/// Convert LambdaParams to a Lisp list (a b &optional c &rest d).
+pub fn lambda_params_to_value(params: &LambdaParams) -> Value {
+    let mut elements = Vec::new();
+    for p in &params.required {
+        elements.push(Value::from_sym_id(*p));
+    }
+    if !params.optional.is_empty() {
+        elements.push(Value::symbol("&optional"));
+        for p in &params.optional {
+            elements.push(Value::from_sym_id(*p));
+        }
+    }
+    if let Some(ref rest) = params.rest {
+        elements.push(Value::symbol("&rest"));
+        elements.push(Value::from_sym_id(*rest));
+    }
+    Value::list(elements)
+}
+
 impl LambdaData {
     /// Convert LambdaData to a GNU-compatible closure slot vector.
     ///
@@ -660,7 +790,7 @@ impl LambdaData {
     /// All slots are GC-managed Values.
     pub fn to_closure_slots(&self) -> Vec<Value> {
         // Slot 0: arglist as Lisp list
-        let arglist = crate::emacs_core::builtins::lambda_params_to_value(&self.params);
+        let arglist = lambda_params_to_value(&self.params);
 
         // Slot 1: body as Lisp list of forms
         let body = Value::list(self.body.clone());
@@ -1860,9 +1990,14 @@ pub enum ByteCodeKeyPart {
     ObservableSlotCount(usize),
     Value(HashKey),
     Bytes(Box<[u8]>),
-    Ops(Box<[super::bytecode::Op]>),
+    /// Decoded instructions packed one lossless `u64` per op (see the
+    /// byte-code module's key encoder); the value layer never names `Op`.
+    Ops(Box<[u64]>),
     Values(Box<[HashKey]>),
-    Text { char_count: usize, bytes: Box<[u8]> },
+    Text {
+        char_count: usize,
+        bytes: Box<[u8]>,
+    },
     Absent,
 }
 
@@ -1894,7 +2029,7 @@ pub enum HashKey {
     /// of every part rather than encoding type information as sentinel text.
     ByteCode(Box<[ByteCodeKeyPart]>),
     /// Structural marker key for `equal`-test hash tables.
-    Marker(Box<(Option<u64>, EmacsBytePos)>),
+    Marker(Box<(Option<u64>, usize)>),
     /// Structural overlay key for `equal`-test hash tables.
     Overlay(Box<(Option<u64>, usize, usize, HashKey)>),
     /// Structural key for a packed bool-vector (`BoolVectorObj`): its bit
@@ -2267,13 +2402,50 @@ impl ByteCodeKeyPart {
     pub(crate) fn heap_bytes(&self) -> usize {
         match self {
             ByteCodeKeyPart::Bytes(bytes) => bytes.len(),
-            ByteCodeKeyPart::Ops(ops) => ops.len() * size_of::<super::bytecode::Op>(),
+            ByteCodeKeyPart::Ops(ops) => ops.len() * size_of::<u64>(),
             ByteCodeKeyPart::Values(parts) => parts.iter().map(HashKey::heap_bytes).sum(),
             ByteCodeKeyPart::Text { bytes, .. } => bytes.len(),
             ByteCodeKeyPart::Value(key) => key.heap_bytes(),
             _ => 0,
         }
     }
+}
+
+/// The byte-code layer's structural semantics, installed once at startup.
+///
+/// `equal` and `equal`-table keys must walk a byte-code function's structure
+/// (GNU compares and hashes a closure like the pseudovector it is), but the
+/// representation (`ByteCodeFunction`, `Op`, `ByteCodeStructuralPart`) lives
+/// in the byte-code module above this layer. Every entry is used only on a
+/// byte-code value's arm; the ordinary value paths never load these pointers.
+pub(crate) struct BytecodeSemantics {
+    pub(crate) to_equal_key: fn(Value, usize, &mut Vec<usize>, bool) -> HashKey,
+    pub(crate) equal:
+        fn(&Value, &Value, usize, &mut Option<HashSet<EqualSeenPair>>, bool, EqualKind) -> bool,
+    pub(crate) try_equal: fn(
+        &Value,
+        &Value,
+        usize,
+        &mut Option<HashSet<EqualSeenPair>>,
+        bool,
+        EqualKind,
+    ) -> Result<bool, Flow>,
+    pub(crate) sxhash: fn(&Value, usize, crate::tagged::SymbolMode) -> Option<u64>,
+}
+
+static BYTECODE_SEMANTICS: OnceLock<BytecodeSemantics> = OnceLock::new();
+
+/// Install the byte-code module's structural semantics. Idempotent: the
+/// byte-code constructors and `Context::new` both call it, and whichever runs
+/// first wins with the same function table.
+pub(crate) fn install_bytecode_semantics(semantics: BytecodeSemantics) {
+    let _ = BYTECODE_SEMANTICS.set(semantics);
+}
+
+pub(crate) fn bytecode_semantics() -> &'static BytecodeSemantics {
+    BYTECODE_SEMANTICS
+        .get()
+        .expect("bytecode semantics are installed before any byte-code value exists")
 }
 
 impl LispHashTable {
@@ -2554,23 +2726,22 @@ impl IntoSymbol for &str {
     }
 }
 
-// Fixed spellings keep the string constructor's nil/keyword tags and observable
-// symbol accounting, while validating the canonical ID at every call boundary.
-impl IntoSymbol for &super::intern::EpochCachedSymbol {
+// A fixed DEFSYM identity keeps the string constructor's observable symbol
+// accounting. The table's compile-time checks exclude nil, t and keyword
+// spellings, so the tag is always a plain canonical symbol; no runtime name
+// inspection is needed (or possible to get wrong).
+impl IntoSymbol for super::intern::WellKnown {
     #[inline]
     fn into_symbol(self) -> Value {
-        match self.name() {
-            "nil" => Value::NIL,
-            "t" => Value::T,
-            name => {
-                add_wrapping(MemoryUseCountSlot::Symbols, 1);
-                if name.starts_with(':') {
-                    TaggedValue::from_kw_id(self.get())
-                } else {
-                    TaggedValue::from_sym_id(self.get())
-                }
-            }
-        }
+        add_wrapping(MemoryUseCountSlot::Symbols, 1);
+        TaggedValue::from_sym_id(self.id())
+    }
+}
+
+impl IntoSymbol for &super::intern::WellKnown {
+    #[inline]
+    fn into_symbol(self) -> Value {
+        (*self).into_symbol()
     }
 }
 
@@ -2862,7 +3033,7 @@ impl TaggedValue {
     pub fn make_char_table(purpose: Value, init: Value, n_extras: usize) -> Self {
         // A new table can reuse a collected table's address; caches keyed on
         // (table bits, char-table write tick) must not match across that.
-        crate::emacs_core::chartable::bump_char_table_write_tick();
+        bump_char_table_write_tick();
         with_tagged_heap(|h| h.alloc_char_table(purpose, init, n_extras))
     }
 
@@ -2875,7 +3046,7 @@ impl TaggedValue {
         use crate::emacs_core::alloc::{AllocLen, reserved_values};
         let mut extras = reserved_values(count)?;
         extras.resize(count.capacity(), init);
-        crate::emacs_core::chartable::bump_char_table_write_tick();
+        bump_char_table_write_tick();
         Ok(with_tagged_heap(|h| {
             h.alloc_char_table_with_extras(purpose, init, extras)
         }))
@@ -2920,33 +3091,6 @@ impl TaggedValue {
     /// Allocate a macro from already-validated GNU closure slots.
     pub fn make_macro_with_slots(slots: Vec<Value>) -> Self {
         with_tagged_heap(|h| h.alloc_macro(slots))
-    }
-
-    /// Allocate a bytecode function.
-    pub fn make_bytecode(bc: super::bytecode::ByteCodeFunction) -> Self {
-        // Test builds hand-assemble instruction vectors all over the suite;
-        // route them through the real sealing normalizer so they may enter
-        // the unchecked-fetch driver. Production sealing happens exclusively
-        // in the decode installers — this branch must never widen to release
-        // builds, or the `ops_sealed` marker would stop proving anything.
-        #[cfg(test)]
-        let bc = {
-            let mut bc = bc;
-            bc.seal_hand_assembled_ops_for_test();
-            bc
-        };
-        with_tagged_heap(|h| h.alloc_bytecode(bc))
-    }
-
-    /// Allocate a `make-closure` instance of `proto` with the constant pool
-    /// `constants` and the prototype's code-string object `code`, built in
-    /// place in its arena slot (see `TaggedHeap::alloc_bytecode_instance`).
-    pub(crate) fn make_bytecode_instance(
-        proto: &super::bytecode::ByteCodeFunction,
-        constants: crate::tagged::header::LispValueVec,
-        code: Value,
-    ) -> Self {
-        with_tagged_heap(|h| h.alloc_bytecode_instance(proto, constants, code))
     }
 
     /// Allocate a hash table.
@@ -3007,13 +3151,15 @@ impl TaggedValue {
         with_tagged_heap(|h| h.alloc_marker(data))
     }
 
-    /// Allocate an overlay.
-    pub fn make_overlay(data: impl Into<crate::heap_types::OverlayData>) -> Self {
-        with_tagged_heap(|h| h.alloc_overlay(data.into()))
+    /// Allocate an overlay. A fresh object's precedence serial is minted by
+    /// the World's heap before the value is published; `Preserved` sources
+    /// (observer copies, buffered copies, image loads) keep their identity.
+    pub fn make_overlay(init: crate::heap_types::OverlayDataInit) -> Self {
+        with_tagged_heap(|h| h.alloc_overlay(init))
     }
 
     /// Allocate a buffer reference.
-    pub fn make_buffer(id: crate::buffer::BufferId) -> Self {
+    pub fn make_buffer(id: BufferId) -> Self {
         with_tagged_heap(|h| {
             if let Some(value) = h.buffer_value(id) {
                 value
@@ -3070,7 +3216,7 @@ impl TaggedValue {
     /// cache, exactly like `make_buffer`/`make_timer`.  A process that has
     /// exited is still a process object in GNU (status `exit`/`signal`), so the
     /// cached value is never evicted on `delete-process`.
-    pub fn make_process(id: crate::emacs_core::process::ProcessId) -> Self {
+    pub fn make_process(id: u64) -> Self {
         with_tagged_heap(|h| {
             if let Some(value) = h.process_value(id) {
                 value
@@ -3129,23 +3275,56 @@ impl TaggedValue {
         with_tagged_heap(|h| h.alloc_video_handle(video_id))
     }
 
-    /// Allocate an opaque thread, mutex or condition-variable handle.
-    ///
-    /// `kind` must be one of `VecLikeType::{Thread, Mutex, CondVar}`.
-    pub(crate) fn make_threading_handle(kind: crate::tagged::header::VecLikeType, id: u64) -> Self {
-        with_tagged_heap(|h| h.alloc_threading_handle(kind, id))
-    }
-
-    /// The id inside a thread, mutex or condition-variable handle, or `None`
-    /// for any other value.
+    /// The native scheduler key inside a thread, mutex or condition variable.
+    /// This does not establish registry membership or extend object liveness.
     pub(crate) fn threading_handle_id(self) -> Option<u64> {
-        use crate::tagged::header::VecLikeType;
-        match self.veclike_type()? {
-            VecLikeType::Thread | VecLikeType::Mutex | VecLikeType::CondVar => {}
-            _ => return None,
+        use crate::tagged::header::{CondVarObj, MutexObj, ThreadObj};
+        let header = self.as_veclike_ptr()?;
+        // SAFETY: the observed live vectorlike value owns its initialized
+        // header. Each exhaustive tag arm selects the matching concrete
+        // layout and copies only its immutable native identity.
+        unsafe {
+            match (*header).type_tag {
+                VecLikeType::Thread => {
+                    Some((*(header as *const ThreadObj)).payload.id.native_key())
+                }
+                VecLikeType::Mutex => Some((*(header as *const MutexObj)).payload.id.native_key()),
+                VecLikeType::CondVar => {
+                    Some((*(header as *const CondVarObj)).payload.id.native_key())
+                }
+                VecLikeType::Vector
+                | VecLikeType::Bignum
+                | VecLikeType::Marker
+                | VecLikeType::Overlay
+                | VecLikeType::Finalizer
+                | VecLikeType::SymbolWithPos
+                | VecLikeType::UserPtr
+                | VecLikeType::Process
+                | VecLikeType::Frame
+                | VecLikeType::Window
+                | VecLikeType::BoolVector
+                | VecLikeType::Buffer
+                | VecLikeType::HashTable
+                | VecLikeType::Obarray
+                | VecLikeType::Terminal
+                | VecLikeType::WindowConfiguration
+                | VecLikeType::Subr
+                | VecLikeType::Xwidget
+                | VecLikeType::XwidgetView
+                | VecLikeType::ModuleFunction
+                | VecLikeType::Sqlite
+                | VecLikeType::Lambda
+                | VecLikeType::CharTable
+                | VecLikeType::SubCharTable
+                | VecLikeType::Record
+                | VecLikeType::Font
+                | VecLikeType::Macro
+                | VecLikeType::ByteCode
+                | VecLikeType::Timer
+                | VecLikeType::SurfaceHandle
+                | VecLikeType::VideoHandle => None,
+            }
         }
-        let ptr = self.as_veclike_ptr()? as *const crate::tagged::header::ThreadingHandleObj;
-        Some(unsafe { (*ptr).id })
     }
 
     /// Allocate an opaque SQLite database or statement object.
@@ -3478,7 +3657,7 @@ impl TaggedValue {
         let cell = self.closure_parsed_params_cell()?;
         Some(cell.get_or_init(|| {
             let arglist = self.closure_slot(CLOSURE_ARGLIST).unwrap_or(Value::NIL);
-            crate::emacs_core::builtins::parse_lambda_params_from_value(&arglist)
+            parse_lambda_params_from_value(&arglist)
                 .unwrap_or_else(|_| LambdaParams::simple(vec![]))
         }))
     }
@@ -3557,134 +3736,6 @@ impl TaggedValue {
         self.closure_slot(CLOSURE_INTERACTIVE)
     }
 
-    /// Borrow the ByteCodeFunction from a ByteCode value.
-    ///
-    /// THE materialization seam: a lazy pdump stub is built from its mapped
-    /// extras here, once, on the mutator thread, before any caller sees the
-    /// data. Everything that reads bytecode data routes through this (the
-    /// architecture test pins it), so a stub can never leak empty vectors.
-    pub fn get_bytecode_data(self) -> Option<&'static super::bytecode::ByteCodeFunction> {
-        #[cfg(test)]
-        BYTECODE_DATA_ACCESS_COUNT.with(|count| count.set(count.get() + 1));
-        // Observe before the header and data projections, which share this
-        // identity and have no intervening Lisp call or write.
-        let header = self.as_veclike_ptr()?;
-        if unsafe { (*header).type_tag } == VecLikeType::ByteCode {
-            let ptr = header as *const ByteCodeObj;
-            let data = unsafe { &(*ptr).data };
-            if data.is_pdump_stub() {
-                crate::emacs_core::pdump::materialize_and_publish_stub(self);
-            }
-            Some(unsafe { &(*ptr).data })
-        } else {
-            None
-        }
-    }
-
-    /// Project bytecode data when the caller has established that this
-    /// mutator has no active capture at this read. Private synchronous map
-    /// traversal can retain that policy across a callback only because every
-    /// nested capture finishes before traversal resumes. Prologue hooks and
-    /// callback Lisp reads must continue using ordinary observed accessors.
-    ///
-    /// The caller re-reads and materializes data after its GC/debugger
-    /// prologue; this caches no pointer or Lisp state. Other mutators capture
-    /// their own reads and do not require this mutator to observe dependencies.
-    #[cfg(feature = "jit")]
-    #[inline(always)]
-    pub(crate) fn get_bytecode_data_unobserved(
-        self,
-    ) -> Option<&'static super::bytecode::ByteCodeFunction> {
-        debug_assert!(!crate::tagged::collection_reads::is_active());
-        #[cfg(test)]
-        BYTECODE_DATA_ACCESS_COUNT.with(|count| count.set(count.get() + 1));
-        if !self.is_veclike() {
-            return None;
-        }
-        let header = (self.bits() & !TAG_MASK) as *const crate::tagged::header::VecLikeHeader;
-        if unsafe { (*header).type_tag } != VecLikeType::ByteCode {
-            return None;
-        }
-        let ptr = header as *const ByteCodeObj;
-        let data = unsafe { &(*ptr).data };
-        if data.is_pdump_stub() {
-            crate::emacs_core::pdump::materialize_and_publish_stub(self);
-        }
-        Some(unsafe { &(*ptr).data })
-    }
-
-    /// Whether `self` is the byte-code object whose data is `f`: an address
-    /// comparison that, unlike [`Self::get_bytecode_data`], never materializes
-    /// a lazy pdump stub (a compile asking "is this function cell me?" must
-    /// not build every stub it merely looks at).
-    pub(crate) fn is_bytecode_object_of(self, f: &super::bytecode::ByteCodeFunction) -> bool {
-        if self.veclike_type() != Some(VecLikeType::ByteCode) {
-            return false;
-        }
-        let ptr = self.as_veclike_ptr().unwrap() as *const ByteCodeObj;
-        // SAFETY: `ptr` addresses a live byte-code object (the type test
-        // above); `addr_of!` forms the field address without reading it.
-        std::ptr::eq(unsafe { std::ptr::addr_of!((*ptr).data) }, f)
-    }
-
-    /// [`Self::get_bytecode_data`] for callers that ALREADY proved the
-    /// veclike type — the VM's resolved-callee token proves it at mint, and
-    /// re-checking on every `code()` projection measured +7.3 Ir/call on the
-    /// tier-0 differential. Lives here, at the chokepoint file, because this
-    /// is exactly where the lazy pdump stub check (two loads + a predictable
-    /// branch to a cold materializer) lands: the caller's type proof does not
-    /// exempt it from materialization, only from re-classification.
-    ///
-    /// SAFETY contract (checked in debug): `self` must be a ByteCode value.
-    #[inline(always)]
-    pub(crate) fn bytecode_data_typechecked_by_caller(
-        self,
-    ) -> &'static super::bytecode::ByteCodeFunction {
-        debug_assert_eq!(self.veclike_type(), Some(VecLikeType::ByteCode));
-        #[cfg(test)]
-        BYTECODE_DATA_ACCESS_COUNT.with(|count| count.set(count.get() + 1));
-        let ptr = (self.bits() & !TAG_MASK) as *const ByteCodeObj;
-        // SAFETY: the caller's type proof (debug-asserted above) establishes
-        // a live ByteCodeObj; bytecode arena/mapped objects are immovable.
-        let data = unsafe { &(*ptr).data };
-        if data.is_pdump_stub() {
-            crate::emacs_core::pdump::materialize_and_publish_stub(self);
-            return unsafe { &(*ptr).data };
-        }
-        data
-    }
-
-    /// [`Self::bytecode_data_typechecked_by_caller`] for a caller that has
-    /// ALSO proved the object materialized: the JIT's armed spec site, whose
-    /// slot caches a leaf compiled from this very object's instruction
-    /// stream (`get_bytecode_data` materialized it before the leaf could be
-    /// resolved, and a stub is materialized in place, once, for good). Skips
-    /// the type check and the stub probe both — six instructions on a call
-    /// path that runs five million times in a package load.
-    ///
-    /// # Safety
-    /// `self` must be a ByteCode value whose data was materialized by an
-    /// earlier `get_bytecode_data` on the same object (debug-asserted).
-    #[cfg(feature = "jit")]
-    #[inline(always)]
-    pub(crate) unsafe fn bytecode_data_materialized_by_caller(
-        self,
-    ) -> &'static super::bytecode::ByteCodeFunction {
-        debug_assert_eq!(self.veclike_type(), Some(VecLikeType::ByteCode));
-        #[cfg(test)]
-        BYTECODE_DATA_ACCESS_COUNT.with(|count| count.set(count.get() + 1));
-        let ptr = (self.bits() & !TAG_MASK) as *const ByteCodeObj;
-        // SAFETY: the caller's type and materialization proofs (debug-asserted)
-        // establish a live, filled ByteCodeObj; bytecode arena/mapped objects
-        // are immovable.
-        let data = unsafe { &(*ptr).data };
-        debug_assert!(
-            !data.is_pdump_stub(),
-            "caller promised a materialized function"
-        );
-        data
-    }
-
     /// The word a byte-code object's `runtime` field holds (`None` for any
     /// other value): the source identity a compiled closure-source guard
     /// compares (`jit_layout::BYTECODE_RUNTIME_WORD_OFFSET`), 0 on a pdump
@@ -3705,21 +3756,6 @@ impl TaggedValue {
                 .cast::<usize>()
                 .read()
         })
-    }
-
-    /// [`Self::get_bytecode_data`] that promises NOT to materialize a lazy
-    /// pdump stub (once stubs exist): the peek for scanners that only care
-    /// about already-live functions — AOT post-insert marking, PGO drains.
-    /// Today (pre-stub) it is the same borrow.
-    pub(crate) fn bytecode_data_if_materialized(
-        self,
-    ) -> Option<&'static super::bytecode::ByteCodeFunction> {
-        if self.veclike_type()? != VecLikeType::ByteCode {
-            return None;
-        }
-        let ptr = self.as_veclike_ptr().unwrap() as *const ByteCodeObj;
-        let data = unsafe { &(*ptr).data };
-        (!data.is_pdump_stub()).then_some(data)
     }
 
     /// The Lisp object `aref` returns for byte-code closure slot `slot`: one
@@ -3790,67 +3826,6 @@ impl TaggedValue {
         (!cached.is_nil()).then_some(cached)
     }
 
-    /// The command-classification facts of a bytecode value, WITHOUT forcing
-    /// full materialization (once stubs exist, this reads the raw mapped
-    /// extras header): closure slot count plus the interactive/doc-form
-    /// slots. Serving `commandp`/`interactive-form`/`command-modes` through
-    /// this probe keeps the first obarray-wide M-x sweep from materializing
-    /// every dumped function in one burst.
-    /// Raw-header required-only check for a still-stub function; `None` when
-    /// the value is not bytecode, `Some(materialized-or-raw answer)` else —
-    /// without materializing a stub.
-    pub(crate) fn bytecode_params_required_only_probe(self) -> Option<bool> {
-        if self.veclike_type()? != VecLikeType::ByteCode {
-            return None;
-        }
-        let ptr = self.as_veclike_ptr().unwrap() as *const ByteCodeObj;
-        let data = unsafe { &(*ptr).data };
-        if data.is_pdump_stub() {
-            return Some(unsafe {
-                crate::emacs_core::pdump::stub_params_required_only(ptr, data.closure_slot_count)
-            });
-        }
-        Some(data.params.fixed_arity().is_some())
-    }
-
-    /// The required-parameter count of a byte-code function that takes only
-    /// required parameters, `None` for any other function or value — read
-    /// from a lazy pdump stub's raw header without materializing it.
-    pub(crate) fn bytecode_required_only_arity_probe(self) -> Option<usize> {
-        if self.veclike_type()? != VecLikeType::ByteCode {
-            return None;
-        }
-        let ptr = self.as_veclike_ptr().unwrap() as *const ByteCodeObj;
-        let data = unsafe { &(*ptr).data };
-        if data.is_pdump_stub() {
-            return unsafe {
-                crate::emacs_core::pdump::stub_required_only_arity(ptr, data.closure_slot_count)
-            };
-        }
-        data.params.fixed_arity()
-    }
-
-    pub(crate) fn bytecode_interactive_probe(self) -> Option<BytecodeInteractiveProbe> {
-        if self.veclike_type()? != VecLikeType::ByteCode {
-            return None;
-        }
-        let ptr = self.as_veclike_ptr().unwrap() as *const ByteCodeObj;
-        let data = unsafe { &(*ptr).data };
-        if data.is_pdump_stub() {
-            // Read the raw mapped extras header — the whole point of this
-            // probe is that an obarray-wide commandp/interactive sweep must
-            // not materialize 6,779 functions in one burst.
-            return Some(unsafe {
-                crate::emacs_core::pdump::stub_interactive_probe(ptr, data.closure_slot_count)
-            });
-        }
-        Some(BytecodeInteractiveProbe {
-            slot_count: data.observable_closure_slot_count(),
-            interactive: data.interactive,
-            doc_form: data.doc_form,
-        })
-    }
-
     /// Get the pointer address as a unique identity for a string value.
     /// Used for text property operations.
     pub fn str_ptr_key(self) -> Option<usize> {
@@ -3858,7 +3833,7 @@ impl TaggedValue {
     }
 
     /// Get the buffer ID from a buffer value.
-    pub fn as_buffer_id(self) -> Option<crate::buffer::BufferId> {
+    pub fn as_buffer_id(self) -> Option<BufferId> {
         if self.is_buffer() {
             let ptr = self.as_veclike_ptr().unwrap() as *const BufferObj;
             Some(unsafe { (*ptr).id })
@@ -3898,7 +3873,7 @@ impl TaggedValue {
     }
 
     /// Get the process ID from a process value.
-    pub fn as_process_id(self) -> Option<crate::emacs_core::process::ProcessId> {
+    pub fn as_process_id(self) -> Option<u64> {
         if self.is_process() {
             let ptr = self.as_veclike_ptr().unwrap() as *const ProcessObj;
             Some(unsafe { (*ptr).id })
@@ -4038,18 +4013,11 @@ impl TaggedValue {
         }
     }
 
-    /// Mutate a packed bool-vector's bits in place. No write barrier: a
-    /// bool-vector holds no Lisp values, and the GC thread never reads its
-    /// words.
+    /// Mutate packed bits through the centralized collection journal.
+    /// Bool-vectors contain no Lisp references and need no GC pointer barrier.
     #[inline]
     pub fn with_bool_vector_mut<R>(self, f: impl FnOnce(&mut BoolVectorObj) -> R) -> Option<R> {
-        if !self.is_bool_vector_obj() {
-            return None;
-        }
-        let ptr = self.as_veclike_ptr().unwrap() as *mut BoolVectorObj;
-        #[cfg(debug_assertions)]
-        let _guard = mutate::HeapMutClosureGuard::enter();
-        Some(f(unsafe { &mut *ptr }))
+        mutate::with_bool_vector_mut(self, f)
     }
 
     /// Borrow a GNU-shaped char-table object.
@@ -4315,7 +4283,7 @@ impl TaggedValue {
         self.to_eql_key()
     }
 
-    fn to_eq_key(self) -> HashKey {
+    pub(crate) fn to_eq_key(self) -> HashKey {
         match self.kind() {
             ValueKind::Nil => HashKey::Nil,
             ValueKind::T => HashKey::True,
@@ -4372,7 +4340,7 @@ impl TaggedValue {
         self.to_equal_key_depth_swp(0, &mut seen, symbols_with_pos_enabled)
     }
 
-    fn to_equal_key_depth_swp(
+    pub(crate) fn to_equal_key_depth_swp(
         self,
         depth: usize,
         seen: &mut Vec<usize>,
@@ -4458,9 +4426,7 @@ impl TaggedValue {
                 seen.pop();
                 HashKey::EqualVec(keys.into_boxed_slice())
             }
-            ValueKind::Veclike(VecLikeType::Marker) => {
-                super::marker::marker_equal_hash_key_value(&self)
-            }
+            ValueKind::Veclike(VecLikeType::Marker) => marker_equal_hash_key_value(&self),
             ValueKind::Veclike(VecLikeType::Overlay) => {
                 if let Some(overlay) = self.as_overlay_data() {
                     let (start, end) = overlay.current_range();
@@ -4484,7 +4450,12 @@ impl TaggedValue {
                     return HashKey::Cycle(index as u32);
                 }
                 seen.push(ptr);
-                let key = bytecode_to_equal_key(self, depth + 1, seen, symbols_with_pos_enabled);
+                let key = (bytecode_semantics().to_equal_key)(
+                    self,
+                    depth + 1,
+                    seen,
+                    symbols_with_pos_enabled,
+                );
                 seen.pop();
                 key
             }
@@ -4675,19 +4646,19 @@ pub fn try_equal_value_including_properties_swp(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EqualKind {
+pub(crate) enum EqualKind {
     Plain,
     IncludingProperties,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct EqualSeenPair {
+pub(crate) struct EqualSeenPair {
     left_bits: usize,
     right_bits: usize,
 }
 
 impl EqualSeenPair {
-    fn new(left: Value, right: Value) -> Self {
+    pub(crate) fn new(left: Value, right: Value) -> Self {
         Self {
             left_bits: left.bits(),
             right_bits: right.bits(),
@@ -4783,7 +4754,7 @@ impl StructuralPseudovectorView<'_> {
     }
 }
 
-fn equal_value_inner(
+pub(crate) fn equal_value_inner(
     left: &Value,
     right: &Value,
     depth: usize,
@@ -4884,8 +4855,7 @@ fn equal_value_inner(
 
     match left_type {
         VecLikeType::Marker => {
-            super::marker::marker_equal_logical_fields(&left)
-                == super::marker::marker_equal_logical_fields(&right)
+            marker_equal_logical_fields(&left) == marker_equal_logical_fields(&right)
         }
         VecLikeType::Bignum => {
             left.as_bignum().expect("left bignum") == right.as_bignum().expect("right bignum")
@@ -4946,7 +4916,7 @@ fn equal_value_inner(
         }
         VecLikeType::HashTable => false,
         VecLikeType::ByteCode => {
-            bytecode_equal(&left, &right, depth, seen, symbols_with_pos_enabled, kind)
+            (bytecode_semantics().equal)(&left, &right, depth, seen, symbols_with_pos_enabled, kind)
         }
         VecLikeType::Lambda => {
             if depth > 10 {
@@ -5058,7 +5028,7 @@ fn equal_value_cycle(
     Ok(false)
 }
 
-fn try_equal_value_inner(
+pub(crate) fn try_equal_value_inner(
     left: &Value,
     right: &Value,
     depth: usize,
@@ -5197,8 +5167,9 @@ fn try_equal_value_inner(
     }
 
     match left_type {
-        VecLikeType::Marker => Ok(super::marker::marker_equal_logical_fields(&left)
-            == super::marker::marker_equal_logical_fields(&right)),
+        VecLikeType::Marker => {
+            Ok(marker_equal_logical_fields(&left) == marker_equal_logical_fields(&right))
+        }
         VecLikeType::Bignum => {
             Ok(left.as_bignum().expect("left bignum") == right.as_bignum().expect("right bignum"))
         }
@@ -5257,9 +5228,14 @@ fn try_equal_value_inner(
             Ok(true)
         }
         VecLikeType::HashTable => Ok(false),
-        VecLikeType::ByteCode => {
-            try_bytecode_equal(&left, &right, depth, seen, symbols_with_pos_enabled, kind)
-        }
+        VecLikeType::ByteCode => (bytecode_semantics().try_equal)(
+            &left,
+            &right,
+            depth,
+            seen,
+            symbols_with_pos_enabled,
+            kind,
+        ),
         VecLikeType::Lambda => {
             if depth > 10 {
                 let pair = EqualSeenPair::new(left, right);
@@ -5287,52 +5263,6 @@ fn try_equal_value_inner(
         }
         _ => Ok(false),
     }
-}
-
-/// `equal`-table key for a byte-code object, derived from
-/// [`ByteCodeFunction::structural_parts`] so it agrees with [`bytecode_equal`]
-/// by construction: equal objects produce equal keys, and every difference
-/// `equal` sees -- including an absent versus a present-but-`nil` captured
-/// environment, and a docstring's character count -- reaches the key.  GNU's
-/// `sxhash_obj` -> `sxhash_vector` gives equal closures one bucket
-/// (src/fns.c:5525-5536); this is the table's side of that promise.
-fn bytecode_to_equal_key(
-    value: Value,
-    depth: usize,
-    seen: &mut Vec<usize>,
-    symbols_with_pos_enabled: bool,
-) -> HashKey {
-    use super::bytecode::ByteCodeStructuralPart as Part;
-    if depth > 200 {
-        return value.to_eq_key();
-    }
-    let Some(bc) = value.get_bytecode_data() else {
-        return value.to_eq_key();
-    };
-    let mut key_of =
-        |slot: &Value| slot.to_equal_key_depth_swp(depth + 1, seen, symbols_with_pos_enabled);
-    let parts = bc.structural_parts();
-    let mut keys = Vec::with_capacity(parts.len());
-    for part in parts {
-        keys.push(match part {
-            Part::ObservableSlotCount(count) => ByteCodeKeyPart::ObservableSlotCount(count),
-            Part::Value(value) => ByteCodeKeyPart::Value(key_of(&value)),
-            Part::Bytes(bytes) => ByteCodeKeyPart::Bytes(bytes.into()),
-            Part::Ops(ops) => ByteCodeKeyPart::Ops(ops.into()),
-            Part::Values(values) => {
-                ByteCodeKeyPart::Values(values.iter().map(&mut key_of).collect())
-            }
-            // GNU string equality is characters + bytes + contents; the
-            // representation flag is not part of it, and the character count
-            // is (two raw bytes are not one multibyte character).
-            Part::Text(text) => ByteCodeKeyPart::Text {
-                char_count: text.schars(),
-                bytes: text.as_bytes().into(),
-            },
-            Part::Absent => ByteCodeKeyPart::Absent,
-        });
-    }
-    HashKey::ByteCode(keys.into_boxed_slice())
 }
 
 fn closure_to_equal_key(
@@ -5514,123 +5444,6 @@ fn try_closure_equal(
     }
 }
 
-/// GNU string equality (src/fns.c `internal_equal_1`, `Lisp_String`):
-/// character count, byte count and contents.  The unibyte/multibyte
-/// representation flag `LispString::eq` also compares is not part of it: an
-/// ASCII string stored unibyte equals the same text stored multibyte, while
-/// two raw bytes never equal the one multibyte character with those bytes.
-fn gnu_string_contents_equal(left: &LispString, right: &LispString) -> bool {
-    left.schars() == right.schars()
-        && left.sbytes() == right.sbytes()
-        && left.as_bytes() == right.as_bytes()
-}
-
-/// The slot walk behind both [`bytecode_equal`] and [`try_bytecode_equal`]:
-/// GNU's `ASIZE` check first, then [`ByteCodeFunction::structural_parts`]
-/// pairwise, with `value_equal` deciding the Lisp values (constants at one
-/// extra level of depth, as elements of the vector they sit in).
-fn bytecode_slots_equal(
-    left: &super::bytecode::ByteCodeFunction,
-    right: &super::bytecode::ByteCodeFunction,
-    depth: usize,
-    value_equal: &mut dyn FnMut(&Value, &Value, usize) -> Result<bool, Flow>,
-) -> Result<bool, Flow> {
-    use super::bytecode::ByteCodeStructuralPart as Part;
-    let (left_parts, right_parts) = (left.structural_parts(), right.structural_parts());
-    if left_parts.len() != right_parts.len() {
-        return Ok(false);
-    }
-    for (left, right) in left_parts.zip(right_parts) {
-        let equal = match (left, right) {
-            (Part::ObservableSlotCount(a), Part::ObservableSlotCount(b)) => a == b,
-            (Part::Value(a), Part::Value(b)) => value_equal(&a, &b, depth + 1)?,
-            (Part::Bytes(a), Part::Bytes(b)) => a == b,
-            (Part::Ops(a), Part::Ops(b)) => a == b,
-            (Part::Values(a), Part::Values(b)) => {
-                if a.len() != b.len() {
-                    return Ok(false);
-                }
-                for (a, b) in a.iter().zip(b) {
-                    if !value_equal(a, b, depth + 2)? {
-                        return Ok(false);
-                    }
-                }
-                true
-            }
-            (Part::Text(a), Part::Text(b)) => gnu_string_contents_equal(a, b),
-            (Part::Absent, Part::Absent) => true,
-            _ => false,
-        };
-        if !equal {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// GNU `internal_equal_1` compares a `PVEC_CLOSURE` exactly like a vector
-/// (src/fns.c:2984-2998 in emacs-31.1, :2987-3001 on master): the `ASIZE`
-/// test first -- which is also the type test, so a five-slot closure never
-/// equals a four-slot one -- then every slot element-wise.  This port keeps
-/// a byte-code function's GNU slots in typed fields, so the walk reads
-/// [`ByteCodeFunction::structural_parts`], the one place that spells the
-/// schema; `make-closure` (bytecode.c `Fmake_closure`) copies the prototype
-/// and replaces the leading constants, so two instances of one prototype
-/// with `equal` captures are `equal` -- the property `remove-hook` needs to
-/// find a closure it was handed a freshly rebuilt twin of.
-fn bytecode_equal(
-    left: &Value,
-    right: &Value,
-    depth: usize,
-    seen: &mut Option<HashSet<EqualSeenPair>>,
-    symbols_with_pos_enabled: bool,
-    kind: EqualKind,
-) -> bool {
-    let (Some(l), Some(r)) = (left.get_bytecode_data(), right.get_bytecode_data()) else {
-        return false;
-    };
-    if depth > 10 {
-        let pair = EqualSeenPair::new(*left, *right);
-        if !seen.get_or_insert_with(HashSet::new).insert(pair) {
-            return true;
-        }
-    }
-    bytecode_slots_equal(l, r, depth, &mut |a, b, depth| {
-        Ok(equal_value_inner(
-            a,
-            b,
-            depth,
-            seen,
-            symbols_with_pos_enabled,
-            kind,
-        ))
-    })
-    .unwrap_or(false)
-}
-
-/// [`bytecode_equal`] for the error-propagating walk.
-fn try_bytecode_equal(
-    left: &Value,
-    right: &Value,
-    depth: usize,
-    seen: &mut Option<HashSet<EqualSeenPair>>,
-    symbols_with_pos_enabled: bool,
-    kind: EqualKind,
-) -> Result<bool, Flow> {
-    let (Some(l), Some(r)) = (left.get_bytecode_data(), right.get_bytecode_data()) else {
-        return Ok(false);
-    };
-    if depth > 10 {
-        let pair = EqualSeenPair::new(*left, *right);
-        if !seen.get_or_insert_with(HashSet::new).insert(pair) {
-            return Ok(true);
-        }
-    }
-    bytecode_slots_equal(l, r, depth, &mut |a, b, depth| {
-        try_equal_value_inner(a, b, depth, seen, symbols_with_pos_enabled, kind)
-    })
-}
-
 // ---------------------------------------------------------------------------
 // List iteration helpers
 // ---------------------------------------------------------------------------
@@ -5731,10 +5544,35 @@ pub fn list_to_vec(value: &Value) -> Option<Vec<Value>> {
 }
 
 /// Length of a list (counts cons cells).
+///
+/// Argument lists are almost always short and acyclic, so the first
+/// [`LIST_LENGTH_SHORT_LIMIT`] cells are walked without Floyd's tortoise.
+/// A list that reaches the limit is re-walked from the head with the cycle
+/// check, so a circular input is still rejected; the only cost is one extra
+/// pass over the first few cells of a genuinely long list.
+#[inline]
 pub fn list_length(value: &Value) -> Option<usize> {
+    let mut len = 0usize;
+    let mut tail = *value;
+    while len < LIST_LENGTH_SHORT_LIMIT {
+        if tail.is_nil() {
+            return Some(len);
+        }
+        if !tail.is_cons() {
+            return None; // improper tail
+        }
+        len += 1;
+        tail = tail.cons_cdr();
+    }
+    list_length_checked(*value)
+}
+
+/// The long/circular arm of [`list_length`]: Floyd's tortoise and hare over
+/// the whole value, including the cells the short walk already counted.
+fn list_length_checked(value: Value) -> Option<usize> {
     let mut len = 0;
-    let mut tortoise = *value;
-    let mut hare = *value;
+    let mut tortoise = value;
+    let mut hare = value;
     loop {
         if hare.is_nil() {
             return Some(len);
@@ -5760,6 +5598,10 @@ pub fn list_length(value: &Value) -> Option<usize> {
         }
     }
 }
+
+/// Cells walked by [`list_length`]'s unchecked short path before it falls
+/// back to the cycle-checking walk.
+const LIST_LENGTH_SHORT_LIMIT: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Display

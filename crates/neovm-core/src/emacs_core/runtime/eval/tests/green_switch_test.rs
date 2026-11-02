@@ -23,6 +23,165 @@ fn green() -> Context {
     Context::new_with_threading(ThreadingMode::Green)
 }
 
+/// Native protocol owned by one test invocation, never evaluator/TLS state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyWriteCommitted {
+    ReadyBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+enum ParkOutputError {
+    #[error("Main Select witness receiver closed")]
+    WitnessReceiverClosed,
+    #[error("real output write acknowledgement missing")]
+    WriteAckMissing,
+    #[error("real output writer disconnected")]
+    WriteAckDisconnected,
+    #[error("Main Select owner closed before failure cancellation")]
+    ParkOwnerClosed,
+}
+static_assertions::assert_impl_all!(ParkOutputError: std::error::Error, Send, Sync);
+
+#[must_use]
+#[derive(Debug)]
+struct ParkOutputGate {
+    parked: std::sync::mpsc::Receiver<super::scheduler::SelectParked>,
+    committed: std::sync::mpsc::Sender<ReadyWriteCommitted>,
+    expectation: super::scheduler::SelectParkExpectation,
+}
+
+static_assertions::assert_impl_all!(ParkOutputGate: Send, std::fmt::Debug);
+static_assertions::assert_not_impl_any!(ParkOutputGate: Clone, Copy);
+
+fn main_select_park_gate(
+    ev: &mut Context,
+    expectation: super::scheduler::SelectParkExpectation,
+) -> (
+    ParkOutputGate,
+    std::sync::mpsc::Receiver<Result<(), ParkOutputError>>,
+) {
+    // Green startup is lazy. This existing thread path seats its owner before
+    // subscribing to that runtime's Control, outside the target timing window.
+    ev.eval_str("(thread-join (make-thread (lambda () nil)))")
+        .expect("seat the owned Green scheduler");
+    let (sender, parked) = std::sync::mpsc::channel();
+    let (committed, ack) = std::sync::mpsc::channel();
+    let (completed, completion) = std::sync::mpsc::channel();
+    let control = std::sync::Arc::clone(&ev.green_seat().expect("Green main seat").control);
+    // The one-shot lives in Control; retaining its Arc here would create
+    // an owner cycle if preparation refuses before the callback is consumed.
+    let cancel_control = std::sync::Arc::downgrade(&control);
+    let cancel = ev.quit_requested.clone();
+    control.after_next_select_park_for_test(
+        super::scheduler::ThreadKey::Main,
+        expectation,
+        move |witness| {
+            let outcome = sender
+                .send(witness)
+                .map_err(|_| ParkOutputError::WitnessReceiverClosed)
+                .and_then(
+                    |()| match ack.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(ReadyWriteCommitted::ReadyBytes) => Ok(()),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            Err(ParkOutputError::WriteAckMissing)
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            Err(ParkOutputError::WriteAckDisconnected)
+                        }
+                    },
+                );
+            // This callback runs outside Control.state's mutex, before
+            // pick_next, while the Baton remains local. A matching Main
+            // Select cannot become Runnable until the write ACK or failure.
+            if outcome.is_err() {
+                cancel.request();
+                match cancel_control.upgrade() {
+                    Some(control) => control.wake(super::scheduler::ThreadKey::Main),
+                    None => {
+                        let _ = completed.send(Err(ParkOutputError::ParkOwnerClosed));
+                        return;
+                    }
+                }
+            }
+            let _ = completed.send(outcome);
+        },
+    );
+    (
+        ParkOutputGate {
+            parked,
+            committed,
+            expectation,
+        },
+        completion,
+    )
+}
+
+fn write_ready_after_main_select_park(
+    listener: std::net::TcpListener,
+    gate: ParkOutputGate,
+) -> std::io::Result<std::net::TcpStream> {
+    use std::io::Write;
+    use std::time::Duration;
+    listener.set_nonblocking(true)?;
+    let poller = polling::Poller::new()?;
+    // SAFETY: listener remains owned here until after the local poller is
+    // deleted/dropped; no descriptor can be closed or replaced concurrently.
+    unsafe {
+        poller.add(&listener, polling::Event::readable(1))?;
+    }
+    let mut events = polling::Events::new();
+    poller.wait(&mut events, Some(Duration::from_secs(5)))?;
+    if !events.iter().any(|event| event.key == 1 && event.readable) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Green peer never connected",
+        ));
+    }
+    let (mut stream, _) = listener.accept()?;
+    poller.delete(&listener)?;
+    let witness = gate
+        .parked
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "actual Main Select witness missing",
+            )
+        })?;
+    if witness.owner() != super::scheduler::ThreadKey::Main {
+        return Err(std::io::Error::other("unexpected Main Select owner"));
+    }
+    // The callback holds this committed transition until our write ACK;
+    // its nominal deadline is diagnostic, not a substitute for ownership.
+    let _nominal_wait_end = witness.wait_end();
+    use super::scheduler::{SelectParkExpectation, SelectParkFacts};
+    match (gate.expectation, witness.into_facts()) {
+        (SelectParkExpectation::Ordinary, SelectParkFacts::Ordinary) => {}
+        (
+            SelectParkExpectation::MainConnectPending(expected),
+            SelectParkFacts::MainConnectPending(pending),
+        ) => {
+            if pending.process() != expected {
+                return Err(std::io::Error::other("wrong pending-connect owner"));
+            }
+        }
+        (SelectParkExpectation::Ordinary, SelectParkFacts::MainConnectPending(_))
+        | (SelectParkExpectation::MainConnectPending(_), SelectParkFacts::Ordinary) => {
+            return Err(std::io::Error::other("wrong Main Select phase"));
+        }
+    }
+    stream.write_all(b"ready")?;
+    gate.committed
+        .send(ReadyWriteCommitted::ReadyBytes)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "park owner did not retain its write ACK",
+            )
+        })?;
+    Ok(stream)
+}
+
 thread_local! {
     static STOREFAST_CERTIFICATE_THREAD: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
@@ -829,7 +988,7 @@ fn parked_root_buffer_reuses_its_allocation_across_peer_collections() {
 /// publication, channel transfer, resume) plus one iteration of the
 /// worker's interpreted `(while (null stop) (thread-yield))`.
 #[test]
-#[ignore = "callgrind micro; run explicitly"]
+#[cfg(feature = "perf-probes")]
 fn green_yield_switch_micro() {
     let n: usize = std::env::var("TGY_MICRO_N")
         .ok()
@@ -1177,15 +1336,16 @@ fn a_sim_worlds_waits_never_slice() {
     assert_eq!(select_parks(), before);
 }
 
-/// With no other thread wanting the Baton, a Green wait blocks itself:
-/// a peer that only sleeps never makes it poll in slices.
+/// GNU really_call_select releases even with no ready peer. Each positive
+/// wait publishes once; sleeping peers never introduce periodic slices.
 #[test]
-fn a_green_wait_parks_only_while_a_peer_is_ready() {
+fn a_green_wait_parks_without_ready_peers_and_never_slices() {
     let mut ev = green();
     eval(&mut ev, "(thread-join (make-thread (lambda () nil)))");
     let before = select_parks();
     assert_eq!(eval(&mut ev, "(progn (sleep-for 0.05) 'alone)"), "alone");
-    assert_eq!(select_parks(), before, "a wait alone sliced");
+    assert_eq!(select_parks() - before, 1, "a lone wait did not publish");
+    let before = select_parks();
     let started = std::time::Instant::now();
     assert_eq!(
         eval(
@@ -1197,14 +1357,139 @@ fn a_green_wait_parks_only_while_a_peer_is_ready() {
         "peer"
     );
     let elapsed = started.elapsed();
-    // One park to let the new thread start, one when its wait ends:
-    // never one per 10 ms of the 0.3 s both spend waiting.
+    // Main and peer each publish their real wait, with at most the
+    // deadline-driven continuation when the peer's wait ends.
     let parks = select_parks() - before;
     assert!(parks <= 4, "{parks} parks while both threads slept");
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "the two waits took {elapsed:?}"
     );
+}
+
+/// Observe the committed canonical park, rather than inferring release
+/// from elapsed time. The callback is before the physical scheduler wait;
+/// this proves publication and a durable control wake before arm.
+fn assert_no_ready_peer_select_publication(ev: &mut Context, sleeping_peer: bool) {
+    use super::scheduler::{Peers, SelectParkExpectation, ThreadKey, Wait};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    let control = Arc::clone(&ev.green_seat().expect("seated Green main").control);
+    assert!(matches!(
+        (
+            sleeping_peer,
+            control.peers(ThreadKey::Main, Instant::now())
+        ),
+        (false, Peers::Blocked) | (true, Peers::Sleeping(_))
+    ));
+    let weak = Arc::downgrade(&control);
+    let (published, publication) = mpsc::channel();
+    control.after_next_select_park_for_test(
+        ThreadKey::Main,
+        SelectParkExpectation::Ordinary,
+        move |parked| {
+            let control = weak.upgrade().expect("live selecting owner");
+            assert_eq!(parked.owner(), ThreadKey::Main);
+            assert_eq!(
+                control.wait_of(ThreadKey::Main),
+                Some(Wait::Select {
+                    wait_end: parked.wait_end(),
+                }),
+                "the native waiter must already have published Select"
+            );
+            assert!(matches!(
+                (
+                    sleeping_peer,
+                    control.peers(ThreadKey::Main, Instant::now())
+                ),
+                (false, Peers::Blocked) | (true, Peers::Sleeping(_))
+            ));
+            // Publish durable Runnable before the idle selector arms. Its
+            // subsequent recheck must retain this control readiness.
+            control.wake(ThreadKey::Main);
+            published
+                .send(parked.wait_end())
+                .expect("publication witness");
+        },
+    );
+    assert!(matches!(
+        ev.green_select_switch(Duration::from_secs(30)),
+        Ok(super::SelectTurn::Switched)
+    ));
+    let deadline = publication
+        .try_recv()
+        .expect("no-ready-peer Select must publish before returning");
+    assert!(
+        Instant::now() < deadline,
+        "control wake did not resume Select"
+    );
+    assert_eq!(control.wait_of(ThreadKey::Main), Some(Wait::Runnable));
+}
+
+#[test]
+fn a_lone_green_select_publishes_and_preserves_a_control_wake_before_arm() {
+    let mut ev = green();
+    eval(&mut ev, "(thread-join (make-thread (lambda () nil)))");
+    assert_no_ready_peer_select_publication(&mut ev, false);
+}
+
+#[test]
+fn a_green_select_with_only_a_sleeping_peer_publishes_its_own_deadline() {
+    let mut ev = green();
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (setq s2r3-select-sleeper
+                 (make-thread (lambda ()
+                   (condition-case nil (sleep-for 60) (error 'interrupted)))))
+               (thread-yield)
+               'sleeping)"
+        ),
+        "sleeping"
+    );
+    assert_no_ready_peer_select_publication(&mut ev, true);
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (thread-signal s2r3-select-sleeper 'error '(stop))
+               (thread-yield)
+               (thread-join s2r3-select-sleeper))"
+        ),
+        "interrupted"
+    );
+}
+
+#[test]
+fn a_lone_green_select_retains_zero_timeout_and_switch_refusal() {
+    use std::time::Duration;
+
+    let mut ev = green();
+    eval(&mut ev, "(thread-join (make-thread (lambda () nil)))");
+    let control = std::sync::Arc::clone(&ev.green_seat().expect("main seat").control);
+    let (sender, observed) = std::sync::mpsc::channel();
+    control.after_next_select_park_for_test(
+        super::ThreadKey::Main,
+        super::scheduler::SelectParkExpectation::Ordinary,
+        move |_| sender.send(()).expect("live negative-path witness"),
+    );
+    assert!(matches!(
+        ev.green_select_switch(Duration::ZERO),
+        Ok(super::SelectTurn::Block(Duration::ZERO))
+    ));
+    ev.gc_inhibit_depth += 1;
+    let refused = ev.green_select_switch(Duration::from_secs(30));
+    ev.gc_inhibit_depth -= 1;
+    assert!(matches!(
+        refused,
+        Ok(super::SelectTurn::Block(duration)) if duration == Duration::from_secs(30)
+    ));
+    assert!(matches!(
+        observed.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
 }
 
 /// A peer stays runnable for the whole timeout. None of its safepoints
@@ -1294,38 +1579,131 @@ fn a_signal_wakes_a_thread_waiting_in_select() {
 /// peer keeps yielding, before the accept timeout or any periodic slice.
 #[test]
 fn fd_readiness_wakes_a_green_select_while_a_peer_yields() {
-    use std::io::Write;
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        stream.write_all(b"ready").unwrap();
-    });
     let mut ev = green();
+    // Establish the connection before arming this ready-peer witness. GNU
+    // select now also parks a lone owner during synchronous connect.
+    let setup = format!(
+        r#"(progn
+      (setq g3f-received nil g3f-peer-stop nil)
+      (setq g3f-process (make-network-process :name "g3f-ready" :host "127.0.0.1"
+                    :service {port} :noquery t
+                    :filter (lambda (_p text) (setq g3f-received text)))) t)"#
+    );
+    assert_eq!(eval(&mut ev, &setup), "t");
+    let (gate, completion) =
+        main_select_park_gate(&mut ev, super::scheduler::SelectParkExpectation::Ordinary);
+    let control = std::sync::Arc::clone(&ev.green_seat().expect("main seat").control);
+    let cancel = ev.quit_requested.clone();
+    let server = std::thread::spawn(move || {
+        let result = write_ready_after_main_select_park(listener, gate);
+        if result.is_err() {
+            cancel.request();
+            control.wake(super::scheduler::ThreadKey::Main);
+        }
+        result.map(|_stream| ())
+    });
     let started = std::time::Instant::now();
     let source = format!(
         r#"(progn
-      (setq g3f-received nil)
-      (let* ((p (make-network-process :name "g3f-ready" :host "127.0.0.1"
-                    :service {port} :noquery t
-                    :filter (lambda (_p text) (setq g3f-received text))))
+      (let* ((p g3f-process)
              (th (make-thread (lambda ()
-                   (while (null g3f-received) (thread-yield)) 'peer))))
-        (accept-process-output p 2)
-        (thread-join th)
-        (delete-process p)
-        g3f-received))"#
+                   (while (and (null g3f-received) (null g3f-peer-stop))
+                     (thread-yield)) 'peer))))
+        (unwind-protect
+            (progn (accept-process-output p 2) g3f-received)
+          (setq g3f-peer-stop t)
+          (thread-join th)
+          (delete-process p))))"#
     );
-    assert_eq!(eval(&mut ev, &source), "\"ready\"");
-    server.join().unwrap();
+    let result = eval(&mut ev, &source);
+    let server_result = server.join().expect("Green peer owner joined");
+    let parked_result = completion.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(result, "\"ready\"");
+    server_result.expect("actual parked-owner output release");
+    assert_eq!(
+        parked_result.expect("actual park/write-ACK completion"),
+        Ok(())
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
-/// The child of `a_worker_panic_aborts_the_process_and_never_hangs_main`.
+/// The same descriptor publication reaches main when every other Green
+/// owner has exited. The writer requires the actual Select witness before
+/// writing; a Baton-held ordinary backend block cannot satisfy that gate.
 #[test]
-#[ignore = "run as a child process by a_worker_panic_aborts_the_process_and_never_hangs_main"]
+fn fd_readiness_wakes_a_green_select_without_a_ready_peer() {
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut ev = green();
+    assert_eq!(
+        eval(
+            &mut ev,
+            &format!(
+                r#"(progn
+                  (thread-join (make-thread (lambda () nil)))
+                  (setq s2r3-no-peer-output nil)
+                  (setq s2r3-no-peer-process
+                    (make-network-process :name "s2r3-no-peer" :host "127.0.0.1"
+                      :service {port} :noquery t
+                      :filter (lambda (_p text) (setq s2r3-no-peer-output text))))
+                  'connected)"#
+            )
+        ),
+        "connected"
+    );
+    let control = std::sync::Arc::clone(&ev.green_seat().expect("main seat").control);
+    assert!(matches!(
+        control.peers(super::ThreadKey::Main, Instant::now()),
+        super::scheduler::Peers::Blocked
+    ));
+    let (gate, completion) =
+        main_select_park_gate(&mut ev, super::scheduler::SelectParkExpectation::Ordinary);
+    let server = std::thread::spawn(move || write_ready_after_main_select_park(listener, gate));
+    let selected = ev.green_select_switch(Duration::from_secs(30));
+    let stream = server
+        .join()
+        .expect("descriptor writer joined")
+        .expect("descriptor bytes published after canonical park");
+    assert_eq!(
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actual Select/write acknowledgement"),
+        Ok(())
+    );
+    assert!(matches!(selected, Ok(super::SelectTurn::Switched)));
+    assert_eq!(
+        eval(
+            &mut ev,
+            "(progn
+               (accept-process-output s2r3-no-peer-process 0)
+               s2r3-no-peer-output)"
+        ),
+        "\"ready\""
+    );
+    assert_eq!(
+        eval(&mut ev, "(delete-process s2r3-no-peer-process)"),
+        "nil"
+    );
+    drop(stream);
+}
+
+/// Marker for the fresh process `a_worker_panic_aborts_the_process_and_never_hangs_main`
+/// spawns; without it the child body returns at once.
+const WORKER_PANIC_CHILD_ENV: &str = "NEOVM_TEST_GREEN_WORKER_PANIC_CHILD";
+
+/// The child of `a_worker_panic_aborts_the_process_and_never_hangs_main`.
+///
+/// The parent re-runs exactly this test in a fresh process with
+/// [`WORKER_PANIC_CHILD_ENV`] set; a normal suite run returns here.
+#[test]
 fn worker_panic_child() {
+    if std::env::var_os(WORKER_PANIC_CHILD_ENV).is_none() {
+        return;
+    }
     let mut ev = green();
     super::switch::PANIC_NEXT_WORKER.store(true, std::sync::atomic::Ordering::Relaxed);
     eval(&mut ev, "(thread-join (make-thread (lambda () 'never)))");
@@ -1341,10 +1719,10 @@ fn a_worker_panic_aborts_the_process_and_never_hangs_main() {
         .args([
             "--exact",
             "emacs_core::eval::green::switch_tests::worker_panic_child",
-            "--ignored",
             "--test-threads",
             "1",
         ])
+        .env(WORKER_PANIC_CHILD_ENV, "1")
         .env_remove("RUST_LOG")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1441,7 +1819,7 @@ fn parking_traces_private_roots_without_world_cells() {
 /// Fixed wall-time wait with a runnable peer: report select parks and peer
 /// throughput independently of the peer's machine-dependent turn count.
 #[test]
-#[ignore = "wait throughput micro; run explicitly"]
+#[cfg(feature = "perf-probes")]
 fn green_select_wait_micro() {
     let millis: u64 = std::env::var("TGSELECT_MICRO_MS")
         .ok()
@@ -1498,40 +1876,238 @@ fn green_select_wait_micro() {
 /// wake. A readable-only broad poll skips a process still in `connect`.
 #[test]
 fn writable_connect_readiness_survives_a_green_select_with_a_yielding_peer() {
-    use std::io::Write;
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let mut ev = green();
+    let setup = format!(
+        r#"(progn
+      (setq g3f-connect-stop nil g3f-connect-open nil g3f-connect-output nil
+            g3f-connect-open-count 0)
+      (setq g3f-connect-process
+        (make-network-process :name "g3f-connect" :host "127.0.0.1"
+          :service {port} :family 'ipv4 :nowait t :noquery t
+          :sentinel (lambda (process event)
+                      (if (string-equal event "open\n")
+                        (setq g3f-connect-open-count (1+ g3f-connect-open-count)
+                              g3f-connect-open (process-status process))))
+          :filter (lambda (_process text) (setq g3f-connect-output text))))
+      (setq g3f-connect-initial (process-status g3f-connect-process)))"#
+    );
+    ev.eval_str(&setup)
+        .expect("create the original real pending TCP connect");
+    let process = ev
+        .eval_symbol("g3f-connect-process")
+        .expect("pending process")
+        .as_process_id()
+        .expect("actual ProcessId");
+    let (gate, completion) = main_select_park_gate(
+        &mut ev,
+        super::scheduler::SelectParkExpectation::MainConnectPending(process),
+    );
+    let (writable_tx, writable_rx) = std::sync::mpsc::channel();
+    ev.processes
+        .after_next_native_connect_writable_for_test(process, move |event| {
+            let _ = writable_tx.send(event);
+        });
+    let control = std::sync::Arc::clone(&ev.green_seat().expect("main seat").control);
+    let cancel = ev.quit_requested.clone();
     let (release, until_finished) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        stream.write_all(b"ready").unwrap();
-        let _ = until_finished.recv();
+        let result = (|| -> std::io::Result<()> {
+            let _stream = write_ready_after_main_select_park(listener, gate)?;
+            match until_finished.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "evaluator did not release its Green peer",
+                )),
+            }
+        })();
+        if result.is_err() {
+            cancel.request();
+            control.wake(super::scheduler::ThreadKey::Main);
+        }
+        result
     });
-    let mut ev = green();
-    let source = format!(
-        r#"(progn
-      (setq g3f-connect-stop nil g3f-connect-open nil g3f-connect-output nil)
-      (let* ((p (make-network-process :name "g3f-connect" :host "127.0.0.1"
-                    :service {port} :family 'ipv4 :nowait t :noquery t
-                    :sentinel (lambda (process event)
-                                (if (string-equal event "open\n")
-                                    (setq g3f-connect-open (process-status process))))
-                    :filter (lambda (_process text) (setq g3f-connect-output text))))
-             (initial (process-status p))
+    let source = r#"(let* ((p g3f-connect-process)
+             (initial g3f-connect-initial)
              (th (make-thread (lambda ()
                    (while (null g3f-connect-stop) (thread-yield))))))
-        (let ((tries 0))
-          (while (and (null g3f-connect-output) (< tries 20))
-            (setq tries (1+ tries))
-            (accept-process-output p 0.05)))
-        (setq g3f-connect-stop t)
-        (thread-join th)
-        (prog1 (list initial g3f-connect-open g3f-connect-output)
-          (delete-process p))))"#
-    );
-    let result = eval(&mut ev, &source);
+        (unwind-protect
+            (progn
+              (let ((tries 0))
+                (while (and (null g3f-connect-output) (< tries 20))
+                  (setq tries (1+ tries))
+                  (accept-process-output p 0.05)))
+              (list initial g3f-connect-open g3f-connect-output))
+          (setq g3f-connect-stop t)
+          (thread-join th)
+          (delete-process p)))"#;
+    let result = eval(&mut ev, source);
     drop(release);
-    server.join().unwrap();
+    let server_result = server.join().expect("Green connect peer owner joined");
+    let parked_result = completion.recv_timeout(std::time::Duration::from_secs(5));
+    let native_writable = writable_rx.recv_timeout(std::time::Duration::from_secs(5));
     assert_eq!(result, "(connect open \"ready\")");
+    server_result.expect("actual parked-connect output release");
+    assert_eq!(
+        parked_result.expect("actual pending-connect park/write ACK"),
+        Ok(())
+    );
+    let native_writable =
+        native_writable.expect("real backend writable event for the pending connect");
+    assert_eq!(native_writable.process(), process);
+    assert_eq!(native_writable.owner(), std::thread::current().id());
+    assert_eq!(eval(&mut ev, "g3f-connect-open-count"), "1");
+}
+
+#[test]
+fn missing_green_park_witness_cancels_without_output_and_joins_peer() {
+    let mut ev = green();
+    let (gate, completion) =
+        main_select_park_gate(&mut ev, super::scheduler::SelectParkExpectation::Ordinary);
+    // Deliberately remove the sole receiver. No socket writer, normal key or
+    // replacement output exists on this failure path.
+    drop(gate);
+    let result = ev.eval_str(
+        r#"(progn
+      (setq g3f-missing-stop nil g3f-missing-cleanup nil)
+      (let ((th (make-thread (lambda ()
+                   (while (null g3f-missing-stop) (thread-yield)) 'peer))))
+        (unwind-protect
+            (progn (sleep-for 2) 'unexpected-success)
+          (setq g3f-missing-stop t g3f-missing-cleanup t)
+          (thread-join th))))"#,
+    );
+    let observed = completion.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(
+        observed.expect("actual failed park callback"),
+        Err(ParkOutputError::WitnessReceiverClosed)
+    );
+    match result {
+        Err(crate::emacs_core::error::EvalError::Signal { symbol, .. }) => {
+            assert_eq!(crate::emacs_core::intern::resolve_sym(symbol), "quit");
+        }
+        other => panic!("missing witness must signal quit, got {other:?}"),
+    }
+    assert!(
+        !ev.quit_requested.is_requested(),
+        "failure quit must be drained"
+    );
+    ev.set_quit_flag_value(Value::NIL);
+    assert_eq!(eval(&mut ev, "g3f-missing-cleanup"), "t");
+}
+
+fn assert_native_admission_refusal_keeps_ordinary_threads(
+    cause: crate::host_effect::wake::NativeReadinessCause,
+) {
+    let mut context = green();
+    context
+        .processes
+        .refuse_green_native_readiness_for_test(cause);
+    assert_eq!(
+        context.green_admission_readiness(),
+        Err(super::GreenAdmissionRefusal::NativeReadinessUnavailable { cause })
+    );
+    assert!(!super::green_world(&context));
+    assert!(!context.threads_admitted());
+    assert_eq!(
+        eval(
+            &mut context,
+            "(let ((worker (make-thread (lambda () 42)))) (list (threadp worker) (thread-join worker)))"
+        ),
+        "(t 42)"
+    );
+    assert!(!context.green_threads_running());
+    assert!(!context.threads_admitted());
+    assert_eq!(
+        context.green_admission_readiness(),
+        Err(super::GreenAdmissionRefusal::NativeReadinessUnavailable { cause })
+    );
+}
+
+#[test]
+fn absent_native_poller_refuses_green_without_refusing_lisp_threads() {
+    assert_native_admission_refusal_keeps_ordinary_threads(
+        crate::host_effect::wake::NativeReadinessCause::AbsentPoller,
+    );
+}
+
+#[test]
+fn failed_native_registration_refuses_green_without_refusing_lisp_threads() {
+    assert_native_admission_refusal_keeps_ordinary_threads(
+        crate::host_effect::wake::NativeReadinessCause::RegistrationFailed(
+            std::io::ErrorKind::PermissionDenied,
+        ),
+    );
+}
+
+#[test]
+fn native_admission_refusal_trace_records_each_cause_once_and_no_healthy_event() {
+    use crate::host_effect::wake::NativeReadinessCause;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct RefusalEvents(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "neovm::green::admission" {
+                struct RefusalField<'a>(&'a mut Vec<String>);
+                impl Visit for RefusalField<'_> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "refusal" {
+                            self.0.push(format!("{value:?}"));
+                        }
+                    }
+                }
+                event.record(&mut RefusalField(&mut self.0.lock().unwrap()));
+            }
+        }
+    }
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(RefusalEvents(Arc::clone(&events)));
+    tracing::subscriber::with_default(subscriber, || {
+        let healthy = green();
+        assert_eq!(healthy.green_admission_readiness(), Ok(()));
+        assert!(events.lock().unwrap().is_empty());
+        for cause in [
+            NativeReadinessCause::AbsentPoller,
+            NativeReadinessCause::RegistrationFailed(std::io::ErrorKind::PermissionDenied),
+        ] {
+            let mut owner = green();
+            owner
+                .processes
+                .refuse_green_native_readiness_for_test(cause);
+            for _ in 0..2 {
+                assert_eq!(
+                    owner.green_admission_readiness(),
+                    Err(super::GreenAdmissionRefusal::NativeReadinessUnavailable { cause })
+                );
+            }
+            // Real dispatch keeps working and must not duplicate its recorded
+            // admission failure or allocate a Green owner/Baton.
+            assert_eq!(
+                eval(&mut owner, "(thread-join (make-thread (lambda () 42)))"),
+                "42"
+            );
+            assert!(!owner.green_threads_running());
+        }
+    });
+    let expected = [
+        NativeReadinessCause::AbsentPoller,
+        NativeReadinessCause::RegistrationFailed(std::io::ErrorKind::PermissionDenied),
+    ]
+    .map(|cause| {
+        format!(
+            "{:?}",
+            super::GreenAdmissionRefusal::NativeReadinessUnavailable { cause }
+        )
+    });
+    assert_eq!(*events.lock().unwrap(), expected);
 }

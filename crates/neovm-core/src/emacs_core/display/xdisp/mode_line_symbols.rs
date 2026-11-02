@@ -1,14 +1,24 @@
 //! Dynamic symbol identities owned by one mode-line formatter pass.
 
-use super::{ModeLinePercentContext, ModeLineSymbol, Value, VariableView};
+use super::{
+    ModeLinePercentContext, ModeLineSymbol, StoredTarget, TargetPolicy, Value, VariableView,
+};
 use crate::emacs_core::intern::{SymId, intern, symbol_registry_epoch_value};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-/// A spelling already resolved by this pass. Use it for adjacent native reads,
-/// before recursion or a Lisp callback; values and properties are never cached.
+/// The actual symbol object admitted by the walker, or a spelling resolved by
+/// this pass for a name-only percent field. Values and properties are always
+/// read live through the existing binding/property authorities.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ResolvedModeLineSymbol(SymId);
+
+impl From<SymId> for ResolvedModeLineSymbol {
+    #[inline]
+    fn from(id: SymId) -> Self {
+        Self(id)
+    }
+}
 
 impl ResolvedModeLineSymbol {
     #[inline]
@@ -78,8 +88,9 @@ impl DynamicSymbols {
             return ResolvedModeLineSymbol(id);
         }
 
-        // Preserve the old &str conversion exactly: input symbol IDs need not
-        // be the current canonical ID, even when their bytes are valid UTF-8.
+        // Only spelling-based requests (such as %M's global-mode-string)
+        // resolve the current canonical name. A supplied format symbol must
+        // retain its own identity, including after unintern/reintern.
         let id = intern(name);
         self.remember(name, id);
         // Keep the pre-intern epoch: a concurrent invalidation during intern
@@ -109,9 +120,9 @@ impl DynamicSymbols {
     }
 }
 
-static_assertions::assert_not_impl_any!(ModeLinePercentContext: Sync);
+static_assertions::assert_not_impl_any!(ModeLinePercentContext<StoredTarget<'static>>: Sync);
 
-impl ModeLinePercentContext {
+impl<T: TargetPolicy> ModeLinePercentContext<T> {
     #[inline]
     pub(super) fn resolve_dynamic_symbol(&self, name: &'static str) -> ResolvedModeLineSymbol {
         self.dynamic_symbols.borrow_mut().resolve(name)

@@ -1,12 +1,13 @@
 use crate::common::assert_oracle_parity;
 use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_occur_stacked_sparse_tree_visibility_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (3 2 5 ((\"Alpha\" nil) (\"needle alpha\" nil) (\"Child\" nil) (\"child needle\" nil) (\"Beta\" nil) (\"Grand\" nil) (\"needle grand\" nil) (\"Gamma\" nil) (\"other text\" t)) ((118 122 org-occur) (3 7 org-occur) (103 109 org-occur) (54 60 org-occur) (21 27 org-occur)) \"* TODO Alpha :work:\\nneedle alpha\\n** WAIT Child\\nchild needle\\n* DONE Beta :home:\\nno match\\n** TODO Grand\\nneedle grand\\n* TODO Gamma :work:\\nother text\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (require 'org)
@@ -43,7 +44,7 @@ fn org_occur_stacked_sparse_tree_visibility_combo() {
                          (overlay-end ov)
                          (overlay-get ov 'org-type)))
                  org-occur-highlights)
-         (buffer-substring-no-properties (point-min) (point-max))))))"#,
+         (buffer-substring-no-properties (point-min) (point-max)))))))"#,
         expect,
     );
 }
@@ -84,12 +85,13 @@ fn org_tags_sparse_tree_property_archive_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_occur_highlight_removal_after_buffer_change_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (2 2 (#<killed buffer> #<killed buffer>) 0 nil nil \"* One\\nneedle one\\n* Two\\nneedle two\\n\\nchanged\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (require 'org)
@@ -111,7 +113,7 @@ fn org_occur_highlight_removal_after_buffer_change_combo() {
                 after
                 org-occur-parameters
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"#,
+                 (point-min) (point-max))))))))"#,
         expect,
     );
 }
@@ -214,12 +216,13 @@ fn org_sparse_todo_occur_navigation_highlight_lifecycle_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_sparse_date_type_range_visibility_matrix_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((range nil \"5 entries between 2026-05-24 and 2026-05-31\" ((\"\\\\<\\\\(?:\\\\(?:DEADLINE\\\\|SCHEDULED\\\\):\\\\) *<\\\\([^>]+\\\\)>\" . #[0 \"��!��>�\u{1b}\\0��u�� )�\u{1}�\\\"�=�\u{1}�\u{1d}\\0� �4\\0��\u{2}!��!\\\"?�4\\0��\u{2}!��!\\\"�\" [nil \"2026-05-31\" \"2026-05-24\" match-string 1 (active inactive all) -1 org-element-context org-element-type t timestamp org-at-planning-p time-less-p org-time-string-to-time] 5])) ((\"Alpha\" 1 nil headline) (\"2026-05-25\" 2 nil planning) (\"2026-05-29\" 2 nil planning) (\"body alpha\" 3 nil paragraph) (\"Alpha child\" 4 nil headline) (\"2026-05-26\" 5 nil planning) (\"2026-05-30\" 5 nil planning) (\"Beta\" 7 nil headline) (\"Gamma\" 10 nil headline) (\"2026-05-27\" 11 t planning) (\"Delta\" 13 t headline) (\"2026-06-02\" 14 t planning) (\"2026-06-03\" 14 t planning)) ((314 341 \"SCHEDULED: <2026-05-27 Wed>\" secondary-selection org-occur #<killed buffer>) (224 250 \"DEADLINE: <2026-05-26 Tue>\" secondary-selection org-occur #<killed buffer>) (149 176 \"SCHEDULED: <2026-05-30 Sat>\" secondary-selection org-occur #<killed buffer>) (49 75 \"DEADLINE: <2026-05-29 Fri>\" secondary-selection org-occur #<killed buffer>) (21 48 \"SCHEDULED: <2026-05-25 Mon>\" secondary-selection org-occur #<killed buffer>))) (before scheduled \"2 entries before 2026-05-29\" ((\"\\\\<SCHEDULED: *<\\\\([^>]+\\\\)>\" . #[0 \"��!��>�\u{1b}\\0��u�� )�\u{1}�\\\"�=�\u{1}�\u{1d}\\0� �(\\0��\u{2}!��!\\\"�\" [scheduled \"2026-05-29\" match-string 1 (active inactive all) -1 org-element-context org-element-type t timestamp org-at-planning-p time-less-p org-time-string-to-time] 5])) ((\"Alpha\" 1 nil headline) (\"2026-05-25\" 2 nil planning) (\"2026-05-29\" 2 nil planning) (\"body alpha\" 3 nil paragraph) (\"Alpha child\" 4 t headline) (\"2026-05-26\" 5 t planning) (\"2026-05-30\" 5 t planning) (\"Beta\" 7 nil headline) (\"Gamma\" 10 nil headline) (\"2026-05-27\" 11 t planning) (\"Delta\" 13 t headline) (\"2026-06-02\" 14 t planning) (\"2026-06-03\" 14 t planning)) ((314 341 \"SCHEDULED: <2026-05-27 Wed>\" secondary-selection org-occur #<killed buffer>) (21 48 \"SCHEDULED: <2026-05-25 Mon>\" secondary-selection org-occur #<killed buffer>))) (after deadline \"2 entries after 2026-05-27\" ((\"\\\\<DEADLINE: *<\\\\([^>]+\\\\)>\" . #[0 \"��!��>�\u{1b}\\0��u�� )�\u{1}�\\\"�=�\u{1}�\u{1d}\\0� �)\\0��\u{2}!��!\\\"?�\" [deadline \"2026-05-27\" match-string 1 (active inactive all) -1 org-element-context org-element-type t timestamp org-at-planning-p time-less-p org-time-string-to-time] 5])) ((\"Alpha\" 1 nil headline) (\"2026-05-25\" 2 nil planning) (\"2026-05-29\" 2 nil planning) (\"body alpha\" 3 nil paragraph) (\"Alpha child\" 4 t headline) (\"2026-05-26\" 5 t planning) (\"2026-05-30\" 5 t planning) (\"Beta\" 7 nil headline) (\"Gamma\" 10 nil headline) (\"2026-05-27\" 11 t planning) (\"Delta\" 13 nil headline) (\"2026-06-02\" 14 nil planning) (\"2026-06-03\" 14 nil planning)) ((397 423 \"DEADLINE: <2026-06-03 Wed>\" secondary-selection org-occur #<killed buffer>) (49 75 \"DEADLINE: <2026-05-29 Fri>\" secondary-selection org-occur #<killed buffer>))) (range closed \"2 entries between 2026-05-26 and 2026-05-28\" ((\"\\\\<CLOSED: *\\\\[\\\\([^]]+\\\\)\\\\]\" . #[0 \"��!��>�\u{1b}\\0��u�� )�\u{1}�\\\"�=�\u{1}�\u{1d}\\0� �4\\0��\u{2}!��!\\\"?�4\\0��\u{2}!��!\\\"�\" [closed \"2026-05-28\" \"2026-05-26\" match-string 1 (active inactive all) -1 org-element-context org-element-type t timestamp org-at-planning-p time-less-p org-time-string-to-time] 5])) ((\"Alpha\" 1 nil headline) (\"2026-05-25\" 2 t planning) (\"2026-05-29\" 2 t planning) (\"body alpha\" 3 t paragraph) (\"Alpha child\" 4 nil headline) (\"2026-05-26\" 5 nil planning) (\"2026-05-30\" 5 nil planning) (\"Beta\" 7 nil headline) (\"Gamma\" 10 nil headline) (\"2026-05-27\" 11 t planning) (\"Delta\" 13 t headline) (\"2026-06-02\" 14 t planning) (\"2026-06-03\" 14 t planning)) ((289 313 \"CLOSED: [2026-05-27 Wed]\" secondary-selection org-occur #<killed buffer>) (124 148 \"CLOSED: [2026-05-26 Tue]\" secondary-selection org-occur #<killed buffer>))) (range all \"2 entries between 2026-05-24 and 2026-05-30\" ((\"[[<]\\\\([[:digit:]]\\\\{4\\\\}-[[:digit:]]\\\\{2\\\\}-[[:digit:]]\\\\{2\\\\}\\\\(?: .*?\\\\)?\\\\)[]>]\" . #[0 \"��!��>�\u{1b}\\0��u�� )�\u{1}�\\\"�=�\u{1}�\u{1d}\\0� �4\\0��\u{2}!��!\\\"?�4\\0��\u{2}!��!\\\"�\" [all \"2026-05-30\" \"2026-05-24\" match-string 1 (active inactive all) -1 org-element-context org-element-type t timestamp org-at-planning-p time-less-p org-time-string-to-time] 5])) ((\"Alpha\" 1 nil headline) (\"2026-05-25\" 2 nil planning) (\"2026-05-29\" 2 nil planning) (\"body alpha\" 3 nil paragraph) (\"Alpha child\" 4 nil headline) (\"2026-05-26\" 5 nil planning) (\"2026-05-30\" 5 nil planning) (\"Beta\" 7 nil headline) (\"Gamma\" 10 nil headline) (\"2026-05-27\" 11 t planning) (\"Delta\" 13 t headline) (\"2026-06-02\" 14 t planning) (\"2026-06-03\" 14 t planning)) ((188 204 \"[2026-05-24 Sun]\" secondary-selection org-occur #<killed buffer>) (87 103 \"<2026-05-28 Thu>\" secondary-selection org-occur #<killed buffer>)))) 2 ((\"[[<]\\\\([[:digit:]]\\\\{4\\\\}-[[:digit:]]\\\\{2\\\\}-[[:digit:]]\\\\{2\\\\}\\\\(?: .*?\\\\)?\\\\)[]>]\" . #[0 \"��!��>�\u{1b}\\0��u�� )�\u{1}�\\\"�=�\u{1}�\u{1d}\\0� �4\\0��\u{2}!��!\\\"?�4\\0��\u{2}!��!\\\"�\" [all \"2026-05-30\" \"2026-05-24\" match-string 1 (active inactive all) -1 org-element-context org-element-type t timestamp org-at-planning-p time-less-p org-time-string-to-time] 5])) (#<killed buffer> #<killed buffer>) nil nil \"* TODO Alpha :work:\\nSCHEDULED: <2026-05-25 Mon> DEADLINE: <2026-05-29 Fri>\\nbody alpha <2026-05-28 Thu>\\n** DONE Alpha child\\nCLOSED: [2026-05-26 Tue] SCHEDULED: <2026-05-30 Sat>\\nchild body [2026-05-24 Sun]\\n* TODO Beta :home:\\nDEADLINE: <2026-05-26 Tue>\\nbody beta\\n* DONE Gamma :work:ARCHIVE:\\nCLOSED: [2026-05-27 Wed] SCHEDULED: <2026-05-27 Wed>\\narchived body\\n* TODO Delta\\nSCHEDULED: <2026-06-02 Tue> DEADLINE: <2026-06-03 Wed>\\ndelta body\\n\\n* TODO Epsilon\\nSCHEDULED: <2026-05-28 Thu>\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -312,17 +315,18 @@ fn org_sparse_date_type_range_visibility_matrix_combo() {
                     org-occur-highlights
                     org-occur-parameters
                     (buffer-substring-no-properties
-                     (point-min) (point-max))))))))"##,
+                     (point-min) (point-max))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_sparse_tag_todo_deps_planning_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 63 41)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Alpha\" 1 nil (\"work\" \"urgent\")) (\"Sub A1\" 3 nil nil) (\"Sub A1a\" 4 nil nil) (\"Sub A1b\" 5 nil nil) (\"Sub A2\" 6 2 nil) (\"Beta\" 8 nil (\"home\")) (\"Sub B1\" 9 nil (\"work\")) (\"Sub B2\" 11 2 nil) (\"Gamma\" 13 nil (\"work\")) (\"Sub G1\" 14 2 nil) (\"Delta\" 16 2 nil) (\"No planning\" 17 2 nil)) ((\"Alpha\" 1 nil (\"work\" \"urgent\")) (\"Sub A1\" 3 2 nil) (\"Sub A1a\" 4 nil nil) (\"Sub A1b\" 5 2 nil) (\"Sub A2\" 6 2 nil) (\"Beta\" 8 nil (\"home\")) (\"Sub B1\" 9 nil (\"work\")) (\"Sub B2\" 11 2 nil) (\"Gamma\" 13 nil (\"work\")) (\"Sub G1\" 14 2 nil) (\"Delta\" 16 2 nil) (\"No planning\" 17 2 nil)) ((\"Alpha\" 1 nil (\"work\" \"urgent\")) (\"Sub A1\" 3 2 nil) (\"Sub A1a\" 4 2 nil) (\"Sub A1b\" 5 nil nil) (\"Sub A2\" 6 nil nil) (\"Beta\" 8 nil (\"home\")) (\"Sub B1\" 9 2 (\"work\")) (\"Sub B2\" 11 2 nil) (\"Gamma\" 13 nil (\"work\")) (\"Sub G1\" 14 nil nil) (\"Delta\" 16 2 nil) (\"No planning\" 17 2 nil)) \"* TODO Alpha :work:urgent:\\nSCHEDULED: <2026-05-27 Wed>\\n** TODO Sub A1\\n*** DONE Sub A1a\\n*** TODO Sub A1b\\n** WAIT Sub A2\\nDEADLINE: <2026-05-28 Thu>\\n* Beta :home:\\n** TODO Sub B1 :work:\\nSCHEDULED: <2026-05-26 Tue>\\n** DONE Sub B2\\nCLOSED: [2026-05-27 Wed]\\n* Gamma :work:\\n** TODO Sub G1\\nDEADLINE: <2026-05-27 Wed>\\n* Delta\\nNo planning.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -386,7 +390,7 @@ fn org_sparse_tag_todo_deps_planning_combo() {
                 (list tag-vis
                       todo-vis
                       deadline-vis
-                      final-buf))))))))))"##,
+                      final-buf)))))))))"##,
         expect,
     );
 }
@@ -451,81 +455,17 @@ fn org_occur_highlight_count_visibility_deep_state_combo() {
         expect,
     );
 }
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_sparse_tree_tag_todo_match_edit_occur_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[
-        r#""ERR (file-missing \"Cannot open load file\" \"No such file or directory\" \"org-occur\")""#
-    ]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-occur)
-  (with-temp-buffer
-    (org-mode)
-    (insert "* TODO Alpha :work:\nBody alpha.\n\n")
-    (insert "** DONE Beta :home:\nBody beta.\n\n")
-    (insert "*** TODO Gamma :work:urgent:\nBody gamma.\n\n")
-    (insert "** WAIT Delta :home:\nBody delta.\n\n")
-    (insert "* DONE Epsilon :work:\nBody epsilon.\n\n")
-    (let ((vis (lambda ()
-                 (mapcar
-                  (lambda (pos)
-                    (save-excursion
-                      (goto-char pos)
-                      (list (buffer-substring-no-properties
-                             (line-beginning-position) (line-end-position))
-                            (invisible-p pos))))
-                  (let ((positions nil))
-                    (goto-char (point-min))
-                    (while (not (eobp))
-                      (push (point) positions)
-                      (forward-line 1))
-                    (nreverse positions)))))))
-      ;; Sparse tree for TODO
-      (let ((before-vis (funcall vis)))
-        (org-match-sparse-tree nil "TODO")
-        (let ((after-match-vis (funcall vis)))
-          ;; Edit: add tag to Gamma
-          (goto-char (point-min))
-          (search-forward "Gamma")
-          (org-toggle-tag "extra" 'on)
-          ;; Occur for "Body"
-          (goto-char (point-min))
-          (occur "Body")
-          (let ((occur-count (length org-occur-highlights))
-                (occur-text
-                 (when (get-buffer "*Occur*")
-                   (with-current-buffer "*Occur*"
-                     (buffer-substring-no-properties
-                      (point-min) (point-max))))))
-            ;; Remove highlights
-            (org-remove-occur-highlights)
-            (list before-vis
-                  after-match-vis
-                  occur-count
-                  occur-text
-                  (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_sparse_tree_todo_tag_edit_resparse_occur_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
     let expect = expect_test::expect![[
-        r#""ERR (file-missing \"Cannot open load file\" \"No such file or directory\" \"org-occur\")""#
+        r#""OK (((\"* TODO Alpha :work:\" nil) (\"Body alpha.\" nil) (\"\" nil) (\"** DONE Beta :home:\" nil) (\"Body beta.\" nil) (\"\" nil) (\"*** TODO Gamma :work:\" nil) (\"Body gamma.\" nil) (\"\" nil) (\"** WAIT Delta :home:\" nil) (\"Body delta.\" nil) (\"\" nil) (\"* DONE Epsilon :work:\" nil) (\"Body epsilon.\" nil) (\"\" nil) (\"* TODO Zeta :work:\" nil) (\"Body zeta.\" nil) (\"\" nil)) ((\"* TODO Alpha :work:\" nil) (\"Body alpha.\" 2) (\"\" nil) (\"** DONE Beta :home:\" nil) (\"Body beta.\" 2) (\"\" nil) (\"*** TODO Gamma :work:\" nil) (\"Body gamma.\" 2) (\"\" 2) (\"** WAIT Delta :home:\" 2) (\"Body delta.\" 2) (\"\" nil) (\"* DONE Epsilon :work:\" nil) (\"Body epsilon.\" 2) (\"\" nil) (\"* TODO Zeta :work:\" nil) (\"Body zeta.\" 2) (\"\" 2)) ((\"* TODO Alpha :work:\" nil) (\"Body alpha.\" 2) (\"\" nil) (\"** DONE Beta :home:\" nil) (\"Body beta.\" 2) (\"\" nil) (\"*** TODO Gamma :work:\" nil) (\"Body gamma.\" 2) (\"\" 2) (\"** WAIT Delta :home:\" 2) (\"Body delta.\" 2) (\"\" nil) (\"* DONE Epsilon :work:\" nil) (\"Body epsilon.\" 2) (\"\" nil) (\"* DONE Zeta :work:\" nil) (\"Body zeta.\" 2) (\"\" 2)) ((\"* TODO Alpha :work:\" nil) (\"Body alpha.\" 2) (\"\" nil) (\"** DONE Beta :home:\" nil) (\"Body beta.\" 2) (\"\" nil) (\"*** TODO Gamma :work:\" nil) (\"Body gamma.\" 2) (\"\" nil) (\"** WAIT Delta :home:\" nil) (\"Body delta.\" 2) (\"\" nil) (\"* DONE Epsilon :work:\" nil) (\"Body epsilon.\" 2) (\"\" nil) (\"* DONE Zeta :work:\" nil) (\"Body zeta.\" 2) (\"\" 2)) 6 \"* TODO Alpha :work:\\nBody alpha.\\n\\n** DONE Beta :home:\\nBody beta.\\n\\n*** TODO Gamma :work:\\nBody gamma.\\n\\n** WAIT Delta :home:\\nBody delta.\\n\\n* DONE Epsilon :work:\\nBody epsilon.\\n\\n* DONE Zeta :work:\\nBody zeta.\\n\\n\")""#
     ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
-  (require 'org-occur)
+  (require 'org-agenda)
   (with-temp-buffer
     (org-mode)
     (insert "* TODO Alpha :work:\nBody alpha.\n\n")
@@ -547,20 +487,20 @@ fn org_sparse_tree_todo_tag_edit_resparse_occur_deep() {
                     (while (not (eobp))
                       (push (point) positions)
                       (forward-line 1))
-                    (nreverse positions)))))))
+                    (nreverse positions))))))
       ;; Sparse tree for TODO
       (let ((before-vis (funcall vis)))
-        (org-match-sparse-tree nil "TODO")
+        (org-match-sparse-tree nil "TODO=\"TODO\"")
         (let ((after-todo-vis (funcall vis)))
           ;; Edit: change Zeta to DONE
           (goto-char (point-min))
           (search-forward "TODO Zeta")
           (replace-match "DONE Zeta")
           ;; Re-sparse
-          (org-match-sparse-tree nil "TODO")
+          (org-match-sparse-tree nil "TODO=\"TODO\"")
           (let ((after-resparse-vis (funcall vis)))
             ;; Sparse by tag
-            (org-tags-view nil "work")
+            (org-match-sparse-tree nil "work")
             (let ((tag-vis (funcall vis)))
               ;; Occur for "Body"
               (goto-char (point-min))
@@ -573,7 +513,68 @@ fn org_sparse_tree_todo_tag_edit_resparse_occur_deep() {
                       tag-vis
                       occur-count
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
+        expect,
+    );
+}
+
+#[test]
+fn org_sparse_tree_tag_todo_match_edit_occur_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (((\"* TODO Alpha :work:\" nil) (\"Body alpha.\" nil) (\"\" nil) (\"** DONE Beta :home:\" nil) (\"Body beta.\" nil) (\"\" nil) (\"*** TODO Gamma :work:urgent:\" nil) (\"Body gamma.\" nil) (\"\" nil) (\"** WAIT Delta :home:\" nil) (\"Body delta.\" nil) (\"\" nil) (\"* DONE Epsilon :work:\" nil) (\"Body epsilon.\" nil) (\"\" nil)) ((\"* TODO Alpha :work:\" nil) (\"Body alpha.\" 2) (\"\" nil) (\"** DONE Beta :home:\" nil) (\"Body beta.\" 2) (\"\" nil) (\"*** TODO Gamma :work:urgent:\" nil) (\"Body gamma.\" 2) (\"\" 2) (\"** WAIT Delta :home:\" 2) (\"Body delta.\" 2) (\"\" nil) (\"* DONE Epsilon :work:\" nil) (\"Body epsilon.\" 2) (\"\" 2)) 2 \"5 matches for \\\"Body\\\" in buffer:  *temp*\\n      2:Body alpha.\\n      5:Body beta.\\n      8:Body gamma.\\n     11:Body delta.\\n     14:Body epsilon.\\n\" \"* TODO Alpha :work:\\nBody alpha.\\n\\n** DONE Beta :home:\\nBody beta.\\n\\n*** TODO Gamma                                            :work:urgent:extra:\\nBody gamma.\\n\\n** WAIT Delta :home:\\nBody delta.\\n\\n* DONE Epsilon :work:\\nBody epsilon.\\n\\n\")""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-agenda)
+  (with-temp-buffer
+    (org-mode)
+    (insert "* TODO Alpha :work:\nBody alpha.\n\n")
+    (insert "** DONE Beta :home:\nBody beta.\n\n")
+    (insert "*** TODO Gamma :work:urgent:\nBody gamma.\n\n")
+    (insert "** WAIT Delta :home:\nBody delta.\n\n")
+    (insert "* DONE Epsilon :work:\nBody epsilon.\n\n")
+    (let ((vis (lambda ()
+                 (mapcar
+                  (lambda (pos)
+                    (save-excursion
+                      (goto-char pos)
+                      (list (buffer-substring-no-properties
+                             (line-beginning-position) (line-end-position))
+                            (invisible-p pos))))
+                  (let ((positions nil))
+                    (goto-char (point-min))
+                    (while (not (eobp))
+                      (push (point) positions)
+                      (forward-line 1))
+                    (nreverse positions))))))
+      ;; Sparse tree for TODO
+      (let ((before-vis (funcall vis)))
+        (org-match-sparse-tree nil "TODO=\"TODO\"")
+        (let ((after-match-vis (funcall vis)))
+          ;; Edit: add tag to Gamma
+          (goto-char (point-min))
+          (search-forward "Gamma")
+          (org-toggle-tag "extra" 'on)
+          ;; Occur for "Body"
+          (goto-char (point-min))
+          (occur "Body")
+          (let ((occur-count (length org-occur-highlights))
+                (occur-text
+                 (when (get-buffer "*Occur*")
+                   (with-current-buffer "*Occur*"
+                     (buffer-substring-no-properties
+                      (point-min) (point-max))))))
+            ;; Remove highlights
+            (org-remove-occur-highlights)
+            (list before-vis
+                  after-match-vis
+                  occur-count
+                  occur-text
+                  (buffer-substring-no-properties
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }

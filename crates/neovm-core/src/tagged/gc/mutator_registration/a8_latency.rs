@@ -672,7 +672,7 @@ fn drive_scenario(
     let one = unsafe { SharedRoot::new(&context.tagged_heap, TaggedValue::fixnum(1)) };
     let mut epochs = Vec::new();
     context
-        .admit_owned_parallel(|projection| {
+        .admit_owned_proof_parallel(|projection| {
             let era = projection.era();
             era.start_cons_storage()
                 .unwrap_or_else(|error| panic!("cons catalog: {error:?}"));
@@ -1120,7 +1120,7 @@ fn a8_latency_native_owner_shape() {
 
 /// The full A8 latency matrix (measurement runs use `--ignored`).
 #[test]
-#[ignore = "A8 full latency matrix; minutes of wall time"]
+#[cfg(feature = "perf-probes")]
 fn a8_latency_full() {
     let rounds = full_rounds();
     let tsv = tsv_dir();

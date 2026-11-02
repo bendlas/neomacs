@@ -2,8 +2,12 @@
 //!
 //! Provides shared helpers used across all test modules.
 
-use crate::emacs_core::error::map_flow;
+#[cfg(test)]
+#[path = "test_utils/input_wait.rs"]
+pub(crate) mod input_wait;
+
 use crate::emacs_core::eval::VariableView;
+use crate::emacs_core::print::map_flow;
 use crate::emacs_core::symbol::CanonicalAccess;
 fn test_ob() -> crate::emacs_core::symbol::Obarray {
     crate::emacs_core::symbol::Obarray::new()
@@ -25,6 +29,59 @@ use std::path::PathBuf;
 /// always routed through the test harness's writer.
 pub fn init_test_tracing() {
     crate::logging::init_for_tests();
+}
+
+/// The abbreviation the platform's own `gmtime_r` reports for UTC.
+///
+/// GNU's UTC zone has no `timezone_t`: `tzlookup` returns the NULL `utc_tz`
+/// and `emacs_localtime_rz` therefore calls `gmtime_r`
+/// (src/timefns.c:198-199, :249-254, :206-218).  The abbreviation is the C
+/// library's: glibc answers "GMT", Darwin answers "UTC".  Tests that observe
+/// the UTC zone must expect the host's answer rather than one platform's.
+pub fn host_utc_zone_abbreviation() -> String {
+    #[cfg(unix)]
+    {
+        let value: libc::time_t = 0;
+        let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+        // SAFETY: `tm` is a valid out-parameter for the call.
+        let converted = unsafe { libc::gmtime_r(&value, &mut tm) };
+        if !converted.is_null() && !tm.tm_zone.is_null() {
+            // SAFETY: `tm_zone` points at a NUL-terminated string owned by libc.
+            let name = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+                .to_string_lossy()
+                .into_owned();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+        "+00".to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        "GMT".to_string()
+    }
+}
+
+/// The symbol name and byte-string data of a signal.
+///
+/// Raw-byte file-name tests must compare GNU's `file-error` data byte for
+/// byte: a name containing 0xFF is not UTF-8, so the `as_utf8_str` helpers
+/// would lose it.  Non-string data keeps its debug form.
+pub fn signal_data_bytes(flow: crate::emacs_core::error::Flow) -> (String, Vec<Vec<u8>>) {
+    match flow.into_kind() {
+        crate::emacs_core::error::FlowKind::Signal(signal) => (
+            signal.symbol_name().to_string(),
+            signal
+                .data
+                .iter()
+                .map(|value| match value.as_lisp_string() {
+                    Some(text) => text.as_bytes().to_vec(),
+                    None => format!("{value:?}").into_bytes(),
+                })
+                .collect(),
+        ),
+        other => panic!("expected a signal, got {other:?}"),
+    }
 }
 
 /// The workspace root baked in at compile time — the **build** machine's
@@ -521,6 +578,143 @@ pub fn eval_with_ldefs_boot_autoloads(names: &[&str]) -> Context {
     eval
 }
 
+/// The one GNU oracle resolver for tests in this crate.
+///
+/// Re-exported so unit tests write `crate::test_utils::gnu_oracle()` rather
+/// than each carrying its own environment/default-path discovery.
+pub use neomacs_test_oracle::gnu::{GnuOracle, gnu_oracle};
+
+/// The canonical environment for GNU oracles spawned by in-crate unit tests.
+///
+/// The two `TempDir`s live for the whole process so the pinned HOME/TMPDIR
+/// stay valid.  `bounded_temp_dir` keeps the temp root short enough for any
+/// unix socket a probe binds.
+struct CanonicalTestSpawn {
+    _home: tempfile::TempDir,
+    _tmp: tempfile::TempDir,
+    environment: neomacs_test_env::CanonicalEnvironment,
+}
+
+fn canonical_test_spawn() -> &'static CanonicalTestSpawn {
+    static SPAWN: std::sync::OnceLock<CanonicalTestSpawn> = std::sync::OnceLock::new();
+    SPAWN.get_or_init(|| {
+        let home = neomacs_test_env::bounded_temp_dir("nv-kbd-home-")
+            .expect("create canonical unit-test HOME");
+        let tmp = neomacs_test_env::bounded_temp_dir("nv-kbd-tmp-")
+            .expect("create canonical unit-test TMPDIR");
+        let environment = neomacs_test_env::CanonicalEnvironment::new(
+            neomacs_test_env::CanonicalProfile::Oracle,
+            home.path(),
+            tmp.path(),
+            workspace_root(),
+        )
+        .expect("canonical unit-test environment");
+        CanonicalTestSpawn {
+            _home: home,
+            _tmp: tmp,
+            environment,
+        }
+    })
+}
+
+/// A canonically pinned command for a GNU oracle spawned inside a unit test.
+///
+/// Recorded GNU fixtures were captured under the oracle profile (locale, time
+/// zone, login/full name, host, HOME, TMPDIR, umask); a test that spawns GNU
+/// itself must give it the same answers or the fixture becomes host-keyed.
+pub fn canonical_oracle_command(
+    program: impl AsRef<std::ffi::OsStr>,
+) -> neomacs_test_env::PinnedCommand {
+    canonical_test_spawn().environment.command(program)
+}
+
+/// A canonically pinned command for a hermetic child a unit test spawns that
+/// is not GNU -- a re-executed test binary, for example.
+///
+/// The child gets the same Oracle-profile environment as every other
+/// harness-spawned process: a test that re-executes itself must not inherit
+/// the parent's ambient HOME, TMPDIR, locale or identity, or its result
+/// becomes host-keyed.
+pub fn canonical_test_command(
+    program: impl AsRef<std::ffi::OsStr>,
+) -> neomacs_test_env::PinnedCommand {
+    canonical_oracle_command(program)
+}
+
+/// A canonically pinned command for a GNU probe.
+///
+/// The campaign's optional process-sandbox wrappers are honored --
+/// `NEOVM_LISP_SANDBOX`, then `NEOMACS_PROBE_SANDBOX` -- and the GNU oracle
+/// is always the attested reference, run under the canonical oracle
+/// environment.  The environment pins do not depend on the wrapper, so a
+/// standalone probe, a refresh and a campaign run compare the same values.
+pub fn gnu_probe_command() -> neomacs_test_env::PinnedCommand {
+    let emacs = gnu_oracle().executable_path();
+    // A test already inside a PID sandbox must not nest systemd scopes (the
+    // carframe probe's documented constraint); the environment pins still
+    // apply to the direct child.
+    if std::env::var("CARFRAME_TEST_IN_SANDBOX").as_deref() == Ok("1") {
+        return canonical_oracle_command(emacs);
+    }
+    match probe_sandbox() {
+        Some(wrapper) => {
+            let mut command = canonical_oracle_command(wrapper);
+            command.arg(emacs);
+            command
+        }
+        None => canonical_oracle_command(emacs),
+    }
+}
+
+/// A canonically pinned GNU command for recording an expectation.
+///
+/// Recording evaluates Lisp in GNU, so on Linux it must run in the campaign
+/// sandbox: the same wrappers as [`gnu_probe_command`], or the campaign's
+/// `tmp/v10x/sandbox-run.sh` found from the workspace root (the main
+/// checkout when the test runs in a worktree).  A host without that wrapper
+/// cannot refresh Linux GNU expectations, and saying so beats silently
+/// recording them unsandboxed.
+pub fn gnu_refresh_command() -> neomacs_test_env::PinnedCommand {
+    let emacs = gnu_oracle().executable_path();
+    if std::env::var("CARFRAME_TEST_IN_SANDBOX").as_deref() == Ok("1") {
+        return canonical_oracle_command(emacs);
+    }
+    let wrapper = probe_sandbox().unwrap_or_else(|| {
+        panic!(
+            "refreshing GNU expectations requires the campaign sandbox: set \
+             NEOVM_LISP_SANDBOX (or NEOMACS_PROBE_SANDBOX), or keep \
+             tmp/v10x/sandbox-run.sh in the workspace or one of its ancestors"
+        )
+    });
+    let mut command = canonical_oracle_command(wrapper);
+    command.arg(emacs);
+    command
+}
+
+/// The campaign sandbox wrapper, when one is configured or installed.
+///
+/// A worktree does not carry the ignored `tmp/` tree, so the script is
+/// searched for in the workspace root and each of its ancestors; that finds
+/// the main checkout's copy without hardcoding a host path.
+fn probe_sandbox() -> Option<std::ffi::OsString> {
+    std::env::var_os("NEOVM_LISP_SANDBOX")
+        .or_else(|| std::env::var_os("NEOMACS_PROBE_SANDBOX"))
+        .or_else(|| std::env::var_os("NEOVM_SANDBOX_RUN"))
+        .or_else(|| {
+            // The campaign sandbox is a Linux process wrapper
+            // (`systemd-run` + PID namespaces); a Darwin host runs the local
+            // GNU reference directly and has no such script.
+            if !cfg!(target_os = "linux") {
+                return None;
+            }
+            workspace_root()
+                .ancestors()
+                .map(|root| root.join("tmp/v10x/sandbox-run.sh"))
+                .find(|path| path.is_file())
+                .map(std::path::PathBuf::into_os_string)
+        })
+}
+
 /// Construct a legacy-GC fixture with the knob selected before heap creation.
 /// Nextest gives each test its own process. Restore the caller's environment
 /// on return or unwind; an existing heap's generation mode is never changed.
@@ -546,7 +740,26 @@ pub(crate) fn with_legacy_gc<T>(create: impl FnOnce() -> T) -> T {
 /// Create a cached runtime-startup evaluator for tests that need the full
 /// GNU bootstrap surface.
 pub fn runtime_startup_context() -> Context {
-    create_runtime_startup_evaluator_cached().expect("bootstrap")
+    match create_runtime_startup_evaluator_cached() {
+        Ok(context) => context,
+        Err(error) => panic!("bootstrap: {}", format_bootstrap_error(&error)),
+    }
+}
+
+/// Format a bootstrap failure without walking a payload that may have died
+/// with the failed evaluator.
+///
+/// The bootstrap paths render the error while their heap is alive and hand
+/// that rendering over; a `Signal`'s data values are heap strings, so reading
+/// them here (after the evaluator was dropped) is a use-after-free. The
+/// captured rendering names the failing load/autoload; the fallback is the
+/// address-safe `Debug` shape.
+fn format_bootstrap_error(error: &crate::emacs_core::error::EvalError) -> String {
+    #[cfg(test)]
+    if let Some(rendered) = crate::emacs_core::load::take_bootstrap_failure_rendering() {
+        return format!("{rendered} | error={error:?}");
+    }
+    format!("{error:?}")
 }
 
 /// Evaluate FORMS in a cached runtime-startup evaluator and return formatted

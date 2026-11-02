@@ -4,6 +4,8 @@
 //! send uninterpreted byte batches. This module preserves that distinction
 //! while converting the display transport into the core input transport.
 
+pub(crate) mod publication;
+
 use neomacs_display_runtime::thread_comm::{
     InputEvent as DisplayEvent, MonitorInfo as DisplayMonitorInfo, PointerAction, PointerTarget,
     PositionedPointerInput, ScrollDelta,
@@ -13,6 +15,50 @@ use neovm_core::keyboard::{
     self, FrontendLoadPhase, FrontendWebProcessFailure, FrontendWebValue, FrontendWebViewEvent,
     InputEvent as KbInputEvent, MouseButton,
 };
+
+/// Whether the evaluator still accepts this producer. A native wake failure
+/// happens after publication, and must never cause the event to be replayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostInputDelivery {
+    Published,
+    ReceiverClosed,
+}
+
+#[inline]
+pub(super) fn finish_host_input_publication(
+    result: Result<(), neovm_core::host_input::HostInputPublishError>,
+) -> HostInputDelivery {
+    match result {
+        Ok(()) => HostInputDelivery::Published,
+        Err(error) => host_input_publication_error(error),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn host_input_publication_error(
+    error: neovm_core::host_input::HostInputPublishError,
+) -> HostInputDelivery {
+    use neovm_core::host_input::HostInputPublishError;
+    match error {
+        HostInputPublishError::ReceiverClosed => HostInputDelivery::ReceiverClosed,
+        HostInputPublishError::ReceiverClosedAfterPrefix { wake } => {
+            match wake {
+                neovm_core::host_input::HostInputWakeOutcome::Failed(error) => {
+                    tracing::error!(%error, "host input prefix failed to wake evaluator before receiver closure");
+                }
+                neovm_core::host_input::HostInputWakeOutcome::Notified
+                | neovm_core::host_input::HostInputWakeOutcome::ChannelFallback
+                | neovm_core::host_input::HostInputWakeOutcome::Closed => {}
+            }
+            HostInputDelivery::ReceiverClosed
+        }
+        HostInputPublishError::WakeAfterCommit(error) => {
+            tracing::error!(%error, "published host input failed to wake evaluator");
+            HostInputDelivery::Published
+        }
+    }
+}
 
 fn convert_web_process_failure(
     failure: &neomacs_webview::WebProcessFailure,

@@ -28,6 +28,9 @@ mod frame_position_test;
 #[path = "frame_resize_test.rs"]
 mod frame_resize_test;
 
+#[path = "initial_gui_lifecycle_test.rs"]
+mod initial_gui_lifecycle_test;
+
 #[test]
 fn alpha_lower_limit_variable_projects_without_replaying_alpha_policy() {
     let mut ev = Context::new();
@@ -343,6 +346,8 @@ struct RecordingDisplayHost {
     primary_size: Option<GuiFrameHostSize>,
     resolved_frame_font: Option<ResolvedFrameFont>,
     native_x11_ids: Rc<RefCell<Vec<(crate::window::FrameId, (u64, u64))>>>,
+    initial_gui_defaults: Option<crate::emacs_core::display_host::InitialGuiFrameDefaults>,
+    finished: Rc<RefCell<Vec<GuiFrameHostRequest>>>,
 }
 
 impl RecordingDisplayHost {
@@ -405,6 +410,16 @@ fn remapped_mono_font_metrics() -> ResolvedFrameFont {
 }
 
 impl DisplayHost for RecordingDisplayHost {
+    fn prepare_initial_gui_frame(
+        &mut self,
+    ) -> Result<Option<crate::emacs_core::display_host::InitialGuiFrameDefaults>, String> {
+        Ok(self.initial_gui_defaults.clone())
+    }
+
+    fn finish_gui_frame_creation(&mut self, request: GuiFrameHostRequest) -> Result<(), String> {
+        self.finished.borrow_mut().push(request);
+        Ok(())
+    }
     fn set_gui_frame_alpha_lower_limit(&mut self, limit: f32) {
         self.alpha_limits.borrow_mut().push(limit);
     }
@@ -1742,9 +1757,11 @@ fn window_body_remap_uses_the_current_buffer_default_face_metrics() {
         )
         .expect("window body units");
 
+    // Body = 800 px - 2x8 px fringes - the 16 px scroll-bar band, x_set_scroll_bar_default_width
+    // (src/xfns.c:2393-2407), so 768 px: 96 columns at 8 px, 48 at the remapped 16 px.
     assert_eq!(
         crate::emacs_core::print::print_value(&value),
-        "(97 48 35 17)"
+        "(96 48 35 17)"
     );
 }
 
@@ -1860,7 +1877,7 @@ fn gui_window_body_geometry_excludes_fringes_and_margins() {
         )
         .expect("presented GUI geometry");
     assert_eq!(
-        super::builtin_window_body_width(&mut ev, vec![Value::NIL, Value::T])
+        super::builtin_window_body_width(&mut ev, &vec![Value::NIL, Value::T])
             .expect("window-body-width"),
         // GNU `window-body-width` also subtracts the frame-default right
         // scroll-bar area when a GUI frame inherits `vertical-scroll-bar = t`.
@@ -1877,12 +1894,12 @@ fn gui_window_body_geometry_excludes_fringes_and_margins() {
     // `top-body + (window-body-height W t)', so the two numbers it would have
     // added come from these C primitives; the width is asserted above.
     assert_eq!(
-        super::builtin_window_body_height(&mut ev, vec![Value::NIL, Value::T])
+        super::builtin_window_body_height(&mut ev, &vec![Value::NIL, Value::T])
             .expect("window-body-height"),
         Value::fixnum(568)
     );
     assert_eq!(
-        super::builtin_window_fringes(&mut ev, vec![Value::NIL]).expect("window-fringes"),
+        super::builtin_window_fringes(&mut ev, &vec![Value::NIL]).expect("window-fringes"),
         Value::list(vec![
             Value::fixnum(8),
             Value::fixnum(12),
@@ -1891,7 +1908,7 @@ fn gui_window_body_geometry_excludes_fringes_and_margins() {
         ])
     );
     assert_eq!(
-        super::builtin_window_margins(&mut ev, vec![Value::NIL]).expect("window-margins"),
+        super::builtin_window_margins(&mut ev, &vec![Value::NIL]).expect("window-margins"),
         Value::cons(Value::fixnum(1), Value::fixnum(2))
     );
 }
@@ -1936,7 +1953,7 @@ fn gui_window_fringes_default_to_frame_defaults_when_reset() {
 
     publish_selected_gui_window_regions(&mut ev, fid, 1, regions_with_fringes(8.0, 8.0));
     assert_eq!(
-        super::builtin_window_fringes(&mut ev, vec![Value::NIL]).expect("default fringes"),
+        super::builtin_window_fringes(&mut ev, &vec![Value::NIL]).expect("default fringes"),
         Value::list(vec![
             Value::fixnum(8),
             Value::fixnum(8),
@@ -1952,7 +1969,7 @@ fn gui_window_fringes_default_to_frame_defaults_when_reset() {
     .expect("set explicit fringes");
     publish_selected_gui_window_regions(&mut ev, fid, 2, regions_with_fringes(0.0, 4.0));
     assert_eq!(
-        super::builtin_window_fringes(&mut ev, vec![Value::NIL]).expect("explicit fringes"),
+        super::builtin_window_fringes(&mut ev, &vec![Value::NIL]).expect("explicit fringes"),
         Value::list(vec![
             Value::fixnum(0),
             Value::fixnum(4),
@@ -1965,7 +1982,7 @@ fn gui_window_fringes_default_to_frame_defaults_when_reset() {
         .expect("reset fringes");
     publish_selected_gui_window_regions(&mut ev, fid, 3, regions_with_fringes(8.0, 8.0));
     assert_eq!(
-        super::builtin_window_fringes(&mut ev, vec![Value::NIL]).expect("reset fringes"),
+        super::builtin_window_fringes(&mut ev, &vec![Value::NIL]).expect("reset fringes"),
         Value::list(vec![
             Value::fixnum(8),
             Value::fixnum(8),
@@ -1991,7 +2008,9 @@ fn gui_window_scroll_bars_round_trip_explicit_state() {
         ev.eval_str("(window-scroll-bars)")
             .map(|value| crate::emacs_core::print::print_value(&value))
             .expect("default scroll bars"),
-        "(nil 1 t nil 0 t nil)"
+        // COLUMNS is FRAME_CONFIG_SCROLL_BAR_COLS = ceil(16 / 8) = 2 for the 16 px toolkit
+        // default (src/xfns.c:2393-2407, src/window.h:934-939).
+        "(nil 2 t nil 0 t nil)"
     );
     ev.eval_str("(set-window-scroll-bars nil 13 'left 9 'bottom t)")
         .expect("set scroll bars");
@@ -2225,7 +2244,7 @@ fn get_buffer_window_list_includes_active_minibuffer_by_default() {
     let active_minibuffer =
         super::builtin_active_minibuffer_window(&mut ev, vec![]).expect("active minibuffer");
     let default_list =
-        super::builtin_window_list_1(&mut ev, vec![Value::NIL, Value::NIL, Value::NIL])
+        super::builtin_window_list_1(&mut ev, &vec![Value::NIL, Value::NIL, Value::NIL])
             .expect("window-list-1 with nil minibuf");
     let default_windows =
         crate::emacs_core::value::list_to_vec(&default_list).expect("default window list");
@@ -2235,7 +2254,7 @@ fn get_buffer_window_list_includes_active_minibuffer_by_default() {
     );
 
     let excluded_list =
-        super::builtin_window_list_1(&mut ev, vec![Value::NIL, Value::symbol("not"), Value::NIL])
+        super::builtin_window_list_1(&mut ev, &vec![Value::NIL, Value::symbol("not"), Value::NIL])
             .expect("window-list-1 with non-nil non-t minibuf");
     let excluded_windows =
         crate::emacs_core::value::list_to_vec(&excluded_list).expect("excluded window list");
@@ -3450,7 +3469,7 @@ fn an_integer_is_not_a_frame_even_when_it_matches_a_frame_id() {
         "an integer equal to a live frame's id is still not a frame"
     );
     assert_eq!(
-        crate::emacs_core::frame::builtin_frame_live_p(&mut ev, vec![as_integer])
+        crate::emacs_core::frame::builtin_frame_live_p(&mut ev, &vec![as_integer])
             .expect("frame-live-p must not signal"),
         Value::NIL,
         "an integer equal to a live frame's id is still not a live frame"
@@ -5411,6 +5430,47 @@ fn window_tree_navigation_and_normal_size_match_gnu_runtime() {
     );
 }
 
+/// A split that splices into an existing combination commits only the staged
+/// `new_normal`s: the untouched siblings keep their normal sizes, and the
+/// following `delete-window` under `window-combination-resize` distributes the
+/// freed columns by them.  Values are GNU 31.1 `--batch` on its 80-column frame
+/// (window-oracle-nightly 2026-10-29: neomacs restated the siblings from pixels,
+/// 27/80 as an f32 quotient, and deleted to 39/20/21 instead of 38/21/21).
+#[test]
+fn splice_split_keeps_sibling_normal_sizes_for_combination_resize_delete_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let out = bootstrap_eval_with_frame(
+        "(let ((nth-window
+                (lambda (n)
+                  (let ((ws (window-list nil 'no-minibuf nil)))
+                    (nth (mod n (length ws)) ws))))
+               (state
+                (lambda ()
+                  (mapcar (lambda (w)
+                            (list (window-left-column w)
+                                  (window-total-width w)
+                                  (window-normal-size w t)))
+                          (window-list nil 'no-minibuf (frame-first-window))))))
+           (list (frame-width)
+                 (progn
+                   (let ((window-combination-limit nil) (window-combination-resize nil))
+                     (split-window (funcall nth-window 0) nil 'left))
+                   (let ((window-combination-limit nil) (window-combination-resize t))
+                     (split-window (funcall nth-window 0) nil 'left))
+                   (let ((window-combination-limit nil) (window-combination-resize nil))
+                     (split-window (funcall nth-window 2) nil 'left))
+                   (funcall state))
+                 (progn
+                   (let ((window-combination-resize t))
+                     (delete-window (funcall nth-window 4)))
+                   (funcall state))))",
+    );
+    assert_eq!(
+        out[0],
+        "OK (80 ((0 27 0.33333333333333337) (27 13 0.16666666666666666) (40 13 0.16666666666666666) (53 27 0.33333333333333337)) ((0 38 0.5000000000000001) (38 21 0.25) (59 21 0.25)))"
+    );
+}
+
 #[test]
 fn vertical_motion_truncates_partial_width_split_windows_like_gnu() {
     crate::test_utils::init_test_tracing();
@@ -5597,6 +5657,58 @@ fn word_wrap_is_inert_under_the_batch_motion_engine_like_gnu() {
                (delete-other-windows)))"#,
     );
     assert_eq!(result, "OK (24 47 70 24 24)");
+}
+
+/// `word-wrap-by-category` non-nil lets a row break inside a CJK run.
+///
+/// GNU's `char_can_wrap_after` / `char_can_wrap_before` (src/xdisp.c:577-617)
+/// keep their whitespace-only answer while `word-wrap-by-category` is nil, but
+/// under non-nil they also consult the `|` (`LINE_BREAKABLE`) category and the
+/// kinsoku `'<'`/`'>'` categories set up in `characters.el`/`kinsoku.el`.  A
+/// row can therefore break between ordinary CJK characters, which contain no
+/// spaces.
+///
+/// Ground truth, GNU Emacs 31.1 behavior in a 24-column TTY window over
+/// "supertag v0.4 " followed by 60 `提`: a TTY window reserves one column for
+/// the continuation glyph, so the row edge is column 23.  The 14 ASCII columns
+/// plus four two-column CJK characters use 22 columns, and the fifth CJK
+/// character would need columns 23-24, so `(vertical-motion 1)` from
+/// `point-min` answers 19.  With `word-wrap-by-category` nil the only saved
+/// candidate is the position before the first CJK character, and the answer is
+/// 15.  Neomacs currently answers 15 in both cases.
+#[test]
+fn word_wrap_by_category_allows_a_cjk_break_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let result = bootstrap_eval_one_with_frame(
+        r#"(let ((b (get-buffer-create " *probe-word-wrap-category*")))
+             (unwind-protect
+                 (progn
+                   (delete-other-windows)
+                   (switch-to-buffer b)
+                   (erase-buffer)
+                   (insert "supertag v0.4 " (make-string 60 ?提))
+                   (let ((w2 (split-window nil -24 'right))
+                         (noninteractive nil))
+                     (select-window w2)
+                     (switch-to-buffer b)
+                     (setq-local truncate-lines nil)
+                     (setq-local truncate-partial-width-windows nil)
+                     (setq-local word-wrap t)
+                     (list (window-body-width)
+                           (char-width ?提)
+                           (let ((word-wrap-by-category t))
+                             (goto-char (point-min))
+                             (vertical-motion 1)
+                             (point))
+                           (let ((word-wrap-by-category nil))
+                             (goto-char (point-min))
+                             (vertical-motion 1)
+                             (point)))))
+               (if (buffer-live-p b)
+                   (kill-buffer b))
+               (delete-other-windows)))"#,
+    );
+    assert_eq!(result, "OK (24 2 19 15)");
 }
 
 /// The oracle's own probe (`div_l0_word_wrap_at_spaces`), as a unit pin on
@@ -6250,7 +6362,9 @@ fn frame_query_builtins_report_pixel_sizes_for_gui_frames() {
     assert_eq!(
         crate::emacs_core::frame::builtin_frame_text_width(&mut ev, vec![Value::make_frame(fid.0)])
             .unwrap(),
-        Value::fixnum(776)
+        // FRAME_PIXEL_TO_TEXT_WIDTH (src/frame.h:1804-1808): 800 - 16 px scroll-bar area
+        // (the toolkit default, src/xfns.c:2393-2407) - 2x8 px fringes.
+        Value::fixnum(768)
     );
     assert_eq!(
         crate::emacs_core::frame::builtin_frame_text_height(
@@ -6283,7 +6397,9 @@ fn frame_text_width_ignores_window_local_fringe_overrides_for_gui_frames() {
     assert_eq!(
         crate::emacs_core::frame::builtin_frame_text_width(&mut ev, vec![Value::make_frame(fid.0)])
             .unwrap(),
-        Value::fixnum(776)
+        // FRAME_PIXEL_TO_TEXT_WIDTH (src/frame.h:1804-1808): 800 - 16 px scroll-bar area
+        // (the toolkit default, src/xfns.c:2393-2407) - 2x8 px fringes.
+        Value::fixnum(768)
     );
 }
 
@@ -7000,11 +7116,11 @@ fn shared_tty_child_minibuffer_window_apis_use_owner_frame() {
     );
     assert!(ev.frames.lookup_window(root_minibuffer).is_some());
     assert_eq!(
-        super::builtin_window_frame(&mut ev, vec![root_minibuffer_value]).expect("window-frame"),
+        super::builtin_window_frame(&mut ev, &vec![root_minibuffer_value]).expect("window-frame"),
         root
     );
     assert!(
-        super::builtin_window_buffer(&mut ev, vec![root_minibuffer_value])
+        super::builtin_window_buffer(&mut ev, &vec![root_minibuffer_value])
             .expect("window-buffer")
             .is_buffer()
     );
@@ -7234,8 +7350,9 @@ fn x_create_frame_with_parent_frame_creates_gui_child_overlay_without_host_windo
     );
     assert_eq!(child.left_pos, 30);
     assert_eq!(child.top_pos, 40);
-    // 20 text columns plus default fringes (8+8) and scrollbar (one cell).
-    assert_eq!(child.width, 226);
+    // 20 text columns x 10 px plus default fringes (8+8) and the 16 px toolkit scroll-bar
+    // area (src/xfns.c:2393-2407; FRAME_TEXT_TO_PIXEL_WIDTH, src/frame.h:1790-1794).
+    assert_eq!(child.width, 232);
     assert_eq!(child.height, 100);
     assert_eq!(child.char_width, 10.0);
     assert_eq!(child.char_height, 20.0);
@@ -7612,13 +7729,14 @@ fn x_create_frame_accepts_text_pixel_size_on_gui_child_frame() {
 
     let child = ev.frames.get(child_id).expect("child frame");
     assert_eq!(requests.borrow().len(), 0);
-    // 190 text pixels, default horizontal chrome (26), and two 2px borders.
-    assert_eq!(child.width, 220);
+    // FRAME_TEXT_TO_PIXEL_WIDTH (src/frame.h:1790-1794): 190 text pixels + 2x8 px fringes +
+    // the 16 px toolkit scroll-bar area (src/xfns.c:2393-2407) + two 2 px borders.
+    assert_eq!(child.width, 226);
     assert_eq!(child.height, 82);
     assert_eq!(child.internal_border_width(), 2);
     assert_eq!(
         *child.root_window().bounds(),
-        crate::window::Rect::new(2.0, 2.0, 216.0, 78.0)
+        crate::window::Rect::new(2.0, 2.0, 222.0, 78.0)
     );
 }
 
@@ -8090,8 +8208,8 @@ fn x_create_frame_syncs_pending_resize_before_adopting_opening_gui_frame() {
     }
     ev.set_variable("terminal-frame", Value::make_frame(fid.0));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Focus {
         focused: true,
         emacs_frame_id: 0,
@@ -8295,7 +8413,7 @@ fn deleting_last_frame_on_terminal_deletes_terminal_too() {
     assert!(
         crate::emacs_core::terminal::pure::builtin_terminal_live_p(
             &mut ev,
-            vec![secondary_terminal]
+            &vec![secondary_terminal]
         )
         .unwrap()
         .is_nil(),
@@ -8359,7 +8477,7 @@ fn frame_builtins_accept_frame_handle_values() {
         Value::T
     );
     assert_eq!(
-        crate::emacs_core::frame::builtin_frame_live_p(&mut ev, vec![frame]).unwrap(),
+        crate::emacs_core::frame::builtin_frame_live_p(&mut ev, &vec![frame]).unwrap(),
         Value::T
     );
     assert_eq!(
@@ -8640,7 +8758,7 @@ fn gui_frame_font_parameter_exposes_font_name_not_font_object() {
     let frame_value = Value::make_frame(fid.0);
     let direct = crate::emacs_core::frame::builtin_frame_parameter(
         &mut ev,
-        vec![frame_value, FrameParam::Font.symbol()],
+        &vec![frame_value, FrameParam::Font.symbol()],
     )
     .expect("frame-parameter");
     assert_eq!(direct.as_utf8_str(), Some(public_font_name_text.as_str()));
@@ -8917,7 +9035,9 @@ fn modify_frame_parameters_width_height_resizes_live_gui_frame() {
     let resize_requests = resized.borrow();
     assert_eq!(resize_requests.len(), 1);
     assert_eq!(resize_requests[0].frame_id, fid);
-    assert_eq!(resize_requests[0].width, 664);
+    // FRAME_TEXT_TO_PIXEL_WIDTH (src/frame.h:1790-1794): 80 columns x 8 px + 2x8 px
+    // fringes + the 16 px toolkit scroll-bar area (src/xfns.c:2393-2407).
+    assert_eq!(resize_requests[0].width, 672);
     assert_eq!(resize_requests[0].height, 400);
     assert_eq!(
         resize_requests[0].geometry_hints,
@@ -8928,7 +9048,7 @@ fn modify_frame_parameters_width_height_resizes_live_gui_frame() {
     );
 
     let frame = ev.frames.get(fid).expect("frame should exist");
-    assert_eq!(frame.width, 664);
+    assert_eq!(frame.width, 672);
     assert_eq!(frame.height, 400);
     assert_eq!(frame.parameter("width"), Some(Value::fixnum(80)));
     assert_eq!(frame.parameter("height"), Some(Value::fixnum(25)));
@@ -9065,8 +9185,8 @@ fn modify_frame_parameters_after_live_font_change_defers_gui_resize_until_geomet
         80 * 13 + frame.horizontal_non_text_width()
     };
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Resize {
         width: expected_width as u32,
         height: 775,
@@ -9185,7 +9305,9 @@ fn modify_frame_parameters_resize_ignores_window_local_fringes_for_gui_frames() 
     let resize_requests = resized.borrow();
     assert_eq!(resize_requests.len(), 1);
     assert_eq!(resize_requests[0].frame_id, fid);
-    assert_eq!(resize_requests[0].width, 664);
+    // FRAME_TEXT_TO_PIXEL_WIDTH (src/frame.h:1790-1794): 80 columns x 8 px + 2x8 px
+    // fringes + the 16 px toolkit scroll-bar area (src/xfns.c:2393-2407).
+    assert_eq!(resize_requests[0].width, 672);
     assert_eq!(resize_requests[0].height, 400);
     assert_eq!(
         resize_requests[0].geometry_hints,
@@ -9325,7 +9447,9 @@ fn set_frame_size_builtins_resize_live_gui_frames_and_notify_host() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert_eq!(request.frame_id, fid);
-    assert_eq!(request.width, 824);
+    // 100 columns x 8 px + 2x8 px fringes + the 16 px toolkit scroll-bar area
+    // (FRAME_TEXT_TO_PIXEL_WIDTH, src/frame.h:1790-1794; src/xfns.c:2393-2407).
+    assert_eq!(request.width, 832);
     assert_eq!(request.height, 560);
     assert_eq!(
         request.geometry_hints,
@@ -9337,14 +9461,14 @@ fn set_frame_size_builtins_resize_live_gui_frames_and_notify_host() {
 
     drop(requests);
 
-    ev.apply_resize_input_event(824, 560, 1.0, fid.0, false)
+    ev.apply_resize_input_event(832, 560, 1.0, fid.0, false)
         .expect("resize redisplay");
 
     let frame = ev
         .frames
         .get(fid)
         .expect("frame should exist after host ack");
-    assert_eq!(frame.width, 824);
+    assert_eq!(frame.width, 832);
     assert_eq!(frame.height, 560);
     assert_eq!(frame.parameter("width"), Some(Value::fixnum(100)));
     assert_eq!(frame.parameter("height"), Some(Value::fixnum(35)));
@@ -9661,8 +9785,8 @@ fn set_frame_size_syncs_resize_event_before_followup_frame_width_queries() {
     let resized = host.resized.clone();
     ev.set_display_host(Box::new(host));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 2144,
         height: 1386,
@@ -9716,8 +9840,8 @@ fn set_frame_size_keeps_resize_pending_until_geometry_queries_force_sync() {
     let resized = host.resized.clone();
     ev.set_display_host(Box::new(host));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 2144,
         height: 1386,
@@ -10343,11 +10467,11 @@ fn window_chrome_height_queries_prefer_last_redisplay_snapshot_when_available() 
         Value::fixnum(35)
     );
     assert_eq!(
-        super::builtin_window_header_line_height(&mut ev, vec![]).expect("header-line height"),
+        super::builtin_window_header_line_height(&mut ev, &vec![]).expect("header-line height"),
         Value::fixnum(35)
     );
     assert_eq!(
-        super::builtin_window_tab_line_height(&mut ev, vec![]).expect("tab-line height"),
+        super::builtin_window_tab_line_height(&mut ev, &vec![]).expect("tab-line height"),
         Value::fixnum(34)
     );
 }
@@ -10604,33 +10728,33 @@ fn gui_geometry_queries_distinguish_logical_layout_from_presented_output() {
         .set_bounds(crate::window::Rect::new(901.0, 902.0, 903.0, 904.0));
 
     assert_eq!(
-        super::builtin_window_pixel_width(&mut ev, vec![])
+        super::builtin_window_pixel_width(&mut ev, &vec![])
             .expect("GNU exposes the synchronous logical pixel width")
             .as_int(),
         Some(903),
         "window-pixel-width reads the window's current layout before first presentation"
     );
     assert_eq!(
-        super::builtin_window_pixel_height(&mut ev, vec![])
+        super::builtin_window_pixel_height(&mut ev, &vec![])
             .expect("GNU exposes the synchronous logical pixel height")
             .as_int(),
         Some(904),
         "window-pixel-height reads the window's current layout before first presentation"
     );
     assert_eq!(
-        super::builtin_window_pixel_left(&mut ev, vec![])
+        super::builtin_window_pixel_left(&mut ev, &vec![])
             .expect("GNU exposes the synchronous logical pixel origin")
             .as_int(),
         Some(901)
     );
     assert_eq!(
-        super::builtin_window_pixel_top(&mut ev, vec![])
+        super::builtin_window_pixel_top(&mut ev, &vec![])
             .expect("GNU exposes the synchronous logical pixel origin")
             .as_int(),
         Some(902)
     );
     assert_eq!(
-        super::builtin_window_body_height(&mut ev, vec![Value::NIL, Value::T])
+        super::builtin_window_body_height(&mut ev, &vec![Value::NIL, Value::T])
             .expect("logical body geometry exists before first presentation")
             .as_int(),
         Some(888),
@@ -10748,8 +10872,8 @@ fn presented_fringe_geometry_and_scrollbar_tuple_keep_live_gnu_configuration() {
         )
         .expect("presented geometry");
 
-    let fringes = super::builtin_window_fringes(&mut ev, vec![]).expect("fringes");
-    let scrollbars = super::builtin_window_scroll_bars(&mut ev, vec![]).expect("scrollbars");
+    let fringes = super::builtin_window_fringes(&mut ev, &vec![]).expect("fringes");
+    let scrollbars = super::builtin_window_scroll_bars(&mut ev, &vec![]).expect("scrollbars");
     assert_eq!(crate::emacs_core::print::print_value(&fringes), "(8 0 t t)");
     assert_eq!(
         crate::emacs_core::print::print_value(&scrollbars),
@@ -10771,10 +10895,12 @@ fn presented_fringe_geometry_and_scrollbar_tuple_keep_live_gnu_configuration() {
         display.horizontal_scroll_bar_type = Value::T;
         display.scroll_bars_persistent = false;
     }
-    let inherited = super::builtin_window_scroll_bars(&mut ev, vec![]).expect("scrollbars");
+    let inherited = super::builtin_window_scroll_bars(&mut ev, &vec![]).expect("scrollbars");
     assert_eq!(
         crate::emacs_core::print::print_value(&inherited),
-        "(nil 1 t nil 0 t nil)",
+        // Inherited COLUMNS = FRAME_CONFIG_SCROLL_BAR_COLS = ceil(16 / 8) = 2 (src/xfns.c:2393-2407,
+        // src/window.h:934-939); the 13 px presented band must not leak into it.
+        "(nil 2 t nil 0 t nil)",
         "realized rectangles must not replace GNU's raw inherited tuple fields"
     );
 }
@@ -11590,7 +11716,7 @@ fn scroll_down_page_scans_buffer_once_not_once_per_screen_row() {
     crate::emacs_core::indent::reset_screen_line_scan_steps_for_test();
     crate::emacs_core::indent::reset_display_stop_recomputes_for_test();
     super::builtin_scroll_down(&mut ev, vec![Value::NIL]).expect("page up from end");
-    let after_start = super::builtin_window_start(&mut ev, vec![Value::make_window(window_id.0)])
+    let after_start = super::builtin_window_start(&mut ev, &vec![Value::make_window(window_id.0)])
         .expect("window-start after page up")
         .as_fixnum()
         .expect("window-start is an integer");
@@ -12749,4 +12875,132 @@ fn minibuffer_selected_window_requires_an_active_selected_minibuffer() {
 "#,
     );
     assert_eq!(result, "OK (nil (t t t) (t nil nil) t (0 nil))");
+}
+
+#[test]
+fn category_word_wrap_respects_custom_ascii_categories_and_kinsoku() {
+    let result = bootstrap_eval_one_with_frame(
+        r#"(progn
+      (delete-other-windows)
+      (select-window (split-window nil -24 'right))
+      (mapcar
+       (lambda (kind)
+         (switch-to-buffer (get-buffer-create (format " *category-wrap-%s*" kind)))
+         (set-category-table (copy-category-table))
+         (setq-local word-wrap t truncate-lines nil truncate-partial-width-windows nil word-wrap-by-category t)
+         (modify-category-entry ?x ?|)
+         (cond ((eq kind 'plain) (insert "supertag v0.4 " (make-string 60 ?x)))
+               ((eq kind 'closing) (insert (make-string 23 ?x) "!" (make-string 20 ?x)) (modify-category-entry ?! ?|) (modify-category-entry ?! ?>))
+               ((eq kind 'opening) (insert (make-string 22 ?x) "?" (make-string 20 ?x)) (modify-category-entry ?? ?|) (modify-category-entry ?? ?<)))
+         (goto-char 1)
+         (let ((noninteractive nil)) (vertical-motion 1))
+         (point))
+       '(plain closing opening)))"#,
+    );
+    assert_eq!(result, "OK (24 23 23)");
+}
+
+/// Word wrapping may add policy reads at display stops, not one obarray walk
+/// per ordinary character. Count real symbol reads around the public command
+/// instead of using a timing threshold that depends on the test machine.
+#[test]
+#[cfg(not(feature = "display-stop-validate"))]
+fn category_word_wrap_symbol_reads_are_bounded_by_display_stops() {
+    let mut ev = runtime_startup_context();
+    ev.eval_str(
+        r#"(progn
+        (delete-other-windows)
+        (set-frame-size nil 1200 24)
+        (switch-to-buffer (get-buffer-create " *wrap-policy-reads*"))
+        (insert (make-string 1500 ?x))
+        (set-category-table (copy-category-table))
+        (modify-category-entry ?x ?|)
+        (setq-local truncate-lines nil truncate-partial-width-windows nil)
+        (setq noninteractive nil))"#,
+    )
+    .expect("prepare a long terminal row");
+
+    for category in ["nil", "t"] {
+        let mut reads = Vec::new();
+        for wrap in ["nil", "t"] {
+            ev.eval_str(&format!(
+                "(progn (setq-local word-wrap {wrap} word-wrap-by-category {category}) (goto-char 1))"
+            ))
+            .expect("select wrap mode");
+            ev.obarray().reset_symbol_slot_read_count();
+            ev.eval_str("(vertical-motion 1)").expect("advance one row");
+            reads.push(ev.obarray().symbol_slot_read_count());
+            assert!(ev.buffers.current_buffer().unwrap().point_char_pos().get() > 1000);
+        }
+        assert!(
+            reads[1] <= reads[0] + 128,
+            "category={category}: word wrapping added {} symbol reads to one ordinary row (character wrap={}, word wrap={})",
+            reads[1].saturating_sub(reads[0]),
+            reads[0],
+            reads[1]
+        );
+    }
+}
+
+#[test]
+fn category_word_wrap_projection_tracks_inherited_sets_and_nested_observations() {
+    use crate::tagged::collection_reads::capture;
+    use crate::window::WordWrapDirection;
+
+    let mut ev = runtime_startup_context();
+    ev.eval_str(
+        r#"(progn
+        (setq-local word-wrap t word-wrap-by-category t)
+        (setq wrap623-parent (make-category-table)
+              wrap623-child (make-category-table))
+        (set-char-table-range wrap623-parent t nil)
+        (set-char-table-range wrap623-parent nil (make-category-set "|"))
+        (set-char-table-range wrap623-child t nil)
+        (set-char-table-range wrap623-child nil nil)
+        (set-char-table-parent wrap623-child wrap623-parent)
+        (set-category-table wrap623-child))"#,
+    )
+    .unwrap();
+    let buffer = ev.buffers.current_buffer_id().unwrap();
+    let permits_x = |ev: &Context| {
+        ev.layout_word_wrap_policy(buffer)
+            .unwrap()
+            .opportunity(u32::from('x'), WordWrapDirection::Forward)
+            .after()
+    };
+    assert!(permits_x(&ev));
+
+    // A warm native result must still contribute its mutable Lisp
+    // dependencies to an enclosing observation used by a layout query.
+    let (permitted, dependencies) = capture(|| permits_x(&ev));
+    assert!(permitted);
+    let dependencies = dependencies.expect("coherent native projection");
+    let unrelated = Value::cons(Value::NIL, Value::NIL);
+    unrelated.set_car(Value::T);
+    assert!(dependencies.unchanged());
+
+    ev.eval_str("(aset (char-table-range wrap623-parent nil) ?| nil)")
+        .unwrap();
+    assert!(
+        !dependencies.unchanged(),
+        "inherited bool-vector dependency"
+    );
+    assert!(!permits_x(&ev));
+
+    ev.eval_str("(set-char-table-range wrap623-parent nil (make-category-set \"|\"))")
+        .unwrap();
+    assert!(permits_x(&ev), "parent default replacement");
+    ev.eval_str("(set-char-table-range wrap623-child nil (make-category-set \"\"))")
+        .unwrap();
+    assert!(!permits_x(&ev), "local default shadows the parent");
+    ev.eval_str("(set-char-table-range wrap623-child nil nil)")
+        .unwrap();
+    assert!(permits_x(&ev));
+    ev.eval_str("(garbage-collect)").unwrap();
+    assert!(permits_x(&ev), "live source survives collection");
+    ev.eval_str(
+        "(progn (set-category-table (make-category-table)) (setq wrap623-parent nil wrap623-child nil) (garbage-collect))",
+    )
+    .unwrap();
+    assert!(!permits_x(&ev), "replace and reclaim the old source");
 }

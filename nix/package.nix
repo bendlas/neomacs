@@ -78,7 +78,8 @@ let
       gstreamerRuntime.pluginScanner
     ]
     ++
-      lib.optionals (pkgs.stdenv.hostPlatform.isLinux && builtins.elem "webview" productionCapabilities.cargoFeatures)
+      lib.optionals
+        (pkgs.stdenv.hostPlatform.isLinux && builtins.elem "webview" productionCapabilities.cargoFeatures)
         [
           "--set-default"
           "WPE_BACKEND_LIBRARY"
@@ -106,6 +107,20 @@ craneLib.buildPackage (
     # used solely for the dependency derivation above.
     src = source;
     inherit cargoArtifacts;
+
+    # A dumped build environment can turn build-only inputs into runtime
+    # dependencies even when the executable never links them. Let Nix's
+    # output reference scan reject that regression after fixup hooks run.
+    disallowedReferences = [
+      rustToolchain
+      cargoArtifacts
+      cargoSrc
+      source
+      pkgs.stdenv.cc
+      pkgs.llvmPackages.clang
+      pkgs.pkg-config
+      pkgs.binutils
+    ];
 
     postBuild = ''
       cargo xtask fresh-build --release --skip-build
@@ -164,6 +179,8 @@ craneLib.buildPackage (
         ${lib.concatStringsSep " \\\n        " linuxWrapArgs}
     '';
 
+    setupHook = ./setup-hook.sh;
+
     passthru = {
       inherit gstreamerRuntime productionCapabilities;
     };
@@ -191,7 +208,13 @@ craneLib.buildPackage (
       # generic Emacs builder reads `emacs.meta.platforms` unconditionally, so
       # leaving it unset makes every `trivialBuild`/`melpaBuild` fail with
       # "attribute 'platforms' missing".
-      platforms = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
+      # The wgpu/WPE backends build on Linux and macOS only; mirrors the
+      # `systems` list in flake.nix.
+      platforms = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
     };
   }
 )

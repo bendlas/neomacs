@@ -10,7 +10,21 @@ mod echo_message;
 
 use super::*;
 use crate::buffer::{BufferId, LispCharPos1};
+use crate::emacs_core::intern::WellKnown;
 use crate::window::{FrameId, PreparedMiniResizeOutcome, Window, WindowId};
+
+// Fixed redisplay spellings with GNU DEFSYM ids. GNU holds these as statics
+// (`Qpre_redisplay_function`, `Qinhibit_redisplay`, `Qinhibit_quit`, ...); the
+// redisplay transaction runs on every command and previously re-interned each
+// spelling at its probe.
+static PRE_REDISPLAY_FUNCTION: WellKnown = WellKnown::PreRedisplayFunction;
+static INHIBIT_REDISPLAY: WellKnown = WellKnown::InhibitRedisplay;
+static INHIBIT_QUIT: WellKnown = WellKnown::InhibitQuit;
+static RESIZE_MINI_FRAMES: WellKnown = WellKnown::ResizeMiniFrames;
+static REDISPLAY_ADHOC_SCROLL_IN_RESIZE_MINI_WINDOWS: WellKnown =
+    WellKnown::RedisplayAdhocScrollInResizeMiniWindows;
+static WINDOW_RESIZE_ROOT_VERTICALLY: WellKnown = WellKnown::WindowResizeRootWindowVertically;
+static WINDOW_RESIZE_MINI_FRAME: WellKnown = WellKnown::WindowResizeMiniFrame;
 use neomacs_display_protocol::types::Px;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -389,7 +403,7 @@ impl Context {
         }
         let root = state.root_window().id();
         let grow = self.funcall_general(
-            Value::symbol("window--resize-root-window-vertically"),
+            Value::symbol(&WINDOW_RESIZE_ROOT_VERTICALLY),
             vec![Value::make_window(root.0), Value::fixnum(-delta), Value::T],
         )?;
         let Some(grow) = grow.as_fixnum().filter(|grow| *grow != 0) else {
@@ -401,7 +415,12 @@ impl Context {
         let Some(state) = self.frames.get(frame) else {
             return Ok(PreparedMiniResizeOutcome::Unchanged);
         };
-        if !crate::window::window_resize_check(state.tree(), state.tree().root_id(), false) {
+        if !crate::window::window_resize_check(
+            state.tree(),
+            state.tree().root_id(),
+            crate::window::SplitDirection::Vertical,
+            crate::window::body::WindowBodyCellSize::new(state.char_width, state.char_height),
+        ) {
             return Ok(PreparedMiniResizeOutcome::Unchanged);
         }
         if let Some(mini) = self
@@ -430,13 +449,13 @@ impl Context {
     pub fn gnu_resize_prepared_mini_frame(&mut self, frame: FrameId) -> EvalResult {
         if !gnu_redisplay_hooks_enabled()
             || !self
-                .special_variable_value_by_id(intern("resize-mini-frames"))
+                .special_variable_value_by_id(RESIZE_MINI_FRAMES.id())
                 .is_some_and(|value| value.is_truthy())
         {
             return Ok(Value::NIL);
         }
         self.safe_funcall(
-            Value::symbol("window--resize-mini-frame"),
+            Value::symbol(&WINDOW_RESIZE_MINI_FRAME),
             vec![Value::make_frame(frame.0)],
         )
     }
@@ -454,13 +473,13 @@ impl Context {
         // GNU xdisp.c:13299 checks inhibit before the optional start reset,
         // even when resize-mini-frames itself is nil.
         if self
-            .special_variable_value_by_id(intern("inhibit-redisplay"))
+            .special_variable_value_by_id(INHIBIT_REDISPLAY.id())
             .is_some_and(|value| value.is_truthy())
         {
             return Ok(Value::NIL);
         }
         if self
-            .special_variable_value_by_id(intern("redisplay-adhoc-scroll-in-resize-mini-windows"))
+            .special_variable_value_by_id(REDISPLAY_ADHOC_SCROLL_IN_RESIZE_MINI_WINDOWS.id())
             .is_none_or(|value| value.is_truthy())
         {
             let begin = self
@@ -519,6 +538,19 @@ impl Context {
         }
         self.gnu_redisplay_hooks.redisplay_frames.insert(frame);
         self.gnu_redisplay_hooks.windows.raise(PendingScope::Some);
+    }
+
+    /// Whether a frame-level redisplay request is pending for `frame`
+    /// (GNU `fset_redisplay`'s set, src/xdisp.c:879).
+    pub(crate) fn frame_redisplay_pending(&self, frame: FrameId) -> bool {
+        self.gnu_redisplay_hooks.redisplay_frames.contains(&frame)
+    }
+
+    /// Forget pending frame-level redisplay requests. Test seam for callers
+    /// that must observe one mutation's contribution in isolation.
+    #[cfg(test)]
+    pub(crate) fn clear_frame_redisplay_marks(&mut self) {
+        self.gnu_redisplay_hooks.redisplay_frames.clear();
     }
 
     /// FRAME_WINDOW_CHANGE is distinct from fset_redisplay (xdisp.c:879).
@@ -650,6 +682,17 @@ impl Context {
         } else {
             self.gnu_redisplay_hooks.windows.raise(PendingScope::Some);
         }
+    }
+
+    /// GNU window.c:window_change_record advances public window history and
+    /// the hook comparison snapshot together, after callbacks have completed.
+    /// Keep the shared boundary for both redisplay policies; neither ordinary
+    /// selection nor frame creation may stand in for a completed hook pass.
+    pub(crate) fn record_redisplay_selection(&mut self) {
+        self.gnu_redisplay_hooks.old_selected_frame =
+            self.frames.selected_frame().map(|frame| frame.id);
+        self.gnu_redisplay_hooks.old_selected_window =
+            self.frames.record_selected_window_after_redisplay();
     }
 
     pub(crate) fn gnu_selected_window(&self) -> Option<WindowId> {
@@ -888,8 +931,7 @@ impl Context {
     }
 
     fn gnu_run_pre_redisplay(&mut self) -> EvalResult {
-        let Some(function) = self.special_variable_value_by_id(intern("pre-redisplay-function"))
-        else {
+        let Some(function) = self.special_variable_value_by_id(PRE_REDISPLAY_FUNCTION.id()) else {
             return Ok(Value::NIL);
         };
         if !builtins::types::value_is_function(self, function) {
@@ -901,7 +943,7 @@ impl Context {
         self.push_specpdl_root(windows);
         let count = self.specpdl.len();
         let result = (|| {
-            self.try_specbind_or_unwind_to(count, intern("inhibit-quit"), Value::T)?;
+            self.try_specbind_or_unwind_to(count, INHIBIT_QUIT.id(), Value::T)?;
             self.safe_funcall(function, vec![windows])
         })();
         let result = self.unbind_to_with_result(count, result);
@@ -919,7 +961,7 @@ impl Context {
         }
         if self.gnu_redisplay_hooks.active.is_active()
             || self
-                .special_variable_value_by_id(intern("inhibit-redisplay"))
+                .special_variable_value_by_id(INHIBIT_REDISPLAY.id())
                 .is_some_and(|value| value.is_truthy())
             || self.redisplay_fn.is_none()
         {

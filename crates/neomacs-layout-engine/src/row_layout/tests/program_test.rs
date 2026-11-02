@@ -1,6 +1,5 @@
 use super::*;
 use crate::display_row::face_state::DisplayRowGlyphMeasurer;
-use crate::font::metrics::FontMetricsService;
 use crate::glyph_advance::GlyphAdvanceQuantization;
 use crate::neovm_bridge::ResolvedFace;
 
@@ -9,8 +8,10 @@ fn geometry(width: f32) -> RowProgramGeometry {
         inherited_line_spacing: 0.0,
         character_wrap: false,
         word_wrap: false,
+        word_wrap_policy: Default::default(),
         fringe: None,
         width,
+        text_origin: crate::display_row::geometry::DisplayRowTextAreaOrigin::row_local(),
         metrics: DisplayRowFallbackMetrics::from_default_face_extents(8.0, 16.0, 12.0),
         tabs: DisplayTabPolicy::every(4),
         base_face: FaceId::new(1),
@@ -246,7 +247,7 @@ fn complete_row_program_uses_exact_captured_fonts_on_worker() {
     require_send::<RowProgram>();
     require_send::<ComputedRow>();
     let faces = faces();
-    let mut fonts = FontMetricsService::new();
+    let mut fonts = crate::font::metrics::test_catalog::metrics_service();
     let mut measurer = DisplayRowGlyphMeasurer::with_mode(
         &faces,
         Some(&mut fonts),
@@ -543,4 +544,128 @@ fn fixed_terminal_prepared_per_char_program_replays_exact_captured_advances() {
         neomacs_display_protocol::glyph_matrix::GlyphType::Char { ch: 'i' }
     ));
     assert_eq!([glyphs[0].pixel_width, glyphs[1].pixel_width], [12.0, 4.0]);
+}
+
+#[test]
+fn contextual_gui_resume_requires_its_native_font_authority() {
+    use crate::font::metrics::test_catalog::TestFontCatalog;
+    let catalog = TestFontCatalog::from_files(&[
+        neomacs_test_fonts::noto_sans_mono_variable(),
+        neomacs_test_fonts::noto_sans_arabic_variable(),
+    ])
+    .expect("pinned contextual shaping fonts");
+    let mut fonts = catalog.metrics_service();
+    let faces = vec![DisplayRowFace::from_resolved(
+        FaceId::new(1),
+        &ResolvedFace::default(),
+    )];
+    let text = "سلامسلامسلامسلام";
+    let chars = text.chars().count();
+    let inputs = vec![
+        DisplayItem::new(
+            SourceSpan::synthetic(1, 0, chars),
+            RenderFaceRef::FaceId(FaceId::new(1)),
+            DisplayItemKind::TextRun(DisplayTextRun::independent(text)),
+        ),
+        DisplayItem::new(
+            SourceSpan::synthetic(1, chars, chars + 1),
+            RenderFaceRef::FaceId(FaceId::new(1)),
+            DisplayItemKind::RowBreak(DisplayRowBreak {
+                line_height: DisplayLineHeightPolicy::Default,
+                line_spacing: DisplayLineSpacingPolicy::Inherit,
+            }),
+        ),
+    ];
+    let mut geometry = geometry(32.0);
+    geometry.character_wrap = true;
+    let mut native = DisplayRowGlyphMeasurer::with_mode(
+        &faces,
+        Some(&mut fonts),
+        8.0,
+        GlyphAdvanceQuantization::PreserveLogicalPixels,
+        DisplayRowMeasurementMode::ConcreteFont,
+    );
+    let captured = RowProgram::capture(
+        geometry.clone(),
+        inputs.clone(),
+        faces.clone(),
+        &mut native,
+        limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        captured.compute_visual_rows(16, || false),
+        Err(RowProgramError::Unsupported)
+    ));
+    let mut terminal = DisplayRowGlyphMeasurer::with_mode(
+        &faces,
+        None,
+        8.0,
+        GlyphAdvanceQuantization::PreserveLogicalPixels,
+        DisplayRowMeasurementMode::LogicalCells,
+    );
+    let captured =
+        RowProgram::capture(geometry, inputs, faces.clone(), &mut terminal, limits()).unwrap();
+    assert!(captured.compute_visual_rows(16, || false).unwrap().len() > 1);
+}
+
+#[test]
+fn category_word_wrap_worker_uses_frozen_rules_after_lisp_table_changes() {
+    use neovm_core::buffer::{BufferId, CharPos0, EmacsBytePos};
+    use neovm_core::window::{WordWrapMode, WordWrapPolicy};
+    let mut eval = neovm_core::emacs_core::Context::new();
+    eval.eval_str("(progn (define-category ?| \"line breakable\") (modify-category-entry ?x ?|))")
+        .unwrap();
+    let policy = WordWrapPolicy::for_buffer(
+        eval.buffer_manager().current_buffer().unwrap(),
+        WordWrapMode::Category,
+    );
+    let text = "a xxxxxxxxx";
+    let face = FaceId::new(1);
+    let faces = vec![DisplayRowFace::from_resolved(
+        face,
+        &ResolvedFace::default(),
+    )];
+    let mut measurer = DisplayRowGlyphMeasurer::new(&faces, None, 8.0);
+    let mut geometry = geometry(40.0);
+    geometry.character_wrap = true;
+    geometry.word_wrap = true;
+    geometry.word_wrap_policy = policy;
+    let pos =
+        |n| DisplaySourcePosition::buffer(BufferId(1), CharPos0::new(n), EmacsBytePos::new(n));
+    let program = RowProgram::capture(
+        geometry,
+        [
+            DisplayItem::new(
+                SourceSpan::new(pos(0), pos(text.len())),
+                RenderFaceRef::FaceId(face),
+                DisplayItemKind::TextRun(DisplayTextRun::independent(text)),
+            ),
+            DisplayItem::new(
+                SourceSpan::new(pos(text.len()), pos(text.len() + 1)),
+                RenderFaceRef::FaceId(face),
+                DisplayItemKind::RowBreak(DisplayRowBreak {
+                    line_height: DisplayLineHeightPolicy::Default,
+                    line_spacing: DisplayLineSpacingPolicy::Inherit,
+                }),
+            ),
+        ],
+        faces.clone(),
+        &mut measurer,
+        limits(),
+    )
+    .unwrap();
+    eval.eval_str("(aset (char-category-set ?x) ?| nil)")
+        .unwrap();
+    let first_row_chars = std::thread::spawn(move || {
+        program.compute_visual_rows(16, || false).unwrap()[0]
+            .slots
+            .len()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        first_row_chars, 5,
+        "the worker must fill the row using the captured category rules"
+    );
 }

@@ -510,9 +510,9 @@ fn object_struct_bytes(header: *const GcHeader) -> usize {
                 VecLikeType::SymbolWithPos => size_of::<SymbolWithPosObj>(),
                 VecLikeType::Finalizer => size_of::<FinalizerObj>(),
                 VecLikeType::Sqlite => size_of::<SqliteObj>(),
-                VecLikeType::Thread | VecLikeType::Mutex | VecLikeType::CondVar => {
-                    size_of::<ThreadingHandleObj>()
-                }
+                VecLikeType::Thread => size_of::<ThreadObj>(),
+                VecLikeType::Mutex => size_of::<MutexObj>(),
+                VecLikeType::CondVar => size_of::<CondVarObj>(),
                 VecLikeType::UserPtr => size_of::<UserPtrObj>(),
                 VecLikeType::ModuleFunction => size_of::<ModuleFunctionObj>(),
             },
@@ -742,8 +742,8 @@ fn buffer_inventory(heap: &TaggedHeap) -> Vec<BufferInventory> {
         ),
         vector_buffer("weak-table-registry", &heap.weak_hash_tables),
         vector_buffer(
-            "permanent-weak-table-registry",
-            &heap.permanent_weak_hash_tables,
+            "always-swept-weak-table-registry",
+            &heap.always_swept_weak_tables,
         ),
         vector_buffer("finalizer-registry", &heap.finalizer_registry),
         vector_buffer("doomed-finalizers", &heap.doomed_finalizer_functions),

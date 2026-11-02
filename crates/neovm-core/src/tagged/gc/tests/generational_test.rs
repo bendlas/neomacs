@@ -133,6 +133,7 @@ fn generational_mapped_and_permanent_logs_are_per_cycle() {
     roots.keep(mapped);
     let permanent = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(permanent);
+    assert_eq!(heap.note_image_object(permanent), ImageStamp::Stamped);
     heap.collect_exact(std::iter::once(permanent));
     assert!(header(permanent).generation.permanent());
     let child = heap.alloc_cons(TaggedValue::T, TaggedValue::NIL);
@@ -169,8 +170,11 @@ fn generational_disabled_never_logs_r() {
     let image = fake_image::FakeImage::leak(false);
     let mapped = image.register_vector(&mut heap);
     roots.keep(mapped);
+    // A generation-disabled partition has no tenured runtime survivors, so
+    // the partition-only barrier's tenured owner is an image resident.
     let permanent = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(permanent);
+    assert_eq!(heap.note_image_object(permanent), ImageStamp::Stamped);
     heap.collect_exact(std::iter::once(permanent));
     let child = heap.alloc_cons(TaggedValue::T, TaggedValue::NIL);
     crate::tagged::mutate::set_vector_slot(mapped, 0, child);
@@ -438,6 +442,7 @@ fn major_before_first_minor_preserves_permanent_edge() {
     let _ = image.register_vector(&mut heap);
     let owner = heap.alloc_vector(vec![TaggedValue::NIL]);
     roots.keep(owner);
+    assert_eq!(heap.note_image_object(owner), ImageStamp::Stamped);
     heap.collect_exact(std::iter::once(owner));
     assert!(header(owner).generation.permanent());
     let child = heap.alloc_cons(TaggedValue::fixnum(97), TaggedValue::NIL);
@@ -456,15 +461,14 @@ fn minor_unchains_young_dead_marker_and_keeps_old_chain_node() {
     let mut heap = heap_with_generations(true);
     set_tagged_heap(&mut heap);
     let roots = ScratchRoots::new();
-    let marker_data = || LispMarker {
-        buffer: None,
-        insertion_type: false,
-        marker_id: None,
-        bytepos: 0,
-        charpos: 0,
-        last_position_valid: false,
-        next_marker: std::ptr::null_mut(),
-        chained: false,
+    let marker_data = || {
+        LispMarker::new(
+            crate::heap_types::MarkerBuffer::DETACHED,
+            crate::buffer::CharPos0::new(0),
+            crate::buffer::EmacsBytePos::new(0),
+            false,
+            false,
+        )
     };
     let old = heap.alloc_marker(marker_data());
     roots.keep(old);
@@ -641,6 +645,7 @@ fn minor_lazy_hydration_keys_survive_from_old_and_permanent_owners() {
         if permanent {
             let image = fake_image::FakeImage::leak(false);
             roots.keep(image.register_vector(&mut heap));
+            assert_eq!(heap.note_image_object(owner), ImageStamp::Stamped);
             heap.collect_exact(std::iter::once(owner));
         } else {
             minor(&mut heap, &[owner]);

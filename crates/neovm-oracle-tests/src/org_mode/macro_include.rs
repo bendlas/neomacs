@@ -86,12 +86,11 @@ fn org_macro_html_export_markup_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_include_location_only_contents_footnotes_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 33 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'ox)
@@ -125,17 +124,16 @@ fn org_include_location_only_contents_footnotes_combo() {
                       (lambda (f) (org-element-property :label f)))
                     (buffer-substring-no-properties
                      (point-min) (point-max)))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_include_literal_blocks_lines_parse_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 28 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'ox)
@@ -164,7 +162,7 @@ fn org_include_literal_blocks_lines_parse_combo() {
                     parsed-example
                     (buffer-substring-no-properties
                      (point-min) (point-max)))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
@@ -198,7 +196,6 @@ fn org_macro_counter_nested_replacement_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_include_nested_macro_footnote_export_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -261,18 +258,17 @@ fn org_include_nested_macro_footnote_export_combo() {
                     (not (null (string-match-p "<i>Inner value</i>" html)))
                     (not (null (string-match-p "footnotes" html)))
                     html)))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_macro_builtin_property_date_env_include_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
     let expect = expect_test::expect![[
-        r#""ERR (user-error \"Unable to read file \\\"/$ORG_ORACLE_INCLUDE_ROOT/env-include.org\\\"\")""#
+        r##""OK (\"#+TITLE: Main Title\\n#+AUTHOR: Ada\\n#+AUTHOR: Bea\\n#+DATE: <2026-05-27 Wed>\\n#+MACRO: kw (eval (org-macro--find-keyword-value $1 t))\\n#+MACRO: prop {{{property($1,$2)}}}\\n* Target\\n:PROPERTIES:\\n:Owner: LocalOwner\\n:Effort: 1:30\\n:END:\\nDate {{{date(%Y-%m-%d)}}}; authors {{{kw(AUTHOR)}}}; owner {{{prop(Owner,* Target)}}}; missing {{{property(Missing,* Target)}}}.\\n#+INCLUDE: \\\"<root>/env-include.org\\\" :minlevel 2\\n\" \"#+TITLE: Main Title\\n#+AUTHOR: Ada\\n#+AUTHOR: Bea\\n#+DATE: <2026-05-27 Wed>\\n#+MACRO: kw (eval (org-macro--find-keyword-value $1 t))\\n#+MACRO: prop {{{property($1,$2)}}}\\n* Target\\n:PROPERTIES:\\n:Owner: LocalOwner\\n:Effort: 1:30\\n:END:\\nDate {{{date(%Y-%m-%d)}}}; authors {{{kw(AUTHOR)}}}; owner {{{prop(Owner,* Target)}}}; missing {{{property(Missing,* Target)}}}.\\n** Env Head\\n:PROPERTIES:\\n:Owner: EnvOwner\\n:END:\\nEnv body {{{property(Owner,* Env Head)}}}.\\n\" (\"date\" \"title\" \"email\" \"author\" \"kw\" \"prop\" \"keyword\" \"n\" \"property\" \"time\") \"#+TITLE: Main Title\\n#+AUTHOR: Ada\\n#+AUTHOR: Bea\\n#+DATE: <2026-05-27 Wed>\\n#+MACRO: kw (eval (org-macro--find-keyword-value $1 t))\\n#+MACRO: prop {{{property($1,$2)}}}\\n* Target\\n:PROPERTIES:\\n:Owner: LocalOwner\\n:Effort: 1:30\\n:END:\\nDate 2026-05-27; authors Ada Bea; owner LocalOwner; missing .\\n** Env Head\\n:PROPERTIES:\\n:Owner: EnvOwner\\n:END:\\nEnv body EnvOwner.\\n\" \"Ada Bea\" \"(eval (if (org-string-nw-p $1) (org-format-timestamp '(timestamp (:standard-properties [1 nil nil nil 17 0 nil nil nil nil nil nil nil nil nil nil nil nil] :type active :range-type nil :raw-value \\\"<2026-05-27 Wed>\\\" :year-start 2026 :month-start 5 :day-start 27 :hour-start nil :minute-start nil :year-end 2026 :month-end 5 :day-end 27 :hour-end nil :minute-end nil)) $1) \\\"<2026-05-27 Wed>\\\"))\" \"LocalOwner\" \"1:30\" (error \"Recursive file inclusion: <root>/loop-a.org\") ((1 \"Target\") (2 \"Env Head\")) \"#+TITLE: Main Title\\n#+AUTHOR: Ada\\n#+AUTHOR: Bea\\n#+DATE: <2026-05-27 Wed>\\n#+MACRO: kw (eval (org-macro--find-keyword-value $1 t))\\n#+MACRO: prop {{{property($1,$2)}}}\\n* Target\\n:PROPERTIES:\\n:Owner: LocalOwner\\n:Effort: 1:30\\n:END:\\nDate 2026-05-27; authors Ada Bea; owner LocalOwner; missing .\\n** Env Head\\n:PROPERTIES:\\n:Owner: EnvOwner\\n:END:\\nEnv body EnvOwner.\\n\")""##
     ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
@@ -308,16 +304,20 @@ fn org_macro_builtin_property_date_env_include_combo() {
             (insert "authors {{{kw(AUTHOR)}}}; ")
             (insert "owner {{{prop(Owner,* Target)}}}; ")
             (insert "missing {{{property(Missing,* Target)}}}.\n")
-            (insert "#+INCLUDE: \"$ORG_ORACLE_INCLUDE_ROOT/env-include.org\" :minlevel 2\n")
-            (let ((before (buffer-substring-no-properties
-                           (point-min) (point-max)))
+            (insert (substitute-env-in-file-name
+                     "#+INCLUDE: \"$ORG_ORACLE_INCLUDE_ROOT/env-include.org\" :minlevel 2\n"))
+            (let ((before (replace-regexp-in-string
+                           (regexp-quote root) "<root>"
+                           (buffer-substring-no-properties
+                            (point-min) (point-max))))
                   expanded recursive-error templates macro-output tree)
               (goto-char (point-min))
               (org-export-expand-include-keyword nil "/" nil nil t)
               (setq expanded
                     (buffer-substring-no-properties
                      (point-min) (point-max)))
-              (setq templates (org-macro--collect-macros))
+              (org-macro-initialize-templates)
+              (setq templates org-macro-templates)
               (org-macro-replace-all templates)
               (setq macro-output
                     (buffer-substring-no-properties
@@ -342,7 +342,7 @@ fn org_macro_builtin_property_date_env_include_combo() {
                                  (replace-regexp-in-string
                                   (regexp-quote root) "<root>" value)
                                value))
-                           (cdr err))))))))
+                           (cdr err)))))))
               (list before
                     expanded
                     (mapcar #'car templates)
@@ -357,7 +357,7 @@ fn org_macro_builtin_property_date_env_include_combo() {
                         (list (org-element-property :level h)
                               (org-element-property :raw-value h))))
                     (buffer-substring-no-properties
-                     (point-min) (point-max)))))))
+                     (point-min) (point-max))))))
       (if old-env
           (setenv "ORG_ORACLE_INCLUDE_ROOT" old-env)
         (setenv "ORG_ORACLE_INCLUDE_ROOT" nil))
@@ -366,12 +366,11 @@ fn org_macro_builtin_property_date_env_include_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_include_export_environment_reference_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 73 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'ox-html)
@@ -445,7 +444,7 @@ fn org_include_export_environment_reference_combo() {
                       "org[[:alnum:]]+"
                       "org-id"
                       (org-export-as 'html nil nil t nil)))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
@@ -527,12 +526,11 @@ fn org_macro_chained_nested_expansion_divergence() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_include_file_lines_blocks_export_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 55 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -588,7 +586,7 @@ fn org_include_file_lines_blocks_export_deep_state_combo() {
                         src-blocks
                         has-code
                         html))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }

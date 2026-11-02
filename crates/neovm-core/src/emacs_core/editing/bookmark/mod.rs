@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::error::{EvalResult, Flow, signal};
 use super::value::{Value, ValueKind};
 use crate::buffer::LispCharPos1;
+use crate::gc_trace::GcTrace;
 use crate::heap_types::LispString;
 #[cfg(test)]
 use strum::{EnumString, IntoStaticStr};
@@ -298,10 +299,62 @@ impl BookmarkManager {
     }
 }
 
+impl GcTrace for BookmarkManager {
+    fn trace_roots(&self, roots: &mut Vec<Value>) {
+        self.trace_roots_with(&mut |value| roots.push(value));
+    }
+
+    fn trace_roots_with(&self, visit: &mut dyn FnMut(Value)) {
+        let Self {
+            bookmarks,
+            recent,
+            modified: _,
+        } = self;
+        // BookmarkKey is a property-free identity. The independently retained
+        // record and recent strings preserve GNU's supplied text properties.
+        for bookmark in bookmarks.values() {
+            let Bookmark {
+                name,
+                filename,
+                position: _,
+                front_context,
+                rear_context,
+                annotation,
+                handler,
+            } = bookmark;
+            name.trace_roots_with(visit);
+            if let Some(filename) = filename {
+                filename.trace_roots_with(visit);
+            }
+            if let Some(front_context) = front_context {
+                front_context.trace_roots_with(visit);
+            }
+            if let Some(rear_context) = rear_context {
+                rear_context.trace_roots_with(visit);
+            }
+            if let Some(annotation) = annotation {
+                annotation.trace_roots_with(visit);
+            }
+            if let Some(handler) = handler {
+                handler.trace_roots_with(visit);
+            }
+        }
+        for name in recent {
+            name.trace_roots_with(visit);
+        }
+    }
+}
+
 fn runtime_string_to_bookmark_string(text: &str) -> LispString {
     super::builtins::plain_str_to_lisp_string(text, true)
 }
 
+/// Property-free, byte-faithful bookmark lookup identity.
+///
+/// GNU's bookmark-get-bookmark uses assoc-string, independent of properties.
+/// Keep the semantic record and recent names separately: bookmark-set-name
+/// preserves their properties. Only this derived identity has no GC edges.
+/// The private field and shared accessor keep its constructor invariant intact.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct BookmarkKey(LispString);
 
@@ -313,7 +366,7 @@ impl BookmarkKey {
         // keeps the bookmark key byte-faithful so distinct names (incl. real PUA
         // glyphs and eight-bit raw bytes) never collide.
         let normalized = if text.is_multibyte() {
-            text.clone()
+            text.without_properties()
         } else {
             LispString::from_emacs_bytes(crate::emacs_core::emacs_char::str_to_multibyte(
                 text.as_bytes(),

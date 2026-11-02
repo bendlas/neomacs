@@ -6,6 +6,18 @@
 use super::*;
 use crate::tagged::value::SymbolMode;
 
+/// GNU's `CURRENT-GROUP` argument for `interrupt-process`, `quit-process`
+/// and `stop-process` (`src/process.c:7100-7138`).  Non-nil asks for the
+/// terminal's current foreground group, which GNU reaches by typing the
+/// control character down the pty; nil keeps `kill (- p->pid, signo)`.
+fn process_signal_recipient(args: &[Value]) -> ProcessSignalRecipient {
+    if args.get(1).is_some_and(|value| !value.is_nil()) {
+        ProcessSignalRecipient::CurrentTerminalGroup
+    } else {
+        ProcessSignalRecipient::ProcessGroup
+    }
+}
+
 /// (internal-default-interrupt-process &optional PROCESS CURRENT-GROUP) -> process-or-nil
 pub(crate) fn builtin_internal_default_interrupt_process(
     eval: &mut super::super::eval::Context,
@@ -31,13 +43,10 @@ pub(crate) fn builtin_internal_default_interrupt_process_impl(
     let (id, ret) =
         resolve_optional_process_with_explicit_return_in_state(processes, buffers, args.first())?;
     check_process_is_real_subprocess(processes, id)?;
+    let recipient = process_signal_recipient(&args);
     if let Some(proc) = processes.get_mut(id) {
         #[cfg(unix)]
-        let _ = signal_process_or_unbacked_success(
-            proc,
-            libc::SIGINT,
-            ProcessSignalRecipient::ProcessGroup,
-        );
+        let _ = signal_process_or_unbacked_success(proc, libc::SIGINT, recipient);
     }
     Ok(ret)
 }
@@ -701,6 +710,11 @@ pub(crate) fn builtin_network_interface_list_impl(args: Vec<Value>) -> EvalResul
     let include_ipv4 = requested_family.is_none_or(|family| family == NetworkAddressFamily::Ipv4);
     let include_ipv6 = requested_family.is_none_or(|family| family == NetworkAddressFamily::Ipv6);
 
+    // GNU answers exactly what `getifaddrs` reports and `nil` when it reports
+    // nothing (`network_interface_list`, src/process.c:4324-4340: a failing
+    // getifaddrs returns Qnil, and the loop only walks the entries the kernel
+    // gave it).  Nothing is synthesized: a host without an IPv6 address has
+    // no IPv6 entry, and a sandbox with no interfaces produces an empty list.
     let mut entries = Vec::new();
     if let Some(host_entries) = sys::interface_snapshot() {
         for entry in host_entries.into_iter().rev() {
@@ -722,15 +736,6 @@ pub(crate) fn builtin_network_interface_list_impl(args: Vec<Value>) -> EvalResul
             } else {
                 entries.push(Value::cons(Value::string(entry.name), entry.address));
             }
-        }
-    }
-
-    if entries.is_empty() {
-        if include_ipv6 {
-            entries.push(interface_entry("lo", loopback_ipv6_address(), full));
-        }
-        if include_ipv4 {
-            entries.push(interface_entry("lo", loopback_ipv4_address(), full));
         }
     }
     Ok(Value::list(entries))
@@ -785,16 +790,12 @@ pub(crate) fn builtin_network_interface_info_impl(args: Vec<Value>) -> EvalResul
         }
     }
 
-    if ifname == "lo" {
-        return Ok(Value::list(vec![
-            loopback_ipv4_address(),
-            loopback_ipv4_broadcast(),
-            loopback_ipv4_netmask(),
-            loopback_hwaddr(),
-            loopback_flags(),
-        ]));
-    }
-
+    // GNU asks the kernel about the named interface (`network_interface_info`,
+    // src/process.c:4485-4505: an ioctl that fails for a name this host does
+    // not have leaves `any` false and the function returns Qnil).  There is no
+    // fallback record for a name the host does not report -- `"lo"` is a
+    // Linux name, and on Darwin the loopback interface is `"lo0"`, so GNU
+    // answers nil there.
     Ok(Value::NIL)
 }
 
@@ -1008,6 +1009,18 @@ pub(super) fn all_processors_count() -> u64 {
         current_processors_count()
     } else {
         count
+    }
+}
+
+/// GNU adds a client's `:local` contact key only when `getsockname` succeeds
+/// (src/process.c:3682-3689) and stores `conv_sockaddr_to_lisp`'s answer.
+/// A failed query leaves the key absent, which `process-contact` reports as
+/// nil -- the Darwin answer for a socket the kernel cannot name.
+#[cfg(unix)]
+fn client_local_contact(contact: Value, fd: std::os::fd::RawFd) -> EvalResult {
+    match unix_socket_endpoint_value(fd, sys::net::SocketEnd::Local) {
+        Some(local) => process_contact_plist_put(contact, ProcessKeyword::Local.value(), local),
+        None => Ok(contact),
     }
 }
 
@@ -1473,11 +1486,7 @@ pub(super) fn connect_network_process_at_explicit_address(
                 let socket = unbound_unix_datagram_socket(&socket_options)?;
                 contact =
                     process_contact_plist_put(contact, ProcessKeyword::Remote.value(), path_value)?;
-                contact = process_contact_plist_put(
-                    contact,
-                    ProcessKeyword::Local.value(),
-                    Value::string(""),
-                )?;
+                contact = client_local_contact(contact, socket.as_raw_fd())?;
 
                 let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
                 eval.processes.sync_process_mark(&mut eval.buffers, id)?;
@@ -1585,11 +1594,7 @@ pub(super) fn connect_network_process_at_explicit_address(
                     ProcessKeyword::Remote.value(),
                     Value::heap_string(crate::emacs_core::fileio::path_to_lisp_file_name(&path)),
                 )?;
-                contact = process_contact_plist_put(
-                    contact,
-                    ProcessKeyword::Local.value(),
-                    Value::string(""),
-                )?;
+                contact = client_local_contact(contact, socket.as_raw_fd())?;
 
                 let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
                 eval.processes.sync_process_mark(&mut eval.buffers, id)?;
@@ -1696,14 +1701,12 @@ pub(super) fn connect_network_process_at_explicit_address(
                 ProcessKeyword::Remote.value(),
                 Value::heap_string(crate::emacs_core::fileio::path_to_lisp_file_name(&path)),
             )?;
-            contact = process_contact_plist_put(
-                contact,
-                ProcessKeyword::Local.value(),
-                Value::string(""),
-            )?;
 
             if nowait {
                 let start = start_nonblocking_unix_stream_socket(&path, &socket_options)?;
+                if let Ok(stream) = &start {
+                    contact = client_local_contact(contact, stream.as_raw_fd())?;
+                }
                 let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
                 eval.processes.sync_process_mark(&mut eval.buffers, id)?;
                 if let Some(proc) = eval.processes.get_mut(id) {
@@ -1750,6 +1753,7 @@ pub(super) fn connect_network_process_at_explicit_address(
             }
 
             let stream = connect_unix_stream_socket(&path, &socket_options)?;
+            contact = client_local_contact(contact, stream.as_raw_fd())?;
             let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
             eval.processes.sync_process_mark(&mut eval.buffers, id)?;
             if let Some(proc) = eval.processes.get_mut(id) {
@@ -2147,11 +2151,7 @@ pub(super) fn connect_local_socket_process(
                 ProcessKeyword::Remote.value(),
                 service_path_value,
             )?;
-            contact = process_contact_plist_put(
-                contact,
-                ProcessKeyword::Local.value(),
-                Value::string(""),
-            )?;
+            contact = client_local_contact(contact, socket.as_raw_fd())?;
 
             let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
             eval.processes.sync_process_mark(&mut eval.buffers, id)?;
@@ -2261,11 +2261,7 @@ pub(super) fn connect_local_socket_process(
                     &service_path,
                 )),
             )?;
-            contact = process_contact_plist_put(
-                contact,
-                ProcessKeyword::Local.value(),
-                Value::string(""),
-            )?;
+            contact = client_local_contact(contact, socket.as_raw_fd())?;
 
             let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
             eval.processes.sync_process_mark(&mut eval.buffers, id)?;
@@ -2388,11 +2384,12 @@ pub(super) fn connect_local_socket_process(
                 &service_path,
             )),
         )?;
-        contact =
-            process_contact_plist_put(contact, ProcessKeyword::Local.value(), Value::string(""))?;
 
         if nowait {
             let start = start_nonblocking_unix_stream_socket(&service_path, &socket_options)?;
+            if let Ok(stream) = &start {
+                contact = client_local_contact(contact, stream.as_raw_fd())?;
+            }
             let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
             eval.processes.sync_process_mark(&mut eval.buffers, id)?;
             if let Some(proc) = eval.processes.get_mut(id) {
@@ -2445,6 +2442,7 @@ pub(super) fn connect_local_socket_process(
         }
 
         let stream = connect_unix_stream_socket(&service_path, &socket_options)?;
+        contact = client_local_contact(contact, stream.as_raw_fd())?;
         let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
         eval.processes.sync_process_mark(&mut eval.buffers, id)?;
         if let Some(proc) = eval.processes.get_mut(id) {
@@ -2747,17 +2745,31 @@ pub(crate) fn builtin_make_network_process(
         let immediate_start = nowait_tcp_immediate_addrs(host_value, &host_str, port, family)
             .map(|addrs| start_pending_tcp_stream_connect(addrs, &socket_options))
             .transpose()?;
-        let pending_dns = if immediate_start.is_none() {
-            Some(start_async_network_dns_lookup(
-                host_str.clone(),
-                port,
-                family,
-                NetworkSocketType::Stream,
-                socket_options.clone(),
-                eval.processes.wait_notifier(),
-            ))
+        let (immediate_start, pending_dns) = if immediate_start.is_some() {
+            (immediate_start, None)
+        } else if crate::emacs_core::platform_facts::ASYNC_GETADDRINFO {
+            (
+                None,
+                Some(start_async_network_dns_lookup(
+                    host_str.clone(),
+                    port,
+                    family,
+                    NetworkSocketType::Stream,
+                    socket_options.clone(),
+                    eval.processes.wait_notifier(),
+                )),
+            )
         } else {
-            None
+            // GNU without `getaddrinfo_a` resolves even a `:nowait` client
+            // synchronously and signals a lookup failure before the process
+            // exists (src/process.c:4203-4205); a successful lookup still
+            // starts the non-blocking connect below.
+            let addrs =
+                resolve_network_socket_addrs(&host_str, port, family, NetworkSocketType::Stream)?;
+            (
+                Some(start_pending_tcp_stream_connect(addrs, &socket_options)?),
+                None,
+            )
         };
 
         let id = create_network_process_record(eval, name, buffer, resolved_coding)?;
@@ -3783,6 +3795,7 @@ pub(crate) fn builtin_stop_process_impl(
     // before it resolves anything (src/process.c:7267-7278): it sets
     // `p->command' to t and returns the process, with no liveness test at all.
     let is_live = processes.get(id).is_some();
+    let recipient = process_signal_recipient(&args);
     if let Some(proc) = processes.get_any_mut(id) {
         if matches!(
             proc.kind,
@@ -3791,8 +3804,7 @@ pub(crate) fn builtin_stop_process_impl(
             proc.command = Value::T;
         } else if is_live {
             #[cfg(unix)]
-            let _ =
-                deliver_process_signal(proc, libc::SIGTSTP, ProcessSignalRecipient::ProcessGroup);
+            let _ = deliver_process_signal(proc, libc::SIGTSTP, recipient);
         }
     }
     Ok(ret)
@@ -3823,10 +3835,12 @@ pub(crate) fn builtin_quit_process_impl(
     let (id, ret) =
         resolve_optional_process_with_explicit_return_in_state(processes, buffers, args.first())?;
     check_process_is_real_subprocess(processes, id)?;
+    let recipient = process_signal_recipient(&args);
     if let Some(proc) = processes.get_mut(id) {
-        // Send SIGQUIT to the child process.
+        // GNU's `quit-process' (src/process.c:7245-7265) reaches
+        // `process_send_signal (process, SIGQUIT, current_group, 0)'.
         #[cfg(unix)]
-        let _ = deliver_process_signal(proc, libc::SIGQUIT, ProcessSignalRecipient::ProcessGroup);
+        let _ = deliver_process_signal(proc, libc::SIGQUIT, recipient);
     }
     Ok(ret)
 }
@@ -5615,16 +5629,27 @@ pub(crate) fn builtin_process_running_child_p(
 
 #[cfg(unix)]
 pub(super) fn process_tty_foreground_group(proc: &Process) -> Option<i32> {
-    if let Some(gid) = proc
-        .live_io
-        .pty_master
-        .as_ref()
-        .and_then(|master| master.as_raw_fd())
-        .and_then(sys::fd_foreground_pgrp)
+    // GNU's emacs_get_tty_pgrp probes `p->infd` (src/process.c:7003-7025):
+    // the pty master for a pty connection, the shared output pipe for a pipe
+    // connection.  The platform answers for a pipe differ and GNU propagates
+    // them: Linux's TIOCGPGRP fails with ENOTTY and process-running-child-p
+    // returns t, while Darwin's succeeds with process group 0 and GNU returns
+    // the fixnum 0.  Probing only a pty master made Neo answer t on both.
     {
-        return Some(gid);
+        use std::os::fd::AsRawFd;
+        let input_fd = proc
+            .live_io
+            .pty_master
+            .as_ref()
+            .and_then(|master| master.as_raw_fd())
+            .or_else(|| proc.live_io.child_stdout.as_ref().map(AsRawFd::as_raw_fd));
+        if let Some(gid) = input_fd.and_then(sys::fd_foreground_pgrp) {
+            return Some(gid);
+        }
     }
 
+    // GNU retries through the controlling tty's path when the fd probe fails
+    // and the process recorded a tty name.
     let tty_name = proc.tty_name.as_lisp_string()?;
     if tty_name.as_bytes().is_empty() {
         return None;

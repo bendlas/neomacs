@@ -41,12 +41,15 @@ fn swash_file_replay(identity: &ResolvedFontIdentity) -> Option<FontReplay> {
 }
 use ttf_parser::Face as TtfFace;
 
-#[cfg(target_os = "linux")]
+#[cfg(test)]
+pub(crate) mod test_catalog;
+
+#[cfg(all(not(test), target_os = "linux"))]
 fn platform_foundry_for_file(file: &str) -> Option<String> {
     crate::font::fontconfig::foundry_for_file(file)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(test), not(target_os = "linux")))]
 fn platform_foundry_for_file(_file: &str) -> Option<String> {
     None
 }
@@ -642,6 +645,42 @@ pub(crate) struct DetachedFontPolicy {
 }
 
 impl DetachedFontPolicy {
+    pub(crate) fn merged(
+        &self,
+        other: &Self,
+        query_limit: usize,
+    ) -> Result<Self, crate::font::resolver::FontPolicyMergeError> {
+        use crate::font::resolver::FontPolicyMergeError;
+        // An ASCII-only capture intentionally carries no live symbol-policy
+        // authority. Its default placeholder must not override Unicode inputs.
+        let symbols = if self.query_count() == 0 {
+            &other.symbols
+        } else if other.query_count() == 0 || self.symbols == other.symbols {
+            &self.symbols
+        } else {
+            return Err(FontPolicyMergeError::Changed);
+        };
+        let characters =
+            std::sync::Arc::new(self.characters.merged(&other.characters, query_limit)?);
+        let bytes = Self::symbol_bytes(symbols)
+            .and_then(|bytes| bytes.checked_add(characters.bytes()))
+            .ok_or(FontPolicyMergeError::Budget)?;
+        Ok(Self {
+            characters,
+            symbols: symbols.clone(),
+            bytes,
+        })
+    }
+
+    fn symbol_bytes(symbols: &SymbolFontPolicy) -> Option<usize> {
+        std::mem::size_of::<Self>().checked_add(
+            symbols
+                .symbol_ranges
+                .len()
+                .checked_mul(std::mem::size_of::<(u32, u32)>())?,
+        )
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -896,6 +935,14 @@ impl FontMetricsService {
         tracing::info!("FontMetricsService: initializing cosmic-text FontSystem");
         let font_system = FontSystem::new();
         tracing::info!("FontMetricsService: FontSystem ready");
+        Self::from_font_system_and_resolver(font_system, font_resolver)
+    }
+
+    #[inline]
+    fn from_font_system_and_resolver(
+        font_system: FontSystem,
+        font_resolver: crate::font::resolver::FontResolver,
+    ) -> Self {
         Self {
             font_catalog: crate::font::catalog::FontCatalog::default(),
             font_system,
@@ -927,9 +974,10 @@ impl FontMetricsService {
         &self,
         requests: &[(&str, char, u16, bool, f32)],
         max_bytes: usize,
-    ) -> Option<DetachedFontPolicy> {
+    ) -> Result<DetachedFontPolicy, crate::font::resolver::FontPolicyCaptureError> {
+        use crate::font::resolver::FontPolicyCaptureError;
         if requests.len() > 128 {
-            return None;
+            return Err(FontPolicyCaptureError::Budget);
         }
         let ascii_symbols = SymbolFontPolicy::default();
         let symbols = if requests.is_empty() {
@@ -937,9 +985,11 @@ impl FontMetricsService {
         } else {
             &self.symbol_font_policy
         };
-        let symbol_bytes = std::mem::size_of::<DetachedFontPolicy>()
-            .checked_add(symbols.symbol_ranges.len().checked_mul(8)?)?;
-        let remaining = max_bytes.checked_sub(symbol_bytes)?;
+        let symbol_bytes =
+            DetachedFontPolicy::symbol_bytes(symbols).ok_or(FontPolicyCaptureError::Budget)?;
+        let remaining = max_bytes
+            .checked_sub(symbol_bytes)
+            .ok_or(FontPolicyCaptureError::Budget)?;
         let requests: Vec<_> = requests
             .iter()
             .map(|&(family, ch, weight, italic, size)| {
@@ -948,8 +998,10 @@ impl FontMetricsService {
             .collect();
         let characters =
             crate::font::resolver::FrozenCharacterPolicies::capture(&requests, remaining)?;
-        let bytes = symbol_bytes.checked_add(characters.bytes())?;
-        Some(DetachedFontPolicy {
+        let bytes = symbol_bytes
+            .checked_add(characters.bytes())
+            .ok_or(FontPolicyCaptureError::Budget)?;
+        Ok(DetachedFontPolicy {
             characters: std::sync::Arc::new(characters),
             symbols: symbols.clone(),
             bytes,
@@ -1008,7 +1060,14 @@ impl FontMetricsService {
                 current = current.get(),
                 "rebuilding layout font state for native catalog change"
             );
-            self.font_system = FontSystem::new();
+            #[cfg(not(test))]
+            {
+                self.font_system = FontSystem::new();
+            }
+            #[cfg(test)]
+            {
+                self.font_system = self.test_catalog().font_system();
+            }
             self.font_file_cache = FontFileCache::new();
             self.clear_caches();
             // Records carry metrics read from the files; a replaced file must
@@ -1378,20 +1437,51 @@ impl FontMetricsService {
         identity: &ResolvedFontIdentity,
         font_size: f32,
     ) -> Option<std::sync::Arc<crate::font::probe::DeviceAsciiAdvances>> {
-        let file = identity.file_path.as_deref()?;
-        let explicit_weight = identity
-            .variation_coords
-            .iter()
-            .find(|coord| coord.tag() == u32::from_be_bytes(*b"wght"))
-            .map(|coord| coord.value());
-        let device_pixel_size = self.selection_size(font_size).rounded_device_px();
-        crate::font::probe::probe_device_ascii_advances(
-            file,
-            identity.freetype_selector()?,
-            device_pixel_size,
-            explicit_weight,
+        let request = crate::font::probe::ExactDeviceFontRequest::for_ascii(
+            identity,
+            self.selection_size(font_size),
         )
-        .map(std::sync::Arc::new)
+        .ok()?;
+        crate::font::probe::probe_device_ascii_advances_for_request(&request)
+            .ok()
+            .map(std::sync::Arc::new)
+    }
+
+    /// GNU ftcrfont_glyph_extents uses the opened device-size metric for
+    /// ordinary non-ASCII glyphs too. The existing character/cluster caches
+    /// own the final answer; no native handle or second cache is retained.
+    #[cfg(target_os = "linux")]
+    #[cold]
+    #[inline(never)]
+    fn device_glyph_advance(&self, materialized: &LayoutFontHandle, ch: char) -> Option<f32> {
+        use crate::font::probe::{DeviceGlyphProbe, ExactDeviceFontRequest};
+        match materialized.font.glyph_advance {
+            ResolvedFontAdvance::PerGlyph => {}
+            ResolvedFontAdvance::FixedCell(_) | ResolvedFontAdvance::MonospaceCells(_) => {
+                return None;
+            }
+        }
+        let measured = ExactDeviceFontRequest::new(
+            &materialized.font.identity,
+            self.selection_size(materialized.font.pixel_size),
+        )
+        .and_then(|request| crate::font::probe::probe_device_glyph_advance(&request, ch));
+        match measured {
+            Ok(DeviceGlyphProbe::Present(advance)) => {
+                Some(advance.logical_advance(self.device_scale))
+            }
+            Ok(DeviceGlyphProbe::MissingGlyph) => None,
+            Err(error) => {
+                tracing::debug!(
+                    target: "font_boundary",
+                    identity = %materialized.font.identity.stable_key,
+                    character = %ch.escape_unicode(),
+                    %error,
+                    "exact device glyph probe refused; retaining the existing outline path"
+                );
+                None
+            }
+        }
     }
 
     fn materialized_font_has_char(&mut self, materialized: &LayoutFontHandle, ch: char) -> bool {
@@ -2008,11 +2098,12 @@ impl FontMetricsService {
             }
         };
         Some(SelectedFontInfo {
-            foundry: resolved
-                .identity
-                .file_path
-                .as_deref()
-                .and_then(platform_foundry_for_file),
+            foundry: resolved.identity.file_path.as_deref().and_then(
+                #[cfg(test)]
+                |file| self.font_resolver.test_foundry_for_file(file),
+                #[cfg(not(test))]
+                platform_foundry_for_file,
+            ),
             resolved,
             slant: materialized.selector_slant,
             metrics,
@@ -2746,6 +2837,10 @@ impl FontMetricsService {
                     .glyph_metrics(&[])
                     .scale(materialized.font.pixel_size)
                     .advance_width(glyph_id);
+                #[cfg(target_os = "linux")]
+                let advance = self
+                    .device_glyph_advance(materialized, ch)
+                    .unwrap_or(advance);
                 (glyph_id.into(), advance)
             }
         };
@@ -3046,9 +3141,18 @@ impl FontMetricsService {
             materialized.resolution == FontResolutionSource::FacePrimary
                 || materialized.font.glyph_advance.cell_advance_px().is_some()
         });
-        let w = direct_glyph
-            .and_then(|materialized| self.simple_copy_glyph_for_char(materialized, ch))
-            .map(|(_, advance_px)| advance_px)
+        #[cfg(target_os = "linux")]
+        let device_advance = materialized
+            .as_ref()
+            .and_then(|font| self.device_glyph_advance(font, ch));
+        #[cfg(not(target_os = "linux"))]
+        let device_advance: Option<f32> = None;
+        let w = device_advance
+            .or_else(|| {
+                direct_glyph
+                    .and_then(|materialized| self.simple_copy_glyph_for_char(materialized, ch))
+                    .map(|(_, advance_px)| advance_px)
+            })
             .unwrap_or_else(|| {
                 let resolved = self.font_request_for_char(ch, selection);
                 self.measure_resolved_char(ch, &resolved, selection.font_size)
@@ -3498,7 +3602,7 @@ pub(crate) fn realize_face_font(
     let family = if face.font_family.is_empty() {
         "monospace"
     } else {
-        face.font_family.as_str()
+        face.font_family.as_ref()
     };
     let font = service.resolved_font_for_face(
         family,
@@ -3508,7 +3612,7 @@ pub(crate) fn realize_face_font(
     )?;
     face.default_resolved_font_id = Some(font.id);
     if face.font_file_path.is_none() {
-        face.font_file_path = font.identity.file_path.clone();
+        face.font_file_path = font.identity.file_path.as_deref().map(std::sync::Arc::from);
     }
     Some(font)
 }
@@ -3519,7 +3623,7 @@ fn protocol_face_font_selection(
     let primary_family = if face.font_family.is_empty() {
         "monospace"
     } else {
-        face.font_family.as_str()
+        face.font_family.as_ref()
     };
     RealizedFaceFontSelection::new(
         primary_family,
@@ -3710,3 +3814,7 @@ fn font_slant_to_cosmic_style(slant: FontSlant) -> Option<Style> {
 #[cfg(test)]
 #[path = "metrics/tests/metrics_test.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "metrics/tests/device_glyph_advance_test.rs"]
+mod device_glyph_advance_tests;

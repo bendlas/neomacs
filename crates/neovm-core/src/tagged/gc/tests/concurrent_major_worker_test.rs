@@ -8,6 +8,7 @@ use crate::emacs_core::eval::{
 use crate::emacs_core::intern::intern_uninterned;
 use crate::emacs_core::value::{HashTableTest, LambdaParams, LispHashTable};
 use crate::heap_types::LispString;
+use crate::tagged::header::ImageResident;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -78,7 +79,7 @@ fn set_age(value: TaggedValue, age: Age) {
         match age {
             Age::Young => {}
             Age::Old => (*header(value)).tenured = true,
-            Age::Permanent => (*header(value)).make_permanent(),
+            Age::Permanent => (*header(value)).make_permanent(&ImageResident::for_test()),
         }
     }
 }

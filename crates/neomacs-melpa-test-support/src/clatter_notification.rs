@@ -57,6 +57,13 @@ impl PrivateClatterService {
     pub fn start(control: &Path) -> Result<Self, String> {
         fs::create_dir_all(control.join("home")).map_err(|error| error.to_string())?;
         fs::create_dir_all(control.join("tmp")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(control.join("run")).map_err(|error| error.to_string())?;
+        let environment = neomacs_infra::packages::install::package_environment_with_runtime(
+            control,
+            &control.join("home"),
+            &control.join("tmp"),
+            &control.join("run"),
+        )?;
         let address_file = control.join("bus-address");
         let socket_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -83,13 +90,17 @@ impl PrivateClatterService {
         }
         let script = control.join("service.el");
         fs::write(&script, SERVICE).map_err(|error| error.to_string())?;
+        // `environment` is this control root's canonical package environment:
+        // it already pins HOME and TMPDIR to `control/home` and `control/tmp`
+        // (they are the home/tmp roots it was built from above).  A second
+        // `with_env` of either name is a raw overwrite of a canonical pin,
+        // which the hermetic-env contract refuses; there is nothing to
+        // override here.
         let mut service = ScopedProcess(
             EmacsRuntime::gnu_emacs()
                 .with_env("DBUS_SESSION_BUS_ADDRESS", &address)
                 .with_env("NEOMACS_CLATTER_CONTROL", control.as_os_str())
-                .with_env("HOME", control.join("home").into_os_string())
-                .with_env("TMPDIR", control.join("tmp").into_os_string())
-                .command()
+                .command(&environment)
                 .args(["--batch", "-Q", "-l"])
                 .arg(&script)
                 .stdout(
@@ -131,13 +142,6 @@ impl PrivateClatterService {
             ("TMPDIR".into(), self.control.join("tmp").into_os_string()),
             ("RUST_LOG".into(), "warn".into()),
         ]
-    }
-
-    pub fn configure_runtime(&self, mut runtime: EmacsRuntime) -> EmacsRuntime {
-        for (key, value) in self.environment() {
-            runtime = runtime.with_env(key, value);
-        }
-        runtime
     }
 
     pub fn write_client_script(&self, packages: &PreparedPackageSet) -> Result<PathBuf, String> {

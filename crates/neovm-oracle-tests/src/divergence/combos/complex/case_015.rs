@@ -81,11 +81,10 @@ fn div_cx15_hash_table_custom_test() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx15_set_transient_map_lookup() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (transient-action transient-action)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((m (make-sparse-keymap)))
@@ -96,7 +95,7 @@ fn div_cx15_set_transient_map_lookup() {
         (list (key-binding "a" t)
               (lookup-key m "a")))
     (error (cons 'errored (car e))))
-"##,
+)"##,
         expect,
     );
 }
@@ -107,13 +106,20 @@ fn div_cx15_process_buffer_sentinel_combined() {
     let expect = expect_test::expect![[r#""OK (\"pre:data\\n\" (:sentinel . \"finished\\n\"))""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
-(let ((buf (get-buffer-create " *neo-cx15-pbs*"))
-      (sentinel-data nil))
+(let* ((buf (get-buffer-create " *neo-cx15-pbs*"))
+       (ready (make-temp-file "neo-cx15-pbs-gate-"))
+       (sentinel-data nil))
   (with-current-buffer buf (insert "pre:"))
-  (let ((p (make-process :name "neo-cx15-pbs" :command '("echo" "data")
+  (let ((p (make-process :name "neo-cx15-pbs"
+                         :command (append (list "sh" "-c"
+                                                "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                                "sh" ready)
+                                          '("echo" "data"))
                          :buffer buf
                          :sentinel (lambda (proc event)
                                      (push (cons :sentinel event) sentinel-data)))))
+    ;; The child writes only after READY is deleted, while this form is waiting.
+    (delete-file ready)
     (let ((deadline (+ (float-time) 2.0)))
       (while (and (< (float-time) deadline)
                   (not sentinel-data))
@@ -125,11 +131,10 @@ fn div_cx15_process_buffer_sentinel_combined() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx15_cl_defmethod_after_hierarchy() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (:base (:base-primary :sub-after))""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (progn
@@ -143,7 +148,7 @@ fn div_cx15_cl_defmethod_after_hierarchy() {
       (push :sub-after log))
     (let ((r (neo-cx15-fn (neo-cx15-sub))))
       (list r (nreverse log))))
-"##,
+)"##,
         expect,
     );
 }

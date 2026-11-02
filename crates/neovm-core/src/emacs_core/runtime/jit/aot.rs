@@ -316,6 +316,29 @@ pub(crate) fn aot_entry_symbol(content_hash: u128) -> String {
     format!("__neovm_aot_{content_hash:032x}_{ABI_TAG:08x}")
 }
 
+/// The prefix the object format prepends to a C identifier.
+///
+/// Mach-O (every macOS binary) stores C symbols with one leading underscore;
+/// ELF and x86-64 COFF store the name unchanged.  `dlsym` applies the
+/// convention itself, so only readers of the object file's symbol table -- the
+/// emit-time shim validation and the object-level tests -- need this.  This is
+/// the Apple ABI's name mangling, not a GNU behavior: GNU's own modules go
+/// through `dlsym` (src/module.c:279-293) and never parse an object file.
+#[cfg(target_os = "macos")]
+pub(crate) const OBJECT_SYMBOL_PREFIX: &str = "_";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const OBJECT_SYMBOL_PREFIX: &str = "";
+
+/// The name `name` has inside the emitted object file.
+pub(crate) fn object_symbol_name(name: &str) -> String {
+    format!("{OBJECT_SYMBOL_PREFIX}{name}")
+}
+
+/// The C name behind an object-file symbol name.
+pub(crate) fn c_symbol_name(name: &str) -> &str {
+    name.strip_prefix(OBJECT_SYMBOL_PREFIX).unwrap_or(name)
+}
+
 // ---------------------------------------------------------------------------
 // R1c-3: per-Value rebuild recipe (canonical, pointer-free).
 //
@@ -2065,7 +2088,10 @@ fn assert_aot_imports_exported(obj: &[u8]) -> Result<(), CompileError> {
         .map_err(|e| module_init_err(format!("parse emitted AOT object: {e}")))?;
     for sym in file.symbols() {
         if sym.is_undefined()
-            && let Ok(name) = sym.name()
+            && let Ok(raw_name) = sym.name()
+            // The object writer has already applied the platform's C-symbol
+            // mangling; compare the C name every list here is written in.
+            && let name = c_symbol_name(raw_name)
             && name.starts_with("neovm_jit_")
             && !MIR_SHIM_NAMES.contains(&name)
         {
@@ -2084,9 +2110,14 @@ fn assert_aot_imports_exported(obj: &[u8]) -> Result<(), CompileError> {
 // R1c-6: `try_load_leaf` — the cache's AOT consult.
 // ---------------------------------------------------------------------------
 
-/// Link a relocatable object's bytes into a shared object at `so_path`, via
-/// `cc -shared`. The host process must export the `neovm_jit_*` shims (linked
-/// `-rdynamic`) so the loader can bind the `.so`'s undefined imports at dlopen.
+/// Link a relocatable object's bytes into a loadable module at `so_path`.
+/// The host process must export the `neovm_jit_*` shims (linked `-rdynamic`)
+/// so the loader can bind the module's undefined imports at dlopen.
+///
+/// ELF links a shared object with `-shared`, which leaves undefined symbols
+/// for the loader.  Mach-O has no equivalent to that default: an executable or
+/// bundle must opt into late binding with `-undefined dynamic_lookup`, and a
+/// bundle (`-bundle`) is the macOS shape for a dlopen'd plugin.
 pub(crate) fn link_object_to_so(
     obj_bytes: &[u8],
     so_path: &std::path::Path,
@@ -2097,8 +2128,12 @@ pub(crate) fn link_object_to_so(
     std::fs::File::create(&o_path)
         .and_then(|mut f| f.write_all(obj_bytes))
         .map_err(|e| module_init_err(format!("write .o: {e}")))?;
-    let status = std::process::Command::new("cc")
-        .arg("-shared")
+    let mut command = std::process::Command::new("cc");
+    #[cfg(target_os = "macos")]
+    command.args(["-bundle", "-undefined", "dynamic_lookup"]);
+    #[cfg(not(target_os = "macos"))]
+    command.arg("-shared");
+    let status = command
         .arg("-o")
         .arg(so_path)
         .arg(&o_path)
@@ -2107,7 +2142,7 @@ pub(crate) fn link_object_to_so(
     // Best-effort cleanup of the intermediate object.
     let _ = std::fs::remove_file(&o_path);
     if !status.success() {
-        return Err(module_init_err(format!("cc -shared failed: {status}")));
+        return Err(module_init_err(format!("cc module link failed: {status}")));
     }
     Ok(())
 }
@@ -2457,7 +2492,9 @@ pub fn testkit_call_bearing_selftest(dir: &std::path::Path) -> Result<(), String
 
     // (1) NON-deopt path: F(5) = 1+(bump 5) = 6; bump ran once. Served from AOT.
     cell.set_car(Value::make_int(0));
-    let got = super::cache::try_run_compiled(ctx, &f, Value::NIL, &[Value::make_int(5)])
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let got = unsafe { super::cache::try_run_compiled(ctx, &f, Value::NIL, &[Value::make_int(5)]) }
         .map_err(|_| "F(5) unexpectedly signalled")?;
     if got != Some(Value::make_int(6).bits()) {
         return Err(format!("F(5) = 1+(bump 5) expected 6, got {got:?}"));
@@ -2475,7 +2512,9 @@ pub fn testkit_call_bearing_selftest(dir: &std::path::Path) -> Result<(), String
     // start) → 1+ of a non-number signals. CRITICAL: bump ran EXACTLY ONCE.
     let arg = Value::symbol("aot-cb-not-a-number");
     cell.set_car(Value::make_int(0));
-    let aot_res = super::cache::try_run_compiled(ctx, &f, Value::NIL, &[arg]);
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let aot_res = unsafe { super::cache::try_run_compiled(ctx, &f, Value::NIL, &[arg]) };
     let aot_count = count(cell);
     if aot_count != 1 {
         return Err(format!(
@@ -2513,8 +2552,11 @@ pub fn testkit_call_bearing_selftest(dir: &std::path::Path) -> Result<(), String
     let g = mk_fn(g_ops.clone(), g_consts.clone(), 1);
     testkit_emit_and_place_so(&g_ops, &g_consts, 1, dir)
         .ok_or("G (reloc-returning) not AOT-runnable")?;
-    let g_got = super::cache::try_run_compiled(ctx, &g, Value::NIL, &[Value::make_int(0)])
-        .map_err(|_| "G signalled")?;
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let g_got =
+        unsafe { super::cache::try_run_compiled(ctx, &g, Value::NIL, &[Value::make_int(0)]) }
+            .map_err(|_| "G signalled")?;
     if g_got != Some(lit.bits()) {
         return Err(format!(
             "#A eq-identity: G must return the SOURCE const object (bits {:#x}), got {g_got:?}",
@@ -2587,7 +2629,9 @@ pub fn testkit_baseline_aot_selftest(dir: &std::path::Path) -> Result<(), String
             let f = mk_fn(arity);
             let f_val = Value::make_bytecode(f.clone());
             // AOT serve (try_run_compiled consults AOT first under force).
-            let aot = super::cache::try_run_compiled(ctx, &f, f_val, &[x])
+            // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+            // runs in this thread under the dormant-Context contract.
+            let aot = unsafe { super::cache::try_run_compiled(ctx, &f, f_val, &[x]) }
                 .map_err(|_| "aot run raised".to_string())?
                 .ok_or("aot run returned None (not served)".to_string())?;
             // Confirm it was actually AOT-backed (not JIT'd).
@@ -2733,7 +2777,9 @@ pub fn testkit_baseline_deep_rawslot_deopt_selftest(dir: &std::path::Path) -> Re
      -> Result<(Value, Value), String> {
         let f = mk_fn();
         let f_val = Value::make_bytecode(f.clone());
-        let bits = super::cache::try_run_compiled(ctx, &f, f_val, &[a, b])
+        // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+        // runs in this thread under the dormant-Context contract.
+        let bits = unsafe { super::cache::try_run_compiled(ctx, &f, f_val, &[a, b]) }
             .map_err(|_| "baseline leaf call raised".to_string())?
             .ok_or("aot run returned None (not served)".to_string())?;
         if super::cache::cached_leaf_is_aot_for_func(&f) != Some(true) {
@@ -2876,7 +2922,9 @@ pub fn testkit_callbuiltinsym_aot_selftest(dir: &std::path::Path) -> Result<(), 
 
     let f = mk_fn();
     let f_val = Value::make_bytecode(f.clone());
-    let aot = super::cache::try_run_compiled(ctx, &f, f_val, &[arg])
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let aot = unsafe { super::cache::try_run_compiled(ctx, &f, f_val, &[arg]) }
         .map_err(|_| "aot run raised".to_string())?
         .ok_or("aot run returned None".to_string())?;
     if super::cache::cached_leaf_is_aot_for_func(&f) != Some(true) {
@@ -2987,7 +3035,9 @@ fn cbsym_aot_serve_and_check(
     let f = mk();
     let f_val = Value::make_bytecode(f.clone());
     let ctx: *mut crate::emacs_core::eval::Context = &mut *ev;
-    let aot = super::cache::try_run_compiled(ctx, &f, f_val, args)
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let aot = unsafe { super::cache::try_run_compiled(ctx, &f, f_val, args) }
         .map_err(|_| format!("{label}: aot run raised"))?
         .ok_or_else(|| format!("{label}: aot run returned None"))?;
     if super::cache::cached_leaf_is_aot_for_func(&f) != Some(true) {
@@ -3263,7 +3313,9 @@ pub fn testkit_baseline_op_symbol_reloc_selftest(dir: &std::path::Path) -> Resul
         let ctx = &mut ev as *mut Context;
         let f = mk_fn();
         let f_val = Value::make_bytecode(f.clone());
-        let aot = super::cache::try_run_compiled(ctx, &f, f_val, &b.args)
+        // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+        // runs in this thread under the dormant-Context contract.
+        let aot = unsafe { super::cache::try_run_compiled(ctx, &f, f_val, &b.args) }
             .map_err(|_| format!("{}: aot run raised", b.label))?
             .ok_or(format!(
                 "{}: aot run returned None (reloc/tier mismatch?)",
@@ -3528,7 +3580,9 @@ pub fn testkit_spec_aot_selftest(dir: &std::path::Path) -> Result<(), String> {
         let g_val = Value::make_bytecode(g.clone());
 
         let fast0 = SUBR_SPEC_FAST_COUNT.load(Ordering::Relaxed);
-        let aot = super::cache::try_run_compiled(ctx, &g, g_val, &c.args)
+        // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+        // runs in this thread under the dormant-Context contract.
+        let aot = unsafe { super::cache::try_run_compiled(ctx, &g, g_val, &c.args) }
             .map_err(|_| format!("{}: aot run raised", c.label))?
             .ok_or_else(|| format!("{}: aot run None (spec .so did not serve?)", c.label))?;
         if super::cache::cached_leaf_is_aot_for_func(&g) != Some(true) {
@@ -3654,7 +3708,9 @@ pub fn testkit_spec_aot_selftest(dir: &std::path::Path) -> Result<(), String> {
 
         let fast0 = SUBR_SPEC_FAST_COUNT.load(Ordering::Relaxed);
         let gen0 = SUBR_SPEC_GENERIC_COUNT.load(Ordering::Relaxed);
-        let aot = super::cache::try_run_compiled(ctx, &g, g_val, &[arg])
+        // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+        // runs in this thread under the dormant-Context contract.
+        let aot = unsafe { super::cache::try_run_compiled(ctx, &g, g_val, &[arg]) }
             .map_err(|_| "crux: aot run raised".to_string())?
             .ok_or("crux: aot run None")?;
         if super::cache::cached_leaf_is_aot_for_func(&g) != Some(true) {
@@ -3692,12 +3748,16 @@ pub fn testkit_spec_aot_selftest(dir: &std::path::Path) -> Result<(), String> {
         // SPEC_EPOCH_DISARMED short-circuit — a merely epoch-stale slot would
         // re-validate + re-arm and FAST would move).
         for _ in 0..5 {
-            let _ = super::cache::try_run_compiled(
-                ctx,
-                &g,
-                Value::make_bytecode(g.clone()),
-                &[Value::string("s")],
-            )
+            // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+            // runs in this thread under the dormant-Context contract.
+            let _ = unsafe {
+                super::cache::try_run_compiled(
+                    ctx,
+                    &g,
+                    Value::make_bytecode(g.clone()),
+                    &[Value::string("s")],
+                )
+            }
             .map_err(|_| "crux: repeated disarmed run raised".to_string())?
             .ok_or("crux: repeated disarmed run None")?;
         }
@@ -3816,7 +3876,9 @@ pub fn testkit_pgo_roundtrip_selftest(dir: &std::path::Path) -> Result<(), Strin
     let args = vec![Value::make_int(5)];
 
     let fast0 = SUBR_SPEC_FAST_COUNT.load(Ordering::Relaxed);
-    let aot = super::cache::try_run_compiled(ctx, &g, g_val, &args)
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let aot = unsafe { super::cache::try_run_compiled(ctx, &g, g_val, &args) }
         .map_err(|_| "pgo-roundtrip: aot run raised".to_string())?
         .ok_or("pgo-roundtrip: aot run None (round-trip .so did not serve?)")?;
     if super::cache::cached_leaf_is_aot_for_func(&g) != Some(true) {
@@ -3951,7 +4013,9 @@ pub fn testkit_pgo_drain_selftest(dir: &std::path::Path) -> Result<(), String> {
     let args = vec![Value::make_int(5)];
 
     let fast0 = SUBR_SPEC_FAST_COUNT.load(Ordering::Relaxed);
-    let aot = super::cache::try_run_compiled(ctx2, &g, g_val, &args)
+    // SAFETY: `ctx` points to the live `Context` borrowed above; the call
+    // runs in this thread under the dormant-Context contract.
+    let aot = unsafe { super::cache::try_run_compiled(ctx2, &g, g_val, &args) }
         .map_err(|_| "pgo-drain: aot run raised".to_string())?
         .ok_or("pgo-drain: aot run None (drained .so did not serve?)")?;
     if super::cache::cached_leaf_is_aot_for_func(&g) != Some(true) {
@@ -5695,3 +5759,23 @@ mod policy_qualification_tests;
 mod tests;
 
 pub(crate) mod retier;
+
+/// Carrier park: drop the AOT prewarm/load caches (they hold heap objects
+/// and per-thread prewarm decisions).
+pub(crate) fn reset_carrier_tls() {
+    LOADED_UNITS.with(|units| units.borrow_mut().clear());
+    PRELOAD_UNIT.with(|slot| *slot.borrow_mut() = None);
+    PREWARM_HASHES.with(|hashes| hashes.borrow_mut().clear());
+    PREWARM_STUBS.with(|stubs| stubs.borrow_mut().clear());
+    PREWARM_STUBS_PENDING.with(|slot| slot.set(false));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(h, LOADED_UNITS.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, PRELOAD_UNIT.with(|slot| slot.borrow().is_some() as u64));
+    crate::tls_fingerprint::mix(h, PREWARM_HASHES.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, PREWARM_STUBS.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, PREWARM_STUBS_PENDING.with(|slot| slot.get() as u64));
+}

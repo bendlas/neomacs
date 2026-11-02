@@ -11,20 +11,9 @@ fn assert_gnu(name: &str, form: &str) {
             .join("../../tmp")
             .join(format!("streams-{name}-{}.el", std::process::id()));
         std::fs::write(&script, format!(";;; -*- lexical-binding: nil; -*-\n(let ((v {form})) (princ \"\nGDK-RESULT:\") (prin1 v))\n")).unwrap();
-        let emacs = std::env::var_os("EMACS").unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".local/bin/emacs")
-                .into_os_string()
-        });
         // Campaign runs sandbox the entire nextest driver. Standalone oracle
         // refreshes can supply an explicit wrapper without a host-specific path.
-        let mut command = if let Some(wrapper) = std::env::var_os("NEOMACS_PROBE_SANDBOX") {
-            let mut command = std::process::Command::new(wrapper);
-            command.arg(emacs);
-            command
-        } else {
-            std::process::Command::new(emacs)
-        };
+        let mut command = crate::test_utils::gnu_probe_command();
         let output = command
             .args(["-Q", "--batch", "-l"])
             .arg(script)

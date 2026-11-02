@@ -258,6 +258,14 @@ pub(crate) fn builtin_make_vector_in_context(
     make_vector(args).map_err(|failure| failure.into_flow_in_context(context))
 }
 
+pub(crate) fn builtin_make_bool_vector_in_context(
+    context: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
+    crate::emacs_core::boolvec::make_bool_vector(args)
+        .map_err(|failure| failure.into_flow_in_context(context))
+}
+
 fn make_vector(args: Vec<Value>) -> Result<Value, crate::emacs_core::alloc::AllocationFailure> {
     expect_args("make-vector", &args, 2)?;
     let len = expect_wholenump(&args[0])? as usize;
@@ -638,24 +646,6 @@ pub(crate) struct HashTableTestRegistry {
     aliases: HashMap<String, HashTableTestAlias>,
 }
 
-/// Entry operands for one synchronous, GC-inhibited user-test activation.
-/// The owning mutator pins this on its stack and its Context selects it;
-/// independent mutators never share it. Normalized scalar settings preserve
-/// the entry countdown without holding Lisp values across callbacks.
-#[derive(Clone, Copy)]
-pub(crate) struct HashTestGcInhibitAccounting {
-    pub(crate) bytes_at_start: usize,
-    pub(crate) charged_bytes_at_start: usize,
-    pub(crate) collector_threshold_at_start: usize,
-    /// Resolved only when GC-maybe first needs the saved entry operands.
-    pub(crate) threshold_at_start: Option<std::num::NonZeroUsize>,
-    pub(crate) entry_threshold_bytes: usize,
-    pub(crate) entry_percentage_scaled: Option<std::num::NonZeroU64>,
-    pub(crate) threshold_overridden: bool,
-    pub(crate) memory_full: bool,
-    pub(crate) startup_ceiling: bool,
-}
-
 #[derive(Clone)]
 pub(crate) struct HashTableTestAlias {
     pub(crate) standard_test: Option<HashTableTest>,
@@ -665,6 +655,12 @@ pub(crate) struct HashTableTestAlias {
 
 pub(super) fn reset_collections_thread_locals() {
     HASH_TABLE_TEST_ALIASES.with(|slot| slot.reset(HashTableTestRegistry::default()));
+}
+
+/// Carrier park: forget the installed hash-table-test registry handle (a
+/// plain store). The World's registry stays alive through its Contexts.
+pub(super) fn park_collections_thread_locals() {
+    HASH_TABLE_TEST_ALIASES.with(HeapRegistrySlot::park);
 }
 
 /// Root the custom comparison/hash closures registered via
@@ -996,7 +992,7 @@ fn hash_table_user_defined_call(
     args: impl Into<LispArgVec>,
 ) -> EvalResult {
     if super::super::hashtab::hash_test_parity_enabled() {
-        return super::super::hashtab::with_user_test_guard(eval, table, |eval| {
+        return super::hash_user_callback::with_user_test_guard(eval, table, |eval| {
             eval.apply(function, args)
         });
     }
@@ -2150,3 +2146,12 @@ mod vector_storage_tests;
 #[cfg(test)]
 #[path = "tests/positioned_builtin_classes_test.rs"]
 mod positioned_builtin_classes_tests;
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        HASH_TABLE_TEST_ALIASES.with(|slot| slot.installed_heap_identity().unwrap_or(0) as u64),
+    );
+}

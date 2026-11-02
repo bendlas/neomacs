@@ -10,6 +10,9 @@ use crate::emacs_core::error::{expect_max_args, expect_min_args};
 use crate::emacs_core::symbol::CanonicalAccess;
 // storage imports removed — now using emacs_char directly
 use super::symbol::Obarray;
+
+// GNU's fixed `Qfontified`: every fontification scan probes this property.
+static FONTIFIED_PROPERTY: WellKnown = WellKnown::Fontified;
 use super::value::*;
 use crate::buffer::text_props::{PropertyPlistApplication, TextPropertyTable};
 use crate::buffer::{
@@ -17,8 +20,11 @@ use crate::buffer::{
     LispCharPos1,
 };
 use crate::emacs_core::SymId;
+use crate::emacs_core::intern::WellKnown;
 use crate::window::{FrameManager, WindowId};
 use strum::IntoStaticStr;
+
+mod raw_plist_lookup;
 
 /// Lisp variables that control native text-property resolution.
 ///
@@ -318,21 +324,7 @@ fn current_textprop_variable_value(
 }
 
 fn plist_get_value(plist: Value, prop: Value) -> Option<Value> {
-    let mut tail = plist;
-    loop {
-        if !tail.is_cons() {
-            return None;
-        };
-        let pair_car = tail.cons_car();
-        let pair_cdr = tail.cons_cdr();
-        if !pair_cdr.is_cons() {
-            return None;
-        };
-        if eq_value(&pair_car, &prop) {
-            return Some(pair_cdr.cons_car());
-        }
-        tail = pair_cdr.cons_cdr();
-    }
+    raw_plist_lookup::get(plist, prop)
 }
 
 fn plist_slice_get_value(plist: &[(Value, Value)], prop: Value) -> Option<Value> {
@@ -2730,7 +2722,7 @@ pub(crate) fn builtin_add_face_text_property_in_buffers(
 /// (remove-text-properties BEG END PROPS &optional OBJECT)
 pub(crate) fn builtin_remove_text_properties(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("remove-text-properties", &args, 3)?;
     expect_max_args("remove-text-properties", &args, 4)?;
@@ -2757,7 +2749,7 @@ pub(crate) fn builtin_remove_text_properties(
 
 pub(crate) fn builtin_remove_text_properties_in_buffers(
     buffers: &mut BufferManager,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("remove-text-properties", &args, 3)?;
     expect_max_args("remove-text-properties", &args, 4)?;
@@ -3242,7 +3234,7 @@ pub(crate) fn fontified_property_at_position_in_state(
         position.as_i64(),
         Value::fixnum(position.as_i64()),
     )?;
-    let fontified = Value::symbol("fontified");
+    let fontified = Value::symbol(&FONTIFIED_PROPERTY);
     if !buffer.overlays().is_empty() {
         let byte_pos = buffer.char_pos_to_emacs_byte_pos_clamped_no_alloc(char_pos);
         if let Some((value, _)) = buffer_overlay_property_at_byte_pos(
@@ -3316,7 +3308,7 @@ pub(crate) fn first_unfontified_position_in_state(
     {
         return FontificationScanAdmission::UseGeneric;
     }
-    let fontified = Value::symbol("fontified");
+    let fontified = Value::symbol(&FONTIFIED_PROPERTY);
     let resolver = CharPropertyResolver::snapshot(vars, buffers, fontified);
     if !resolver.supports_presence_coalescing()
         || buffer.text_props_property_name_presence(Value::from_sym_id(category_sym_id()))
@@ -3364,7 +3356,7 @@ pub(crate) fn next_fontified_property_boundary_in_state(
     {
         return Ok(FontificationBoundaryAdmission::UseGeneric);
     }
-    let fontified = Value::symbol("fontified");
+    let fontified = Value::symbol(&FONTIFIED_PROPERTY);
     let resolver = CharPropertyResolver::snapshot(vars, buffers, fontified);
     if resolver.supports_presence_coalescing()
         && buffer.text_props_property_name_presence(Value::from_sym_id(category_sym_id()))
@@ -3781,7 +3773,7 @@ pub(crate) fn builtin_next_property_change_in_buffers(
 /// (text-property-any BEG END PROP VAL &optional OBJECT)
 pub(crate) fn builtin_text_property_any(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     builtin_text_property_any_in_state(eval.variables(), &eval.buffers, args)
 }
@@ -3789,7 +3781,7 @@ pub(crate) fn builtin_text_property_any(
 pub(crate) fn builtin_text_property_any_in_state(
     vars: crate::emacs_core::eval::VariableView<'_>,
     buffers: &BufferManager,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("text-property-any", &args, 4)?;
     expect_max_args("text-property-any", &args, 5)?;
@@ -4204,3 +4196,7 @@ mod text_property_any_interval_tests;
 #[cfg(test)]
 #[path = "tests/fontification_scan_test.rs"]
 mod fontification_scan_tests;
+
+#[cfg(test)]
+#[path = "tests/raw_plist_lookup_test.rs"]
+mod raw_plist_lookup_tests;

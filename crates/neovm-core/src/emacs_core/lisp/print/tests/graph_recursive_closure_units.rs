@@ -32,19 +32,7 @@ fn gnu_output(name: &str, program: &str) -> Vec<u8> {
         format!(";; -*- lexical-binding: t; -*-\n{program}\n"),
     )
     .expect("GNU script");
-    let emacs = std::env::var_os("EMACS").unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".local/bin/emacs")
-            .into_os_string()
-    });
-    let mut command = match std::env::var_os("NEOMACS_PROBE_SANDBOX") {
-        Some(sandbox) => {
-            let mut command = std::process::Command::new(sandbox);
-            command.arg(emacs);
-            command
-        }
-        None => std::process::Command::new(emacs),
-    };
+    let mut command = crate::test_utils::gnu_probe_command();
     let output = command
         .args(["-Q", "--batch", "-l"])
         .arg(script)

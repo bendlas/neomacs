@@ -261,7 +261,10 @@ impl TaggedHeap {
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
     assert!(
-        size_of::<TaggedHeap>() == 4576 + size_of::<super::super::collection_reads::StoreState>()
+        size_of::<TaggedHeap>()
+            == 4576
+                + size_of::<super::super::collection_reads::StoreState>()
+                + size_of::<crate::heap_types::OverlaySerialCounter>()
     );
     assert!(align_of::<TaggedHeap>() == 8);
     assert!(offset_of!(TaggedHeap, mutator_gc) == 24);
@@ -545,4 +548,18 @@ mod tests {
             assert!(log.written_hash_owners.is_empty());
         }
     }
+}
+
+/// Carrier park: drop the concurrent-hash mutator identity.
+pub(crate) fn reset_carrier_tls() {
+    CONCURRENT_HASH_MUTATOR_ID.with(|slot| slot.set(None));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        CONCURRENT_HASH_MUTATOR_ID.with(|slot| slot.get().is_some() as u64),
+    );
 }

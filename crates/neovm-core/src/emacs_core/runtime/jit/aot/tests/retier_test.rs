@@ -323,7 +323,9 @@ fn aot_retier_legacy_cache_heat_replaces_without_reloading_aot() {
     let function = f.function;
     let data = f.data();
     assert_eq!(
-        cache::try_run_compiled(&mut f.ctx, data, function, &[Value::make_int(37)]).unwrap(),
+        // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+        unsafe { cache::try_run_compiled(&mut f.ctx, data, function, &[Value::make_int(37)]) }
+            .unwrap(),
         Some(f.answer.bits()),
     );
     f.expect_jit(old);
@@ -359,7 +361,8 @@ fn cached_symbol_calls_reach_request(t2: bool) {
     let data = caller.get_bytecode_data().unwrap();
     let run = |ctx: &mut Context| {
         assert_eq!(
-            cache::try_run_compiled(ctx, data, caller, &[Value::make_int(37)]).unwrap(),
+            // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+            unsafe { cache::try_run_compiled(ctx, data, caller, &[Value::make_int(37)]) }.unwrap(),
             Some(Value::make_int(42).bits()),
         );
     };
@@ -612,6 +615,7 @@ fn aot_retier_cached_legacy_symbol_calls_reach_request_without_advancing_heat() 
 
 fn force_compile_budget_denial(old: &CompiledLeaf) {
     old.obs.compile_us.set(u32::MAX);
+    old.obs.compile_cpu_us.set(u32::MAX);
     compile::force_tier2_policy_for_test(Some(Tier2PolicyKnob {
         stable: 1,
         attempts: 4,

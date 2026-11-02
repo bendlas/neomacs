@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use command_group::{CommandGroup, GroupChild};
+use neomacs_test_env::{CanonicalEnvironment, PinnedCommand};
 use wait_timeout::ChildExt;
 
 #[cfg(target_os = "linux")]
@@ -25,12 +26,12 @@ mod package_archive;
 mod prepared_package_set;
 mod source_lock;
 mod tree_sitter_grammar;
-pub use package_archive::{GNU_ELPA_ARCHIVE, PackageArchiveSpec, prepare_cached_gnu_elpa_package};
+pub use package_archive::{GNU_ELPA_LABEL, GnuElpaPackage, prepare_cached_gnu_elpa_package};
 pub use prepared_package_set::{
     LoadSuffixes, PackageActivation, PreparedPackageSet, package_activation_elisp,
 };
 pub use source_lock::{
-    CLATTER_PIN, LockedPackageSource, SHALLOW_GIT_FETCH_ARGS, SourceBuild,
+    CLATTER_PIN, LockedPackageSource, PreparedSourceInstall, SHALLOW_GIT_FETCH_ARGS, SourceBuild,
     locked_melpa_install_plan, locked_melpa_source, locked_melpa_sources,
     preflight_locked_melpa_packages, prepare_cached_locked_melpa_package,
     prepare_cached_locked_package_plan,
@@ -61,6 +62,9 @@ pub struct MelpaSandbox {
     home: PathBuf,
     tmp: PathBuf,
     runtime: RuntimeDirectory,
+    /// The package profile's canonical environment for this case: identity
+    /// pins plus this sandbox's HOME/TMPDIR/XDG/test roots.
+    environment: CanonicalEnvironment,
 }
 
 enum RuntimeDirectory {
@@ -153,12 +157,19 @@ impl MelpaSandbox {
         let runtime = RuntimeDirectory::new(case_root.path())?;
         fs::create_dir_all(home.join(".emacs.d"))
             .map_err(|error| format!("failed to create isolated .emacs.d: {error}"))?;
+        let environment = neomacs_infra::packages::install::package_environment_with_runtime(
+            case_root.path(),
+            &home,
+            &tmp,
+            runtime.path(),
+        )?;
 
         Ok(Self {
             case_root,
             home,
             tmp,
             runtime,
+            environment,
         })
     }
 
@@ -174,38 +185,60 @@ impl MelpaSandbox {
         &self.tmp
     }
 
+    /// The canonical environment for this case.
+    pub fn environment(&self) -> &CanonicalEnvironment {
+        &self.environment
+    }
+
     /// Deterministic environment entries for adapters that do not use
     /// [`std::process::Command`] directly, such as a PTY launcher.
     pub fn process_environment(&self) -> Vec<PackageEnvironmentEntry> {
-        deterministic_process_environment(self.root(), &self.home, &self.tmp, self.runtime.path())
+        self.environment
+            .env_pairs()
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), value))
+            .collect()
     }
 
-    /// Apply the deterministic process environment shared by package test
-    /// adapters.
-    pub fn configure(&self, command: &mut Command) {
-        configure_process_environment_with_runtime(
-            command,
-            self.root(),
-            &self.home,
-            &self.tmp,
-            self.runtime.path(),
-        );
+    /// A canonically pinned command for RUNTIME, running in this sandbox.
+    ///
+    /// This is the only editor-command constructor a package scenario needs:
+    /// the environment (identity pins and this case's roots) is applied by the
+    /// type, and the command starts in the scenario root.
+    pub fn command(&self, runtime: &EmacsRuntime) -> PinnedCommand {
+        let mut command = runtime.command(&self.environment);
+        self.configure(&mut command);
+        command
+    }
+
+    /// Finish a command built by [`Self::command`]: start it in the scenario
+    /// root.
+    ///
+    /// The environment is not re-applied here.  `command()` builds it from
+    /// this sandbox's [`CanonicalEnvironment`], and the pin guards refuse a
+    /// second raw application; a deliberate per-case change is an
+    /// `override_pin` statement at the call site.
+    pub fn configure(&self, command: &mut PinnedCommand) {
+        command.current_dir(self.root());
     }
 }
 
-/// Apply the deterministic environment used by package preparation and test
-/// processes.
-fn configure_process_environment_with_runtime(
-    command: &mut Command,
-    root: &Path,
-    home: &Path,
-    tmp: &Path,
-    runtime: &Path,
-) {
-    command
-        .current_dir(root)
-        .envs(deterministic_process_environment(root, home, tmp, runtime))
-        .env_remove("EMACSLOADPATH");
+/// A canonical package environment for an editor probe rooted at `root`.
+///
+/// For probes that are not a [`MelpaSandbox`] but still spawn an editor (the
+/// GUI font checks keep their own display and control directories): the
+/// per-case HOME, TMPDIR and XDG runtime roots are created below `root`, and
+/// the workspace/cache roots come from the same resolvers the package drivers
+/// use.
+pub fn package_environment_at(root: &Path) -> Result<CanonicalEnvironment, String> {
+    let home = root.join("home");
+    let tmp = root.join("tmp");
+    let runtime = root.join("runtime");
+    for directory in [&home, &tmp, &runtime] {
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    }
+    neomacs_infra::packages::install::package_environment_with_runtime(root, &home, &tmp, &runtime)
 }
 
 pub fn sanitize_label(label: &str) -> String {
@@ -235,7 +268,7 @@ pub struct EmacsRuntime {
     pub timeout: Duration,
     /// Set only by [`EmacsRuntime::gnu_emacs`], and only when a reference was
     /// actually attested.  `None` on this port's own runtime, where no pin
-    /// applies, and on a GNU that is absent.
+    /// applies.
     reference: Option<neomacs_parity_reference::ReferenceUse>,
 }
 
@@ -254,66 +287,20 @@ impl EmacsRuntime {
         Self::new("neomacs", neomacs_binary())
     }
 
-    /// GNU Emacs oracle selected explicitly by environment, then from the
-    /// developer's adjacent source checkout, and finally from `PATH`.
+    /// GNU Emacs oracle resolved by the workspace's one resolver and attested
+    /// against `parity-reference.toml`.
     ///
-    /// # The reference is ATTESTED here (ledger 214)
-    ///
-    /// This is the single chokepoint through which every melpa and TUI parity
-    /// test reaches GNU, and until ledger 214 it checked nothing at all: the
-    /// three environment variables, the hard-coded checkout and `PATH` are FOUR
-    /// resolution rules, and the other harnesses have their own, so two suites
-    /// in one session could have scored against two different GNUs without a
-    /// word.  Attesting here means a mismatch cannot reach a comparison.
-    ///
-    /// A mismatch panics rather than returning an error on purpose.  Every
-    /// caller is a parity test whose only possible response is to stop, and a
-    /// `Result` here would be a door for someone to score anyway.  A GNU that
-    /// is simply ABSENT is left to the caller as before --- that is a skip, not
-    /// a wrong answer.
+    /// `neomacs_test_oracle::gnu` owns the only two inputs ---
+    /// `NEOVM_FORCE_ORACLE_PATH`, else the pinned reference check on the
+    /// `emacs` found on `PATH` --- and PANICS when no attested oracle is
+    /// available.  Every caller is a parity test whose only possible response
+    /// to an absent or mismatched oracle is to stop: a skip here would be a
+    /// green run that measured nothing.
     pub fn gnu_emacs() -> Self {
-        let mut runtime = Self::new("gnu-emacs", Self::gnu_emacs_executable());
-        match neomacs_parity_reference::attest(
-            &runtime.executable,
-            neomacs_parity_reference::AttestationDepth::Fingerprint,
-        ) {
-            Ok(reference) => {
-                runtime.executable = reference.executable().to_path_buf();
-                runtime.reference = Some(reference);
-            }
-            Err(
-                error @ neomacs_parity_reference::AttestationError::ExecutableUnresolved { .. },
-            ) => {
-                // No GNU here at all; the caller's own missing-editor handling
-                // reports it.  Ledger 211 section 10.1's distinction: an editor
-                // that could not be RUN is not an editor that answered wrongly.
-                let _ = error;
-            }
-            Err(error) => panic!(
-                "the GNU oracle is present but is NOT the pinned reference, so a parity \
-                 comparison against it is not comparable with any published number.\n{error}"
-            ),
-        }
+        let oracle = neomacs_test_oracle::gnu::gnu_oracle();
+        let mut runtime = Self::new("gnu-emacs", oracle.executable_path());
+        runtime.reference = Some(oracle.reference().clone());
         runtime
-    }
-
-    fn gnu_emacs_executable() -> PathBuf {
-        for variable in [
-            "NEOMACS_MELPA_ORACLE_EMACS",
-            "NEOVM_FORCE_ORACLE_PATH",
-            "NEOVM_ORACLE_EMACS",
-            "ORACLE_EMACS",
-        ] {
-            if let Some(path) = std::env::var_os(variable) {
-                return PathBuf::from(path);
-            }
-        }
-        let source_checkout =
-            PathBuf::from("/home/exec/Projects/github.com/emacs-mirror/emacs/src/emacs");
-        if source_checkout.is_file() {
-            return source_checkout;
-        }
-        PathBuf::from("emacs")
     }
 
     /// What this runtime was attested to be, when it is GNU and was checked.
@@ -334,8 +321,10 @@ impl EmacsRuntime {
         self
     }
 
-    pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.executable);
+    /// A command for this editor carrying ENVIRONMENT's canonical pins and
+    /// this runtime's extra environment.
+    pub fn command(&self, environment: &CanonicalEnvironment) -> PinnedCommand {
+        let mut command = environment.command(&self.executable);
         for (name, value) in &self.extra_env {
             command.env(name, value);
         }
@@ -513,6 +502,78 @@ fn output_with_timeout_in_scope(
     })
 }
 
+/// [`output_with_timeout`] for a canonically pinned editor command.
+///
+/// The pinned form owns a `std::process::Command` privately, so it cannot be
+/// handed to the group-scope runner; editor probes use single-process
+/// ownership anyway (a package scenario's editor does not fork a tree the
+/// harness has to reap).
+pub fn output_with_timeout_pinned(
+    command: &mut PinnedCommand,
+    timeout: Duration,
+) -> Result<Output, CommandError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = ManagedChild::Single(command.spawn().map_err(CommandError::Launch)?);
+    let stdout = child
+        .process()
+        .stdout
+        .take()
+        .ok_or_else(|| CommandError::Capture("stdout pipe was not created".to_string()))?;
+    let stderr = child
+        .process()
+        .stderr
+        .take()
+        .ok_or_else(|| CommandError::Capture("stderr pipe was not created".to_string()))?;
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+
+    let status = match child
+        .wait_for_exit_and_output(
+            ProcessScope::Single,
+            timeout,
+            &stdout_reader,
+            &stderr_reader,
+        )
+        .map_err(CommandError::Launch)?
+    {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let status = child.wait().map_err(CommandError::Launch)?;
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| CommandError::Capture("stdout reader panicked".to_string()))?
+                .map_err(|error| {
+                    CommandError::Capture(format!("failed to read stdout: {error}"))
+                })?;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| CommandError::Capture("stderr reader panicked".to_string()))?
+                .map_err(|error| {
+                    CommandError::Capture(format!("failed to read stderr: {error}"))
+                })?;
+            return Err(CommandError::TimedOut(Output {
+                status,
+                stdout,
+                stderr,
+            }));
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| CommandError::Capture("stdout reader panicked".to_string()))?
+        .map_err(|error| CommandError::Capture(format!("failed to read stdout: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| CommandError::Capture("stderr reader panicked".to_string()))?
+        .map_err(|error| CommandError::Capture(format!("failed to read stderr: {error}")))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     pipe.read_to_end(&mut bytes)?;
@@ -521,7 +582,7 @@ fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
 
 pub use neomacs_infra::packages::elisp_string;
 pub use neomacs_infra::packages::install::{
-    configure_process_environment, deterministic_process_environment, package_preparation_run_id,
+    deterministic_process_environment, package_preparation_run_id,
     publish_package_preparation_failure,
 };
 /// The path to the `neomacs` binary (override with `NEOMACS_BIN`).

@@ -14,18 +14,39 @@ use crate::render_thread::frame_windows::GuiFrameRenderState;
 use neomacs_renderer_wgpu::WgpuRenderer;
 
 impl GuiFrameRenderState {
+    /// Record a primary cursor interpolation sample. Only cursors belonging
+    /// to this native host's root frame can use retained cursor composition;
+    /// child cursors are painted inside the child scene and need a repaint.
+    fn mark_cursor_interpolation_changed(&mut self) {
+        self.compositor.cursor_dirty = true;
+        if self
+            .cursor
+            .target_cloned()
+            .is_some_and(|target| target.frame_id != self.emacs_frame_id)
+        {
+            self.compositor.dirty = true;
+        }
+    }
+
+    /// Advance cursor motion, preserving scene damage for child-frame and
+    /// decorative cursors whose pixels are baked into the retained picture.
     pub(in crate::render_thread) fn tick_cursor_animation(
         &mut self,
         at: neomacs_display_protocol::frame_time::EventTime,
     ) -> bool {
-        let mut dirty = self.cursor.tick_animation(at);
+        let cursor_dirty = self.cursor.tick_animation(at);
+        if cursor_dirty {
+            self.mark_cursor_interpolation_changed();
+        }
+        // Decorative cursors are materialized into the frame, whereas the
+        // primary cursor has an AnimatedCursor override at composition time.
+        // Their cached cells cannot yet be reused while geometry changes.
+        let mut scene_dirty = false;
         for cursor in self.compositor.visual_cursors.values_mut() {
-            dirty |= cursor.tick_animation(at);
+            scene_dirty |= cursor.tick_animation(at);
         }
-        if dirty {
-            self.compositor.dirty = true;
-        }
-        dirty
+        self.compositor.dirty |= scene_dirty;
+        cursor_dirty || scene_dirty
     }
 
     pub(in crate::render_thread) fn tick_cursor_blink(
@@ -94,18 +115,25 @@ impl GuiFrameRenderState {
         self.compositor.dirty = true;
     }
 
+    /// Advance cursor sizing with the same root-versus-child damage policy
+    /// as motion, including the final sample after interpolation completes.
     pub(in crate::render_thread) fn tick_cursor_size_animation(
         &mut self,
         at: neomacs_display_protocol::frame_time::EventTime,
     ) -> bool {
-        let mut dirty = self.cursor.tick_size_animation(at);
+        let cursor_dirty = self.cursor.tick_size_animation(at);
+        if cursor_dirty {
+            self.mark_cursor_interpolation_changed();
+        }
+        // Decorative cursors are materialized into the frame, whereas the
+        // primary cursor has an AnimatedCursor override at composition time.
+        // Their cached cells cannot yet be reused while geometry changes.
+        let mut scene_dirty = false;
         for cursor in self.compositor.visual_cursors.values_mut() {
-            dirty |= cursor.tick_size_animation(at);
+            scene_dirty |= cursor.tick_size_animation(at);
         }
-        if dirty {
-            self.compositor.dirty = true;
-        }
-        dirty
+        self.compositor.dirty |= scene_dirty;
+        cursor_dirty || scene_dirty
     }
 
     pub(in crate::render_thread) fn sync_visual_cursors_from_current_frame(

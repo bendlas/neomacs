@@ -1,11 +1,25 @@
 use super::*;
 use crate::tagged::SymbolMode;
 mod redisplay_gnu;
+mod window_configuration_geometry;
 mod window_configuration_redisplay;
 use crate::buffer::LispCharPos1;
 use crate::emacs_core::error::{expect_args, expect_args_range, expect_max_args, expect_min_args};
 use crate::emacs_core::heap_registry::{HeapRegistryHandle, HeapRegistrySlot};
 use crate::emacs_core::hook_runtime;
+
+// Fixed GNU hook spellings run on every window/redisplay change. The by-name
+// resolver interned each spelling at every probe; the handles resolve once
+// per registry epoch and the alias walk below is unchanged.
+static WINDOW_BUFFER_CHANGE_FUNCTIONS: WellKnown = WellKnown::WindowBufferChangeFunctions;
+static WINDOW_SIZE_CHANGE_FUNCTIONS: WellKnown = WellKnown::WindowSizeChangeFunctions;
+static WINDOW_SELECTION_CHANGE_FUNCTIONS: WellKnown = WellKnown::WindowSelectionChangeFunctions;
+static WINDOW_STATE_CHANGE_FUNCTIONS: WellKnown = WellKnown::WindowStateChangeFunctions;
+static WINDOW_STATE_CHANGE_HOOK: WellKnown = WellKnown::WindowStateChangeHook;
+static WINDOW_CONFIGURATION_CHANGE_HOOK: WellKnown = WellKnown::WindowConfigurationChangeHook;
+static WINDOW_SCROLL_FUNCTIONS: WellKnown = WellKnown::WindowScrollFunctions;
+static INHIBIT_REDISPLAY: WellKnown = WellKnown::InhibitRedisplay;
+use crate::emacs_core::intern::WellKnown;
 use crate::gc_trace::GcTrace;
 
 // ===========================================================================
@@ -18,7 +32,7 @@ pub(crate) fn builtin_run_hooks(eval: &mut super::eval::Context, args: Vec<Value
 
 pub(crate) fn builtin_run_hook_with_args(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("run-hook-with-args", &args, 1)?;
     hook_runtime::run_named_hook_with_args(eval, &args)
@@ -26,7 +40,7 @@ pub(crate) fn builtin_run_hook_with_args(
 
 pub(crate) fn builtin_run_hook_with_args_until_success(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("run-hook-with-args-until-success", &args, 1)?;
     hook_runtime::run_named_hook_with_args_until_success(eval, &args)
@@ -42,7 +56,7 @@ pub(crate) fn builtin_run_hook_with_args_until_failure(
 
 pub(crate) fn builtin_run_hook_wrapped(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("run-hook-wrapped", &args, 2)?;
     hook_runtime::run_named_hook_wrapped(eval, &args)
@@ -325,11 +339,7 @@ pub(crate) fn run_redisplay_window_change_hooks(eval: &mut super::eval::Context)
     // would otherwise re-enter here and infinitely recurse. The specpdl
     // entry is popped when we return, restoring the previous value.
     let specpdl_count = eval.specpdl.len();
-    eval.try_specbind_or_unwind_to(
-        specpdl_count,
-        crate::emacs_core::intern::intern("inhibit-redisplay"),
-        Value::T,
-    )?;
+    eval.try_specbind_or_unwind_to(specpdl_count, INHIBIT_REDISPLAY.id(), Value::T)?;
 
     let result = run_redisplay_window_change_hooks_inner(eval);
 
@@ -411,15 +421,15 @@ fn run_redisplay_window_change_hooks_inner(eval: &mut super::eval::Context) -> E
     }
 
     let window_buffer_change_functions =
-        hook_runtime::hook_symbol_by_name(eval, "window-buffer-change-functions");
+        hook_runtime::hook_symbol_by_id(eval, WINDOW_BUFFER_CHANGE_FUNCTIONS.id());
     let window_size_change_functions =
-        hook_runtime::hook_symbol_by_name(eval, "window-size-change-functions");
+        hook_runtime::hook_symbol_by_id(eval, WINDOW_SIZE_CHANGE_FUNCTIONS.id());
     let window_selection_change_functions =
-        hook_runtime::hook_symbol_by_name(eval, "window-selection-change-functions");
+        hook_runtime::hook_symbol_by_id(eval, WINDOW_SELECTION_CHANGE_FUNCTIONS.id());
     let window_state_change_functions =
-        hook_runtime::hook_symbol_by_name(eval, "window-state-change-functions");
+        hook_runtime::hook_symbol_by_id(eval, WINDOW_STATE_CHANGE_FUNCTIONS.id());
     let window_state_change_hook =
-        hook_runtime::hook_symbol_by_name(eval, "window-state-change-hook");
+        hook_runtime::hook_symbol_by_id(eval, WINDOW_STATE_CHANGE_HOOK.id());
 
     let mut run_window_state_change_hook = false;
     for plan in &plans {
@@ -534,6 +544,7 @@ fn run_redisplay_window_change_hooks_inner(eval: &mut super::eval::Context) -> E
         }
     }
 
+    eval.record_redisplay_selection();
     Ok(Value::NIL)
 }
 
@@ -1288,6 +1299,12 @@ pub(super) fn reset_hooks_thread_locals() {
     WINDOW_CONFIGURATION_SNAPSHOTS.with(|slot| slot.reset(HashMap::new()));
 }
 
+/// Carrier park: forget the installed window-configuration registry handle
+/// (a plain store). The World's registry stays alive through its Contexts.
+pub(super) fn park_hooks_thread_locals() {
+    WINDOW_CONFIGURATION_SNAPSHOTS.with(HeapRegistrySlot::park);
+}
+
 pub(crate) type WindowConfigurationRegistryHandle =
     HeapRegistryHandle<HashMap<i64, WindowConfigurationSnapshot>>;
 
@@ -1903,9 +1920,7 @@ pub(crate) fn set_window_configuration_with_options(
         // for the initial batch frame: its saved root may still cover all 24
         // pre-menu-bar rows, while the live frame has a one-line top margin and
         // therefore a 23-line root at row 1.
-        if let Some(frame) = eval.frames.get_mut(snapshot.frame_id) {
-            frame.reconcile_restored_window_configuration_geometry();
-        }
+        window_configuration_geometry::reconcile(eval, snapshot.frame_id)?;
 
         eval.gnu_mark_frame_window_change(snapshot.frame_id);
         let frame_to_select = match options.selected_frame {
@@ -1969,7 +1984,7 @@ pub(crate) fn builtin_run_window_configuration_change_hook(
         return Ok(Value::NIL);
     };
 
-    let hook_sym = hook_runtime::hook_symbol_by_name(eval, "window-configuration-change-hook");
+    let hook_sym = hook_runtime::hook_symbol_by_id(eval, WINDOW_CONFIGURATION_CHANGE_HOOK.id());
     let global_hook_value = eval
         .variables()
         .default_value(hook_sym)
@@ -2040,7 +2055,7 @@ pub(crate) fn builtin_run_window_scroll_functions(
     }
 
     let window_arg = match args.first().copied().unwrap_or(Value::NIL).kind() {
-        ValueKind::Nil => super::window_cmds::builtin_selected_window(eval, vec![])?,
+        ValueKind::Nil => super::window_cmds::builtin_selected_window(eval, &[])?,
         _value => args.first().copied().unwrap_or(Value::NIL),
     };
     let Some(wid) = window_arg.as_window_id() else {
@@ -2056,8 +2071,8 @@ pub(crate) fn builtin_run_window_scroll_functions(
             vec![Value::symbol("window-live-p"), window_arg],
         )
     })?;
-    let window_start = super::window_cmds::builtin_window_start(eval, vec![window_arg])?;
-    let hook_sym = hook_runtime::hook_symbol_by_name(eval, "window-scroll-functions");
+    let window_start = super::window_cmds::builtin_window_start(eval, &[window_arg])?;
+    let hook_sym = hook_runtime::hook_symbol_by_id(eval, WINDOW_SCROLL_FUNCTIONS.id());
     let saved_buffer_id = eval.buffers.current_buffer_id();
     if let Some(buffer_id) = window_buffer_id_in_state(eval, frame_id, window_id) {
         // GNU `set_window_buffer` temporarily enters the displayed buffer
@@ -2135,3 +2150,13 @@ pub(crate) fn builtin_featurep(eval: &mut super::eval::Context, args: Vec<Value>
 #[cfg(test)]
 #[path = "tests/gc_tls_window_configuration_test.rs"]
 mod gc_tls_ownership_tests;
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        WINDOW_CONFIGURATION_SNAPSHOTS
+            .with(|slot| slot.installed_heap_identity().unwrap_or(0) as u64),
+    );
+}

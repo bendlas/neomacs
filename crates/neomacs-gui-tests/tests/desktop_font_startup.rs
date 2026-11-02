@@ -21,15 +21,17 @@ fn command_line_font_drives_the_first_native_allocation() {
         .lines()
         .find(|line| line.contains("creating primary window: emacs_pixels="))
         .expect("missing first native window allocation");
-    // Opened DejaVu 16 is 13px wide: 80 text columns, 16px fringes,
-    // and Neomacs's one-column default scrollbar allocation.
-    assert!(initial.contains("emacs_pixels=1069x"), "{initial}");
+    // Opened DejaVu 16 is 13px wide: 80 text columns, 16px fringes, and
+    // GNU's toolkit scroll bar (16 px, src/xfns.c:2393-2438) -- the same
+    // constant the layout reserves, so the first frame is exactly 80
+    // columns (80*13 + 16 + 16 = 1072).
+    assert!(initial.contains("emacs_pixels=1072x"), "{initial}");
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(result.artifacts.gui_state).unwrap()).unwrap();
     // Native CSD must not shift the base used to snap inner dimensions.
     // This font requests 35 text rows plus menu/tool bars: 952 pixels.
-    assert!(initial.contains("emacs_pixels=1069x952"), "{initial}");
-    assert_eq!(state["native_width"], 1069);
+    assert!(initial.contains("emacs_pixels=1072x952"), "{initial}");
+    assert_eq!(state["native_width"], 1072);
     assert_eq!(state["native_height"], 952);
 }
 
@@ -68,9 +70,12 @@ fn hidpi_scale_change_never_shrinks_the_logical_frame() {
         "must exercise native scale discovery"
     );
     for resize in scale_two_resizes {
-        // Ubuntu Mono 13: 80 columns at 9 logical pixels plus 25px of chrome.
+        // Ubuntu Mono 13: 80 columns at 10 logical pixels plus 32px of chrome,
+        // the scroll bar being GNU's 16 px toolkit default (src/xfns.c:2393-2438).
+        // 10px is the cell fonts-ubuntu 0.869 (noble) realizes at 96 DPI; the
+        // pre-0.869 9px font gave 752.
         assert!(
-            resize.contains("width: 745,"),
+            resize.contains("width: 832,"),
             "scale discovery changed logical width: {resize}"
         );
     }
@@ -164,16 +169,23 @@ fn check_receipt_timestamp(result: &GuiRunResult) {
         field(":nanoseconds")
     );
     let clock = format!(".clock_id({})", field(":clock-id"));
-    let wire = fs::read_to_string(&result.artifacts.stderr).unwrap();
     // Compare against independent native protocol traffic, not the renderer's
     // own confirmation log or a timestamp recomputed from its scheduler clock.
+    // libwayland 1.26 colorizes the dump and separates a method name from its
+    // argument list with a reset, so probe the stripped line (the runner's
+    // 1.22 prints plain).
+    let wire = fs::read_to_string(&result.artifacts.stderr).unwrap();
+    let wire: Vec<String> = wire
+        .lines()
+        .map(|line| neomacs_gui_tests::interaction::strip_ansi(line).into_owned())
+        .collect();
     assert!(
-        wire.lines()
+        wire.iter()
             .any(|line| line.contains("wp_presentation_feedback") && line.contains(&timestamp)),
         "receipt timestamp absent from native Presented events: {receipt}"
     );
     assert!(
-        wire.lines()
+        wire.iter()
             .any(|line| line.contains("wp_presentation") && line.contains(&clock)),
         "receipt clock absent from native ClockId events: {receipt}"
     );
@@ -221,6 +233,7 @@ fn check_fixture_with_font(
             .unwrap()
             .success()
     );
+    let fontconfig = crate::desktop_font_pins::desktop_font_fontconfig(&artifacts);
     let backend = GuiBackend::LinuxWayland;
     let session = start_weston_with_desktop(&artifacts, output, desktop).unwrap();
     let binary = std::env::var_os("NEOMACS_GUI_TEST_BINARY")
@@ -236,6 +249,7 @@ fn check_fixture_with_font(
         ),
     )
     .with_program(binary)
+    .with_env("FONTCONFIG_FILE", fontconfig.to_string_lossy())
     .with_env("WAYLAND_DEBUG", "client")
     .with_env(
         "NEOMACS_GUI_PRESENTATION_RECEIPT",

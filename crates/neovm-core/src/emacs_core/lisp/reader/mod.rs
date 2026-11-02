@@ -1226,7 +1226,10 @@ fn read_from_active_load_cursor(
     let source = cursor.source;
     let eof_source = cursor.eof_source;
     let pos = cursor.pos;
-    let shorthands = cursor.shorthands.clone();
+    let shorthands = match &cursor.shorthands {
+        super::eval::LoadReadShorthands::Snapshot(snapshot) => snapshot.clone(),
+        super::eval::LoadReadShorthands::CurrentBinding => current_read_symbol_shorthands(ctx),
+    };
 
     let lisp_str = ctx.lisp_string(source).ok_or_else(|| {
         signal(
@@ -1335,7 +1338,7 @@ fn stdin_end_of_file_error() -> Flow {
 /// global binding is normally nil — hence the current buffer's binding cell
 /// (`read_symbol_shorthands_value`) rather than the raw obarray slot.
 /// Returns `None` when unset/nil.
-fn current_read_symbol_shorthands(
+pub(crate) fn current_read_symbol_shorthands(
     eval: &super::eval::Context,
 ) -> Option<super::value_reader::ReadSymbolShorthands> {
     let value = super::builtins::symbols::read_symbol_shorthands_value(eval);
@@ -2747,7 +2750,8 @@ impl KeyboardInputRuntime for super::eval::Context {
         &mut self,
         options: crate::keyboard::ReadKeySequenceOptions,
     ) -> Result<(Vec<Value>, Value), Flow> {
-        super::eval::Context::read_key_sequence_with_options(self, options)
+        let (keys, binding) = super::eval::Context::read_key_sequence_with_options(self, options)?;
+        Ok((keys, binding.executed()))
     }
 
     fn symbol_value_or_nil(&self, name: &str) -> Value {
@@ -3346,7 +3350,7 @@ pub(crate) fn builtin_read_key(eval: &mut super::eval::Context, args: Vec<Value>
     }
 
     // 2. Interactive mode: block on input channel
-    if eval.input_rx.is_some() {
+    if eval.input_rx.as_ref().is_some() {
         let event = eval.read_char()?;
         eval.record_nonmenu_input_event(event);
         eval.set_read_command_keys(vec![event]);

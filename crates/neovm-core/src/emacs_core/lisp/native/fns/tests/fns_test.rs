@@ -1401,7 +1401,7 @@ fn equal_including_properties_honors_symbols_with_pos_enabled() {
                  (equal-including-properties a 'foo)))",
     );
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&off),
+        crate::emacs_core::format_eval_result(&off),
         "OK (nil nil)",
         "flag off: position-symbols are distinct (GNU 31 parity)"
     );
@@ -1413,7 +1413,7 @@ fn equal_including_properties_honors_symbols_with_pos_enabled() {
                    (equal-including-properties a 'foo))))",
     );
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&on),
+        crate::emacs_core::format_eval_result(&on),
         "OK (t t)",
         "flag on: position ignored, compared eq-wise (GNU 31 parity)"
     );
@@ -1449,7 +1449,7 @@ fn equal_including_properties_gnu_parity_edges() {
                                        (propertize \"abc\" 'face 'bold)))",
     );
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&edges),
+        crate::emacs_core::format_eval_result(&edges),
         "OK (t nil nil t nil t nil t nil t nil t)",
         "equal-including-properties edge behavior must match GNU Emacs 31"
     );
@@ -1485,7 +1485,7 @@ fn eip_bench_ns(rounds: u32, inner: u32, mut f: impl FnMut() -> bool) -> f64 {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture equal_including_properties_bench
 #[test]
-#[ignore = "micro benchmark; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn equal_including_properties_bench() {
     use crate::buffer::text_props::TextPropertyTable;
     use crate::emacs_core::value::{
@@ -1575,7 +1575,7 @@ fn equal_including_properties_bench() {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture equal_including_properties_byte_compile_macro_bench
 #[test]
-#[ignore = "macro benchmark; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn equal_including_properties_byte_compile_macro_bench() {
     crate::test_utils::init_test_tracing();
     // SAFETY: nextest runs each test in its own process; set before the VM
@@ -1968,15 +1968,31 @@ fn collate_lessp_ignore_case() {
     assert!(r.is_truthy());
 }
 
+/// GNU compiles the locale-aware collation only under
+/// `__STDC_ISO_10646__` (src/fns.c:628-645).  On a build without it --
+/// Darwin's libc -- LOCALE is neither read nor type-checked, so these
+/// tests pin each platform's own GNU behavior.
+fn collation_reads_the_locale() -> bool {
+    crate::emacs_core::platform_facts::STRING_COLLATION
+        == crate::emacs_core::platform_facts::StringCollation::LocaleAware
+}
+
 #[test]
 fn collate_lessp_rejects_non_string_locale() {
     crate::test_utils::init_test_tracing();
-    let err = call_string_collate_lessp(vec![
+    let result = call_string_collate_lessp(vec![
         Value::string("a"),
         Value::string("b"),
         Value::fixnum(42),
-    ])
-    .expect_err("non-nil locale must be a string");
+    ]);
+    if !collation_reads_the_locale() {
+        assert!(
+            result.expect("LOCALE is ignored").is_truthy(),
+            "the byte comparison answers a < b"
+        );
+        return;
+    }
+    let err = result.expect_err("non-nil locale must be a string");
     match err.into_kind() {
         FlowKind::Signal(sig) => {
             assert_eq!(
@@ -1994,12 +2010,19 @@ fn collate_lessp_rejects_non_string_locale() {
 #[test]
 fn collate_lessp_invalid_locale_signals_error() {
     crate::test_utils::init_test_tracing();
-    let err = call_string_collate_lessp(vec![
+    let result = call_string_collate_lessp(vec![
         Value::string("a"),
         Value::string("b"),
         Value::string("neomacs-invalid-locale"),
-    ])
-    .expect_err("invalid explicit locale should signal error");
+    ]);
+    if !collation_reads_the_locale() {
+        assert!(
+            result.expect("LOCALE is ignored").is_truthy(),
+            "the byte comparison answers a < b"
+        );
+        return;
+    }
+    let err = result.expect_err("invalid explicit locale should signal error");
     match err.into_kind() {
         FlowKind::Signal(sig) => {
             assert_eq!(
@@ -2030,7 +2053,12 @@ fn collate_equalp_ignore_case() {
         Value::T,
     ])
     .unwrap();
-    assert!(r.is_truthy());
+    if collation_reads_the_locale() {
+        assert!(r.is_truthy());
+    } else {
+        // The byte-comparison fallback never reads IGNORE-CASE either.
+        assert!(r.is_nil());
+    }
 }
 
 #[test]
@@ -2043,12 +2071,19 @@ fn collate_equalp_different() {
 #[test]
 fn collate_equalp_rejects_non_string_locale() {
     crate::test_utils::init_test_tracing();
-    let err = call_string_collate_equalp(vec![
+    let result = call_string_collate_equalp(vec![
         Value::string("a"),
         Value::string("a"),
         Value::symbol("not-a-locale"),
-    ])
-    .expect_err("non-nil locale must be a string");
+    ]);
+    if !collation_reads_the_locale() {
+        assert!(
+            result.expect("LOCALE is ignored").is_truthy(),
+            "the byte comparison answers a = a"
+        );
+        return;
+    }
+    let err = result.expect_err("non-nil locale must be a string");
     match err.into_kind() {
         FlowKind::Signal(sig) => {
             assert_eq!(

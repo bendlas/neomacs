@@ -10,8 +10,8 @@ use std::mem::{ManuallyDrop, align_of};
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
+use super::super::value::flow_vocab::ShutdownRequest;
 use super::{FlowKind, FlowRef, SignalData, ThreadBlockedData, ThrowData};
-use crate::emacs_core::eval::ShutdownRequest;
 
 /// Low two bits of the word.  Payload boxes are 8-aligned (asserted below),
 /// so the bits are free; `Signal` is 0 so its pointer needs no masking.
@@ -33,7 +33,7 @@ const _: () = assert!(align_of::<ThrowData>() > TAG_MASK);
 const _: () = assert!(align_of::<ThreadBlockedData>() > TAG_MASK);
 
 /// One machine word, so `Result<Value, Flow>` is a ScalarPair (rax:rdx).
-/// Owns its payload box; `!Send`/`!Sync` like the enum carrier. Its payload's
+/// Owns its payload box and remains `!Send`/`!Sync`. Its payload's
 /// pin keeps roots in the owning Context registry, independent of activation.
 ///
 /// ```compile_fail

@@ -52,6 +52,8 @@ pub use point_rows::{
 pub(crate) use posn_object_extent::force_posn_object_extent_for_test;
 pub use posn_object_extent::{PosnObjectExtentMode, posn_object_extent_mode, retained_posn_extent};
 mod scroll_bar;
+mod scroll_margin;
+pub use scroll_margin::ScrollMargin;
 mod sibling_layout;
 mod size;
 pub(crate) use size::{
@@ -60,6 +62,11 @@ pub(crate) use size::{
 };
 pub mod split;
 mod string_property_input;
+mod word_wrap;
+pub(crate) use word_wrap::CachedWordWrapPolicy;
+pub use word_wrap::{
+    WordWrapCategories, WordWrapDirection, WordWrapMode, WordWrapOpportunity, WordWrapPolicy,
+};
 pub mod window_markers;
 
 pub use part::{
@@ -70,10 +77,14 @@ use sibling_layout::{ChildExtent, sibling_bounds};
 pub use split::{CombinationLimit, DeleteOutcome, DeleteResize, ParentSeal, SplitAttachment};
 
 pub use display::{
-    WindowBufferDisplayDefaults, WindowFringeDefaults, WindowScrollBarDefaults,
-    WindowScrollBarGeometry, resolve_window_scroll_bar_geometry,
+    GUI_SCROLL_BAR_DEFAULT_WIDTH_PX, WindowBufferDisplayDefaults, WindowFringeDefaults,
+    WindowScrollBarDefaults, WindowScrollBarGeometry, resolve_window_scroll_bar_geometry,
 };
-pub(crate) use display::{WindowLayoutQueryAdapter, note_char_table_layout_mutation};
+pub(crate) use display::{
+    WindowLayoutQueryAdapter, frame_config_scroll_bar_height, frame_config_scroll_bar_width,
+    frame_has_horizontal_scroll_bar, frame_vertical_scroll_bar_side,
+    note_char_table_layout_mutation,
+};
 pub use frame_params::{
     CursorTypeSymbol, FrameFullscreen, FrameParam, FrameParamKey, FrameToolBarPosition,
     FrameZGroup, GNU_FRAME_PARAM_COUNT, GNU_FRAME_PARAMS,
@@ -90,6 +101,58 @@ pub use scroll_bar::{
 /// Opaque window identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WindowId(pub u64);
+
+const FIRST_WINDOW_ID: WindowId = WindowId(1);
+
+/// GNU's observable `window.sequence_number`, separate from native identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowSequenceNumber {
+    RetiredPreload,
+    Runtime(std::num::NonZeroU64),
+    /// Contextual diagnostics can be asked to print an unminted test handle.
+    /// It has no owner-issued sequence; preserve its native diagnostic ID.
+    Unminted(WindowId),
+}
+
+impl std::fmt::Display for WindowSequenceNumber {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RetiredPreload => 0_u64.fmt(formatter),
+            Self::Runtime(sequence) => sequence.fmt(formatter),
+            Self::Unminted(window) => window.0.fmt(formatter),
+        }
+    }
+}
+
+/// Native IDs stay monotone across source preload; only this printable origin
+/// advances at the closed, no-live-frames construction boundary.
+#[derive(Clone, Copy, Debug)]
+struct WindowSequenceOrigin(WindowId);
+
+impl WindowSequenceOrigin {
+    fn sequence_number(self, window: WindowId, next: WindowId) -> WindowSequenceNumber {
+        if window.0 < FIRST_WINDOW_ID.0 || window.0 >= next.0 {
+            return WindowSequenceNumber::Unminted(window);
+        }
+        match window.0.checked_sub(self.0.0) {
+            None => WindowSequenceNumber::RetiredPreload,
+            Some(offset) => offset
+                .checked_add(1)
+                .and_then(std::num::NonZeroU64::new)
+                .map_or(
+                    WindowSequenceNumber::Unminted(window),
+                    WindowSequenceNumber::Runtime,
+                ),
+        }
+    }
+}
+
+static_assertions::assert_eq_size!(WindowSequenceOrigin, WindowId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourcePreloadWindowRetirementRefusal {
+    LiveFramesRemain,
+}
 
 /// Opaque frame identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -666,6 +729,7 @@ pub struct BufferLayoutInputState<Fontification = ()> {
     pub(crate) prefixes: LayoutPrefixInputs,
     pub(crate) invisibility: LayoutInvisibilityInput,
     pub(crate) display_table: LayoutDisplayTableInput,
+    pub(crate) word_wrap_policy: WordWrapPolicy,
 }
 
 /// Effective callback identity, captured on this Context's mutator. The
@@ -783,6 +847,7 @@ pub enum WindowLayoutVariable {
     LinePrefix,
     LineSpacing,
     MaxMiniWindowHeight,
+    MaximumScrollMargin,
     MenuBarFinalItems,
     ModeLineFormat,
     NeomacsCursorEffect,
@@ -819,6 +884,7 @@ pub enum WindowLayoutVariable {
     TruncatePartialWidthWindows,
     VerticalScrollBar,
     WordWrap,
+    WordWrapByCategory,
     WrapPrefix,
     XCursorForePixel,
     XStretchCursor,
@@ -1257,19 +1323,19 @@ fn redisplay_f32_bits(value: f32) -> u32 {
 /// unmarked entries before sweeping them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowStartMarker {
-    id: u64,
+    marker: crate::buffer::MarkerRef,
     gc_root: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowPointMarker {
-    id: u64,
+    marker: crate::buffer::MarkerRef,
     gc_root: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowOldPointMarker {
-    id: u64,
+    marker: crate::buffer::MarkerRef,
     gc_root: Value,
 }
 
@@ -1322,18 +1388,22 @@ impl WindowPositionMarkerState {
 }
 
 impl AttachedWindowPositionMarkers {
-    fn new(start: (u64, Value), point: (u64, Value), old_point: (u64, Value)) -> Self {
+    fn new(
+        start: (crate::buffer::MarkerRef, Value),
+        point: (crate::buffer::MarkerRef, Value),
+        old_point: (crate::buffer::MarkerRef, Value),
+    ) -> Self {
         Self {
             start: WindowStartMarker {
-                id: start.0,
+                marker: start.0,
                 gc_root: start.1,
             },
             point: WindowPointMarker {
-                id: point.0,
+                marker: point.0,
                 gc_root: point.1,
             },
             old_point: WindowOldPointMarker {
-                id: old_point.0,
+                marker: old_point.0,
                 gc_root: old_point.1,
             },
         }
@@ -1347,8 +1417,8 @@ impl AttachedWindowPositionMarkers {
 }
 
 impl WindowStartMarker {
-    const fn raw(self) -> u64 {
-        self.id
+    const fn raw(self) -> crate::buffer::MarkerRef {
+        self.marker
     }
 
     /// The rooted Lisp marker, whose `MarkerObj` carries the position.
@@ -1358,8 +1428,8 @@ impl WindowStartMarker {
 }
 
 impl WindowPointMarker {
-    const fn raw(self) -> u64 {
-        self.id
+    const fn raw(self) -> crate::buffer::MarkerRef {
+        self.marker
     }
 
     pub(crate) const fn root(self) -> Value {
@@ -1368,8 +1438,8 @@ impl WindowPointMarker {
 }
 
 impl WindowOldPointMarker {
-    const fn raw(self) -> u64 {
-        self.id
+    const fn raw(self) -> crate::buffer::MarkerRef {
+        self.marker
     }
 
     pub(crate) const fn root(self) -> Value {
@@ -3121,6 +3191,10 @@ pub struct WindowDisplaySnapshotFreshness {
     pub(crate) media_generation: u64,
     pub(crate) function_epoch: u64,
     pub(crate) symbol_property_revision: crate::emacs_core::symbol::SymbolPropertyRevision,
+    /// Every overlay in the buffer could only change faces when this token was
+    /// captured. This excludes structural overlays from point-only query reuse;
+    /// it does not prove that overlay modifications preserve row geometry.
+    pub(crate) overlays_face_only: bool,
 }
 
 impl WindowDisplaySnapshotFreshness {
@@ -3139,6 +3213,30 @@ impl WindowDisplaySnapshotFreshness {
     /// source context. The producer must also validate its captured reads.
     pub fn same_query_row_content(&self, current: &Self) -> bool {
         self.window.point == current.window.point && self.same_scroll_content(current)
+    }
+
+    /// Row geometry for a position query when only point and repaint requests
+    /// changed.
+    ///
+    /// A command moves point and then asks `posn-at-point` /
+    /// `pos-visible-in-window-p` before redisplay runs. Overlay revisions must
+    /// still match: even face-only overlays can change font metrics and wrapping.
+    /// Every actual row input -- text, properties, accessibility, prefixes,
+    /// display table, faces, fonts, geometry -- must still match, and BOTH
+    /// tokens must certify that the overlays present could only change faces
+    /// (an overlay with `display`/`invisible`/`category` never qualifies). The
+    /// caller must separately rule out point-dependent chrome and line-number
+    /// metrics: unchanged format/face definitions can still yield new geometry.
+    pub fn same_position_rows_ignoring_point(&self, current: &Self) -> bool {
+        if !(self.overlays_face_only && current.overlays_face_only) {
+            return false;
+        }
+        let mut expected = current.clone();
+        // Point-dependent geometry is checked by the position-query caller.
+        expected.window.point = self.window.point;
+        // A request to repaint is not a body-content mutation.
+        expected.redisplay_generation = self.redisplay_generation;
+        self == &expected
     }
 
     /// A committed scroll may move start/point and hide part of the first row.
@@ -4422,6 +4520,17 @@ pub struct Frame {
     /// Internal window-system kind, mirroring GNU Emacs frame state rather
     /// than the mutable Lisp-visible frame parameter alist.
     pub window_system: Option<Value>,
+    /// The Lisp-visible `window-system` parameter, cached beside the map entry.
+    ///
+    /// `effective_window_system` falls back to this parameter when no internal
+    /// kind is installed, and geometry/layout code calls it dozens of times
+    /// per command.  Reading the entry out of `parameters` on every call cost
+    /// 171 instructions (hash + symbol comparison) in the C-n profile; this
+    /// copy makes the accessor two field reads.  The parameter map is private
+    /// to this module and only [`Frame::set_parameter`] and
+    /// [`Frame::remove_parameter`] write it, so those two methods are the
+    /// complete set of writers that keep this copy current.
+    window_system_parameter: Option<Value>,
     /// Native display connection plus the X display inherited by child
     /// processes. These differ for a Wayland frame running alongside
     /// Xwayland, just as GNU's PGTK backend distinguishes its GDK display from
@@ -4629,6 +4738,7 @@ impl Frame {
             left_pos: 0,
             top_pos: 0,
             window_system: None,
+            window_system_parameter: None,
             display_identity: FrameDisplayIdentity::default(),
             // GNU terminal frames expose the terminal's default colors as
             // string sentinel values, not concrete RGB colors.  `term.c`
@@ -4814,11 +4924,20 @@ impl Frame {
     }
 
     /// Return the effective window-system symbol for this frame.
+    ///
+    /// GNU separates the backend output method (`FRAME_WINDOW_P`) from the
+    /// Lisp `window-system` frame parameter.  The internal kind wins; the
+    /// parameter is the fallback that lets frames no backend created (batch
+    /// fixtures, tests) act as window-system frames when Lisp says so.
+    /// [`Frame::window_system_parameter`] mirrors that one map entry so this
+    /// accessor -- called dozens of times per command by geometry queries,
+    /// layout inputs and redisplay signatures -- does not hash the parameter
+    /// alist on every call.
     pub fn effective_window_system(&self) -> Option<Value> {
         self.window_system
             .filter(|value| value.is_truthy())
             .or_else(|| {
-                self.fixed_parameter(crate::window::FrameQueryParam::WindowSystem)
+                self.window_system_parameter
                     .filter(|value| value.is_truthy())
             })
     }
@@ -4855,14 +4974,17 @@ impl Frame {
 
     /// Update the frame's internal window-system kind and keep the Lisp-visible
     /// frame parameter in sync.
+    ///
+    /// The field is the backend kind; the parameter is its Lisp projection.
+    /// This is the only path that can retract the kind (pass `None`).
     pub fn set_window_system(&mut self, window_system: Option<Value>) {
         self.window_system = window_system;
         match window_system {
             Some(value) => {
-                self.set_parameter(Value::symbol("window-system"), value);
+                self.set_parameter(FrameQueryParam::WindowSystem.symbol(), value);
             }
             None => {
-                self.remove_parameter(Value::symbol("window-system"));
+                self.remove_parameter(FrameQueryParam::WindowSystem.symbol());
             }
         }
     }
@@ -4946,9 +5068,10 @@ impl Frame {
         // applies for the missing parameter, so seeding them changes reporting only,
         // never geometry: GTK builds default vertical scroll bars to the right,
         // horizontal off, the standard 8px fringes, and a zero internal/outer border.
-        // scroll-bar-width is intentionally left unset: its fallback tracks the live
-        // char width, so a fixed seed would go stale when the frame font changes
-        // (GNU re-resolves it on font change; our fallback already follows the font).
+        // scroll-bar-width/height are intentionally left unset: their shared
+        // fallback is GNU's toolkit default (16 px, xfns.c:2393-2438), which does
+        // not follow the frame font either; `frame-parameter` reports that same
+        // number for an unset frame (frame.c:5437-5456).
         self.set_known_parameter(FrameParam::VerticalScrollBars, Value::symbol("right"));
         self.set_known_parameter(FrameParam::HorizontalScrollBars, Value::NIL);
         self.set_known_parameter(FrameParam::LeftFringe, Value::fixnum(8));
@@ -4962,6 +5085,14 @@ impl Frame {
     }
 
     pub fn parameter(&self, key: &str) -> Option<Value> {
+        self.parameters.get(&Value::symbol(key)).copied()
+    }
+
+    /// [`Self::parameter`] for a fixed GNU spelling.
+    ///
+    /// Same parameter-map key and the same constructor accounting; the spelling
+    /// is a compile-time DEFSYM id instead of a per-read intern.
+    pub fn parameter_symbol(&self, key: &crate::emacs_core::intern::WellKnown) -> Option<Value> {
         self.parameters.get(&Value::symbol(key)).copied()
     }
 
@@ -5002,6 +5133,9 @@ impl Frame {
             }
             _ => {}
         }
+        if key.as_bare_symbol_id() == Some(FrameQueryParam::WindowSystem.symbol_id()) {
+            self.window_system_parameter = Some(value);
+        }
         self.parameters.insert(key, value)
     }
 
@@ -5013,7 +5147,15 @@ impl Frame {
         self.set_parameter(key.symbol(), value)
     }
 
+    /// Remove one Lisp-visible frame parameter.
+    ///
+    /// Removing `window-system` drops only the parameter fallback: an internal
+    /// kind installed by [`Frame::set_window_system`] stays in force, matching
+    /// GNU, where deleting the parameter cannot change `FRAME_WINDOW_P`.
     pub fn remove_parameter(&mut self, key: Value) -> Option<Value> {
+        if key.as_bare_symbol_id() == Some(FrameQueryParam::WindowSystem.symbol_id()) {
+            self.window_system_parameter = None;
+        }
         self.parameters.remove(&key)
     }
 
@@ -5126,10 +5268,7 @@ impl Frame {
     }
 
     fn default_vertical_scroll_bar_width(&self) -> i64 {
-        self.known_parameter(FrameParam::ScrollBarWidth)
-            .and_then(|v| v.as_int())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| self.char_width.max(1.0).round() as i64)
+        i64::from(display::frame_config_scroll_bar_width(self))
     }
 
     pub(crate) fn vertical_scroll_bar_area_width(&self) -> i64 {
@@ -5137,6 +5276,22 @@ impl Frame {
             && self.default_vertical_scroll_bar_side().is_some()
         {
             self.default_vertical_scroll_bar_width()
+        } else {
+            0
+        }
+    }
+
+    /// GNU `FRAME_SCROLL_BAR_AREA_HEIGHT` (src/frame.h:1342-1345): the
+    /// configured horizontal scroll-bar height only while the frame enables
+    /// horizontal scroll bars, zero otherwise.  This is what
+    /// `frame-scroll-bar-height` returns (src/frame.c:4496-4501); the
+    /// `scroll-bar-height` frame *parameter* keeps reporting the configured
+    /// height even with the bars turned off (src/frame.c:5437-5456).
+    pub(crate) fn horizontal_scroll_bar_area_height(&self) -> i64 {
+        if self.effective_window_system().is_some()
+            && display::frame_has_horizontal_scroll_bar(self)
+        {
+            i64::from(display::frame_config_scroll_bar_height(self))
         } else {
             0
         }
@@ -5258,16 +5413,18 @@ impl Frame {
         self.reposition_minibuffer_below_root();
     }
 
+    /// Root pixel budget shared by Lisp-planned and native configuration restore.
+    pub(crate) fn restored_window_configuration_root_bounds(&self) -> Rect {
+        self.window_text_area_bounds_with_chrome(true)
+    }
+
     /// Reconcile a restored window tree with the frame's current geometry.
     ///
-    /// GNU `Fset_window_configuration` restores the saved window fields and
-    /// then calls `adjust_frame_size` (`window.c`).  That final pass realizes
-    /// the current `FRAME_TOP_MARGIN` even when the saved initial batch-frame
-    /// tree still spans the pre-menu-bar area.  Keep this transition separate
-    /// from ordinary batch-frame initialization: the latter intentionally
-    /// retains its initial `(0, 0)` root until a reconciliation point occurs.
+    /// GNU Fset_window_configuration performs a final adjust_frame_size pass,
+    /// realizing the current top margin even for an initial batch-frame tree.
+    /// Ordinary initial batch geometry intentionally retains its (0, 0) root.
     pub fn reconcile_restored_window_configuration_geometry(&mut self) {
-        let root_bounds = self.window_text_area_bounds_with_chrome(true);
+        let root_bounds = self.restored_window_configuration_root_bounds();
         // Everything read off `self` is gathered before the tree is borrowed
         // mutably; each was previously a direct field read that could sit
         // inside the same expression.
@@ -5279,6 +5436,18 @@ impl Frame {
         self.root_window_mut().set_top_line(top_margin);
         sync_window_character_edges_from_bounds(&mut self.tree, root, char_width, char_height);
         self.reposition_minibuffer_below_root();
+    }
+
+    /// Commit the minibuffer's character origin after a root resize without
+    /// deriving it again from rounded pixel geometry (GNU resize_frame_windows).
+    pub(crate) fn sync_minibuffer_top_line_after_root_resize(&mut self) {
+        let top_line =
+            self.root_window().top_line() + self.root_window().total_lines(self.char_height);
+        if self.minibuffer_window.is_some()
+            && let Some(minibuffer) = self.minibuffer_leaf.as_mut()
+        {
+            minibuffer.set_top_line(top_line);
+        }
     }
 
     pub fn reposition_minibuffer_below_root(&mut self) {
@@ -6596,6 +6765,7 @@ pub struct FrameManager {
     next_frame_id: u64,
     last_tty_frame_name: Option<TtyFrameNameOrdinal>,
     next_window_id: u64,
+    window_sequence_origin: WindowSequenceOrigin,
     old_selected_window: Option<WindowId>,
     /// Windows that were live and have been deleted, with the buffer each was
     /// showing when it went.
@@ -6660,7 +6830,8 @@ impl FrameManager {
             terminal_top_frames: HashMap::default(),
             next_frame_id: FRAME_ID_BASE,
             last_tty_frame_name: None,
-            next_window_id: 1,
+            next_window_id: FIRST_WINDOW_ID.0,
+            window_sequence_origin: WindowSequenceOrigin(FIRST_WINDOW_ID),
             old_selected_window: None,
             deleted_windows: HashMap::default(),
             deleted_window_parameters: HashMap::default(),
@@ -6852,6 +7023,28 @@ impl FrameManager {
         };
         frame.set_generated_name_value(generated);
         true
+    }
+
+    /// Retire source-preload sequence numbers after its last frame is gone.
+    ///
+    /// GNU dumps old windows as distinct dead objects with zero sequence numbers
+    /// (`pdumper.c:2996-3002`) and recreates the initial root at sequence one
+    /// (`window.c:9143-9178`). Keep native IDs and deleted-window records intact:
+    /// an escaped preload handle must never alias the runtime's new root.
+    pub(crate) fn retire_source_preload_window_sequences(
+        &mut self,
+    ) -> Result<(), SourcePreloadWindowRetirementRefusal> {
+        if !self.frames.is_empty() {
+            return Err(SourcePreloadWindowRetirementRefusal::LiveFramesRemain);
+        }
+        self.window_sequence_origin = WindowSequenceOrigin(WindowId(self.next_window_id));
+        Ok(())
+    }
+
+    /// The only conversion from native identity to GNU's printable sequence.
+    pub(crate) fn window_sequence_number(&self, window: WindowId) -> WindowSequenceNumber {
+        self.window_sequence_origin
+            .sequence_number(window, WindowId(self.next_window_id))
     }
 
     /// Allocate a new window ID.
@@ -7434,8 +7627,11 @@ impl FrameManager {
             return None;
         }
         let mut current = id;
-        let mut seen = HashSet::default();
-        while seen.insert(current) {
+        // Frame parent chains are a handful of links; keep the cycle guard
+        // inline so the common case does not allocate a hash set per call.
+        let mut seen: smallvec::SmallVec<[FrameId; 8]> = smallvec::SmallVec::new();
+        while !seen.contains(&current) {
+            seen.push(current);
             let Some(parent) = self.frame_parent_id(current) else {
                 return Some(current);
             };
@@ -7447,8 +7643,9 @@ impl FrameManager {
     /// Return true when ANCESTOR is in DESCENDANT's parent-frame chain.
     pub fn frame_ancestor_p(&self, ancestor: FrameId, descendant: FrameId) -> bool {
         let mut current = descendant;
-        let mut seen = HashSet::default();
-        while seen.insert(current) {
+        let mut seen: smallvec::SmallVec<[FrameId; 8]> = smallvec::SmallVec::new();
+        while !seen.contains(&current) {
+            seen.push(current);
             let Some(parent) = self.frame_parent_id(current) else {
                 return false;
             };
@@ -7801,16 +7998,24 @@ impl FrameManager {
             if let Some(size) = new_size {
                 window.set_new_pixel(Some(size));
             }
-            // GNU `wset_new_normal (n, normal_size)`.  The *other* children's
-            // fractions were staged by `window.el`, so they are not touched
-            // here -- `window_resize_apply` commits them all together.
-            if !new_normal.is_nil() {
-                window.set_new_normal(new_normal);
-            }
+            // GNU `wset_new_normal (n, normal_size)`, unconditionally: a nil
+            // NORMAL-SIZE leaves the new window at `make_window`'s 1.0 rather
+            // than committing a value cloned from the split target.  The
+            // *other* children's fractions were staged by `window.el`, so they
+            // are not touched here -- `window_resize_apply` commits them all
+            // together.
+            window.set_new_normal(new_normal);
         }
         let parent_id = frame.tree().parent_of(new_window_id)?;
         let horflag = matches!(direction, SplitDirection::Horizontal);
-        window_resize_apply(frame.tree_mut(), parent_id, horflag, 1.0, 1.0);
+        let (char_width, char_height) = (frame.char_width, frame.char_height);
+        window_resize_apply(
+            frame.tree_mut(),
+            parent_id,
+            horflag,
+            char_width,
+            char_height,
+        );
         frame.tty_posn_adjust_current_matrices();
         Some(())
     }
@@ -7846,7 +8051,8 @@ impl FrameManager {
         let deleted_parameters = &mut self.deleted_window_parameters;
         // A promotion at the very top has no grandparent to merge into, so the
         // outcome collapses to "was it removed" here.
-        let removed = delete_window_in_tree(frame.tree_mut(), window_id, resize, |window| {
+        let cells = body::WindowBodyCellSize::new(frame.char_width, frame.char_height);
+        let removed = delete_window_in_tree(frame.tree_mut(), window_id, resize, cells, |window| {
             let id = window.id();
             let record = Self::deletion_record(Some(frame_id), Some(&window));
             let parameters = match window {
@@ -8457,22 +8663,19 @@ fn split_window_in_tree(
         }
     }
 
-    /// Record `window`'s share of a `parent_size`-wide combination, mirroring
-    /// GNU `Fsplit_window_internal` (`src/window.c:5517-5644`): the fraction in
-    /// the split direction is the window's extent over the parent's, and the
-    /// orthogonal fraction is always 1.0 because every child fills the parent
-    /// across the combination.
-    fn set_normal_fraction(window: &mut Window, direction: SplitDirection, fraction: f64) {
-        match direction {
-            SplitDirection::Horizontal => {
-                window.set_normal_cols(Value::make_float(fraction));
-                window.set_normal_lines(Value::make_float(1.0));
-            }
-            SplitDirection::Vertical => {
-                window.set_normal_lines(Value::make_float(fraction));
-                window.set_normal_cols(Value::make_float(1.0));
-            }
-        }
+    /// Give `window` the normal sizes GNU leaves on a window that a split
+    /// creates or interposes a parent above: 1.0 on both axes.
+    ///
+    /// `make_window` initializes a fresh window that way, and `replace_window`
+    /// (with SETFLAG) moves the old window's normal sizes to the new parent
+    /// and resets the old window's to 1.0 (`src/window.c:4597-4612`).  Neither
+    /// derives a share from pixel extents: the split-direction share is the
+    /// `new_normal` that `split-window` staged in Lisp, which
+    /// `window_resize_apply` commits afterwards
+    /// ([`FrameManager::apply_staged_split_sizes`]).
+    fn reset_to_unit_normals(window: &mut Window) {
+        window.set_normal_cols(Value::make_float(1.0));
+        window.set_normal_lines(Value::make_float(1.0));
     }
 
     let old = tree.find(target)?;
@@ -8513,26 +8716,22 @@ fn split_window_in_tree(
     let mut new_leaf =
         make_split_sibling(tree.find(target)?, new_id, new_buffer_id, new_leaf_bounds);
 
+    // GNU `make_window`: the new window starts at normal size 1.0 on both
+    // axes until its staged `new_normal` is committed.
+    reset_to_unit_normals(&mut new_leaf);
+
     if attachment.reuses_parent() {
         // The target's own parent combination absorbs the new window as a
         // plain sibling (GNU `p = XWINDOW (o->parent)` -- no
-        // `make_parent_window`), so every child's share of it is restated.
+        // `make_parent_window`).  The siblings' normal sizes are NOT restated
+        // from their pixel extents: `Fsplit_window_internal` never writes them,
+        // and `window_resize_apply` copies only the numeric `new_normal`s that
+        // `split-window` staged (the old window's, or every sibling's under
+        // `window-combination-resize`).  A sibling `window--resize-reset` left
+        // at nil keeps its normal size, which later `delete-window` and
+        // `balance-windows` arithmetic reads (window-oracle-nightly
+        // 2026-10-29: restating from pixels gave 27/80 instead of GNU's 1/3).
         let parent = tree.parent_of(target)?;
-        let parent_size = extent(*tree.find(parent)?.bounds(), direction);
-        if parent_size > 0.0 {
-            for child in tree.child_ids(parent).to_vec() {
-                let Some(child_bounds) = tree.find(child).map(|node| *node.bounds()) else {
-                    continue;
-                };
-                let fraction = (extent(child_bounds, direction) / parent_size) as f64;
-                if let Some(node) = tree.find_mut(child) {
-                    set_normal_fraction(node, direction, fraction);
-                }
-            }
-            let fraction = (extent(new_leaf_bounds, direction) / parent_size) as f64;
-            set_normal_fraction(&mut new_leaf, direction, fraction);
-        }
-
         tree.insert(new_leaf);
         let mut siblings = tree.child_ids(parent).to_vec();
         let idx = siblings.iter().position(|child| *child == target)?;
@@ -8542,18 +8741,12 @@ fn split_window_in_tree(
     }
 
     // A fresh internal node takes the target's slot and holds both windows.
-    let parent_size = extent(old_bounds, direction);
-    let (old_fraction, new_fraction) = if parent_size > 0.0 {
-        (
-            (extent(old_slot_bounds, direction) / parent_size) as f64,
-            (extent(new_leaf_bounds, direction) / parent_size) as f64,
-        )
-    } else {
-        (0.5, 0.5)
-    };
-    set_normal_fraction(&mut new_leaf, direction, new_fraction);
+    // GNU `replace_window (old, parent, true)` hands the old window's normal
+    // sizes to the parent (`inherited_normal_*` below) and resets the old
+    // window's own to 1.0; its split-direction share is the staged
+    // `new_normal`.
     if let Some(node) = tree.find_mut(target) {
-        set_normal_fraction(node, direction, old_fraction);
+        reset_to_unit_normals(node);
     }
 
     // Asked before the new parent is inserted, which would itself name the
@@ -8619,6 +8812,7 @@ fn delete_window_in_tree(
     tree: &mut WindowTree,
     target: WindowId,
     resize: DeleteResize,
+    cells: body::WindowBodyCellSize,
     mut on_removed: impl FnMut(Window),
 ) -> DeleteOutcome {
     let Some(parent) = tree.parent_of(target) else {
@@ -8655,7 +8849,12 @@ fn delete_window_in_tree(
     // the multi-child case left a promoted subtree laid out by proportional
     // redistribution instead of by the plan `window.el` computed.
     if let DeleteResize::ApplyStaged = resize {
-        window_resize_apply(tree, parent, horflag, 1.0, 1.0);
+        let axis = if horflag {
+            SplitDirection::Horizontal
+        } else {
+            SplitDirection::Vertical
+        };
+        resize_apply_pixels(tree, parent, axis, cells);
     }
 
     if remaining == 1 {
@@ -8809,10 +9008,13 @@ fn recombine_child_into_parent(
             && let Some(node) = tree.find_mut(child)
         {
             let child_bounds = *node.bounds();
-            let fraction = match parent_direction {
-                SplitDirection::Horizontal => child_bounds.width / parent_size,
-                SplitDirection::Vertical => child_bounds.height / parent_size,
-            } as f64;
+            // GNU divides in double precision; an f32 quotient widened
+            // afterwards stores 0.33750000596... for 27/80, not 0.3375.
+            let child_size = match parent_direction {
+                SplitDirection::Horizontal => child_bounds.width,
+                SplitDirection::Vertical => child_bounds.height,
+            };
+            let fraction = f64::from(child_size) / f64::from(parent_size);
             match parent_direction {
                 SplitDirection::Horizontal => {
                     node.set_normal_cols(Value::make_float(fraction));
@@ -8924,63 +9126,74 @@ pub fn window_resize_apply(
     tree: &mut WindowTree,
     id: WindowId,
     horflag: bool,
-    _char_width: f32,
-    _char_height: f32,
+    char_width: f32,
+    char_height: f32,
+) {
+    let axis = if horflag {
+        SplitDirection::Horizontal
+    } else {
+        SplitDirection::Vertical
+    };
+    resize_apply_pixels(
+        tree,
+        id,
+        axis,
+        body::WindowBodyCellSize::new(char_width, char_height),
+    );
+}
+
+fn resize_body_axis(axis: SplitDirection) -> body::WindowBodyAxis {
+    match axis {
+        SplitDirection::Horizontal => body::WindowBodyAxis::Width,
+        SplitDirection::Vertical => body::WindowBodyAxis::Height,
+    }
+}
+
+fn resize_apply_pixels(
+    tree: &mut WindowTree,
+    id: WindowId,
+    axis: SplitDirection,
+    cells: body::WindowBodyCellSize,
 ) {
     let Some(window) = tree.find_mut(id) else {
         return;
     };
-    // Apply new_pixel to this window's bounds.
-    let new_px = window.new_pixel();
     let bounds = *window.bounds();
-    if let Some(px) = new_px {
+    if let Some(px) = window.new_pixel() {
         let px = px.max(0) as f32;
-        if horflag {
-            window.set_bounds(Rect::new(bounds.x, bounds.y, px, bounds.height));
-        } else {
-            window.set_bounds(Rect::new(bounds.x, bounds.y, bounds.width, px));
-        }
-        // Clear the pending slot to mirror GNU's
-        // `wset_new_pixel(w, make_fixnum(-1))` reset at the end of
-        // `window_resize_apply`.
+        let bounds = match axis {
+            SplitDirection::Horizontal => Rect::new(bounds.x, bounds.y, px, bounds.height),
+            SplitDirection::Vertical => Rect::new(bounds.x, bounds.y, bounds.width, px),
+        };
+        window.set_bounds(bounds);
         window.set_new_pixel(None);
     }
 
-    // Commit the pending normal-size fraction. GNU
-    // `Fwindow_resize_apply` (`src/window.c:4826,4835`):
-    //
-    //   if (horflag) wset_normal_cols (w, w->new_normal);
-    //   else         wset_normal_lines (w, w->new_normal);
-    //
-    // Audit Critical 7 in `drafts/window-system-audit.md`:
-    // moving the persistent fraction onto the Window struct here
-    // means `window-normal-size` reads it back instead of
-    // re-deriving the ratio from current pixel bounds.
-    // GNU guards this with `NUMBERP` (`src/window.c`):
-    //
-    //     if (NUMBERP (w->new_normal))
-    //       wset_normal_cols (w, w->new_normal);
-    //
-    // The slot legitimately holds the SYMBOLS `skip'/`stuck'/`ignore' while
-    // `window--resize-child-windows' is marking which children to leave alone
-    // (see `window--resize-child-windows-skip-p' in `lisp/window.el').
-    // Committing one of those as a window's normal size makes the next
-    // arithmetic on it signal `(wrong-type-argument number-or-marker-p skip)'.
-    //
-    // GNU also does NOT clear the slot here -- `window--resize-child-windows-skip-p'
-    // reads it back on the next pass, so clearing it changes which windows are
-    // skipped.
+    // GNU window_resize_apply commits floored cell totals before returning to
+    // Lisp's window--pixel-to-total reconciliation, including unchanged sizes.
+    let bounds = *window.bounds();
+    let extent = match axis {
+        SplitDirection::Horizontal => bounds.width,
+        SplitDirection::Vertical => bounds.height,
+    };
+    let total = body::WindowBodyUnit::CanonicalChars.measure(
+        resize_body_axis(axis),
+        extent as i64,
+        cells,
+        None,
+    );
+    window.commit_cell_total(axis == SplitDirection::Horizontal, total);
+
+    // A planner may leave skip/stuck/ignore in new_normal. Only a numeric
+    // value becomes persistent, and the pending slot remains readable by Lisp.
     let pending_normal = window.new_normal();
     if pending_normal.is_number() {
-        if horflag {
-            window.set_normal_cols(pending_normal);
-        } else {
-            window.set_normal_lines(pending_normal);
+        match axis {
+            SplitDirection::Horizontal => window.set_normal_cols(pending_normal),
+            SplitDirection::Vertical => window.set_normal_lines(pending_normal),
         }
     }
 
-    // Get updated bounds after applying new_pixel.
-    let bounds = *window.bounds();
     let Window::Internal {
         direction,
         children,
@@ -8989,86 +9202,120 @@ pub fn window_resize_apply(
     else {
         return;
     };
-    let dir = *direction;
+    let direction = *direction;
     let children = children.clone();
-    let mut edge = if horflag { bounds.x } else { bounds.y };
-
+    let mut edge = match axis {
+        SplitDirection::Horizontal => bounds.x,
+        SplitDirection::Vertical => bounds.y,
+    };
     for child in children {
-        // Position child at current edge.
         let Some(node) = tree.find_mut(child) else {
             continue;
         };
-        let cb = *node.bounds();
-        if horflag {
-            node.set_bounds(Rect::new(edge, cb.y, cb.width, cb.height));
-        } else {
-            node.set_bounds(Rect::new(cb.x, edge, cb.width, cb.height));
+        let child_bounds = *node.bounds();
+        let cell_edge = body::WindowBodyUnit::CanonicalChars.measure(
+            resize_body_axis(axis),
+            edge as i64,
+            cells,
+            None,
+        );
+        match axis {
+            SplitDirection::Horizontal => {
+                node.set_bounds(Rect::new(
+                    edge,
+                    child_bounds.y,
+                    child_bounds.width,
+                    child_bounds.height,
+                ));
+                node.set_left_col(cell_edge);
+            }
+            SplitDirection::Vertical => {
+                node.set_bounds(Rect::new(
+                    child_bounds.x,
+                    edge,
+                    child_bounds.width,
+                    child_bounds.height,
+                ));
+                node.set_top_line(cell_edge);
+            }
         }
-
-        // Recurse.
-        window_resize_apply(tree, child, horflag, _char_width, _char_height);
-
-        // Accumulate edge in the combination direction.
-        let Some(child_bounds) = tree.find(child).map(|node| *node.bounds()) else {
-            continue;
-        };
-        match (dir, horflag) {
-            (SplitDirection::Horizontal, true) => edge += child_bounds.width,
-            (SplitDirection::Vertical, false) => edge += child_bounds.height,
-            _ => {}
+        resize_apply_pixels(tree, child, axis, cells);
+        if direction == axis {
+            if let Some(node) = tree.find(child) {
+                edge += match axis {
+                    SplitDirection::Horizontal => node.bounds().width,
+                    SplitDirection::Vertical => node.bounds().height,
+                };
+            }
         }
     }
 }
 
-/// Check that a resize is valid: the sum of children's new_pixel values
-/// must equal the parent's new_pixel value in the combination direction.
-///
-/// Reads each window's own `new_pixel` slot, mirroring GNU's
-/// recursive walk in `window_resize_check`.
-pub fn window_resize_check(tree: &WindowTree, id: WindowId, horflag: bool) -> bool {
-    /// A window's staged extent along the checked axis, falling back to the
-    /// extent it already has when nothing is staged.
-    fn staged_extent(window: &Window, horflag: bool) -> i64 {
-        window.new_pixel().unwrap_or_else(|| {
-            let bounds = window.bounds();
-            if horflag {
-                bounds.width as i64
-            } else {
-                bounds.height as i64
-            }
-        })
-    }
-
+/// Validate a completely staged pixel plan, as GNU window_resize_check does:
+/// iso children sum to their parent, ortho children equal their parent, and
+/// leaves retain at least two columns or one line. Missing staging is invalid.
+pub(crate) fn window_resize_check(
+    tree: &WindowTree,
+    id: WindowId,
+    axis: SplitDirection,
+    cells: body::WindowBodyCellSize,
+) -> bool {
     let Some(window) = tree.find(id) else {
-        return true;
+        return false;
     };
-    let my_new = staged_extent(window, horflag);
-
-    let Window::Internal {
-        direction,
-        children,
-        ..
-    } = window
-    else {
-        return true;
+    let Some(staged) = window.new_pixel() else {
+        return false;
     };
-
-    // In the combination direction, sum of children must equal parent.
-    let combines = (*direction == SplitDirection::Horizontal) == horflag;
-    if combines {
-        let child_sum: i64 = children
-            .iter()
-            .filter_map(|child| tree.find(*child))
-            .map(|child| staged_extent(child, horflag))
-            .sum();
-        if child_sum != my_new {
-            return false;
+    if staged < 0 {
+        return false;
+    }
+    match window {
+        Window::Leaf { .. } => {
+            let minimum = match axis {
+                SplitDirection::Horizontal => 2,
+                SplitDirection::Vertical => 1,
+            };
+            body::WindowBodyUnit::CanonicalChars.measure(
+                resize_body_axis(axis),
+                staged,
+                cells,
+                None,
+            ) >= minimum
+        }
+        Window::Internal {
+            direction,
+            children,
+            ..
+        } => {
+            if children.is_empty() {
+                return false;
+            }
+            let mut remaining = staged;
+            for child in children {
+                let Some(child_window) = tree.find(*child) else {
+                    return false;
+                };
+                let Some(child_staged) = child_window.new_pixel() else {
+                    return false;
+                };
+                if !window_resize_check(tree, *child, axis, cells) {
+                    return false;
+                }
+                if *direction == axis {
+                    let Some(rest) = remaining.checked_sub(child_staged) else {
+                        return false;
+                    };
+                    if rest < 0 {
+                        return false;
+                    }
+                    remaining = rest;
+                } else if child_staged != staged {
+                    return false;
+                }
+            }
+            *direction != axis || remaining == 0
         }
     }
-    // All children must also pass the check.
-    children
-        .iter()
-        .all(|child| window_resize_check(tree, *child, horflag))
 }
 
 /// Apply only character-grid sizes and edges, like GNU window_resize_apply_total.
@@ -9357,3 +9604,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/eob_overlay_motion_test.rs"]
 mod eob_overlay_motion_tests;
+
+#[cfg(test)]
+#[path = "tests/resize_commit_test.rs"]
+mod resize_commit_tests;

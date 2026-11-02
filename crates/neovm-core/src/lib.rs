@@ -10,6 +10,8 @@ mod frontend_events;
 pub mod fuzz_support;
 pub mod gc_trace;
 pub mod heap_types;
+pub mod host_effect;
+pub mod host_input;
 mod image_identity;
 pub mod keyboard;
 mod keyboard_input;
@@ -18,6 +20,8 @@ pub mod tagged;
 #[cfg(test)]
 #[path = "tests/test_utils_test.rs"]
 pub mod test_utils;
+#[cfg(debug_assertions)]
+pub(crate) mod tls_fingerprint;
 mod tls_scope;
 pub mod window;
 

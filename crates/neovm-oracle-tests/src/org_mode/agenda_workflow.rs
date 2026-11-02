@@ -274,12 +274,12 @@ DEADLINE: <2026-05-28 Thu>
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_filter_apply_remove_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect =
+        expect_test::expect![[r#""ERR (error \"Invalid duration format: \\\":00\\\"\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -333,7 +333,7 @@ fn org_agenda_filter_apply_remove_combo() {
                         org-agenda-effort-filter)))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (delete-file file))))"##,
+      (delete-file file)))))"##,
         expect,
     );
 }
@@ -455,12 +455,12 @@ fn org_agenda_bulk_mark_toggle_regexp_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_filter_matcher_visibility_matrix_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect =
+        expect_test::expect![[r#""ERR (error \"Invalid duration format: \\\":00\\\"\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -543,12 +543,11 @@ fn org_agenda_filter_matcher_visibility_matrix_combo() {
                           org-agenda-effort-filter))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (when (file-exists-p file) (delete-file file)))))"##,
+      (when (file-exists-p file) (delete-file file))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_clockreport_archives_mode_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -611,7 +610,7 @@ CLOCK: [2026-05-28 Thu 08:00]--[2026-05-28 Thu 08:45] =>  0:45
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
       (when (get-file-buffer file) (kill-buffer (get-file-buffer file)))
-      (delete-file file))))"##,
+      (delete-file file)))))"##,
         expect,
     );
 }
@@ -1249,12 +1248,11 @@ fn org_agenda_date_shift_redo_source_mutation_deep_state_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_bulk_mark_tag_filter_effort_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 46 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1301,17 +1299,18 @@ fn org_agenda_bulk_mark_tag_filter_effort_deep_state_combo() {
                         effort-filter)))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_entry_text_switch_context_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument markerp 42)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"Day-agenda (W22):\\nWednesday  27 May 2026\\n  tasks:      Scheduled:  TODO Alpha                                     :work:\\n  tasks:      Scheduled:  WAIT Beta                                      :home:\\n\" \"Alpha body paragraph.\" \"tasks\" \"2:00\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1345,10 +1344,10 @@ fn org_agenda_entry_text_switch_context_deep_state_combo() {
               (beginning-of-line)
               (let ((entry-text
                      (org-agenda-get-some-entry-text
-                      (point) 100)))
-                (let ((cat (org-entry-get (point) "CATEGORY"))
-                      (effort (org-entry-get (point) "Effort")))
-                  (list agenda-text entry-text cat effort)))))))
+                      (get-text-property (point) 'org-hd-marker) 100)))
+                (let ((cat (org-entry-get (get-text-property (point) 'org-hd-marker) "CATEGORY"))
+                      (effort (org-entry-get (get-text-property (point) 'org-hd-marker) "Effort")))
+                  (list agenda-text entry-text cat effort))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
       (delete-directory root t))))"##,
@@ -1356,12 +1355,11 @@ fn org_agenda_entry_text_switch_context_deep_state_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_day_entries_properties_timestamp_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 46 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1408,17 +1406,16 @@ fn org_agenda_day_entries_properties_timestamp_deep_state_combo() {
                   (list agenda-text mon-count wed-count has-0900 has-1400)))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_clockreport_filter_effort_todo_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 60 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1479,7 +1476,7 @@ fn org_agenda_clockreport_filter_effort_todo_deep_state_combo() {
                     (list full-text work-text effort-text todo-text))))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
@@ -1535,13 +1532,13 @@ fn org_agenda_list_edit_todo_reagenda_deep() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_tag_filter_edit_clock_reagenda_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect =
-        expect_test::expect![[r#""ERR (user-error \"Command not allowed in this line\")""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"Day-agenda (W22):\\nThursday   28 May 2026\\n  a:          Scheduled:  TODO Alpha                                     :work:\\n  a:          Scheduled:  TODO Beta                                      :home:\\n  a:          Scheduled:  NEXT Gamma                              :work:urgent:\\n  a:          Scheduled:  DONE Delta                                     :home:\\n\" \"Day-agenda (W22):\\nThursday   28 May 2026\\n  a:          Scheduled:  TODO Alpha                                     :work:\\n  a:          Scheduled:  TODO Beta                                      :home:\\n  a:          Scheduled:  NEXT Gamma                              :work:urgent:\\n  a:          Scheduled:  DONE Delta                                     :home:\\n\" \"Day-agenda (W22):\\nThursday   28 May 2026\\n  a:          Scheduled:  TODO Alpha                                     :work:\\n  a:          Scheduled:  TODO Beta                                      :home:\\n  a:          Scheduled:  NEXT Gamma                              :work:urgent:\\n  a:          Scheduled:  DONE Delta                                     :home:\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1573,11 +1570,15 @@ fn org_agenda_tag_filter_edit_clock_reagenda_deep() {
                                  (point-min) (point-max)))))
                 (org-agenda-filter-remove-all)
                 ;; Edit: clock in on Alpha
+                (goto-char (point-min))
+                (search-forward "Alpha")
+                (beginning-of-line)
                 (org-agenda-goto nil)
                 (with-current-buffer (current-buffer)
                   (org-clock-in)
                   (org-clock-out))
                 ;; Re-agenda
+                (set-buffer org-agenda-buffer-name)
                 (org-agenda-quit)
                 (org-agenda-list nil "2026-05-28" 1)
                 (with-current-buffer org-agenda-buffer-name
@@ -1586,7 +1587,7 @@ fn org_agenda_tag_filter_edit_clock_reagenda_deep() {
                                      (buffer-substring-no-properties
                                       (point-min) (point-max)))))
                     (org-agenda-quit)
-                    (list full work-only after-clock))))))))
+                    (list full work-only after-clock)))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
       (delete-directory root t))))"##,
@@ -1648,13 +1649,13 @@ fn org_agenda_multi_file_edit_clock_reagenda_deep() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_todo_filter_edit_reschedule_reagenda_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect =
-        expect_test::expect![[r#""ERR (user-error \"Command not allowed in this line\")""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"2 days-agenda (W22):\\nThursday   28 May 2026\\n  a:          Scheduled:  TODO Alpha\\n  a:          Scheduled:  DONE Beta\\n  a:          Scheduled:  TODO Gamma\\nFriday     29 May 2026\\n  a:          Scheduled:  NEXT Delta\\n\" \"2 days-agenda (W22):\\nThursday   28 May 2026\\n  a:          Scheduled:  TODO Alpha\\n  a:          Scheduled:  DONE Beta\\n  a:          Scheduled:  TODO Gamma\\nFriday     29 May 2026\\n  a:          Scheduled:  NEXT Delta\\n\" \"2 days-agenda (W22):\\nThursday   28 May 2026\\n  a:          Scheduled:  TODO Alpha\\n  a:          Scheduled:  DONE Beta\\nFriday     29 May 2026\\n  a:          Scheduled:  TODO Gamma\\n  a:          Scheduled:  NEXT Delta\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1684,11 +1685,15 @@ fn org_agenda_todo_filter_edit_reschedule_reagenda_deep() {
                                 (buffer-substring-no-properties
                                  (point-min) (point-max)))))
                 (org-agenda-filter-remove-all)
-                ;; Edit: reschedule Gamma to Thursday
+                ;; Edit: reschedule Gamma to Friday
+                (goto-char (point-min))
+                (search-forward "Gamma")
+                (beginning-of-line)
                 (org-agenda-goto nil)
                 (with-current-buffer (current-buffer)
-                  (org-reschedule nil '(5 29 2026)))
+                  (org-schedule nil "2026-05-29"))
                 ;; Re-agenda
+                (set-buffer org-agenda-buffer-name)
                 (org-agenda-quit)
                 (org-agenda-list nil "2026-05-28" 2)
                 (with-current-buffer org-agenda-buffer-name
@@ -1697,7 +1702,7 @@ fn org_agenda_todo_filter_edit_reschedule_reagenda_deep() {
                                           (buffer-substring-no-properties
                                            (point-min) (point-max)))))
                     (org-agenda-quit)
-                    (list full todo-only after-reschedule))))))))
+                    (list full todo-only after-reschedule)))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
       (delete-directory root t))))"##,
@@ -1757,12 +1762,11 @@ fn org_agenda_week_view_clock_filter_edit_reagenda_deep() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_agenda_tag_filter_edit_todo_change_reagenda_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 45 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1808,7 +1812,7 @@ fn org_agenda_tag_filter_edit_todo_change_reagenda_deep() {
                     (list full work-only after-edit))))))))
       (when (get-buffer org-agenda-buffer-name)
         (kill-buffer org-agenda-buffer-name))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }

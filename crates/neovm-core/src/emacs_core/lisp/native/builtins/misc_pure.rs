@@ -1,5 +1,6 @@
 use super::*;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
+use crate::emacs_core::intern::WellKnown;
 
 // ===========================================================================
 // Misc
@@ -117,8 +118,13 @@ fn message_dolog(
     msg: &crate::heap_types::LispString,
     termination: MessageLogTermination,
 ) {
+    // GNU reads the DEFVAR_LISP `message-log-max` and `messages-buffer-name`;
+    // `message` runs on ordinary command output, so the by-name spellings
+    // re-interned both at every message.
+    static MESSAGE_LOG_MAX: WellKnown = WellKnown::MessageLogMax;
+    static MESSAGES_BUFFER_NAME: WellKnown = WellKnown::MessagesBufferName;
     // GNU: check message-log-max; if nil, don't log
-    let log_max = ctx.visible_variable_value_or_nil("message-log-max");
+    let log_max = ctx.visible_variable_value_or_nil_by_id(MESSAGE_LOG_MAX.id());
     if log_max.is_nil() {
         return;
     }
@@ -137,7 +143,7 @@ fn message_dolog(
     // GNU xdisp.c defaults `messages-buffer-name` to "*Messages*" and lets
     // Lisp rebind it to redirect message logging.
     let messages_name = ctx
-        .visible_variable_value_or_nil("messages-buffer-name")
+        .visible_variable_value_or_nil_by_id(MESSAGES_BUFFER_NAME.id())
         .as_str_owned()
         .unwrap_or_else(|| "*Messages*".to_string());
     let buf_id = if let Some(id) = ctx.buffers.find_buffer_by_name(&messages_name) {
@@ -366,7 +372,7 @@ pub(crate) fn stderr_message_ends_with_newline(
     message_is_string || !cursor_in_echo_area
 }
 
-pub(crate) fn builtin_message(ctx: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_message(ctx: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     expect_min_args("message", &args, 1)?;
     ctx.note_output_effect();
     // GNU Emacs: nil or empty string clears the echo area and returns as-is.
@@ -390,7 +396,7 @@ pub(crate) fn builtin_message(ctx: &mut super::eval::Context, args: Vec<Value>) 
     // GNU Emacs's `message` ALWAYS calls `format-message` on the args,
     // even for a single string argument.  This converts %% -> % and
     // applies text-quoting (curly quotes).
-    let formatted = super::strings::builtin_format_message(ctx, args.clone())?;
+    let formatted = super::strings::builtin_format_message(ctx, args)?;
     // GNU Fmessage returns the formatted Lisp object after display/logging
     // side effects. Keep that object rooted while those side effects allocate.
     let root_scope = ctx.save_vm_roots();
@@ -494,7 +500,7 @@ pub(crate) fn builtin_message_box(ctx: &mut super::eval::Context, args: Vec<Valu
         return Ok(Value::NIL);
     }
     // GNU Emacs: always calls format-message, even for single-arg.
-    let formatted = super::strings::builtin_format_message(ctx, args.clone())?;
+    let formatted = super::strings::builtin_format_message(ctx, &args)?;
     if let Some(ls) = ctx.lisp_string(formatted) {
         tracing::info!(msg = %crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes()));
     }
@@ -510,7 +516,7 @@ pub(crate) fn builtin_message_or_box(
         return Ok(Value::NIL);
     }
     // GNU Emacs: always calls format-message, even for single-arg.
-    let formatted = super::strings::builtin_format_message(ctx, args.clone())?;
+    let formatted = super::strings::builtin_format_message(ctx, &args)?;
     if let Some(ls) = ctx.lisp_string(formatted) {
         tracing::info!(msg = %crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes()));
     }
@@ -519,7 +525,7 @@ pub(crate) fn builtin_message_or_box(
 
 pub(crate) fn builtin_current_message(
     ctx: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_args("current-message", &args, 0)?;
     Ok(ctx.current_message_value().unwrap_or(Value::NIL))

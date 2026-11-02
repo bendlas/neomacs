@@ -1,281 +1,18 @@
 use crate::common::assert_oracle_parity;
 use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_crypt_stubbed_encrypt_decrypt_reuse_hook_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-crypt)
-  (with-temp-buffer
-    (let ((org-crypt-key "default@example.org")
-          (org-crypt-tag-matcher "crypt")
-          (org-crypt-disable-auto-save nil)
-          (cipher-table nil)
-          (calls nil))
-      (cl-letf (((symbol-function 'epg-make-context)
-                 (lambda (&rest args)
-                   (push (cons 'context args) calls)
-                   'mock-context))
-                ((symbol-function 'epg-list-keys)
-                 (lambda (_context name &optional mode)
-                   (push (list 'keys name mode) calls)
-                   (and (not (string= name ""))
-                        (list (concat "KEY:" name)))))
-                ((symbol-function 'epg-encrypt-string)
-                 (lambda (_context plain recipients &optional sign trust)
-                   (let ((cipher
-                          (format "-----BEGIN PGP MESSAGE-----\nkey=%S sign=%S trust=%S\nsha=%s\n-----END PGP MESSAGE-----\n"
-                                  recipients sign trust (sha1 plain))))
-                     (push (list 'encrypt recipients plain) calls)
-                     (push (cons (org-crypt--encrypted-text
-                                  1 (with-temp-buffer
-                                      (insert cipher)
-                                      (point-max)))
-                                 plain)
-                           cipher-table)
-                     cipher)))
-                ((symbol-function 'epg-decrypt-string)
-                 (lambda (_context cipher)
-                   (push (list 'decrypt cipher) calls)
-                   (or (cdr (assoc cipher cipher-table))
-                       (error "missing cipher")))))
-        (org-mode)
-        (insert "* Secrets :crypt:\n")
-        (insert ":PROPERTIES:\n:CRYPTKEY: alice@example.org\n:END:\n")
-        (insert "Plain alpha\n")
-        (insert "** Nested raw\nBody nested\n")
-        (insert "* Symmetric :crypt:\n")
-        (insert ":PROPERTIES:\n:CRYPTKEY: nil\n:END:\n")
-        (insert "Plain beta\n")
-        (let ((initial (buffer-substring-no-properties
-                        (point-min) (point-max))))
-          (goto-char (point-min))
-          (org-encrypt-entries)
-          (let ((after-encrypt
-                 (buffer-substring-no-properties (point-min) (point-max)))
-                (encrypted-regions
-                 (mapcar
-                  (lambda (needle)
-                    (save-excursion
-                      (goto-char (point-min))
-                      (search-forward needle)
-                      (beginning-of-line)
-                      (org-at-encrypted-entry-p)))
-                  '("Secrets" "Symmetric"))))
-            (goto-char (point-min))
-            (org-decrypt-entry)
-            (let ((after-first-decrypt
-                   (buffer-substring-no-properties
-                    (point-min) (point-max))))
-              (org-encrypt-entry)
-              (let ((after-reencrypt
-                     (buffer-substring-no-properties
-                      (point-min) (point-max))))
-                (goto-char (point-min))
-                (search-forward "Symmetric")
-                (beginning-of-line)
-                (org-decrypt-entry)
-                (goto-char (point-min))
-                (org-crypt-use-before-save-magic)
-                (let ((hooks (mapcar (lambda (fn)
-                                       (cond ((eq fn 'org-encrypt-entries)
-                                              'org-encrypt-entries)
-                                             ((functionp fn) 'function)
-                                             (t fn)))
-                                     org-mode-hook))
-                      (encrypt-calls
-                       (mapcar (lambda (call)
-                                 (and (eq (car-safe call) 'encrypt)
-                                      (list (nth 1 call)
-                                            (string-match-p
-                                             "Plain alpha\\|Plain beta"
-                                             (nth 2 call)))))
-                               (reverse calls))))
-                  (list initial
-                        after-encrypt
-                        encrypted-regions
-                        after-first-decrypt
-                        after-reencrypt
-                        (buffer-substring-no-properties
-                         (point-min) (point-max))
-                        encrypt-calls
-                        hooks
-                        (mapcar (lambda (call)
-                                  (if (eq (car-safe call) 'decrypt)
-                                      (list 'decrypt
-                                            (string-match-p
-                                             "BEGIN PGP MESSAGE"
-                                             (nth 1 call)))
-                                    call))
-                                (reverse calls)))))))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_crypt_decrypt_nested_headings_autosave_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-crypt)
-  (require 'org-fold)
-  (with-temp-buffer
-    (let ((org-crypt-key "fallback@example.org")
-          (org-crypt-tag-matcher "crypt")
-          (org-crypt-disable-auto-save 'encrypt)
-          (cipher-table nil)
-          (calls nil))
-      (cl-labels
-          ((cipher-for
-            (name plain)
-            (let ((cipher
-                   (format "-----BEGIN PGP MESSAGE-----\n%s\n-----END PGP MESSAGE-----\n"
-                           name)))
-              (push (cons (org-crypt--encrypted-text
-                           1 (with-temp-buffer
-                               (insert cipher)
-                               (point-max)))
-                          plain)
-                    cipher-table)
-              cipher))
-           (snapshot
-            (label)
-            (list label
-                  (buffer-substring-no-properties
-                   (point-min) (point-max))
-                  (mapcar
-                   (lambda (needle)
-                     (save-excursion
-                       (goto-char (point-min))
-                       (search-forward needle nil t)
-                       (and (match-beginning 0)
-                            (list needle
-                                  (line-number-at-pos)
-                                  (org-current-level)
-                                  (org-at-heading-p)
-                                  (not (null
-                                        (org-invisible-p
-                                         (line-beginning-position))))))))
-                   '("Vault" "Child one" "Grand child" "Peer one"
-                     "Symmetric" "Sym child" "Plain" "Not encrypted"))
-                  (mapcar
-                   (lambda (fn)
-                     (cond ((eq fn 'org-encrypt-entries)
-                            'org-encrypt-entries)
-                           ((functionp fn) 'function)
-                           (t fn)))
-                   auto-save-hook))))
-        (let* ((plain-a "* Child one\nchild body\n** Grand child\ngrand body\n* Peer one\npeer body\n")
-               (plain-b "** Sym child\nsym body\n"))
-          (cl-letf (((symbol-function 'epg-make-context)
-                     (lambda (&rest args)
-                       (push (cons 'context args) calls)
-                       'mock-context))
-                    ((symbol-function 'epg-list-keys)
-                     (lambda (_context name &optional mode)
-                       (push (list 'keys name mode) calls)
-                       (and name
-                            (not (string= name ""))
-                            (list (concat "KEY:" name)))))
-                    ((symbol-function 'epg-encrypt-string)
-                     (lambda (_context plain recipients &optional sign trust)
-                       (let ((cipher
-                              (format "-----BEGIN PGP MESSAGE-----\nre:%s\n-----END PGP MESSAGE-----\n"
-                                      (sha1 plain))))
-                         (push (list 'encrypt recipients plain) calls)
-                         (push (cons (org-crypt--encrypted-text
-                                      1 (with-temp-buffer
-                                          (insert cipher)
-                                          (point-max)))
-                                     plain)
-                               cipher-table)
-                         cipher)))
-                    ((symbol-function 'epg-decrypt-string)
-                     (lambda (_context cipher)
-                       (push (list 'decrypt cipher) calls)
-                       (or (cdr (assoc cipher cipher-table))
-                           (error "missing cipher")))))
-            (org-mode)
-            (auto-save-mode 1)
-            (insert "* Vault :crypt:\n")
-            (insert ":PROPERTIES:\n:CRYPTKEY: bob@example.org\n:END:\n")
-            (insert (cipher-for "cipher-a" plain-a))
-            (insert "* Symmetric :crypt:\n")
-            (insert ":PROPERTIES:\n:CRYPTKEY: nil\n:END:\n")
-            (insert (cipher-for "cipher-b" plain-b))
-            (insert "* Plain\nNot encrypted\n")
-            (goto-char (point-min))
-            (org-fold-hide-subtree)
-            (let ((initial (snapshot 'initial)))
-              (org-decrypt-entries)
-              (let ((after-decrypt (snapshot 'after-decrypt))
-                    (encrypted-after-decrypt
-                     (mapcar
-                      (lambda (needle)
-                        (save-excursion
-                          (goto-char (point-min))
-                          (search-forward needle)
-                          (beginning-of-line)
-                          (org-at-encrypted-entry-p)))
-                      '("Vault" "Symmetric" "Plain"))))
-                (run-hooks 'auto-save-hook)
-                (let ((after-autosave (snapshot 'after-autosave))
-                      (encrypted-after-autosave
-                       (mapcar
-                        (lambda (needle)
-                          (save-excursion
-                            (goto-char (point-min))
-                            (search-forward needle)
-                            (beginning-of-line)
-                            (not (null (org-at-encrypted-entry-p)))))
-                        '("Vault" "Symmetric" "Plain"))))
-                  (list initial
-                        after-decrypt
-                        encrypted-after-decrypt
-                        after-autosave
-                        encrypted-after-autosave
-                        (mapcar
-                         (lambda (call)
-                           (pcase (car-safe call)
-                             ('encrypt
-                              (list 'encrypt
-                                    (nth 1 call)
-                                    (string-match-p
-                                     "Child one\\|Sym child"
-                                     (nth 2 call))
-                                    (string-match-p
-                                     "^\\*\\* Child one"
-                                     (nth 2 call))))
-                             ('decrypt
-                              (list 'decrypt
-                                    (string-match-p
-                                     "BEGIN PGP MESSAGE"
-                                     (nth 1 call))))
-                             (_ call)))
-                         (reverse calls)))))))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_crypt_matcher_key_error_autosave_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"KEY:alice@example.org\") (\"KEY:bob@example.org\") nil nil (\"KEY:global@example.org\")) \"mock encrypt refused payload\" (t nil t t nil nil) 701 \"mock missing cipher\" t ((t t (\"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) nil nil) (nil nil (\"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) \"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) (ask t (\"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) nil nil) (ask nil (\"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) \"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) (encrypt nil (\"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) \"[SESSION-TMPDIR]/#crypt-policy.org#\" #'t) (unknown nil (\"[SESSION-TMPDIR]/#crypt-policy.org#\" nil) \"[SESSION-TMPDIR]/#crypt-policy.org#\" nil)) ((keys \"alice@example.org\" nil) (keys \"bob@example.org\" nil) (keys \"\" nil) (keys \"missing@example.org\" nil) (keys \"global@example.org\" nil) (context nil t t) (keys \"alice@example.org\" nil) (encrypt (\"KEY:alice@example.org\") 0 nil) (context nil t t) (keys \"\" nil) (encrypt nil nil nil) (context nil t t) (keys \"missing@example.org\" nil) (encrypt nil nil nil) (context nil t t) (keys \"global@example.org\" nil) (context nil t t) (decrypt 5) (ask \"`org-decrypt': auto-save-mode may cause leakage.  Disable it for current buffer? \") (ask \"`org-decrypt': auto-save-mode may cause leakage.  Disable it for current buffer? \")))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'org-crypt)
+  (require 'epg)
   (with-temp-buffer
     (let ((org-crypt-key "global@example.org")
           (org-crypt-tag-matcher "crypt+LEVEL=1")
@@ -300,9 +37,9 @@ fn org_crypt_matcher_key_error_autosave_combo() {
             (title fn)
             (save-excursion
               (goto-char (point-min))
-              (search-forward title)
-              (beginning-of-line)
-              (funcall fn)))
+              (when (search-forward title nil t)
+                (beginning-of-line)
+                (funcall fn))))
            (policy
             (setting answer)
             (let ((org-crypt-disable-auto-save setting)
@@ -344,10 +81,9 @@ fn org_crypt_matcher_key_error_autosave_combo() {
                             (format "-----BEGIN PGP MESSAGE-----\nrecipients=%S sign=%S trust=%S sha=%s\n-----END PGP MESSAGE-----\n"
                                     recipients sign trust (sha1 plain))))
                        (push (list 'encrypt recipients plain) calls)
-                       (push (cons (org-crypt--encrypted-text
-                                    1 (with-temp-buffer
-                                        (insert cipher)
-                                        (point-max)))
+                       (push (cons (with-temp-buffer
+                                    (insert cipher)
+                                    (org-crypt--encrypted-text (point-min) (point-max)))
                                    plain)
                              cipher-table)
                        cipher)))
@@ -426,7 +162,272 @@ fn org_crypt_matcher_key_error_autosave_combo() {
                   decrypt-error
                   corrupt-still-encrypted
                    policy-results
-                   (mapcar #'compact-call (reverse calls))))))))"##,
+                   (mapcar #'compact-call (reverse calls)))))))))"##,
+        expect,
+    );
+}
+
+#[test]
+fn org_crypt_decrypt_nested_headings_autosave_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK ((initial \"* Vault :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: bob@example.org\\n:END:\\n-----BEGIN PGP MESSAGE-----\\ncipher-a\\n-----END PGP MESSAGE-----\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\n-----BEGIN PGP MESSAGE-----\\ncipher-b\\n-----END PGP MESSAGE-----\\n* Plain\\nNot encrypted\\n\" ((\"Vault\" 1 1 t nil) nil nil nil (\"Symmetric\" 8 1 t nil) nil (\"Plain\" 15 1 t nil) (\"Not encrypted\" 16 1 nil nil)) nil) (after-decrypt \"* Vault :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: bob@example.org\\n:END:\\n** Child one\\nchild body\\n*** Grand child\\ngrand body\\n** Peer one\\npeer body\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\n** Sym child\\nsym body\\n* Plain\\nNot encrypted\\n\" ((\"Vault\" 1 1 t nil) (\"Child one\" 5 2 t t) (\"Grand child\" 7 3 t t) (\"Peer one\" 9 2 t t) (\"Symmetric\" 11 1 t nil) (\"Sym child\" 15 2 t nil) (\"Plain\" 17 1 t nil) (\"Not encrypted\" 18 1 nil nil)) #'t) (nil nil nil) (after-autosave \"* Vault :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: bob@example.org\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nre:8b66282a07b04a9c99e3baca5542132084ffc6fd\\n-----END PGP MESSAGE-----\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nre:9073648510f93050a1d6d9edfd02267e18ed80b8\\n-----END PGP MESSAGE-----\\n* Plain\\nNot encrypted\\n\" ((\"Vault\" 1 1 t nil) nil nil nil (\"Symmetric\" 8 1 t nil) nil (\"Plain\" 15 1 t nil) (\"Not encrypted\" 16 1 nil nil)) #'t) (t t nil) ((context nil t t) (decrypt 5) (context nil t t) (decrypt 5) (keys \"fallback@example.org\" nil) (context nil t t) (keys \"bob@example.org\" nil) (encrypt (\"KEY:bob@example.org\") 3 0) (context nil t t) (keys \"\" nil) (encrypt nil 3 nil)))""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-crypt)
+  (require 'epg)
+  (require 'org-fold)
+  (with-temp-buffer
+    (let ((org-crypt-key "fallback@example.org")
+          (org-crypt-tag-matcher "crypt")
+          (org-crypt-disable-auto-save 'encrypt)
+          (cipher-table nil)
+          (calls nil))
+      (cl-labels
+          ((cipher-for
+            (name plain)
+            (let ((cipher
+                   (format "-----BEGIN PGP MESSAGE-----\n%s\n-----END PGP MESSAGE-----\n"
+                           name)))
+              (push (cons (with-temp-buffer
+                           (insert cipher)
+                           (org-crypt--encrypted-text (point-min) (point-max)))
+                          plain)
+                    cipher-table)
+              cipher))
+           (snapshot
+            (label)
+            (list label
+                  (buffer-substring-no-properties
+                   (point-min) (point-max))
+                  (mapcar
+                   (lambda (needle)
+                     (save-excursion
+                       (goto-char (point-min))
+                       (when (search-forward needle nil t)
+                         (list needle
+                                  (line-number-at-pos)
+                                  (org-current-level)
+                                  (org-at-heading-p)
+                                  (not (null
+                                        (org-invisible-p
+                                         (line-beginning-position))))))))
+                   '("Vault" "Child one" "Grand child" "Peer one"
+                     "Symmetric" "Sym child" "Plain" "Not encrypted"))
+                  (mapcar
+                   (lambda (fn)
+                     (cond ((eq fn 'org-encrypt-entries)
+                            'org-encrypt-entries)
+                           ((functionp fn) 'function)
+                           (t fn)))
+                   auto-save-hook))))
+        (let* ((plain-a "* Child one\nchild body\n** Grand child\ngrand body\n* Peer one\npeer body\n")
+               (plain-b "** Sym child\nsym body\n"))
+          (cl-letf (((symbol-function 'epg-make-context)
+                     (lambda (&rest args)
+                       (push (cons 'context args) calls)
+                       'mock-context))
+                    ((symbol-function 'epg-list-keys)
+                     (lambda (_context name &optional mode)
+                       (push (list 'keys name mode) calls)
+                       (and name
+                            (not (string= name ""))
+                            (list (concat "KEY:" name)))))
+                    ((symbol-function 'epg-encrypt-string)
+                     (lambda (_context plain recipients &optional sign trust)
+                       (let ((cipher
+                              (format "-----BEGIN PGP MESSAGE-----\nre:%s\n-----END PGP MESSAGE-----\n"
+                                      (sha1 plain))))
+                         (push (list 'encrypt recipients plain) calls)
+                         (push (cons (with-temp-buffer
+                                      (insert cipher)
+                                      (org-crypt--encrypted-text (point-min) (point-max)))
+                                     plain)
+                               cipher-table)
+                         cipher)))
+                    ((symbol-function 'epg-decrypt-string)
+                     (lambda (_context cipher)
+                       (push (list 'decrypt cipher) calls)
+                       (or (cdr (assoc cipher cipher-table))
+                           (error "missing cipher")))))
+            (org-mode)
+            (auto-save-mode 1)
+            (insert "* Vault :crypt:\n")
+            (insert ":PROPERTIES:\n:CRYPTKEY: bob@example.org\n:END:\n")
+            (insert (cipher-for "cipher-a" plain-a))
+            (insert "* Symmetric :crypt:\n")
+            (insert ":PROPERTIES:\n:CRYPTKEY: nil\n:END:\n")
+            (insert (cipher-for "cipher-b" plain-b))
+            (insert "* Plain\nNot encrypted\n")
+            (goto-char (point-min))
+            (org-fold-hide-subtree)
+            (let ((initial (snapshot 'initial)))
+              (org-decrypt-entries)
+              (let ((after-decrypt (snapshot 'after-decrypt))
+                    (encrypted-after-decrypt
+                     (mapcar
+                      (lambda (needle)
+                        (save-excursion
+                          (goto-char (point-min))
+                          (search-forward needle)
+                          (beginning-of-line)
+                          (org-at-encrypted-entry-p)))
+                      '("Vault" "Symmetric" "Plain"))))
+                (run-hooks 'auto-save-hook)
+                (let ((after-autosave (snapshot 'after-autosave))
+                      (encrypted-after-autosave
+                       (mapcar
+                        (lambda (needle)
+                          (save-excursion
+                            (goto-char (point-min))
+                            (search-forward needle)
+                            (beginning-of-line)
+                            (not (null (org-at-encrypted-entry-p)))))
+                        '("Vault" "Symmetric" "Plain"))))
+                  (list initial
+                        after-decrypt
+                        encrypted-after-decrypt
+                        after-autosave
+                        encrypted-after-autosave
+                        (mapcar
+                         (lambda (call)
+                           (pcase (car-safe call)
+                             ('encrypt
+                              (list 'encrypt
+                                    (nth 1 call)
+                                    (string-match-p
+                                     "Child one\\|Sym child"
+                                     (nth 2 call))
+                                    (string-match-p
+                                     "^\\*\\* Child one"
+                                     (nth 2 call))))
+                             ('decrypt
+                              (list 'decrypt
+                                    (string-match-p
+                                     "BEGIN PGP MESSAGE"
+                                     (nth 1 call))))
+                             (_ call)))
+                         (reverse calls))))))))))))"##,
+        expect,
+    );
+}
+
+#[test]
+fn org_crypt_stubbed_encrypt_decrypt_reuse_hook_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (\"* Secrets :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: alice@example.org\\n:END:\\nPlain alpha\\n** Nested raw\\nBody nested\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\nPlain beta\\n\" \"* Secrets :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: alice@example.org\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nkey=(\\\"KEY:alice@example.org\\\") sign=nil trust=nil\\nsha=16ddaf9c85dc856806a71138bb3de5e6e51e0c99\\n-----END PGP MESSAGE-----\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nkey=nil sign=nil trust=nil\\nsha=9f1ae986ebc1c3fbf52a6cd1f64bf049c380f609\\n-----END PGP MESSAGE-----\\n\" ((67 . 215) (269 . 395)) \"* Secrets :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: alice@example.org\\n:END:\\nPlain alpha\\n** Nested raw\\nBody nested\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nkey=nil sign=nil trust=nil\\nsha=9f1ae986ebc1c3fbf52a6cd1f64bf049c380f609\\n-----END PGP MESSAGE-----\\n\" \"* Secrets :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: alice@example.org\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nkey=(\\\"KEY:alice@example.org\\\") sign=nil trust=nil\\nsha=16ddaf9c85dc856806a71138bb3de5e6e51e0c99\\n-----END PGP MESSAGE-----\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nkey=nil sign=nil trust=nil\\nsha=9f1ae986ebc1c3fbf52a6cd1f64bf049c380f609\\n-----END PGP MESSAGE-----\\n\" \"* Secrets :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: alice@example.org\\n:END:\\n-----BEGIN PGP MESSAGE-----\\nkey=(\\\"KEY:alice@example.org\\\") sign=nil trust=nil\\nsha=16ddaf9c85dc856806a71138bb3de5e6e51e0c99\\n-----END PGP MESSAGE-----\\n* Symmetric :crypt:\\n:PROPERTIES:\\n:CRYPTKEY: nil\\n:END:\\nPlain beta\\n\" (nil nil ((\"KEY:alice@example.org\") 0) nil nil (nil 0) nil nil nil nil nil ((\"KEY:alice@example.org\") 0) nil nil nil) (function function function function function) ((context nil t t) (keys \"alice@example.org\" nil) (encrypt (\"KEY:alice@example.org\") \"Plain alpha\\n** Nested raw\\nBody nested\\n\") (context nil t t) (keys \"\" nil) (encrypt nil \"Plain beta\\n\") (context nil t t) (decrypt 5) (keys \"default@example.org\" nil) (context nil t t) (keys \"alice@example.org\" nil) (encrypt (\"KEY:alice@example.org\") #(\"Plain alpha\\n** Nested raw\\nBody nested\\n\" 0 38 (org-crypt-checksum \"16ddaf9c85dc856806a71138bb3de5e6e51e0c99\" org-crypt-key (\"KEY:default@example.org\") org-crypt-text \"-----BEGIN PGP MESSAGE-----\\nkey=(\\\"KEY:alice@example.org\\\") sign=nil trust=nil\\nsha=16ddaf9c85dc856806a71138bb3de5e6e51e0c99\\n-----END PGP MESSAGE-----\\n\"))) (context nil t t) (decrypt 5) (keys \"\" nil)))""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-crypt)
+  (require 'epg)
+  (with-temp-buffer
+    (let ((org-crypt-key "default@example.org")
+          (org-crypt-tag-matcher "crypt")
+          (org-crypt-disable-auto-save nil)
+          (cipher-table nil)
+          (calls nil))
+      (cl-letf (((symbol-function 'epg-make-context)
+                 (lambda (&rest args)
+                   (push (cons 'context args) calls)
+                   'mock-context))
+                ((symbol-function 'epg-list-keys)
+                 (lambda (_context name &optional mode)
+                   (push (list 'keys name mode) calls)
+                   (and (not (string= name ""))
+                        (list (concat "KEY:" name)))))
+                ((symbol-function 'epg-encrypt-string)
+                 (lambda (_context plain recipients &optional sign trust)
+                   (let ((cipher
+                          (format "-----BEGIN PGP MESSAGE-----\nkey=%S sign=%S trust=%S\nsha=%s\n-----END PGP MESSAGE-----\n"
+                                  recipients sign trust (sha1 plain))))
+                     (push (list 'encrypt recipients plain) calls)
+                     (push (cons (with-temp-buffer
+                                  (insert cipher)
+                                  (org-crypt--encrypted-text (point-min) (point-max)))
+                                 plain)
+                           cipher-table)
+                     cipher)))
+                ((symbol-function 'epg-decrypt-string)
+                 (lambda (_context cipher)
+                   (push (list 'decrypt cipher) calls)
+                   (or (cdr (assoc cipher cipher-table))
+                       (error "missing cipher")))))
+        (org-mode)
+        (insert "* Secrets :crypt:\n")
+        (insert ":PROPERTIES:\n:CRYPTKEY: alice@example.org\n:END:\n")
+        (insert "Plain alpha\n")
+        (insert "** Nested raw\nBody nested\n")
+        (insert "* Symmetric :crypt:\n")
+        (insert ":PROPERTIES:\n:CRYPTKEY: nil\n:END:\n")
+        (insert "Plain beta\n")
+        (let ((initial (buffer-substring-no-properties
+                        (point-min) (point-max))))
+          (goto-char (point-min))
+          (org-encrypt-entries)
+          (let ((after-encrypt
+                 (buffer-substring-no-properties (point-min) (point-max)))
+                (encrypted-regions
+                 (mapcar
+                  (lambda (needle)
+                    (save-excursion
+                      (goto-char (point-min))
+                      (search-forward needle)
+                      (beginning-of-line)
+                      (org-at-encrypted-entry-p)))
+                  '("Secrets" "Symmetric"))))
+            (goto-char (point-min))
+            (org-decrypt-entry)
+            (let ((after-first-decrypt
+                   (buffer-substring-no-properties
+                    (point-min) (point-max))))
+              (org-encrypt-entry)
+              (let ((after-reencrypt
+                     (buffer-substring-no-properties
+                      (point-min) (point-max))))
+                (goto-char (point-min))
+                (search-forward "Symmetric")
+                (beginning-of-line)
+                (org-decrypt-entry)
+                (goto-char (point-min))
+                (org-crypt-use-before-save-magic)
+                (let ((hooks (mapcar (lambda (fn)
+                                       (cond ((eq fn 'org-encrypt-entries)
+                                              'org-encrypt-entries)
+                                             ((functionp fn) 'function)
+                                             (t fn)))
+                                     org-mode-hook))
+                      (encrypt-calls
+                       (mapcar (lambda (call)
+                                 (and (eq (car-safe call) 'encrypt)
+                                      (list (nth 1 call)
+                                            (string-match-p
+                                             "Plain alpha\\|Plain beta"
+                                             (nth 2 call)))))
+                               (reverse calls))))
+                  (list initial
+                        after-encrypt
+                        encrypted-regions
+                        after-first-decrypt
+                        after-reencrypt
+                        (buffer-substring-no-properties
+                         (point-min) (point-max))
+                        encrypt-calls
+                        hooks
+                        (mapcar (lambda (call)
+                                  (if (eq (car-safe call) 'decrypt)
+                                      (list 'decrypt
+                                            (string-match-p
+                                             "BEGIN PGP MESSAGE"
+                                             (nth 1 call)))
+                                    call))
+                                (reverse calls))))))))))))"##,
         expect,
     );
 }

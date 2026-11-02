@@ -1,23 +1,38 @@
 //! Coverage checks for oracle parity tests.
 
 use std::collections::{BTreeSet, HashSet};
-use std::process::Command;
 
 use crate::common::live_oracle_enabled;
+use neomacs_test_env::{CanonicalEnvironment, CanonicalProfile, bounded_temp_dir};
 
 use crate::coverage_manifest::{
     ORACLE_TESTED_NONPRIMITIVE_NAMES, ORACLE_TESTED_PRIMITIVE_NAMES,
     ORACLE_TESTED_SPECIAL_FORM_NAMES,
 };
 
-fn oracle_emacs_path() -> String {
-    std::env::var("NEOVM_FORCE_ORACLE_PATH").unwrap_or_else(|_| "emacs".to_string())
+fn oracle_emacs_path() -> std::path::PathBuf {
+    neomacs_test_oracle::gnu::gnu_oracle().executable_path()
 }
 
 fn run_oracle_name_dump(program: &str) -> Result<BTreeSet<String>, String> {
     let oracle_bin = oracle_emacs_path();
+    // The dump only lists subr names, but the spawn still goes through the
+    // canonical environment: an editor process the harness starts by any path
+    // is a process whose ambient host must not be able to change its answer.
+    let home = bounded_temp_dir("nv-coverage-home-")
+        .map_err(|e| format!("failed to create coverage HOME: {e}"))?;
+    let tmp = bounded_temp_dir("nv-coverage-tmp-")
+        .map_err(|e| format!("failed to create coverage TMPDIR: {e}"))?;
+    let environment = CanonicalEnvironment::new(
+        CanonicalProfile::Oracle,
+        home.path(),
+        tmp.path(),
+        crate::common::oracle_sandbox::project_root(),
+    )
+    .map_err(|e| format!("invalid coverage environment: {e}"))?;
 
-    let output = Command::new(&oracle_bin)
+    let mut command = environment.command(&oracle_bin);
+    let output = command
         .args(["--batch", "-Q", "--eval", program])
         .output()
         .map_err(|e| format!("failed to run oracle Emacs: {e}"))?;

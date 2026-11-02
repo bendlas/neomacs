@@ -1,17 +1,66 @@
 use crate::common::assert_oracle_parity;
 use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
+#[test]
+fn org_sort_list_checkbox_time_custom_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (\"- [ ] task beta <2026-05-29 Fri>\\n  - nested z\\n- [-] task gamma <2026-05-28 Thu>\\n- [X] task alpha <2026-05-27 Wed>\\n\" \"- [X] task alpha <2026-05-27 Wed>\\n- [-] task gamma <2026-05-28 Thu>\\n- [ ] task beta <2026-05-29 Fri>\\n  - nested z\\n\" \"- [ ] task beta <2026-05-29 Fri>\\n  - nested z\\n- [-] task gamma <2026-05-28 Thu>\\n- [X] task alpha <2026-05-27 Wed>\\n\" ((1 \"- [ ] task beta <2026-05-29 Fri>\\n\") (1 \"- [X] task alpha <2026-05-27 Wed>\\n\") (1 \"- [ ] task beta <2026-05-29 Fri>\\n\")) (unordered (\"[ ] task beta <2026-05-29 Fri>\" (unordered (\"nested z\"))) (\"[-] task gamma <2026-05-28 Thu>\") (\"[X] task alpha <2026-05-27 Wed>\")))""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-list)
+  (with-temp-buffer
+    (let* ((events nil)
+          (org-after-sorting-entries-or-items-hook
+           (list (lambda ()
+                   (push (list (line-number-at-pos)
+                               (thing-at-point 'line t))
+                         events)))))
+      (org-mode)
+      (insert "- [ ] task beta <2026-05-29 Fri>\n")
+      (insert "  - nested z\n")
+      (insert "- [X] task alpha <2026-05-27 Wed>\n")
+      (insert "- [-] task gamma <2026-05-28 Thu>\n")
+      (goto-char (point-min))
+      (org-sort-list nil ?x)
+      (let ((by-check (buffer-substring-no-properties (point-min) (point-max))))
+        (goto-char (point-min))
+        (org-sort-list nil ?t)
+        (let ((by-time (buffer-substring-no-properties (point-min) (point-max))))
+          (goto-char (point-min))
+          (org-sort-list
+           t ?f
+           (lambda ()
+             (let ((line (thing-at-point 'line t)))
+               (list (length line) line)))
+           (lambda (a b)
+             (if (= (car a) (car b))
+                 (string< (cadr a) (cadr b))
+               (< (car a) (car b)))))
+          (list by-check
+                by-time
+                (buffer-substring-no-properties (point-min) (point-max))
+                (nreverse events)
+                (org-list-to-lisp)))))))"##,
+        expect,
+    );
+}
+
 #[test]
 fn org_sort_entries_property_schedule_custom_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"* Parent\\n** DONE Middle [#B]\\nSCHEDULED: <2026-05-28 Thu>\\n:PROPERTIES:\\n:Rank: 11\\n:Owner: bob\\n:END:\\n** WAIT Zebra [#C]\\nSCHEDULED: <2026-05-29 Fri>\\n:PROPERTIES:\\n:Rank: 20\\n:Owner: zoe\\n:END:\\nSee [[https://example.org/z][Zed]].\\n** TODO alpha [#A]\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Rank: 3\\n:Owner: ada\\n:END:\\n\" \"* Parent\\n** TODO alpha [#A]\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Rank: 3\\n:Owner: ada\\n:END:\\n** DONE Middle [#B]\\nSCHEDULED: <2026-05-28 Thu>\\n:PROPERTIES:\\n:Rank: 11\\n:Owner: bob\\n:END:\\n** WAIT Zebra [#C]\\nSCHEDULED: <2026-05-29 Fri>\\n:PROPERTIES:\\n:Rank: 20\\n:Owner: zoe\\n:END:\\nSee [[https://example.org/z][Zed]].\\n\" \"* Parent\\n** WAIT Zebra [#C]\\nSCHEDULED: <2026-05-29 Fri>\\n:PROPERTIES:\\n:Rank: 20\\n:Owner: zoe\\n:END:\\nSee [[https://example.org/z][Zed]].\\n** DONE Middle [#B]\\nSCHEDULED: <2026-05-28 Thu>\\n:PROPERTIES:\\n:Rank: 11\\n:Owner: bob\\n:END:\\n** TODO alpha [#A]\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Rank: 3\\n:Owner: ada\\n:END:\\n\" ((1 \"Parent\") (1 \"Parent\") (1 \"Parent\")) ((1 nil nil \"Parent\") (2 \"WAIT\" 67 \"\") (2 \"DONE\" 66 \"\") (2 \"TODO\" 65 \"\")))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (with-temp-buffer
-    (let ((org-todo-keywords '((sequence "TODO" "WAIT" "|" "DONE")))
+    (let* ((org-todo-keywords '((sequence "TODO" "WAIT" "|" "DONE")))
           (events nil)
           (org-after-sorting-entries-or-items-hook
            (list (lambda ()
@@ -54,54 +103,7 @@ fn org_sort_entries_property_schedule_custom_combo() {
                     (list (org-element-property :level h)
                           (org-element-property :todo-keyword h)
                           (org-element-property :priority h)
-                          (org-element-property :raw-value h))))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_sort_list_checkbox_time_custom_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-list)
-  (with-temp-buffer
-    (let ((events nil)
-          (org-after-sorting-entries-or-items-hook
-           (list (lambda ()
-                   (push (list (line-number-at-pos)
-                               (thing-at-point 'line t))
-                         events)))))
-      (org-mode)
-      (insert "- [ ] task beta <2026-05-29 Fri>\n")
-      (insert "  - nested z\n")
-      (insert "- [X] task alpha <2026-05-27 Wed>\n")
-      (insert "- [-] task gamma <2026-05-28 Thu>\n")
-      (goto-char (point-min))
-      (org-sort-list nil ?x)
-      (let ((by-check (buffer-substring-no-properties (point-min) (point-max))))
-        (goto-char (point-min))
-        (org-sort-list nil ?t)
-        (let ((by-time (buffer-substring-no-properties (point-min) (point-max))))
-          (goto-char (point-min))
-          (org-sort-list
-           t ?f
-           (lambda ()
-             (let ((line (thing-at-point 'line t)))
-               (list (length line) line)))
-           (lambda (a b)
-             (if (= (car a) (car b))
-                 (string< (cadr a) (cadr b))
-               (< (car a) (car b)))))
-          (list by-check
-                by-time
-                (buffer-substring-no-properties (point-min) (point-max))
-                (nreverse events)
-                (org-list-to-lisp))))))"##,
+                          (org-element-property :raw-value h))))))))))"##,
         expect,
     );
 }
@@ -150,19 +152,20 @@ fn org_table_sort_region_time_numeric_function_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_sort_dispatch_table_list_entries_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"* Data\\n| Name | Score |\\n|------+-------|\\n| beta | 3 |\\n| alpha | 10 |\\n\\n- zeta <2026-05-29 Fri>\\n- alpha <2026-05-27 Wed>\\n- beta <2026-05-28 Thu>\\n** WAIT Later\\nSCHEDULED: <2026-05-29 Fri>\\n:PROPERTIES:\\n:Rank: 20\\n:END:\\n** TODO First\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Rank: 3\\n:END:\\n** DONE Middle\\nSCHEDULED: <2026-05-28 Thu>\\n:PROPERTIES:\\n:Rank: 11\\n:END:\\n\" \"* Data\\n| Name | Score |\\n|------+-------|\\n| beta | 3 |\\n| alpha | 10 |\\n\\n- alpha <2026-05-27 Wed>\\n- beta <2026-05-28 Thu>\\n- zeta <2026-05-29 Fri>\\n** WAIT Later\\nSCHEDULED: <2026-05-29 Fri>\\n:PROPERTIES:\\n:Rank: 20\\n:END:\\n** TODO First\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Rank: 3\\n:END:\\n** DONE Middle\\nSCHEDULED: <2026-05-28 Thu>\\n:PROPERTIES:\\n:Rank: 11\\n:END:\\n\" \"* Data\\n| Name | Score |\\n|------+-------|\\n| beta | 3 |\\n| alpha | 10 |\\n\\n- alpha <2026-05-27 Wed>\\n- beta <2026-05-28 Thu>\\n- zeta <2026-05-29 Fri>\\n** DONE Middle\\nSCHEDULED: <2026-05-28 Thu>\\n:PROPERTIES:\\n:Rank: 11\\n:END:\\n** WAIT Later\\nSCHEDULED: <2026-05-29 Fri>\\n:PROPERTIES:\\n:Rank: 20\\n:END:\\n** TODO First\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Rank: 3\\n:END:\\n\" ((1 \"- alpha <2026-05-27 Wed>\\n\" nil t nil) (1 \"* Data\\n\" nil nil t)) ((#(\"Name\" 0 4 (face org-table)) #(\"Score\" 0 5 (face org-table))) hline (#(\"beta\" 0 4 (face org-table)) #(\"3\" 0 1 (face org-table))) (#(\"alpha\" 0 5 (face org-table)) #(\"10\" 0 2 (face org-table)))) (unordered (\"alpha <2026-05-27 Wed>\") (\"beta <2026-05-28 Thu>\") (\"zeta <2026-05-29 Fri>\")) ((1 nil \"Data\" 1) (2 \"DONE\" \"Middle\" 144) (2 nil \"WAIT Later\" 216) (2 \"TODO\" \"First\" 287)))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'org-list)
   (require 'org-table)
   (with-temp-buffer
-    (let ((events nil)
+    (let* ((events nil)
           (org-after-sorting-entries-or-items-hook
            (list (lambda ()
                    (push (list (line-number-at-pos)
@@ -202,25 +205,31 @@ fn org_sort_dispatch_table_list_entries_combo() {
         (let ((after-list
                (buffer-substring-no-properties (point-min) (point-max))))
           (goto-char (point-min))
-          (search-forward "** WAIT")
+          (search-forward "* Data")
           (beginning-of-line)
           (cl-letf (((symbol-function 'read-char-exclusive)
                      (lambda (&rest _) ?r))
-                    ((symbol-function 'read-string)
+                    ((symbol-function 'completing-read)
                      (lambda (&rest _) "Rank")))
             (org-sort nil))
           (list after-table
                 after-list
                 (buffer-substring-no-properties (point-min) (point-max))
                 (nreverse events)
-                (org-table-to-lisp)
-                (org-list-to-lisp)
+                (save-excursion
+                  (goto-char (point-min))
+                  (search-forward "| Name")
+                  (org-table-to-lisp))
+                (save-excursion
+                  (goto-char (point-min))
+                  (search-forward "- ")
+                  (org-list-to-lisp))
                 (org-element-map (org-element-parse-buffer) 'headline
                   (lambda (h)
                     (list (org-element-property :level h)
                           (org-element-property :todo-keyword h)
                           (org-element-property :raw-value h)
-                          (org-element-property :begin h))))))))"##,
+                          (org-element-property :begin h))))))))))"##,
         expect,
     );
 }
@@ -333,7 +342,6 @@ fn org_sort_entries_priority_clock_region_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_sort_entries_time_tag_property_alpha_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -390,12 +398,11 @@ fn org_sort_entries_time_tag_property_alpha_combo() {
                     by-prop
                     by-prop-headlines
                     by-alpha
-                    by-alpha-headlines)))))))))"##,
+                    by-alpha-headlines))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_sort_entries_edit_resort_by_alpha_time_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -447,7 +454,7 @@ fn org_sort_entries_edit_resort_by_alpha_time_deep() {
                     resorted
                     alpha-buf
                     time-buf
-                    resort-buf)))))))))"##,
+                    resort-buf))))))))"##,
         expect,
     );
 }

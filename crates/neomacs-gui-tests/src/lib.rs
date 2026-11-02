@@ -461,6 +461,42 @@ pub trait GuiCommandRunner {
     ) -> io::Result<GuiCommandOutput>;
 }
 
+/// Run an input-injection tool (wtype, xdotool, ...) with a deadline.
+///
+/// These tools talk to a live compositor; when the compositor stops
+/// delivering input the child can block forever, and a bare `output()` would
+/// then hang the whole test until nextest's slow-timeout kills the run
+/// without saying why.  Kill the tool at the deadline and fail with its
+/// status and stderr instead.
+#[must_use]
+pub fn run_input_tool(
+    mut command: std::process::Command,
+    deadline: Duration,
+) -> std::process::Output {
+    use std::process::Stdio;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn input tool");
+    let start = Instant::now();
+    loop {
+        if child.try_wait().expect("wait for input tool").is_some() {
+            return child.wait_with_output().expect("collect input tool output");
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("collect input tool output");
+            panic!(
+                "input tool did not finish within {deadline:?}: status={:?} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ProcessGuiCommandRunner;
 
@@ -471,12 +507,30 @@ impl GuiCommandRunner for ProcessGuiCommandRunner {
         _artifacts: &GuiArtifactSet,
         options: &GuiRunOptions,
     ) -> io::Result<GuiCommandOutput> {
-        let mut child = Command::new(&command.program)
+        let mut process = Command::new(&command.program);
+        process
             .args(&command.args)
             .envs(command.env.iter().map(|(key, value)| (key, value)))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        // A scenario's session is exactly one window system.  Inheriting the
+        // other backend's variables from the developer's desktop (or a CI
+        // step) makes winit/wgpu observe a second, usually unreachable,
+        // display: a Wayland scenario with DISPLAY set stalls before its
+        // first present, and an X11 scenario can silently bind a stale
+        // Wayland socket.  Scrub them so the test exercises the backend it
+        // names, on every host.
+        match command.env_value("WINIT_UNIX_BACKEND") {
+            Some("wayland") => {
+                process.env_remove("DISPLAY");
+            }
+            Some("x11") => {
+                process.env_remove("WAYLAND_DISPLAY");
+                process.env_remove("WAYLAND_SOCKET");
+            }
+            _ => {}
+        }
+        let mut child = process.spawn()?;
 
         let stdout = child.stdout.take().expect("stdout pipe should be captured");
         let stderr = child.stderr.take().expect("stderr pipe should be captured");

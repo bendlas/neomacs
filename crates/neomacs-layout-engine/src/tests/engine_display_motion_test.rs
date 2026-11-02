@@ -2599,7 +2599,7 @@ fn pixel_extent_queries_match_complete_rows_with_mixed_heights_and_overlays() {
     for start in [1, 4, 33] {
         for height in [1, 17, 80, 350] {
             let start = LispCharPos1::from_one_based_usize(start);
-            let mut query = WindowLayoutQueryEngine::new();
+            let mut query = crate::font::metrics::test_catalog::query_engine();
             let pixels = query
                 .query_window_layout(
                     &mut eval,
@@ -2613,7 +2613,7 @@ fn pixel_extent_queries_match_complete_rows_with_mixed_heights_and_overlays() {
                 .unwrap()
                 .into_geometry()
                 .unwrap();
-            let mut fresh = WindowLayoutQueryEngine::new();
+            let mut fresh = crate::font::metrics::test_catalog::query_engine();
             let rows = fresh
                 .query_window_layout(
                     &mut eval,
@@ -2672,7 +2672,7 @@ fn forward_page_uses_the_visible_wrap_context_with_tabs_and_overlays() {
             .unwrap()
             .as_fixnum()
             .unwrap();
-        let mut query = WindowLayoutQueryEngine::new();
+        let mut query = crate::font::metrics::test_catalog::query_engine();
         let snapshot = query
             .query_window_layout(
                 &mut eval,
@@ -2783,7 +2783,7 @@ fn pixel_coverage_reuses_a_larger_certified_observation() {
         start: LispCharPos1::ONE,
         height: NonZeroUsize::new(height).unwrap(),
     };
-    let mut engine = WindowLayoutQueryEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::query_engine();
     let large = engine
         .query_window_layout(&mut eval, frame, window, scope(400))
         .unwrap();
@@ -2808,7 +2808,7 @@ fn pixel_coverage_reuses_a_larger_certified_observation() {
         probe::max_depth() > 0,
         "source mutation must invalidate coverage"
     );
-    let fresh = WindowLayoutQueryEngine::new()
+    let fresh = crate::font::metrics::test_catalog::query_engine()
         .query_window_layout(&mut eval, frame, window, scope(160))
         .unwrap();
     assert_eq!(changed.geometry(), fresh.geometry());
@@ -2833,7 +2833,7 @@ fn assert_cross_start_pixel_observation(
     let last = geometry.rows.last().unwrap();
     let extent = usize::try_from(last.y + last.height - first.y).unwrap();
     let height = extent.max(requested_height);
-    let expected = WindowLayoutQueryEngine::new()
+    let expected = crate::font::metrics::test_catalog::query_engine()
         .query_window_layout(
             eval,
             frame,
@@ -2877,7 +2877,7 @@ fn cross_start_pixels_reuse_complete_physical_line_suffixes() {
                 start: LispCharPos1::from_one_based_usize(start),
                 height: NonZeroUsize::new(height).unwrap(),
             };
-            let mut engine = WindowLayoutQueryEngine::new();
+            let mut engine = crate::font::metrics::test_catalog::query_engine();
             let original = engine
                 .query_window_layout(&mut eval, frame, window, scope(1, 500))
                 .unwrap();
@@ -2936,7 +2936,7 @@ fn cross_start_pixels_reject_changed_source_point_collections_and_callbacks() {
             start: LispCharPos1::from_one_based_usize(start),
             height: NonZeroUsize::new(height).unwrap(),
         };
-        let mut engine = WindowLayoutQueryEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::query_engine();
         engine
             .query_window_layout(&mut eval, frame, window, scope(1, 500))
             .unwrap();
@@ -2946,7 +2946,7 @@ fn cross_start_pixels_reject_changed_source_point_collections_and_callbacks() {
             .query_window_layout(&mut eval, frame, window, scope(27, 120))
             .unwrap();
         let depth = probe::max_depth();
-        let expected = WindowLayoutQueryEngine::new()
+        let expected = crate::font::metrics::test_catalog::query_engine()
             .query_window_layout(&mut eval, frame, window, scope(27, 120))
             .unwrap();
         assert_eq!(actual.end(), expected.end(), "{mutation}");
@@ -2971,7 +2971,7 @@ fn cross_start_pixels_walk_for_retained_cursor_and_missing_coverage() {
             start: LispCharPos1::from_one_based_usize(start),
             height: NonZeroUsize::new(height).unwrap(),
         };
-        let mut engine = WindowLayoutQueryEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::query_engine();
         // Starting after the requested source start cannot certify its prefix.
         let cached_start = if start == 1 { 27 } else { 1 };
         engine
@@ -2982,7 +2982,7 @@ fn cross_start_pixels_walk_for_retained_cursor_and_missing_coverage() {
             .query_window_layout(&mut eval, frame, window, scope(start, height))
             .unwrap();
         let depth = probe::max_depth();
-        let expected = WindowLayoutQueryEngine::new()
+        let expected = crate::font::metrics::test_catalog::query_engine()
             .query_window_layout(&mut eval, frame, window, scope(start, height))
             .unwrap();
         assert_eq!(actual.end(), expected.end());
@@ -3008,7 +3008,7 @@ fn cross_start_pixels_walk_when_a_cached_wrap_row_has_no_restart_proof() {
         start: LispCharPos1::from_one_based_usize(start),
         height: NonZeroUsize::new(height).unwrap(),
     };
-    let mut engine = WindowLayoutQueryEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::query_engine();
     let original = engine
         .query_window_layout(&mut eval, frame, window, scope(1, 500))
         .unwrap();
@@ -3026,7 +3026,7 @@ fn cross_start_pixels_walk_when_a_cached_wrap_row_has_no_restart_proof() {
         .query_window_layout(&mut eval, frame, window, scope(start, 120))
         .unwrap();
     let depth = probe::max_depth();
-    let expected = WindowLayoutQueryEngine::new()
+    let expected = crate::font::metrics::test_catalog::query_engine()
         .query_window_layout(&mut eval, frame, window, scope(start, 120))
         .unwrap();
     assert_eq!(actual.end(), expected.end());
@@ -3046,7 +3046,7 @@ fn cross_start_pixels_preserve_multibyte_end_records_and_eob_rows() {
             start: LispCharPos1::from_one_based_usize(start),
             height: NonZeroUsize::new(height).unwrap(),
         };
-        let mut engine = WindowLayoutQueryEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::query_engine();
         engine
             .query_window_layout(&mut eval, frame, window, scope(1, 500))
             .unwrap();
@@ -3066,7 +3066,7 @@ fn cross_start_pixels_preserve_multibyte_end_records_and_eob_rows() {
                 "multibyte end record and EOB",
             );
         } else {
-            let expected = WindowLayoutQueryEngine::new()
+            let expected = crate::font::metrics::test_catalog::query_engine()
                 .query_window_layout(&mut eval, frame, window, scope(17, 120))
                 .unwrap();
             assert_eq!(actual.end(), expected.end());
@@ -3100,7 +3100,7 @@ fn cross_start_pixels_match_cold_eob_after_a_decorated_final_newline() {
             start: LispCharPos1::from_one_based_usize(start),
             height: NonZeroUsize::new(height).unwrap(),
         };
-        let mut engine = WindowLayoutQueryEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::query_engine();
         engine
             .query_window_layout(&mut eval, frame, window, scope(1, 500))
             .unwrap();
@@ -3123,7 +3123,7 @@ fn cross_start_pixels_match_cold_eob_after_a_decorated_final_newline() {
                 &format!("final newline {face}, tail={tail:?}"),
             );
         } else {
-            let expected = WindowLayoutQueryEngine::new()
+            let expected = crate::font::metrics::test_catalog::query_engine()
                 .query_window_layout(&mut eval, frame, window, scope(start, 1))
                 .unwrap();
             assert_eq!(actual.end(), expected.end(), "{face}");
@@ -3142,7 +3142,7 @@ fn cross_start_pixels_match_fractional_row_origins_and_extents() {
     {
         let (mut eval, frame, window) =
             position_query_fixture(&"ordinary row\n".repeat(100), 400, 200);
-        let calibration = WindowLayoutQueryEngine::new()
+        let calibration = crate::font::metrics::test_catalog::query_engine()
             .query_window_layout(
                 &mut eval,
                 frame,
@@ -3176,7 +3176,7 @@ fn cross_start_pixels_match_fractional_row_origins_and_extents() {
             start: LispCharPos1::from_one_based_usize(start),
             height: NonZeroUsize::new(height).unwrap(),
         };
-        let mut engine = WindowLayoutQueryEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::query_engine();
         let original = engine
             .query_window_layout(&mut eval, frame, window, scope(1, initial_height))
             .unwrap();
@@ -3206,7 +3206,7 @@ fn cross_start_pixels_match_fractional_row_origins_and_extents() {
                 &format!("fractional leading={leading_height}, suffix={suffix_height}"),
             );
         } else {
-            let expected = WindowLayoutQueryEngine::new()
+            let expected = crate::font::metrics::test_catalog::query_engine()
                 .query_window_layout(&mut eval, frame, window, scope(27, requested_height))
                 .unwrap();
             assert_eq!(actual.end(), expected.end());
@@ -3337,7 +3337,7 @@ fn cross_start_pixels_match_canonical_context_sensitive_rows() {
             start: LispCharPos1::from_one_based_usize(start),
             height: NonZeroUsize::new(height).unwrap(),
         };
-        let mut engine = WindowLayoutQueryEngine::new();
+        let mut engine = crate::font::metrics::test_catalog::query_engine();
         engine
             .query_window_layout(&mut eval, frame, window, scope(1, 500))
             .unwrap();
@@ -3347,7 +3347,7 @@ fn cross_start_pixels_match_canonical_context_sensitive_rows() {
             .unwrap();
         let walked = probe::max_depth() > 0;
         if walked {
-            let expected = WindowLayoutQueryEngine::new()
+            let expected = crate::font::metrics::test_catalog::query_engine()
                 .query_window_layout(&mut eval, frame, window, scope(start, 120))
                 .unwrap();
             assert_eq!(actual.end(), expected.end(), "{decoration}");
@@ -3510,4 +3510,99 @@ fn pixel_only_queries_reuse_rows_when_point_is_outside_the_viewport() {
             assert_eq!(actual.geometry(), expected.geometry(), "{change}");
         }
     }
+}
+
+/// Drive `forward-line` one line at a time through a window whose scroll
+/// margin asks to keep point centred, returning `(point line, window-start
+/// line)` after every redisplay.
+///
+/// `maximum-scroll-margin` is set explicitly so the test pins GNU's cap
+/// (`window_scroll_margin`, src/window.c:6207) rather than the default.
+fn centered_cursor_samples(maximum_scroll_margin: f64) -> Vec<(i64, i64)> {
+    let mut eval = Context::new();
+    let buffer = eval.buffer_manager().current_buffer().unwrap().id();
+    let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    eval.buffer_manager_mut()
+        .get_mut(buffer)
+        .unwrap()
+        .insert(&text);
+    let frame = eval
+        .frame_manager_mut()
+        .create_frame("centered-cursor", 320, 500, buffer);
+    eval.frame_manager_mut()
+        .get_mut(frame)
+        .unwrap()
+        .window_system = Some(Value::symbol("neomacs"));
+    eval.eval_str(&format!(
+        "(setq scroll-conservatively 1 scroll-margin 999 maximum-scroll-margin {maximum_scroll_margin}) (goto-char (point-min)) (set-window-start nil 1 t)"
+    ))
+    .unwrap();
+    let mut engine = LayoutEngine::new_without_font_metrics();
+    engine.layout_frame_rust(&mut eval, frame);
+    let mut samples = Vec::new();
+    for _ in 0..40 {
+        eval.eval_str("(forward-line 1)").unwrap();
+        engine.layout_frame_rust(&mut eval, frame);
+        let sample = eval
+            .eval_str("(list (line-number-at-pos (point)) (line-number-at-pos (window-start)))")
+            .unwrap();
+        let printed = neovm_core::emacs_core::print::print_value(&sample);
+        let inner = printed
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("two-integer sample list");
+        let (point, start) = inner.split_once(' ').expect("point and start");
+        samples.push((
+            point.parse::<i64>().expect("point line"),
+            start.parse::<i64>().expect("window-start line"),
+        ));
+    }
+    samples
+}
+
+/// The constant screen row point occupies while the window follows it.
+fn steady_centered_row(samples: &[(i64, i64)]) -> i64 {
+    let initial_start = samples[0].1;
+    let first_scroll = samples
+        .iter()
+        .position(|(_, start)| *start != initial_start)
+        .expect("the window must eventually scroll");
+    let offset = samples[first_scroll].0 - samples[first_scroll].1;
+    for window in samples[first_scroll..].windows(2) {
+        let (prev_point, prev_start) = window[0];
+        let (point, start) = window[1];
+        assert_eq!(
+            start,
+            prev_start + 1,
+            "one line of point motion past the margin must scroll exactly one line \
+             (GNU try_scrolling dy = 1); got {prev_point}->{point} with start \
+             {prev_start}->{start} in {samples:?}"
+        );
+        assert_eq!(
+            point - start,
+            offset,
+            "point must keep the same screen row while scrolling one line at a time"
+        );
+    }
+    offset
+}
+
+/// Issue #654: `scroll-conservatively 1` with a large `scroll-margin` capped by
+/// `maximum-scroll-margin 0.5` behaves like GNU's centred cursor — every line
+/// of motion past the margin scrolls exactly one line and point holds its row.
+///
+/// Before the fix the layout engine capped the margin at `rows / 4`, ignored
+/// `maximum-scroll-margin`, and the cursor-only fast path never declined for a
+/// point inside the margin, so the start stayed pinned until a far-jump
+/// recenter moved point in chunks.
+#[test]
+fn scroll_margin_follows_point_one_line_at_a_time() {
+    let half = centered_cursor_samples(0.5);
+    let quarter = centered_cursor_samples(0.25);
+    let half_row = steady_centered_row(&half);
+    let quarter_row = steady_centered_row(&quarter);
+    assert!(
+        half_row < quarter_row,
+        "maximum-scroll-margin 0.5 must keep point on a higher row ({half_row}) than 0.25 ({quarter_row})"
+    );
 }

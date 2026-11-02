@@ -7,20 +7,25 @@
 
 use super::super::world::Baton;
 use super::super::{Context, Flow, Value};
-use super::scheduler::{Control, Handoff, Lifecycle, Peers, ThreadKey, Wait};
+use super::carrier::CarrierJob;
+use super::host_service::{
+    self, MainNativeDrain, NativeSettlement, OwnerReceive, PreparedHostCall, RestoredHostOwner,
+};
+use super::scheduler::{
+    Control, Handoff, Lifecycle, NativeRelease, ServiceReturn, ThreadKey, Wait, Wake,
+};
+use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::signal;
 use crate::emacs_core::intern::SymId;
+use crate::host_effect::contracts::OwnedNativeData;
+use crate::host_effect::wake::native_wait::{
+    NativeWaitHandoff, PreparedNativeWait, RealWaitPermit,
+};
 use crate::tagged::gc::MarkPhase;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-/// How a `thread_select` wait went ([`Context::green_select_switch`]).
-pub(crate) enum SelectTurn {
-    /// This thread gave the Baton up until input, a scheduler event, or its deadline.
-    Switched,
-    /// This thread blocks itself for this long.
-    Block(Duration),
-}
+pub(crate) use crate::host_effect::wake::SelectTurn;
 
 /// Waits that gave the Baton up (tests read it).
 #[cfg(test)]
@@ -34,11 +39,110 @@ enum BindingResumeError {
     Forward(crate::emacs_core::forward::ForwardStoreError, Value),
 }
 
+/// Ordinary waits and host service share the exact owner publication/restore path.
+#[allow(
+    dead_code,
+    reason = "routed host calls remain dormant until hosted activation"
+)]
+enum ParkRequest {
+    Ordinary(Wait),
+    MainNative {
+        wait: PreparedNativeWait,
+        wait_end: Instant,
+    },
+    Host {
+        call: PreparedHostCall,
+        native: OwnedNativeData,
+    },
+}
+
+/// The consumer runs only on its restored requesting owner. It cannot borrow
+/// a mutable evaluator or run Lisp while registered reply roots are retired.
+#[allow(
+    dead_code,
+    reason = "routed host calls remain dormant until hosted activation"
+)]
+enum ParkCompletion<'owner> {
+    Ordinary,
+    MainNative(std::io::Result<crate::host_effect::wake::ControlWakeOutcome>),
+    Host {
+        owner: &'owner RestoredHostOwner<'owner>,
+        settlement: &'owner NativeSettlement,
+    },
+}
+
+/// Holds native/scheduler ownership only while main's Context is published.
+enum MainWaitAuthority {
+    Held(Baton),
+    Released(NativeRelease),
+    Transition,
+}
+
+struct MainNativeHandoff<'native> {
+    control: &'native Control,
+    receiver: &'native mut OwnerReceive,
+    wait_end: Instant,
+    authority: MainWaitAuthority,
+}
+
+impl NativeWaitHandoff for MainNativeHandoff<'_> {
+    fn release(&mut self, permit: RealWaitPermit) {
+        let MainWaitAuthority::Held(baton) =
+            std::mem::replace(&mut self.authority, MainWaitAuthority::Transition)
+        else {
+            std::process::abort()
+        };
+        self.authority = MainWaitAuthority::Released(self.control.release_main_wait(
+            permit,
+            baton,
+            self.wait_end,
+        ));
+    }
+
+    fn reacquire(&mut self) {
+        let MainWaitAuthority::Released(release) =
+            std::mem::replace(&mut self.authority, MainWaitAuthority::Transition)
+        else {
+            std::process::abort()
+        };
+        let wake = self
+            .control
+            .reacquire_main_wait(release, self.receiver.as_channel());
+        self.authority = MainWaitAuthority::Held(receive_owner_turn(
+            ThreadKey::Main,
+            wake,
+            self.control,
+            self.receiver,
+        ));
+    }
+    #[cfg(test)]
+    fn physical_block_entered(&mut self) {
+        self.control.record_main_native_event_for_test(
+            super::scheduler::MainNativeWaitEvent::PhysicalBlockEntered,
+        );
+    }
+    #[cfg(test)]
+    fn physical_block_returned(&mut self) {
+        self.control.record_main_native_event_for_test(
+            super::scheduler::MainNativeWaitEvent::PhysicalBlockReturned,
+        );
+    }
+}
+
+impl MainNativeHandoff<'_> {
+    fn into_baton(self) -> Baton {
+        match self.authority {
+            MainWaitAuthority::Held(baton) => baton,
+            MainWaitAuthority::Released(_) | MainWaitAuthority::Transition => std::process::abort(),
+        }
+    }
+}
+
 /// A Lisp thread's place in its Green runtime, kept in its owner slab.
 pub(crate) struct GreenSeat {
     pub(crate) key: ThreadKey,
     pub(super) control: Arc<Control>,
-    receiver: Option<mpsc::Receiver<Baton>>,
+    receiver: Option<OwnerReceive>,
     /// The World's Baton, while this thread runs.
     baton: Option<Baton>,
     /// A constant or native forwarder refused a rebind. Deliver this after
@@ -54,6 +158,12 @@ pub(crate) struct GreenSeat {
     #[cfg(feature = "jit")]
     pub(super) parked_jit_scratch: crate::emacs_core::jit::green_owner::ParkedJitScratch,
 }
+
+// Wake envelopes change only the cold channel payload, never the owner slot.
+static_assertions::const_assert_eq!(
+    std::mem::size_of::<mpsc::Receiver<Baton>>(),
+    std::mem::size_of::<mpsc::Receiver<Wake>>()
+);
 
 impl GreenSeat {
     pub(crate) fn trace_binding_resume_error(&self, visit: &mut dyn FnMut(Value)) {
@@ -101,14 +211,14 @@ impl Context {
         &mut self,
         key: ThreadKey,
         control: Arc<Control>,
-        receiver: mpsc::Receiver<Baton>,
+        receiver: mpsc::Receiver<Wake>,
         baton: Baton,
     ) {
         self.ensure_owner_slab()
             .install_green_seat(Box::new(GreenSeat {
                 key,
                 control,
-                receiver: Some(receiver),
+                receiver: Some(OwnerReceive::new(key, receiver)),
                 baton: Some(baton),
                 binding_resume_error: None,
                 parked_roots_buffer: Vec::new(),
@@ -160,8 +270,84 @@ impl Context {
     /// when the process is exiting. A pending `thread-signal` stays pending:
     /// [`Context::green_wait`] raises it.
     pub(crate) fn green_park(&mut self, wait: Wait) -> Result<(), Flow> {
+        self.green_park_impl(ParkRequest::Ordinary(wait), |completion| match completion {
+            ParkCompletion::Ordinary => Ok(()),
+            ParkCompletion::Host { .. } | ParkCompletion::MainNative(_) => std::process::abort(),
+        })
+    }
+
+    /// Reserve request roots while this original owner still holds the Baton.
+    ///
+    /// # Safety
+    /// Every input must be this owner's live same-heap Lisp value; no callback,
+    /// GC or handoff may occur until the retained batch has been published.
+    #[allow(
+        dead_code,
+        reason = "owned host adapters are installed in a later range"
+    )]
+    pub(super) unsafe fn green_prepare_host_call(
+        &mut self,
+        roots: &[Value],
+    ) -> Result<PreparedHostCall, host_service::HostRootError> {
+        let heap = &self.tagged_heap;
+        let seat = self
+            .owner
+            .slab_mut()
+            .and_then(|slab| slab.green_seat_mut())
+            .ok_or(host_service::HostRootError::ForeignOwner)?;
+        let baton = seat
+            .baton
+            .as_ref()
+            .ok_or(host_service::HostRootError::BatonRequired)?;
+        let runtime = baton.green_runtime();
+        let runtime = runtime
+            .as_ref()
+            .ok_or(host_service::HostRootError::BatonRequired)?;
+        // SAFETY: private original-owner admission keeps the supplied roots live
+        // through retained publication while the unique Baton remains held.
+        unsafe {
+            runtime
+                .parked
+                .borrow_mut()
+                .hosts()
+                .prepare(baton, heap, seat.key, roots)
+        }
+    }
+
+    /// Dormant routed boundary. Native service never receives this consumer;
+    /// response decoding and errors stay on the requesting worker's OS thread.
+    #[allow(
+        dead_code,
+        reason = "owned host adapters are installed in a later range"
+    )]
+    pub(super) fn green_host_call<R>(
+        &mut self,
+        call: PreparedHostCall,
+        native: OwnedNativeData,
+        consume: impl FnOnce(&RestoredHostOwner<'_>, &NativeSettlement) -> Result<R, Flow>,
+    ) -> Result<R, Flow> {
+        self.green_park_impl(
+            ParkRequest::Host { call, native },
+            |completion| match completion {
+                ParkCompletion::Host { owner, settlement } => consume(owner, settlement),
+                ParkCompletion::Ordinary | ParkCompletion::MainNative(_) => std::process::abort(),
+            },
+        )
+    }
+
+    fn green_park_impl<R>(
+        &mut self,
+        request: ParkRequest,
+        consume: impl FnOnce(ParkCompletion<'_>) -> Result<R, Flow>,
+    ) -> Result<R, Flow> {
         let Some(seat) = self.green_seat() else {
-            return Ok(());
+            return match request {
+                ParkRequest::Ordinary(_) => consume(ParkCompletion::Ordinary),
+                ParkRequest::Host { .. } | ParkRequest::MainNative { .. } => Err(signal(
+                    LispCondition::Error,
+                    vec![Value::string("Host request requires a Green owner")],
+                )),
+            };
         };
         let key = seat.key;
         let control = Arc::clone(&seat.control);
@@ -251,7 +437,7 @@ impl Context {
             .baton
             .take()
             .expect("the running thread holds the Baton");
-        let receiver = seat.receiver.take().expect("a seat keeps its channel");
+        let mut receiver = seat.receiver.take().expect("a seat keeps its channel");
         // The thread record keeps what another thread may read or change
         // while this one is parked: its current buffer and its errors.
         let current = self.buffers.current_buffer_id();
@@ -266,11 +452,41 @@ impl Context {
         stow_owner_state(self, &baton);
         stow_carried_state(&baton);
         self.publish_parked_roots(&baton, key, publication);
-        let outcome = control.transfer(key, wait, baton, &receiver);
-        let (baton, deadlocked) = match outcome {
-            Ok(baton) => (baton, false),
-            Err(Handoff::NoRunnable(baton)) => (baton, true),
+        // All World/registry borrows have ended before the unique Baton moves.
+        let (outcome, host_resume, native_resume) = match request {
+            ParkRequest::Ordinary(wait) => (
+                control.transfer(key, wait, baton, receiver.as_channel()),
+                None,
+                None,
+            ),
+            ParkRequest::MainNative { mut wait, wait_end } => {
+                let mut handoff = MainNativeHandoff {
+                    control: &control,
+                    receiver: &mut receiver,
+                    wait_end,
+                    authority: MainWaitAuthority::Held(baton),
+                };
+                let result = wait.wait_with(&mut handoff);
+                (Ok(Wake::Resume(handoff.into_baton())), None, Some(result))
+            }
+            ParkRequest::Host { call, native } => {
+                let (wake, resume) = host_service::dispatch_host(
+                    call,
+                    native,
+                    baton,
+                    &control,
+                    receiver.as_channel(),
+                );
+                (Ok(wake), Some(resume), None)
+            }
         };
+        let (wake, deadlocked) = match outcome {
+            Ok(wake) => (wake, false),
+            Err(Handoff::NoRunnable(baton)) => (Wake::Resume(baton), true),
+        };
+        // A service turn must not restore main's Lisp continuation, JIT pins,
+        // bindings or TLS, or consume its original semantic Wait.
+        let baton = receive_owner_turn(key, wake, &control, &mut receiver);
         // Only the returning continuation refreshes its private dispatch
         // header from canonical cells. A peer's function write updates its own
         // header, so comparing our stale header would miss that redefinition.
@@ -310,7 +526,6 @@ impl Context {
             .unwrap_or((None, self.cached_standard_case_table));
         let seat = self.green_seat().expect("seated above");
         seat.receiver = Some(receiver);
-        seat.baton = Some(baton);
         // GNU enters this owner before unbinding the previous one. Its
         // failure wins over this owner's own rebind, and condition-wait
         // still retakes its mutex before either error is delivered.
@@ -341,6 +556,20 @@ impl Context {
         // syntax tables these caches answer from.
         crate::emacs_core::string_pos_cache::reset_string_pos_cache();
         crate::emacs_core::regex::reset_regex_thread_locals();
+        // Registered results/errors are decoded, acknowledged and retired on
+        // this restored owner BEFORE its ordinary parked publication retires.
+        let completion = match host_resume {
+            Some(resume) => {
+                host_service::finish_owner_reply(self, &baton, resume, |owner, settlement| {
+                    consume(ParkCompletion::Host { owner, settlement })
+                })
+            }
+            None => match native_resume {
+                Some(result) => consume(ParkCompletion::MainNative(result)),
+                None => consume(ParkCompletion::Ordinary),
+            },
+        };
+        self.green_seat().expect("restored owner is seated").baton = Some(baton);
         let retirement = self.retire_parked_roots(key);
         if let Some(request) = exit {
             // The process exits: like GNU's `exit`, no cleanup form of this
@@ -359,7 +588,7 @@ impl Context {
                 )],
             ));
         }
-        Ok(())
+        completion
     }
 
     /// [`Context::green_park`], then raise an error another thread signalled
@@ -418,9 +647,9 @@ impl Context {
 
     /// GNU `thread_select`: how a wait of WAIT_TIME for input or a
     /// deadline shares the Baton.
-    /// With a ready peer this owner parks until input, a scheduler event,
-    /// or WAIT_TIME, with no slices. With no ready peer it uses the existing
-    /// wait backend, clipped to the earliest peer's absolute deadline.
+    /// Every permitted blocking wait publishes and parks, even with no ready
+    /// peer: GNU releases its global lock before select in that case too.
+    /// The idle scheduler observes owned native readiness and the deadline.
     /// Outside Green, at zero timeout, or where switching is refused, the
     /// existing wait backend remains responsible for the block.
     pub(crate) fn green_select_switch(&mut self, wait_time: Duration) -> Result<SelectTurn, Flow> {
@@ -433,27 +662,72 @@ impl Context {
     #[cold]
     #[inline(never)]
     fn green_select_turn(&mut self, wait_time: Duration) -> Result<SelectTurn, Flow> {
-        let seat = self.green_seat().expect("seated");
-        let key = seat.key;
-        let control = Arc::clone(&seat.control);
         if wait_time.is_zero() || switch_refusal(self).is_some() {
             return Ok(SelectTurn::Block(wait_time));
         }
-        let now = Instant::now();
-        match control.peers(key, now) {
-            Peers::Ready => {
-                #[cfg(test)]
-                SELECT_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.green_wait(Wait::Select {
-                    wait_end: now + wait_time,
-                })?;
-                Ok(SelectTurn::Switched)
+        #[cfg(test)]
+        let (key, control) = {
+            let seat = self.green_seat().expect("seated");
+            (seat.key, Arc::clone(&seat.control))
+        };
+        let wait_end = Instant::now() + wait_time;
+        // GNU really_call_select releases the global lock even when no peer
+        // is ready. Publish this owner before the scheduler's native wait so
+        // a later control publication can wake it without needing the Baton.
+        #[cfg(test)]
+        let prepare_park = |context: &Context| {
+            control
+                .prepare_select_park_for_test(key, &context.processes)
+                .map_err(|error| {
+                    signal(LispCondition::Error, vec![Value::string(error.to_string())])
+                })
+        };
+        #[cfg(test)]
+        SELECT_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.green_key() == Some(ThreadKey::Main) {
+            let control = Arc::clone(&self.green_seat().expect("seated").control);
+            // When main retains an idle Baton, an earlier sleeping peer must
+            // still get its deadline. Runnable peers take the Baton themselves.
+            let physical_end = match control.peers(ThreadKey::Main, Instant::now()) {
+                super::scheduler::Peers::Sleeping(end) => end.min(wait_end),
+                super::scheduler::Peers::Ready | super::scheduler::Peers::Blocked => wait_end,
+            };
+            match self.processes.prepare_green_main_wait(physical_end) {
+                crate::emacs_core::process::MainNativePreparation::Ready => {}
+                crate::emacs_core::process::MainNativePreparation::Prepared(wait) => {
+                    #[cfg(test)]
+                    prepare_park(self)?;
+                    self.green_park_impl(
+                        ParkRequest::MainNative { wait, wait_end },
+                        |completion| match completion {
+                            ParkCompletion::MainNative(result) => {
+                                result.map(|_| ()).map_err(|error| {
+                                    signal(
+                                        LispCondition::Error,
+                                        vec![Value::string(error.to_string())],
+                                    )
+                                })
+                            }
+                            ParkCompletion::Ordinary | ParkCompletion::Host { .. } => {
+                                std::process::abort()
+                            }
+                        },
+                    )?;
+                }
+                crate::emacs_core::process::MainNativePreparation::Scheduler => {
+                    #[cfg(test)]
+                    prepare_park(self)?;
+                    self.green_wait(Wait::Select { wait_end })?;
+                    return Ok(SelectTurn::Switched);
+                }
             }
-            Peers::Sleeping(deadline) => Ok(SelectTurn::Block(
-                wait_time.min(deadline.saturating_duration_since(now)),
-            )),
-            Peers::Blocked => Ok(SelectTurn::Block(wait_time)),
+            self.green_raise_pending_signal(ThreadKey::Main)?;
+        } else {
+            #[cfg(test)]
+            prepare_park(self)?;
+            self.green_wait(Wait::Select { wait_end })?;
         }
+        Ok(SelectTurn::Switched)
     }
 
     /// Yield only when another owner can run. A sleeping selector remains
@@ -497,20 +771,42 @@ impl Context {
             return;
         }
         let control = Arc::clone(&seat.control);
+        let mut native_drain = match seat.receiver.as_mut() {
+            Some(receiver) => receiver.close_native(),
+            // A running main owns its receive-side storage. Losing it cannot
+            // authorize dropping outstanding native tickets or parked roots.
+            None => std::process::abort(),
+        };
         control.close();
-        while control.others_could_run(ThreadKey::Main) {
+        loop {
+            match native_drain {
+                MainNativeDrain::Drained => {
+                    if !control.others_could_run(ThreadKey::Main) {
+                        break;
+                    }
+                }
+                MainNativeDrain::Pending => {}
+            }
             // Each hand-off ends a thread; main's own exit flow, if any, has
-            // nowhere left to go.
+            // nowhere left to go. Native-only HostRequest waiters remain a
+            // drain obligation even with no ordinarily runnable peer.
             let _ = self.green_park(Wait::Runnable);
+            native_drain = match self.green_seat().and_then(|seat| seat.receiver.as_mut()) {
+                Some(receiver) => receiver.native_drain(),
+                None => std::process::abort(),
+            };
         }
-        for (_, os_thread) in control.take_join_handles() {
-            let _ = os_thread.join();
-        }
+        // Every carrier is idle here (no Lisp thread can run after the loop
+        // above). Wake and join them deterministically; idle carriers hold no
+        // Baton and touch no World state.
+        self.with_green_runtime(|runtime| runtime.carriers.drain());
         // All continuations have restored or terminated, and their scoped
         // collectors/readers have returned. Finish any retained failure before
         // dropping the main reservation; keep the Baton for post-teardown
         // inspection until this Context itself retires.
-        self.finish_ended_parked_roots();
+        if let Err(blocked) = self.finish_ended_parked_roots() {
+            blocked.retain_for_shutdown();
+        }
         self.green_seat().expect("main is seated").parked_root_batch = None;
     }
 
@@ -680,20 +976,47 @@ impl Context {
         self.with_green_runtime(|runtime| {
             runtime.pending_starts.borrow_mut().insert(key, function);
         });
-        let worker_control = Arc::clone(&control);
-        let os_thread = std::thread::Builder::new()
-            .name(format!("neovm-lisp-{id}"))
-            .spawn(move || run_worker(key, receiver, worker_control))
-            .expect("spawning a Lisp thread's OS thread");
-        control.note_join_handle(key, os_thread);
+        let job = CarrierJob {
+            key,
+            receiver,
+            control: Arc::clone(&control),
+            // Set by the pool when an idle carrier is handed this job.
+            reused: false,
+        };
+        // Reuse an idle carrier when one is parked, otherwise spawn one. The
+        // Lisp thread object above is already fresh; only the OS executor is
+        // recycled.
+        if let Err(refusal) = self.with_green_runtime(|runtime| runtime.carriers.dispatch(job)) {
+            // GNU `make-thread` (src/thread.c:933-938) restores the previous
+            // situation (the never-started thread never appears in
+            // `all-threads`) and then signals; the same resource failure must
+            // not abort the editor. Undo every Lisp-side and scheduler-side
+            // registration before the signal.
+            let refused = refusal.job.key;
+            self.with_green_runtime(|runtime| {
+                runtime.pending_starts.borrow_mut().remove(&refused);
+            });
+            control.unregister_worker(refused);
+            self.threads.discard_unstarted_thread(id);
+            drop(refusal);
+            return Err(signal(
+                "error",
+                vec![Value::string("Could not start a new thread")],
+            ));
+        }
         Ok(handle)
     }
 
     /// Start the Green runtime and seat this owner as its main thread.
     #[cold]
     #[inline(never)]
-    pub(crate) fn start_green_threads(&mut self) -> Result<(), super::GreenStartError> {
+    pub(crate) fn start_green_threads(&mut self) -> Result<(), super::GreenThreadStartError> {
+        self.green_admission_readiness()
+            .map_err(super::GreenThreadStartError::Admission)?;
         let baton = self.start_green_runtime()?;
+        // The main carrier runs Lisp on this OS thread; reserve its dense
+        // SymId/NameId caches as worker owners do on creation.
+        crate::emacs_core::intern::prepare_thread_symbol_caches();
         let control = self.with_green_runtime(|runtime| Arc::clone(&runtime.control));
         control.install_select(self.processes.green_select_handle());
         let receiver = control.register_main();
@@ -708,17 +1031,108 @@ impl Context {
     }
 }
 
-/// A Lisp thread's OS thread: wait for the Baton, build the thread's
-/// owner, run its function, record the outcome and hand the Baton on.
-fn run_worker(key: ThreadKey, receiver: mpsc::Receiver<Baton>, control: Arc<Control>) {
+/// Native service runs on evaluator-host main before ANY owner restoration.
+/// Returning from it resumes main's original channel wait, not its Lisp Wait.
+fn receive_owner_turn(
+    key: ThreadKey,
+    mut wake: Wake,
+    control: &Control,
+    receiver: &mut OwnerReceive,
+) -> Baton {
+    let _abort_on_panic = AbortOnPanic;
+    loop {
+        wake = control.intercept_acquire(key, wake, receiver.as_channel());
+        let result = match wake {
+            Wake::Resume(baton) => {
+                baton.enter();
+                return baton;
+            }
+            Wake::ServiceTurn {
+                key: request,
+                baton,
+            } => {
+                if key != ThreadKey::Main {
+                    tracing::error!(?key, "native service addressed a non-main owner");
+                    std::process::abort();
+                }
+                receiver.serve(request, baton, control)
+            }
+            Wake::NativePump { baton } => {
+                if key != ThreadKey::Main {
+                    tracing::error!(?key, "native pump addressed a non-main owner");
+                    std::process::abort();
+                }
+                receiver.drive(baton, control)
+            }
+        };
+        match result {
+            // Already qualified by the native scheduler. Re-intercepting would
+            // steal a ready original main turn merely because A remains pending.
+            ServiceReturn::ResumeMain(baton) => {
+                baton.enter();
+                return baton;
+            }
+            ServiceReturn::Sent => {
+                wake = match receiver.as_channel().recv() {
+                    Ok(wake) => wake,
+                    Err(_) => std::process::abort(),
+                };
+            }
+        }
+    }
+}
+
+/// One carrier job: wait for the Baton, build the Lisp thread's owner, run
+/// its function, record the outcome and hand the Baton on. The carrier loop
+/// parks the OS thread afterwards; the job's heap-pointer TLS is nulled at
+/// that park, and the remaining cache resets run here at the start of a
+/// reused job, before the new owner's prologue.
+pub(super) fn run_carrier_job(
+    job: CarrierJob,
+    pool: &super::carrier::PoolShared,
+    carrier: super::carrier::CarrierId,
+) -> super::carrier::ParkResult {
+    let CarrierJob {
+        key,
+        receiver,
+        control,
+        reused,
+    } = job;
     // A panic here would drop the Baton with this thread's owner, and every
     // parked thread would wait for it forever: end the process instead.
     let _abort_on_panic = AbortOnPanic;
-    let Ok(baton) = receiver.recv() else {
-        // The runtime went away before this thread ever ran.
-        return;
+    let mut receiver = OwnerReceive::new(key, receiver);
+    let Ok(wake) = receiver.as_channel().recv() else {
+        // The runtime went away before this thread ever ran; the pool is
+        // draining and never reuses this slot.
+        return super::carrier::ParkResult::Exit;
     };
+    // A reused carrier went idle with its heap pointers park-nulled; prove it
+    // did not acquire one while idle (debug builds), then run the deferred
+    // cache resets. This is the first action of a reused job, before
+    // `baton.enter` and before any owner or World state is installed. A fresh
+    // carrier captures its pristine TLS reference instead.
+    if reused {
+        super::carrier_tls::carrier_tls_idle_state_and_check();
+        super::carrier_tls::reset_carrier_tls();
+        super::carrier_tls::carrier_tls_reset_and_check();
+    } else {
+        super::carrier_tls::carrier_tls_job_started();
+    }
+    #[cfg(test)]
+    CARRIER_JOB_THREADS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push((key.id(), std::thread::current().id()));
+    // A reused carrier's park left the heap slot empty; a fresh carrier
+    // starts empty. `new_green_owner` installs the World's heap below.
+    debug_assert!(
+        crate::tagged::gc::carrier_heap_is_acceptable_for_job_start(),
+        "carrier job starts with a stale TAGGED_HEAP TLS pointer"
+    );
+    let baton = receive_owner_turn(key, wake, &control, &mut receiver);
     baton.enter();
+    set_job_thread_name(key);
     #[cfg(feature = "jit")]
     crate::emacs_core::jit::green_owner::begin_owner_turn();
     unstow_carried_state(&baton);
@@ -733,8 +1147,15 @@ fn run_worker(key: ThreadKey, receiver: mpsc::Receiver<Baton>, control: Arc<Cont
         stow_owner_state(&mut owner, &baton);
         owner.retire_green_owner();
         stow_carried_state(&baton);
+        // Park-time heap-pointer nulls (see the prologue): the carrier must
+        // name no heap or World object before it may be registered idle.
+        // Park before publishing the exit: no other Lisp thread holds the
+        // Baton until `finish` hands it on, so the idle registration is
+        // visible to any dispatcher that runs after `exited` is observed.
+        super::carrier_tls::park_carrier_tls();
+        let parked = pool.park(carrier);
         control.finish(key, baton);
-        return;
+        return parked;
     }
     let outgoing_error = baton
         .green_runtime()
@@ -758,7 +1179,12 @@ fn run_worker(key: ThreadKey, receiver: mpsc::Receiver<Baton>, control: Arc<Cont
         }
         runtime.pending_starts.borrow_mut().remove(&key)
     });
-    owner.take_green_seat(key, Arc::clone(&control), receiver, baton);
+    owner.take_green_seat(
+        key,
+        Arc::clone(&control),
+        receiver.into_worker_channel(),
+        baton,
+    );
     #[cfg(test)]
     if PANIC_NEXT_WORKER.swap(false, std::sync::atomic::Ordering::Relaxed) {
         panic!("test hook: a Green worker panics");
@@ -810,7 +1236,14 @@ fn run_worker(key: ThreadKey, receiver: mpsc::Receiver<Baton>, control: Arc<Cont
     stow_owner_state(&mut owner, &baton);
     owner.retire_green_owner();
     stow_carried_state(&baton);
+    // Park-time heap-pointer nulls (see the prologue): the carrier must name
+    // no heap or World object before it may be registered idle. Idle
+    // registration precedes the exit publication so a dispatcher that runs
+    // after `exited` is observed always finds the slot parked.
+    super::carrier_tls::park_carrier_tls();
+    let parked = pool.park(carrier);
     control.finish(key, baton);
+    parked
 }
 
 /// The World's thread-local state leaves this OS thread with the Baton
@@ -844,6 +1277,48 @@ fn unstow_owner_state(owner: &mut Context, baton: &Baton) {
     {
         state.put(owner);
     }
+}
+
+/// Linux `comm` name for a running job (diagnostics only). `std` fixes the
+/// thread name at spawn, so the carrier renames the kernel view per job; other
+/// platforms keep the carrier's spawn name.
+fn set_job_thread_name(key: ThreadKey) {
+    #[cfg(target_os = "linux")]
+    {
+        let name = format!("neovm-lisp-{}", key.id());
+        let mut buf = [0u8; 16];
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(buf.len() - 1);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        // SAFETY: PR_SET_NAME copies a NUL-terminated string of at most 16
+        // bytes from the buffer for the duration of the call.
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_NAME,
+                buf.as_ptr() as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = key;
+}
+
+/// Test hook: `(Lisp thread id, OS thread id)` for every carrier job, in
+/// dispatch order.
+#[cfg(test)]
+pub(crate) static CARRIER_JOB_THREADS: std::sync::Mutex<Vec<(u64, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Recorded `(Lisp thread id, OS thread id)` for every carrier job, in order.
+#[cfg(test)]
+pub(crate) fn carrier_job_threads_for_test() -> Vec<(u64, std::thread::ThreadId)> {
+    CARRIER_JOB_THREADS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
 }
 
 /// Aborts the process when dropped by a panic.

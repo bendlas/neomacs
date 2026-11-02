@@ -166,15 +166,17 @@ pub(crate) fn chrome_generation_record() -> Vec<(i64, ChromeGenerationRecord)> {
     CHROME_GENERATION_RECORD.with(|record| record.borrow().iter().map(|(k, v)| (*k, *v)).collect())
 }
 
-fn record_mode_line_eval(format_symbol: &str) {
-    if format_symbol == "mode-line-format" {
-        MODE_LINE_EVAL_COUNT.with(|count| count.set(count.get() + 1));
-    }
-    if format_symbol == "header-line-format" {
-        HEADER_LINE_EVAL_COUNT.with(|count| count.set(count.get() + 1));
-    }
-    if format_symbol == "tab-line-format" {
-        TAB_LINE_EVAL_COUNT.with(|count| count.set(count.get() + 1));
+fn record_mode_line_eval(kind: WindowChromeKind) {
+    match kind {
+        WindowChromeKind::ModeLine => {
+            MODE_LINE_EVAL_COUNT.with(|count| count.set(count.get() + 1));
+        }
+        WindowChromeKind::HeaderLine => {
+            HEADER_LINE_EVAL_COUNT.with(|count| count.set(count.get() + 1));
+        }
+        WindowChromeKind::TabLine => {
+            TAB_LINE_EVAL_COUNT.with(|count| count.set(count.get() + 1));
+        }
     }
 }
 
@@ -621,6 +623,43 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
         self,
         state: &mut WindowChromeRowsRenderState<'_, '_, 'face>,
     ) -> WindowChromeRowsRenderOutcome {
+        let row_order = if state.render_services.face_resolver.has_tty_realization() {
+            [
+                WindowChromeKind::ModeLine,
+                WindowChromeKind::TabLine,
+                WindowChromeKind::HeaderLine,
+            ]
+        } else {
+            [
+                WindowChromeKind::TabLine,
+                WindowChromeKind::HeaderLine,
+                WindowChromeKind::ModeLine,
+            ]
+        };
+        self.render_in_order(state, &row_order)
+    }
+
+    /// GNU pos_visible_p measures mode, tab, header before start_display,
+    /// including on graphic frames (xdisp.c:1732-1770).
+    pub(crate) fn measure_position(
+        self,
+        state: &mut WindowChromeRowsRenderState<'_, '_, 'face>,
+    ) -> WindowChromeRowsRenderOutcome {
+        self.render_in_order(
+            state,
+            &[
+                WindowChromeKind::ModeLine,
+                WindowChromeKind::TabLine,
+                WindowChromeKind::HeaderLine,
+            ],
+        )
+    }
+
+    fn render_in_order(
+        self,
+        state: &mut WindowChromeRowsRenderState<'_, '_, 'face>,
+        row_order: &[WindowChromeKind],
+    ) -> WindowChromeRowsRenderOutcome {
         let params = self.params;
         let source = WindowChromeSourceIdentity::new(params.window_id, params.buffer_id);
         let regions = self.layout_box.regions();
@@ -640,7 +679,11 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
             .evaluator
             .buffer_manager()
             .get(BufferId(params.buffer_id))
-            .and_then(|buffer| buffer.buffer_local_value("header-line-indent-width"))
+            .and_then(|buffer| {
+                buffer.buffer_local_value_id(
+                    neovm_core::emacs_core::intern::WellKnown::HeaderLineIndentWidth.id(),
+                )
+            })
         {
             status_line_symbol_values.insert("header-line-indent-width".to_string(), value);
         }
@@ -660,19 +703,6 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
         // GNU display_mode_lines realizes used row faces in mode, tab, header
         // order (xdisp.c:28085-28122). Rendering at those actual row boundaries
         // preserves advice order without demanding any speculative faces.
-        let row_order = if state.render_services.face_resolver.has_tty_realization() {
-            [
-                WindowChromeKind::ModeLine,
-                WindowChromeKind::TabLine,
-                WindowChromeKind::HeaderLine,
-            ]
-        } else {
-            [
-                WindowChromeKind::TabLine,
-                WindowChromeKind::HeaderLine,
-                WindowChromeKind::ModeLine,
-            ]
-        };
         // Preserve the ownership transfer to the last visible row. Earlier
         // rows need copies; the final row consumes the shared inputs directly.
         let final_row = row_order.iter().rev().copied().find(|kind| match kind {
@@ -691,13 +721,13 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
                     .clone()
             }
         };
-        for kind in row_order {
+        for &kind in row_order {
             if kind == WindowChromeKind::TabLine && params.tab_line_height > 0.0 {
                 let (chrome_tab_policy, status_line_symbol_values) = inputs_for_row(kind);
                 let tab_line_y = regions.tab_line.map_or(regions.outer.y, |bounds| bounds.y);
                 let tab_line_text = eval_status_line_format_output(
                     state.evaluator,
-                    "tab-line-format",
+                    WindowChromeKind::TabLine,
                     params.window_id,
                     params.buffer_id,
                     target_cols,
@@ -750,7 +780,7 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
                 let header_line_y = regions.outer.y + measured.tab_line_height;
                 let header_line_text = eval_status_line_format_output(
                     state.evaluator,
-                    "header-line-format",
+                    WindowChromeKind::HeaderLine,
                     params.window_id,
                     params.buffer_id,
                     target_cols,
@@ -808,7 +838,7 @@ impl<'face, 'params> WindowChromeRowsRenderRequest<'face, 'params> {
                 let mode_line_text = {
                     let result = eval_status_line_format_output(
                         state.evaluator,
-                        "mode-line-format",
+                        WindowChromeKind::ModeLine,
                         params.window_id,
                         params.buffer_id,
                         target_cols,
@@ -1637,12 +1667,12 @@ impl ResizeMiniWindowsMode {
 #[cfg(test)]
 pub(crate) fn eval_status_line_format(
     evaluator: &mut Context,
-    format_symbol: &str,
+    kind: WindowChromeKind,
     window_id: i64,
     buffer_id: u64,
     target_cols: usize,
 ) -> Option<String> {
-    eval_status_line_format_value(evaluator, format_symbol, window_id, buffer_id, target_cols)
+    eval_status_line_format_value(evaluator, kind, window_id, buffer_id, target_cols)
         .and_then(|val| val.as_runtime_string_owned())
         .filter(|s| !s.is_empty())
 }
@@ -1650,22 +1680,24 @@ pub(crate) fn eval_status_line_format(
 #[cfg(test)]
 pub(crate) fn eval_status_line_format_value(
     evaluator: &mut Context,
-    format_symbol: &str,
+    kind: WindowChromeKind,
     window_id: i64,
     buffer_id: u64,
     target_cols: usize,
 ) -> Option<Value> {
-    eval_status_line_format_output(evaluator, format_symbol, window_id, buffer_id, target_cols)
+    eval_status_line_format_output(evaluator, kind, window_id, buffer_id, target_cols)
         .map(ModeLineDisplayOutput::into_value)
 }
 
 fn eval_status_line_format_output(
     evaluator: &mut Context,
-    format_symbol: &str,
+    kind: WindowChromeKind,
     window_id: i64,
     buffer_id: u64,
     target_cols: usize,
 ) -> Option<ModeLineDisplayOutput> {
+    let format_var = kind.format_var();
+    let format_symbol = format_var.name();
     evaluator.setup_thread_locals();
     // GNU Emacs (xdisp.c:28187): format-mode-line reads the format
     // variable from the TARGET buffer, not the caller's current
@@ -1673,18 +1705,18 @@ fn eval_status_line_format_output(
     // from the specified buffer BEFORE calling the walker.
     let window_format_value = evaluator
         .frame_manager()
-        .window_parameter(WindowId(window_id as u64), &Value::symbol(format_symbol));
+        .window_parameter(WindowId(window_id as u64), &Value::symbol(format_var));
     let format_value = window_format_value
         .filter(|value| !value.is_nil())
         .unwrap_or_else(|| {
             evaluator
                 .buffer_manager()
                 .get(BufferId(buffer_id))
-                .and_then(|buf| buf.buffer_local_value(format_symbol))
+                .and_then(|buf| buf.buffer_local_value_id(format_var.id()))
                 .unwrap_or_else(|| {
                     // Fall back to the global default
                     evaluator
-                        .variable_value_by_name(format_symbol)
+                        .variable_value(format_var.id())
                         .unwrap_or(Value::NIL)
                 })
         });
@@ -1703,7 +1735,7 @@ fn eval_status_line_format_output(
     // mode-line format exactly once (in the chrome render, after the body, so
     // `%p`/`%l` reflect the final window-start). The reserved/reported height
     // is the *measured* row height, not a second eval.
-    record_mode_line_eval(format_symbol);
+    record_mode_line_eval(kind);
     // Arm the `%c`/`%C` detector for exactly this expansion. P5.2(b)'s chrome
     // skip refuses whenever a column was displayed, because a column is the one
     // point-dependent construct its same-screen-row precondition does not pin.
@@ -1840,7 +1872,9 @@ impl TabBarDisplayBuildRequest {
 
     fn make_keymap(evaluator: &mut Context) -> Option<Value> {
         evaluator
-            .eval_form(Value::list(vec![Value::symbol("tab-bar-make-keymap-1")]))
+            .eval_form(Value::list(vec![Value::symbol(
+                neovm_core::emacs_core::intern::WellKnown::TabBarMakeKeymap1,
+            )]))
             .ok()
     }
 }
@@ -1913,7 +1947,9 @@ impl TabBarDisplaySource {
             })
             .collect();
         let mut concat_form = Vec::with_capacity(self.entries.len() + 1);
-        concat_form.push(Value::symbol("concat"));
+        concat_form.push(Value::symbol(
+            neovm_core::emacs_core::intern::WellKnown::Concat,
+        ));
         concat_form.extend(self.entries.iter().map(|entry| entry.caption));
         let text = evaluator.eval_form(Value::list(concat_form)).ok()?;
         text.as_runtime_string_owned()
@@ -1923,15 +1959,20 @@ impl TabBarDisplaySource {
 }
 
 fn quoted(value: Value) -> Value {
-    Value::list(vec![Value::symbol("quote"), value])
+    Value::list(vec![
+        Value::symbol(neovm_core::emacs_core::intern::WellKnown::Quote),
+        value,
+    ])
 }
 
 fn tab_bar_close_at(evaluator: &mut Context, text: Value, char_index: usize) -> bool {
     evaluator
         .eval_form(Value::list(vec![
-            Value::symbol("get-text-property"),
+            Value::symbol(neovm_core::emacs_core::intern::WellKnown::GetTextProperty),
             Value::fixnum(char_index as i64),
-            quoted(Value::symbol("close-tab")),
+            quoted(Value::symbol(
+                neovm_core::emacs_core::intern::WellKnown::CloseTab,
+            )),
             quoted(text),
         ]))
         .is_ok_and(|value| !value.is_nil())
@@ -1940,9 +1981,11 @@ fn tab_bar_close_at(evaluator: &mut Context, text: Value, char_index: usize) -> 
 fn tab_bar_mouse_face_at(evaluator: &mut Context, text: Value, char_index: usize) -> Value {
     evaluator
         .eval_form(Value::list(vec![
-            Value::symbol("get-text-property"),
+            Value::symbol(neovm_core::emacs_core::intern::WellKnown::GetTextProperty),
             Value::fixnum(char_index as i64),
-            quoted(Value::symbol("mouse-face")),
+            quoted(Value::symbol(
+                neovm_core::emacs_core::intern::WellKnown::MouseFace,
+            )),
             quoted(text),
         ]))
         .unwrap_or(Value::NIL)
@@ -2020,9 +2063,14 @@ fn tab_bar_posn_string(
     ]);
     let caption = evaluator
         .eval_form(Value::list(vec![
-            Value::symbol("propertize"),
-            Value::list(vec![Value::symbol("copy-sequence"), quoted(item.caption)]),
-            quoted(Value::symbol("menu-item")),
+            Value::symbol(neovm_core::emacs_core::intern::WellKnown::Propertize),
+            Value::list(vec![
+                Value::symbol(neovm_core::emacs_core::intern::WellKnown::CopySequence),
+                quoted(item.caption),
+            ]),
+            quoted(Value::symbol(
+                neovm_core::emacs_core::intern::WellKnown::MenuItem,
+            )),
             quoted(menu_item),
         ]))
         .ok()?;
@@ -2556,7 +2604,7 @@ pub(crate) fn build_tab_bar_display(
 
 pub(crate) fn max_mini_window_lines(evaluator: &Context, frame_rows: f32) -> f32 {
     let raw = evaluator
-        .variable_value_by_name("max-mini-window-height")
+        .variable_value(crate::fixed_symbols::MAX_MINI_WINDOW_HEIGHT.id())
         .unwrap_or_else(|| Value::make_float(0.25));
     max_mini_window_lines_from_value(raw, frame_rows)
 }
@@ -2567,7 +2615,7 @@ pub(crate) fn max_mini_window_lines_for_buffer<B: LayoutBufferView>(
     frame_rows: f32,
 ) -> f32 {
     let raw = buffer_local_value(buffer, LayoutVar::MaxMiniWindowHeight)
-        .or_else(|| evaluator.variable_value_by_name("max-mini-window-height"))
+        .or_else(|| evaluator.variable_value(crate::fixed_symbols::MAX_MINI_WINDOW_HEIGHT.id()))
         .unwrap_or_else(|| Value::make_float(0.25));
     max_mini_window_lines_from_value(raw, frame_rows)
 }
@@ -2630,3 +2678,19 @@ pub(crate) fn window_chrome_row_height_for_face_at_scale(
 #[cfg(test)]
 #[path = "display_status_line/tests/display_status_line_test.rs"]
 mod tests;
+
+/// Carrier park: reset the per-redisplay chrome counters and records.
+pub(crate) fn reset_carrier_tls() {
+    reset_mode_line_eval_count();
+    reset_chrome_generation_record();
+}
+
+/// Debug-only carrier TLS fingerprint.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    let counts = MODE_LINE_EVAL_COUNT.with(std::cell::Cell::get) as u64
+        ^ ((HEADER_LINE_EVAL_COUNT.with(std::cell::Cell::get) as u64) << 8)
+        ^ ((TAB_LINE_EVAL_COUNT.with(std::cell::Cell::get) as u64) << 16)
+        ^ ((CHROME_GENERATION_RECORD.with(|r| r.borrow().len()) as u64) << 24);
+    *h = (*h ^ counts).wrapping_mul(0x0000_0100_0000_01b3);
+}

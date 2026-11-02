@@ -20,6 +20,111 @@ fn kmacro_string(text: &str) -> crate::heap_types::LispString {
 // -----------------------------------------------------------------------
 
 #[test]
+fn kmacro_copied_properties_have_only_manager_roots() {
+    use crate::buffer::{CharPos0, CharRange};
+
+    struct Probe(usize);
+    fn payload(probes: &mut Vec<Probe>) -> Value {
+        let value = Value::vector(vec![Value::fixnum(probes.len() as i64)]);
+        probes.push(Probe(value.bits()));
+        value
+    }
+
+    crate::test_utils::init_test_tracing();
+    for mut format in [
+        LispString::from_utf8("é %d"),
+        LispString::from_unibyte(vec![0x80, b' ', b'%', b'd']),
+    ] {
+        let mut eval = Context::new();
+        eval.gc_stress = false;
+        eval.gc_collect_exact();
+        eval.tagged_heap.set_gc_threshold(usize::MAX);
+        let property = Value::symbol("kmacro-format-owner-only");
+        let probes = eval.with_gc_inhibited(|eval| {
+            let mut probes = Vec::new();
+            let ring = vec![
+                vec![payload(&mut probes), payload(&mut probes)],
+                vec![payload(&mut probes)],
+            ];
+            format.intervals_mut().put_property_in_char_range(
+                CharRange::from_usize(0, 1),
+                property,
+                payload(&mut probes),
+            );
+            // Use the real World's retained metadata independently of Lisp
+            // counter variables and the live keyboard recording/playback.
+            *eval.kmacro = KmacroManager {
+                macro_ring: ring,
+                counter: 17,
+                counter_format: format,
+            };
+            probes
+        });
+        let check_live = |eval: &Context| {
+            // Existing ring controls come first, so omitting the new format
+            // visit cannot hide a regression in the pre-existing root walk.
+            for Probe(bits) in &probes {
+                assert!(
+                    eval.tagged_heap.retains_veclike(Value::from_bits(*bits)),
+                    "kmacro-only property vector was reclaimed"
+                );
+            }
+            for (index, Probe(bits)) in probes.iter().enumerate() {
+                assert_eq!(
+                    Value::from_bits(*bits)
+                        .as_vector_data()
+                        .expect("live kmacro vector")
+                        .as_slice(),
+                    &[Value::fixnum(index as i64)]
+                );
+            }
+            assert_eq!(
+                eval.kmacro
+                    .counter_format
+                    .intervals()
+                    .get_property_at_char_pos(CharPos0::ZERO, property)
+                    .expect("retained counter-format property")
+                    .bits(),
+                probes[3].0
+            );
+        };
+        let completed = eval.gc_count;
+        if eval.tagged_heap.generational_enabled() {
+            assert!(eval.tagged_heap.should_run_minor(false, false));
+            eval.gc_pending = true;
+            eval.gc_safe_point_exact();
+            assert!(eval.tagged_heap.sweep_in_progress(), "expected minor sweep");
+            assert!(!eval.tagged_heap.concurrent_mark_running());
+            for _ in 0..10_000 {
+                if !eval.tagged_heap.sweep_in_progress() {
+                    break;
+                }
+                eval.gc_safe_point_exact();
+            }
+            assert!(!eval.tagged_heap.sweep_in_progress());
+            assert!(!eval.tagged_heap.mark_in_progress());
+        } else {
+            eval.gc_collect_exact();
+        }
+        assert_eq!(eval.gc_count, completed + 1);
+        check_live(&eval);
+        let completed = eval.gc_count;
+        eval.gc_collect_exact();
+        assert_eq!(eval.gc_count, completed + 1);
+        check_live(&eval);
+
+        *eval.kmacro = KmacroManager::new();
+        eval.gc_collect_exact();
+        for Probe(bits) in probes {
+            assert!(
+                !eval.tagged_heap.retains_veclike(Value::from_bits(bits)),
+                "retired kmacro graph remained permanently rooted"
+            );
+        }
+    }
+}
+
+#[test]
 fn new_manager_defaults() {
     crate::test_utils::init_test_tracing();
     let mgr = KmacroManager::new();
@@ -490,6 +595,45 @@ fn test_execute_kbd_macro_real_key_events_use_command_loop_dispatch() {
     );
     assert_eq!(results.len(), 1);
     assert_eq!(format_eval_result(&results[0]), "OK 1");
+}
+
+/// GNU applies `command-remapping` once, in `read_key_sequence`
+/// (keyboard.c:11863-11868), and `command_loop_1` reuses that answer
+/// (keyboard.c:1464-1495).  A remapped command therefore is not remapped
+/// again, and `this-original-command` remains the binding the keymaps
+/// produced.  GNU 31.1 answers `(a remap-once-a next-line)`.
+#[test]
+fn execute_kbd_macro_remaps_once_and_records_the_keymap_binding() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = Context::new();
+    let results = eval.eval_str_each(
+        r#"(progn
+             (fset 'command-execute
+                   (lambda (cmd &optional _record _keys _special) (funcall cmd)))
+             (setq remap-seen nil remap-seen-this nil remap-seen-original nil)
+             (fset 'remap-once-a
+                   (lambda () (interactive)
+                     (setq remap-seen 'a
+                           remap-seen-this this-command
+                           remap-seen-original this-original-command)))
+             (fset 'remap-once-b
+                   (lambda () (interactive)
+                     (setq remap-seen 'b
+                           remap-seen-this this-command
+                           remap-seen-original this-original-command)))
+             (let ((g (make-sparse-keymap)))
+               (use-global-map g)
+               (define-key g [14] 'next-line)
+               (define-key g [remap next-line] 'remap-once-a)
+               (define-key g [remap remap-once-a] 'remap-once-b)
+               (execute-kbd-macro [14])
+               (list remap-seen remap-seen-this remap-seen-original)))"#,
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        format_eval_result(&results[0]),
+        "OK (a remap-once-a next-line)"
+    );
 }
 
 #[test]

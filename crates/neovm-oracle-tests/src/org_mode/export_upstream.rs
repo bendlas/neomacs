@@ -717,16 +717,18 @@ fn org_export_headline_numbering_edit_reexport_deep() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_export_todo_tags_planning_edit_reexport_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-export-get-todo-keyword)""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((\"Alpha\" 1 nil nil \"TODO\") (\"Beta\" 2 nil nil \"DONE\") (\"WAIT Gamma\" 2 nil nil nil)) ((\"Alpha\" 1 nil nil \"DONE\") (\"Beta\" 2 nil nil \"DONE\") (\"Gamma\" 2 nil nil \"TODO\")) \"<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">1.</span> <span class=\\\"todo DONE\\\">DONE</span> Alpha</h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<p>\\nBody alpha.\\n</p>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.1.</span> <span class=\\\"todo DONE\\\">DONE</span> Beta</h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-1\\\">\\n<p>\\nBody beta.\\n</p>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.2.</span> <span class=\\\"todo TODO\\\">TODO</span> Gamma</h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-2\\\">\\n<p>\\nBody gamma.\\n</p>\\n</div>\\n</div>\\n</div>\\n\" \"#+TITLE: PlanningExport\\n#+TODO: TODO DONE WAIT\\n\\n* DONE Alpha\\nSCHEDULED: <2026-05-28 Wed>\\n:PROPERTIES:\\n:Effort: 2h\\n:END:\\nBody alpha.\\n\\n** DONE Beta\\nCLOSED: [2026-05-27 Tue 10:00]\\nBody beta.\\n\\n** TODO Gamma\\nDEADLINE: <2026-06-01 Mon>\\nBody gamma.\\n\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ox)
+  (require 'org-element)
   (with-temp-buffer
     (org-mode)
     (insert "#+TITLE: PlanningExport\n")
@@ -752,7 +754,7 @@ fn org_export_todo_tags_planning_edit_reexport_deep() {
                                      (org-element-property :level h)
                                      (org-export-get-headline-number h info)
                                      (org-export-get-tags h info)
-                                     (org-export-get-todo-keyword h info)))
+                                     (org-element-property :todo-keyword h)))
                              headlines)))))
       (let ((before (funcall snap)))
         ;; Edit: change WAIT to TODO
@@ -765,24 +767,26 @@ fn org_export_todo_tags_planning_edit_reexport_deep() {
         (replace-match "DONE Alpha")
         (let ((after (funcall snap)))
           ;; Export
-          (let ((html (org-export-as 'html nil nil t '(:with-toc nil))))
+          (let ((html (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'html nil nil t '(:with-toc nil)))))
             (list before after html
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_export_tags_property_planning_edit_reexport_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-export-get-todo-keyword)""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((\"Alpha\" 1 nil (\"work\") \"TODO\") (\"Beta\" 2 nil (\"home\") \"DONE\") (\"WAIT Gamma\" 2 nil (\"work\" \"urgent\") nil)) ((\"Alpha\" 1 nil (\"work\") \"DONE\") (\"Beta\" 2 nil (\"home\") \"DONE\") (\"Gamma\" 2 nil (\"work\" \"urgent\") \"TODO\")) \"<div id=\\\"outline-container-alpha\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"alpha\\\"><span class=\\\"section-number-2\\\">1.</span> <span class=\\\"todo DONE\\\">DONE</span> Alpha&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"work\\\">work</span></span></h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-alpha\\\">\\n<p>\\nBody alpha.\\n</p>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.1.</span> <span class=\\\"todo DONE\\\">DONE</span> Beta&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"home\\\">home</span></span></h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-1\\\">\\n<p>\\nBody beta.\\n</p>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.2.</span> <span class=\\\"todo TODO\\\">TODO</span> Gamma&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"work\\\">work</span>&nbsp;<span class=\\\"urgent\\\">urgent</span></span></h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-2\\\">\\n<p>\\nBody gamma.\\n</p>\\n</div>\\n</div>\\n</div>\\n\" \"\\\\section{{\\\\bfseries\\\\sffamily DONE} Alpha\\\\hfill{}\\\\textsc{work}}\\n\\\\label{sec:orgHASH}\\nBody alpha.\\n\\\\subsection{{\\\\bfseries\\\\sffamily DONE} Beta\\\\hfill{}\\\\textsc{home}}\\n\\\\label{sec:orgHASH}\\nBody beta.\\n\\\\subsection{{\\\\bfseries\\\\sffamily TODO} Gamma\\\\hfill{}\\\\textsc{work:urgent}}\\n\\\\label{sec:orgHASH}\\nBody gamma.\\n\" \"#+TITLE: DeepExport\\n#+TODO: TODO DONE WAIT\\n#+FILETAGS: :project:\\n\\n* DONE Alpha :work:\\nSCHEDULED: <2026-05-28 Wed>\\n:PROPERTIES:\\n:Effort: 2h\\n:CUSTOM_ID: alpha\\n:END:\\nBody alpha.\\n\\n** DONE Beta :home:\\nCLOSED: [2026-05-27 Tue 10:00]\\n:PROPERTIES:\\n:Effort: 1h\\n:END:\\nBody beta.\\n\\n** TODO Gamma :work:urgent:\\nDEADLINE: <2026-06-01 Mon>\\nBody gamma.\\n\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ox)
+  (require 'org-element)
   (with-temp-buffer
     (org-mode)
     (insert "#+TITLE: DeepExport\n")
@@ -810,7 +814,7 @@ fn org_export_tags_property_planning_edit_reexport_deep() {
                                      (org-element-property :level h)
                                      (org-export-get-headline-number h info)
                                      (org-export-get-tags h info)
-                                     (org-export-get-todo-keyword h info)))
+                                     (org-element-property :todo-keyword h)))
                              headlines)))))
       (let ((before (funcall snap)))
         ;; Edit: change WAIT to TODO
@@ -823,22 +827,23 @@ fn org_export_tags_property_planning_edit_reexport_deep() {
         (replace-match "DONE Alpha")
         (let ((after (funcall snap)))
           ;; Export HTML
-          (let ((html (org-export-as 'html nil nil t '(:with-toc nil))))
+          (let ((html (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'html nil nil t '(:with-toc nil)))))
             ;; Export LaTeX
-            (let ((latex (org-export-as 'latex nil nil t '(:with-toc nil))))
+            (let ((latex (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'latex nil nil t '(:with-toc nil)))))
               (list before after html latex
                     (buffer-substring-no-properties
-                     (point-min) (point-max)))))))))))"##,
+                     (point-min) (point-max))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_export_footnote_citation_edit_reexport_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 35 51)""#]];
+    let expect = expect_test::expect![[
+        r##""OK ((((\"1\" nil) (\"2\" nil) (\"1\" nil)) ((\"Introduction\" 1) (\"Methods\" 1))) (((\"1\" nil) (\"2\" nil) (\"1\" nil) (\"3\" nil)) ((\"Introduction\" 1) (\"Methods\" 1))) \"<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">1.</span> Introduction</h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<p>\\nThis is a claim<sup><a id=\\\"fnr.1\\\" class=\\\"footref\\\" href=\\\"#fn.1\\\" role=\\\"doc-backlink\\\">1</a></sup> with evidence<sup><a id=\\\"fnr.2\\\" class=\\\"footref\\\" href=\\\"#fn.2\\\" role=\\\"doc-backlink\\\">2</a></sup>.\\n</p>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">2.</span> Methods</h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-2\\\">\\n<p>\\nWe used approach<sup><a id=\\\"fnr.1.1\\\" class=\\\"footref\\\" href=\\\"#fn.1\\\" role=\\\"doc-backlink\\\">1</a></sup> as described. See also<sup><a id=\\\"fnr.3\\\" class=\\\"footref\\\" href=\\\"#fn.3\\\" role=\\\"doc-backlink\\\">3</a></sup>.\\n</p>\\n</div>\\n</div>\\n<div id=\\\"footnotes\\\">\\n<h2 class=\\\"footnotes\\\">Footnotes: </h2>\\n<div id=\\\"text-footnotes\\\">\\n\\n<div class=\\\"footdef\\\"><sup><a id=\\\"fn.1\\\" class=\\\"footnum\\\" href=\\\"#fnr.1\\\" role=\\\"doc-backlink\\\">1</a></sup> <div class=\\\"footpara\\\" role=\\\"doc-footnote\\\"><p class=\\\"footpara\\\">\\nFirst footnote text.\\n</p></div></div>\\n\\n<div class=\\\"footdef\\\"><sup><a id=\\\"fn.2\\\" class=\\\"footnum\\\" href=\\\"#fnr.2\\\" role=\\\"doc-backlink\\\">2</a></sup> <div class=\\\"footpara\\\" role=\\\"doc-footnote\\\"><p class=\\\"footpara\\\">\\nSecond footnote text.\\n</p></div></div>\\n\\n<div class=\\\"footdef\\\"><sup><a id=\\\"fn.3\\\" class=\\\"footnum\\\" href=\\\"#fnr.3\\\" role=\\\"doc-backlink\\\">3</a></sup> <div class=\\\"footpara\\\" role=\\\"doc-footnote\\\"><p class=\\\"footpara\\\">\\nThird footnote added later.\\n</p></div></div>\\n\\n\\n</div>\\n</div>\" \"#+TITLE: FootnoteExport\\n\\n* Introduction\\nThis is a claim[fn:1] with evidence[fn:2].\\n\\n* Methods\\nWe used approach[fn:1] as described. See also[fn:3].\\n\\n[fn:1] First footnote text.\\n[fn:2] Second footnote text.\\n\\n[fn:3] Third footnote added later.\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -871,24 +876,26 @@ fn org_export_footnote_citation_edit_reexport_deep() {
         (end-of-line)
         (insert " See also[fn:3].")
         (let ((after (funcall snap)))
-          (let ((html (org-export-as 'html nil nil t '(:with-toc nil))))
+          (let ((html (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'html nil nil t '(:with-toc nil)))))
             (list before after html
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_export_todo_tag_property_planning_html_latex_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-export-get-todo-keyword)""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((\"Launch\" 1 nil (\"project\" \"critical\") \"TODO\") (\"Design\" 2 nil (\"design\") \"DONE\") (\"WAIT Approval\" 2 nil (\"admin\") nil)) ((\"Launch\" 1 nil (\"project\" \"critical\") \"TODO\") (\"Design\" 2 nil (\"design\") \"DONE\") (\"Approval\" 2 nil (\"admin\") \"TODO\")) \"<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">1.</span> <span class=\\\"todo TODO\\\">TODO</span> Launch&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"project\\\">project</span>&nbsp;<span class=\\\"critical\\\">critical</span></span></h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<p>\\nDEADLINE: <span class=\\\"timestamp-wrapper\\\"><span class=\\\"timestamp\\\">&lt;2026-06-15 Mon&gt;</span></span>\\n</p>\\n<p>\\n:Effort: 40h\\n:Budget: 10000\\n:CUSTOM<sub>ID</sub>: launch\\n</p>\\n<p>\\nLaunch plan body.\\n</p>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.1.</span> <span class=\\\"todo DONE\\\">DONE</span> Design&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"design\\\">design</span></span></h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-1\\\">\\n<p>\\nDesign body.\\n</p>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.2.</span> <span class=\\\"todo TODO\\\">TODO</span> Approval&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"admin\\\">admin</span></span></h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-2\\\">\\n<p>\\nApproval body.\\n</p>\\n</div>\\n</div>\\n</div>\\n\" \"\\\\section{{\\\\bfseries\\\\sffamily TODO} Launch\\\\hfill{}\\\\textsc{project:critical}}\\n\\\\label{sec:orgHASH}\\nDEADLINE: \\\\textit{<2026-06-15 Mon>}\\n:Effort: 40h\\n:Budget: 10000\\n:CUSTOM\\\\textsubscript{ID}: launch\\nLaunch plan body.\\n\\\\subsection{{\\\\bfseries\\\\sffamily DONE} Design\\\\hfill{}\\\\textsc{design}}\\n\\\\label{sec:orgHASH}\\nDesign body.\\n\\\\subsection{{\\\\bfseries\\\\sffamily TODO} Approval\\\\hfill{}\\\\textsc{admin}}\\n\\\\label{sec:orgHASH}\\nApproval body.\\n\" \"#+TITLE: DeepExportCombo\\n#+TODO: TODO DONE WAIT CANCEL\\n#+FILETAGS: :main:\\n\\n* TODO Launch :project:critical:\\nSCHEDULED: <2026-05-28 Wed>\\nDEADLINE: <2026-06-15 Mon>\\n:PROPERTIES:\\n:Effort: 40h\\n:Budget: 10000\\n:CUSTOM_ID: launch\\n:END:\\nLaunch plan body.\\n\\n** DONE Design :design:\\nCLOSED: [2026-05-20 Tue 14:00]\\n:PROPERTIES:\\n:Effort: 10h\\n:END:\\nDesign body.\\n\\n** TODO Approval :admin:\\nDEADLINE: <2026-06-01 Mon>\\n:PROPERTIES:\\n:Effort: 1h\\n:END:\\nApproval body.\\n\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ox)
+  (require 'org-element)
   (with-temp-buffer
     (org-mode)
     (insert "#+TITLE: DeepExportCombo\n")
@@ -918,32 +925,34 @@ fn org_export_todo_tag_property_planning_html_latex_deep() {
                                      (org-element-property :level h)
                                      (org-export-get-headline-number h info)
                                      (org-export-get-tags h info)
-                                     (org-export-get-todo-keyword h info)))
+                                     (org-element-property :todo-keyword h)))
                              headlines)))))
       (let ((before (funcall snap)))
         (goto-char (point-min))
         (search-forward "WAIT Approval")
         (replace-match "TODO Approval")
         (let ((after (funcall snap)))
-          (let ((html (org-export-as 'html nil nil t '(:with-toc nil)))
-                (latex (org-export-as 'latex nil nil t '(:with-toc nil))))
+          (let ((html (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'html nil nil t '(:with-toc nil))))
+                (latex (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'latex nil nil t '(:with-toc nil)))))
             (list before after html latex
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_export_separate_scheduled_deadline_html_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-export-get-todo-keyword)""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((\"Alpha\" 1 nil nil \"TODO\") (\"Beta\" 2 nil nil \"DONE\") (\"Gamma\" 2 nil nil \"TODO\")) ((\"Alpha\" 1 nil nil \"TODO\") (\"Beta\" 2 nil nil \"TODO\") (\"Gamma\" 2 nil nil \"TODO\")) \"<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">1.</span> <span class=\\\"todo TODO\\\">TODO</span> Alpha</h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<p>\\nBody alpha.\\n</p>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.1.</span> <span class=\\\"todo TODO\\\">TODO</span> Beta</h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-1\\\">\\n<p>\\nBody beta.\\n</p>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.2.</span> <span class=\\\"todo TODO\\\">TODO</span> Gamma</h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-2\\\">\\n<p>\\nBody gamma.\\n</p>\\n</div>\\n</div>\\n</div>\\n\" \"#+TITLE: SeparatePlanning\\n\\n* TODO Alpha\\nSCHEDULED: <2026-05-28 Wed>\\nBody alpha.\\n\\n** TODO Beta\\nBody beta.\\n\\n** TODO Gamma\\nBody gamma.\\n\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ox)
+  (require 'org-element)
   (with-temp-buffer
     (org-mode)
     (insert "#+TITLE: SeparatePlanning\n\n")
@@ -965,7 +974,7 @@ fn org_export_separate_scheduled_deadline_html_deep() {
                                      (org-element-property :level h)
                                      (org-export-get-headline-number h info)
                                      (org-export-get-tags h info)
-                                     (org-export-get-todo-keyword h info)))
+                                     (org-element-property :todo-keyword h)))
                              headlines)))))
       (let ((before (funcall snap)))
         ;; Edit: change Beta to TODO
@@ -974,10 +983,10 @@ fn org_export_separate_scheduled_deadline_html_deep() {
         (replace-match "TODO Beta")
         (let ((after (funcall snap)))
           ;; Export HTML
-          (let ((html (org-export-as 'html nil nil t '(:with-toc nil))))
+          (let ((html (replace-regexp-in-string "org[0-9a-f]\\{7\\}" "orgHASH" (org-export-as 'html nil nil t '(:with-toc nil)))))
             (list before after html
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }

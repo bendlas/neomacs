@@ -10,9 +10,10 @@
 //! more closely: a symbol is an object with a name, not just "slot N in the
 //! string interner".
 
-mod fixed_symbol;
 pub(crate) mod parallel;
-pub use fixed_symbol::EpochCachedSymbol;
+pub(crate) mod shared;
+mod well_known;
+pub use well_known::{FIRST_ID as FIRST_WELL_KNOWN_SYM_ID, NAMES as WELL_KNOWN_NAMES, WellKnown};
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
@@ -223,9 +224,12 @@ pub struct NameId(pub(crate) u32);
 pub const NIL_SYM_ID: SymId = SymId(0);
 
 /// Number of symbols `SymbolRegistry::new` seeds before anything interns:
-/// nil, t, and the non-canonical `unbound` sentinel. The pdump restore maps
-/// this prefix by POSITION (see `restore_dump_symbol_table`).
-pub(crate) const SEED_SYMBOL_COUNT: usize = 3;
+/// nil, t, the non-canonical `unbound` sentinel, then every well-known DEFSYM
+/// spelling in [`WellKnown`] order. The pdump restore maps this whole prefix
+/// by POSITION (see `restore_dump_symbol_table`), so the table's identities
+/// are stable across dump/load.
+pub(crate) const SEED_SYMBOL_COUNT: usize = 3 + WellKnown::COUNT;
+const _: () = assert!(well_known::FIRST_ID as usize == 3);
 pub const T_SYM_ID: SymId = SymId(1);
 pub const UNBOUND_SYM_ID: SymId = SymId(2);
 
@@ -601,6 +605,11 @@ impl StringInterner {
         }
     }
 
+    /// Number of interned name ids allocated so far.
+    fn len(&self) -> usize {
+        self.strings.len()
+    }
+
     /// Look up a symbol-name atom without interning it.
     pub fn lookup(&self, s: &str) -> Option<NameId> {
         self.lookup_name_parts(s.as_bytes(), SymbolNameCharacterCount::from(s))
@@ -914,6 +923,21 @@ impl SymbolRegistry {
         let unbound_id = registry.alloc_symbol(unbound_name, false, NewSymbolName::AtomOnly);
         debug_assert_eq!(unbound_id, UNBOUND_SYM_ID);
 
+        // GNU's DEFSYM statics: seed every well-known spelling, in table
+        // order, before anything else can intern. The assigned id must equal
+        // the table's compile-time id; a mismatch would silently misread every
+        // C-side fixed symbol, so this is a release assert, not a debug assert.
+        for variant in WellKnown::VARIANTS {
+            let name = registry.names.intern(variant.name());
+            let id = registry.alloc_symbol(name, true, NewSymbolName::AtomOnly);
+            assert_eq!(
+                id,
+                variant.id(),
+                "well-known symbol seeding diverged for {}",
+                variant.name()
+            );
+        }
+
         registry
     }
 
@@ -940,6 +964,16 @@ impl SymbolRegistry {
 
     fn slot(&self, id: SymId) -> Option<&SymbolSlot> {
         self.symbols.get(id.0 as usize)
+    }
+
+    /// Number of symbol ids allocated so far: the current `SymId` span.
+    fn symbol_span(&self) -> usize {
+        self.symbols.len()
+    }
+
+    /// Number of interned name ids allocated so far: the current `NameId` span.
+    fn name_span(&self) -> usize {
+        self.names.len()
     }
 
     fn intern(&mut self, s: &str) -> SymId {
@@ -1257,7 +1291,8 @@ impl SymbolRegistry {
         };
 
         // Seed-prefix position map. A fresh registry holds exactly the
-        // constructor's seeds (nil, t, unbound); the dump table is the full
+        // constructor's seeds (nil, t, unbound, then the well-known table);
+        // the dump table is the full
         // dumper interner in id order, so its leading slots are the SAME
         // seeds. Interning them by name cannot reproduce that: `unbound` is
         // deliberately NON-canonical (an uninterned sentinel), so name-intern
@@ -2135,6 +2170,52 @@ fn ensure_thread_local_cache_epoch_current() {
     });
 }
 
+/// Extra `SymId` slots reserved beyond the current interner span.
+///
+/// Reserve-only headroom: the measured many-threads jobs allocate zero new
+/// symbol ids after owner creation, so this is defensive for callers that do
+/// intern during a job, not a measured requirement. One eighth of the span
+/// keeps the reservation below the doubling capacity the natural growth path
+/// would end at (2x), which is what the reservation is saving.
+const SYMBOL_CACHE_HEADROOM_DIVISOR: usize = 8;
+
+/// The capacity [`prepare_thread_symbol_caches`] reserves for `SYMBOL_CACHE`.
+fn symbol_cache_target(span: usize) -> usize {
+    span.saturating_add(span / SYMBOL_CACHE_HEADROOM_DIVISOR)
+}
+
+/// Reserve the per-OS-thread dense `SymId` cache for a fresh Green owner.
+///
+/// A fresh Green owner runs on a fresh OS thread, whose symbol cache starts
+/// empty and is then rebuilt through `resize` growth as the owner touches
+/// ordinary symbols: the first touches allocate, the next higher id reallocates
+/// and copies the prefix, and the natural doubling can end at twice the span.
+/// Callers invoke this once on the cold owner-creation path so one allocation
+/// up front covers the ids the owner will touch.
+///
+/// Reserve-only: `thread_local_record_name`, `_name_id`, `_canonical` and
+/// `_keyword` keep `resize(idx + 1)` as the fill and as the fallback when the
+/// interner grows past the reservation; the epoch reset above clears without
+/// dropping capacity.
+///
+/// The `NameId`-indexed `NAME_CANONICAL_SYMBOL_CACHE` is not reserved: the
+/// measured many-threads jobs never touch it (its length stayed zero while its
+/// full name span would have been allocated per worker), so its first use
+/// grows it lazily. The sparse name-keyed `INTERN_STR_CACHE` is likewise left
+/// to its lazy growth: its size follows the distinct spellings an owner
+/// interns, not the `SymId` span.
+pub(crate) fn prepare_thread_symbol_caches() {
+    let symbol_span = global_symbol_registry().read().symbol_span();
+    let target = symbol_cache_target(symbol_span);
+    SYMBOL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let len = cache.len();
+        if cache.capacity() < target {
+            cache.reserve_exact(target - len);
+        }
+    });
+}
+
 /// A paired spelling/hash query for the private native positive cache.
 ///
 /// `&str` supplies only the ordinary UTF-8 domain. Supplied-count Lisp names
@@ -2357,3 +2438,23 @@ mod native_lookup_cache_tests;
 #[cfg(test)]
 #[path = "tests/ascii_reader_name.rs"]
 mod ascii_reader_name_tests;
+
+/// Carrier park: drop the heap-keyed visible symbol-name cache. The intern
+/// epoch caches are carrier-intrinsic and keep their capacity.
+pub(crate) fn reset_carrier_tls() {
+    VISIBLE_SYMBOL_NAME_CACHE.with(|cache| {
+        *cache.borrow_mut() = VisibleSymbolNameCache::default();
+    });
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        VISIBLE_SYMBOL_NAME_CACHE.with(|c| {
+            let c = c.borrow();
+            ((c.heap_id.is_some() as u64) << 32) ^ (c.names.len() as u64)
+        }),
+    );
+}

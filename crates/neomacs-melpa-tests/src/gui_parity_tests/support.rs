@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use neomacs_gui_tests::{DisplayHarness, DisplaySession, GuiBackend};
+use neomacs_test_env::CanonicalPin;
 
 use crate::{
     DirectEditorChild, EmacsRuntime, EvalOutcome, MelpaSandbox, PreparedPackageSet,
@@ -61,29 +62,8 @@ impl LinuxCpuAffinity {
         Ok(Self { cpus })
     }
 
-    fn apply(&self, command: &mut std::process::Command) {
-        let cpus = self.cpus.clone();
-        // SAFETY: `pre_exec` runs after fork. The closure performs only
-        // stack-local CPU-set operations and the async-signal-safe
-        // sched_setaffinity syscall, then returns immediately.
-        unsafe {
-            command.pre_exec(move || {
-                let mut selected = std::mem::zeroed::<libc::cpu_set_t>();
-                libc::CPU_ZERO(&mut selected);
-                for cpu in &cpus {
-                    libc::CPU_SET(*cpu, &mut selected);
-                }
-                if libc::sched_setaffinity(
-                    0,
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &raw const selected,
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+    fn apply(&self, command: &mut neomacs_test_env::PinnedCommand) {
+        command.limit_to_cpus(&self.cpus);
     }
 }
 
@@ -187,16 +167,29 @@ fn run_editor(
         )
     })?;
 
-    let mut command = runtime.command();
+    let mut command = sandbox.command(&runtime);
     affinity.apply(&mut command);
-    sandbox.configure(&mut command);
     command
         .envs(packages.process_environment())
         .env("RUST_LOG", "off")
         .env("WINIT_UNIX_BACKEND", "x11")
         .args(["--quick", "--geometry", "100x35"]);
+    // The display session pins the locale that keeps X11 clients and the
+    // editor on one message encoding (`locale_pin`, neomacs-infra's
+    // display.rs:869-873).  This command already carries the sandbox's
+    // canonical pins, so a display variable that is itself a canonical pin
+    // is a deliberate per-case override; the typed statement is the only
+    // way to apply it, and a raw `env` would silently undo the recorded
+    // environment (and is refused).
     for (name, value) in display.env() {
-        command.env(name, value);
+        match CanonicalPin::from_env_name(name) {
+            Some(pin) => {
+                command.override_pin(pin, value);
+            }
+            None => {
+                command.env(name, value);
+            }
+        }
     }
     let display_name = display
         .env()

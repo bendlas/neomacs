@@ -18,7 +18,42 @@
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Output, Stdio};
+use std::path::PathBuf;
+use std::process::{Output, Stdio};
+use std::sync::OnceLock;
+
+use neomacs_test_env::{CanonicalEnvironment, CanonicalProfile, PinnedCommand, bounded_temp_dir};
+
+/// The canonical environment both editors run under in this test process.
+///
+/// These argv/startup probes compare the two engines live, so the pins only
+/// have to be equal -- but they must be *pinned*: an inherited passwd GECOS or
+/// time zone can otherwise turn a comparison into a property of the host.
+struct CanonicalProbes {
+    _home: tempfile::TempDir,
+    _tmp: tempfile::TempDir,
+    environment: CanonicalEnvironment,
+}
+
+fn canonical_probes() -> &'static CanonicalProbes {
+    static PROBES: OnceLock<CanonicalProbes> = OnceLock::new();
+    PROBES.get_or_init(|| {
+        let home = bounded_temp_dir("nv-probes-home-").expect("create canonical probes HOME");
+        let tmp = bounded_temp_dir("nv-probes-tmp-").expect("create canonical probes TMPDIR");
+        let environment = CanonicalEnvironment::new(
+            CanonicalProfile::Oracle,
+            home.path(),
+            tmp.path(),
+            neomacs_infra::workspace_root(),
+        )
+        .expect("canonical probes environment");
+        CanonicalProbes {
+            _home: home,
+            _tmp: tmp,
+            environment,
+        }
+    })
+}
 
 /// Captured outcome of running a binary with a specific argv.
 #[derive(Debug, Clone)]
@@ -38,61 +73,15 @@ impl From<Output> for ProbeResult {
     }
 }
 
-/// Path to the GNU `emacs` binary used as the parity oracle.
+/// The attested GNU `emacs` every parity test in this crate runs against.
 ///
-/// Resolution order, mirroring `crates/neovm-oracle-tests/src/common.rs:125`:
-/// 1. `NEOVM_FORCE_ORACLE_PATH` environment variable.
-/// 2. A nearby `emacs-mirror/emacs/src/emacs` checkout, walking up to
-///    four levels from the Cargo workspace root.
-/// 3. Fall through to `emacs` on `$PATH`.
-pub fn oracle_emacs_path() -> String {
-    if let Ok(path) = std::env::var("NEOVM_FORCE_ORACLE_PATH") {
-        return path;
-    }
-    let mut dir = neomacs_infra::workspace_root();
-    for _ in 0..4 {
-        let candidate = dir.join("emacs-mirror/emacs/src/emacs");
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    "emacs".to_string()
-}
-
-/// True when oracle parity tests should run. Mirrors
-/// `crates/neovm-oracle-tests/src/common.rs:84`.
-///
-/// We gate on the same `NEOVM_FORCE_ORACLE_PATH` env var so a single
-/// invocation flag opts the entire workspace into oracle testing.
-pub fn oracle_enabled() -> bool {
-    std::env::var_os("NEOVM_FORCE_ORACLE_PATH").is_some()
-}
-
-/// Skip the current test when oracle parity is not enabled.
-///
-/// Use as the first line of a `#[test]` body:
-///
-/// ```ignore
-/// #[test]
-/// fn parity_check() {
-///     skip_unless_oracle!();
-///     // …
-/// }
-/// ```
-#[macro_export]
-macro_rules! skip_unless_oracle {
-    () => {
-        if !$crate::common::oracle_enabled() {
-            eprintln!(
-                "skipping {}: set NEOVM_FORCE_ORACLE_PATH=/path/to/emacs",
-                module_path!()
-            );
-            return;
-        }
-    };
+/// Resolution and identity attestation are centralized in
+/// `neomacs_test_oracle::gnu`: `NEOVM_FORCE_ORACLE_PATH` when set, otherwise
+/// the pinned-reference check on the `emacs` found on `PATH`.  A missing or
+/// mismatched oracle PANICS in the helper below; a parity test must never
+/// skip or compare against an unpinned editor.
+pub fn oracle_emacs_path() -> PathBuf {
+    neomacs_test_oracle::gnu::gnu_oracle().executable_path()
 }
 
 /// Memory limit (bytes) imposed on each spawned subprocess to keep a
@@ -111,28 +100,16 @@ fn oracle_mem_limit_bytes() -> u64 {
 }
 
 #[cfg(unix)]
-fn apply_memory_limit(cmd: &mut Command) {
-    let limit = oracle_mem_limit_bytes() as libc::rlim_t;
-    // Safety: `pre_exec` runs between fork and exec in the child.
-    // setrlimit is async-signal-safe, so this is sound. Mirrors
-    // crates/neovm-oracle-tests/src/common.rs:278.
-    unsafe {
-        cmd.pre_exec(move || {
-            let rlim = libc::rlimit {
-                rlim_cur: limit,
-                rlim_max: limit,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &rlim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+fn apply_memory_limit(cmd: &mut PinnedCommand) {
+    if !neomacs_infra::ADDRESS_SPACE_LIMIT_SUPPORTED {
+        return;
     }
+    cmd.limit_address_space(oracle_mem_limit_bytes());
 }
 
 /// RLIMIT_AS is Unix-only; non-Unix hosts run spawned probes unlimited.
 #[cfg(not(unix))]
-fn apply_memory_limit(_cmd: &mut Command) {}
+fn apply_memory_limit(_cmd: &mut PinnedCommand) {}
 
 /// Spawn the under-test `neomacs` binary with the given argv (passed
 /// after `argv[0]`, which Cargo provides via the `CARGO_BIN_EXE_neomacs`
@@ -147,9 +124,8 @@ pub fn run_neomacs(argv: &[&str]) -> ProbeResult {
 /// Spawn the under-test `neomacs` binary with text supplied on stdin.
 pub fn run_neomacs_with_stdin(argv: &[&str], stdin: &str) -> ProbeResult {
     let neomacs_bin = env!("CARGO_BIN_EXE_neomacs");
-    let mut cmd = Command::new(neomacs_bin);
+    let mut cmd = canonical_probes().environment.command(neomacs_bin);
     cmd.args(argv);
-    cmd.env("HOME", std::env::temp_dir());
     cmd.env_remove("NEOMACS_LOG_FILE");
     cmd.env_remove("NEOMACS_LOG_TO_FILE");
     run_with_stdin(&mut cmd, stdin, "neomacs")
@@ -165,13 +141,16 @@ pub fn run_oracle_emacs(argv: &[&str]) -> ProbeResult {
 /// Spawn GNU oracle Emacs with text supplied on stdin.
 pub fn run_oracle_emacs_with_stdin(argv: &[&str], stdin: &str) -> ProbeResult {
     let oracle = oracle_emacs_path();
-    let mut cmd = Command::new(&oracle);
+    let mut cmd = canonical_probes().environment.command(&oracle);
     cmd.args(argv);
-    cmd.env("HOME", std::env::temp_dir());
-    run_with_stdin(&mut cmd, stdin, &format!("oracle emacs at {oracle}"))
+    run_with_stdin(
+        &mut cmd,
+        stdin,
+        &format!("oracle emacs at {}", oracle.display()),
+    )
 }
 
-fn run_with_stdin(cmd: &mut Command, stdin: &str, label: &str) -> ProbeResult {
+fn run_with_stdin(cmd: &mut PinnedCommand, stdin: &str, label: &str) -> ProbeResult {
     apply_memory_limit(cmd);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());

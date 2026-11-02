@@ -10,6 +10,10 @@ autotests = false
 
 [features]
 default = []
+# Performance probes (the GUI layout benchmark family).  Measurement tools,
+# not correctness tests: compiled out of the default suite and kept building by
+# the build-gate's opt-in feature check.
+perf-probes = []
 neo-term = ["neomacs-display-protocol/neo-term"]
 # Numeric fixture policy propagation in unit/dependent-crate tests only.
 redisplay-test-policy = ["neovm-core/redisplay-test-policy"]

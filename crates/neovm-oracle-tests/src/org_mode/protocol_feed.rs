@@ -56,12 +56,13 @@ fn org_protocol_parse_store_open_source_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_protocol_custom_handler_dispatch_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"/tmp/from-protocol.org\" nil t \"org-protocol://unknown?x=1\" ((normal (:url \"https://example.org/a?b=1\" :title \"A B\" :file \"/tmp/from-protocol.org\")) (drop (:url \"https://example.org/drop\" :title \"Drop\")) (greedy (\"<cwd>/first\" 1 \"<cwd>/second\" 2 \"<cwd>/third\" 3))) (server-edit) (\"Greedy org-protocol handler.  Killing client.\") (:url \"https://example.org/one\" :title \"One Two\" :body \"A/B\") (:url \"https://example.org/old\" :title \"Old Title\" :body \"body\" :extra \"value\"))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -70,26 +71,25 @@ fn org_protocol_custom_handler_dispatch_combo() {
         (killed nil)
         (messages nil)
         (org-protocol-protocol-alist
-         `(("normal"
-            :protocol "normal"
-            :function ,(lambda (plist)
-                         (push (list 'normal plist) calls)
-                         (plist-get plist :file)))
-           ("drop"
-            :protocol "drop"
-            :function ,(lambda (plist)
-                         (push (list 'drop plist) calls)
-                         nil)
+         '(("normal" :protocol "normal" :function oracle-protocol-normal)
+           ("drop" :protocol "drop" :function oracle-protocol-drop
             :kill-client t)
-           ("greedy"
-            :protocol "greedy"
-            :function ,(lambda (files)
-                         (push (list 'greedy
-                                     (org-protocol-flatten-greedy
-                                      files t "<cwd>/"))
-                               calls))
+           ("greedy" :protocol "greedy" :function oracle-protocol-greedy
             :greedy t))))
-    (cl-letf (((symbol-function 'server-edit)
+    (cl-letf (((symbol-function 'oracle-protocol-normal)
+               (lambda (plist)
+                 (push (list 'normal plist) calls)
+                 (plist-get plist :file)))
+              ((symbol-function 'oracle-protocol-drop)
+               (lambda (plist)
+                 (push (list 'drop plist) calls)
+                 nil))
+              ((symbol-function 'oracle-protocol-greedy)
+               (lambda (files)
+                 (push (list 'greedy
+                             (org-protocol-flatten-greedy files t "<cwd>/"))
+                       calls)))
+              ((symbol-function 'server-edit)
                (lambda (&rest _) (push 'server-edit killed)))
               ((symbol-function 'message)
                (lambda (fmt &rest args)
@@ -124,7 +124,7 @@ fn org_protocol_custom_handler_dispatch_combo() {
                t)
               (org-protocol-assign-parameters
                '("https://example.org/old" "Old Title" "body" "extra" "value")
-               '(:url :title :body))))))"##,
+               '(:url :title :body)))))))"##,
         expect,
     );
 }
@@ -254,19 +254,27 @@ fn org_protocol_rewrite_greedy_sanitize_matrix_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_protocol_capture_template_finalize_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable capture-state)""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((\"CAPTURE-org-protocol-capture-fixed.org\" ((\"https://example.org/path?q=1#frag\" \"Example Title\")) (:type \"https\" :link \"https://example.org/path?q=1#frag\" :description \"Example Title\" :annotation \"[[https://example.org/path?q=1#frag][Example Title]]\" :initial \"Line one\\nLine two\" :query (:template \"p\" :url \"https://example.org/path?q=1#frag\" :title \"Example Title\" :body \"Line one\\nLine two\")) \"** TODO Example Title\\nURL: https://example.org/path?q=1#frag\\nType: https\\nAnnotation: [[https://example.org/path?q=1#frag][Example Title]]\\nBody:\\nLine one\\nLine two\\nQuery: (:template \\\"p\\\" :url \\\"https://example.org/path?q=1#frag\\\" :title \\\"Example Title\\\" :body \\\"Line one\\nLine two\\\")\") (\"CAPTURE-org-protocol-capture-fixed.org\" ((\"mailto:ada@example.org\" \"Mail Title\") (\"https://example.org/path?q=1#frag\" \"Example Title\")) (:type \"mailto\" :link \"mailto:ada@example.org\" :description \"Mail Title\" :annotation \"[[mailto:ada@example.org][Mail Title]]\" :initial \"> quoted\\n> body\" :query (:template \"q\" :url \"mailto:ada@example.org\" :title \"Mail Title\" :body \"> quoted\\n> body\")) \"** QUOTE Mail Title\\n[[mailto:ada@example.org][Mail Title]]\\n> quoted\\n> body\\n\") ((\"mailto:ada@example.org\" \"Mail Title\") (\"https://example.org/path?q=1#frag\" \"Example Title\")) \"* Inbox\\n** TODO Example Title\\nURL: https://example.org/path?q=1#frag\\nType: https\\nAnnotation: [[https://example.org/path?q=1#frag][Example Title]]\\nBody:\\nLine one\\nLine two\\nQuery: (:template \\\"p\\\" :url \\\"https://example.org/path?q=1#frag\\\" :title \\\"Example Title\\\" :body \\\"Line one\\nLine two\\\")\\n* Archive\\n** QUOTE Mail Title\\n[[mailto:ada@example.org][Mail Title]]\\n> quoted\\n> body\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'org-protocol)
   (require 'org-capture)
-  (let* ((file (make-temp-file "org-protocol-capture" nil ".org"
-                               "* Inbox\n* Archive\n"))
+  (let* ((tmp (make-temp-file "org-protocol-capture" nil ".org"
+                              "* Inbox\n* Archive\n"))
+         ;; `org-protocol-capture` derives the CAPTURE buffer name from the
+         ;; file's base name, and make-temp-file's random suffix would leak
+         ;; into the pinned state.  The captured content is what this probe
+         ;; checks, so give the file a stable name inside the case directory.
+         (file (expand-file-name "org-protocol-capture-fixed.org"
+                                 (file-name-directory tmp)))
+         (_ (rename-file tmp file))
          (org-stored-links nil)
          (org-protocol-default-template-key "p")
          (org-capture-templates
@@ -277,7 +285,7 @@ fn org_protocol_capture_template_finalize_combo() {
             ("q" "Quoted" entry
              (file+headline ,file "Archive")
              "* QUOTE %:description\n%a\n%i\n"
-             :empty-lines 0))))
+             :empty-lines 0)))
          capture-state)
     (unwind-protect
         (progn
@@ -319,7 +327,7 @@ fn org_protocol_capture_template_finalize_combo() {
                      "CAPTURE-org-protocol-capture.org"))
         (when (get-buffer buf) (kill-buffer buf)))
       (when (get-file-buffer file) (kill-buffer (get-file-buffer file)))
-      (delete-directory root t))))"##,
+      (delete-file file))))"##,
         expect,
     );
 }
@@ -376,12 +384,11 @@ fn org_feed_rss_parse_entry_insert_filter_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_feed_parse_format_status_add_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 48 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -430,7 +437,7 @@ fn org_feed_parse_format_status_add_combo() {
                      (point-min) (point-max)))))))
       (when (get-buffer rss) (kill-buffer rss))
       (when (get-file-buffer file) (kill-buffer (get-file-buffer file)))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }

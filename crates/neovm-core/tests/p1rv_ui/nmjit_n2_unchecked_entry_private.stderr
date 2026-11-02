@@ -1,0 +1,13 @@
+error[E0624]: associated function `admit` is private
+ --> tests/p1rv_ui/nmjit_n2_unchecked_entry_private.rs:4:30
+  |
+4 |       let _ = ParallelHeapEra::admit;
+  |                                ^^^^^ private associated function
+  |
+ ::: src/emacs_core/runtime/eval/world/era.rs
+  |
+  | /     pub(crate) fn admit(
+  | |         admission: gc::Gen1Admission<'heap>,
+  | |         keeper: Baton,
+  | |     ) -> Result<Self, gc::EraAdmissionFailure<'heap, Baton>> {
+  | |____________________________________________________________- private associated function defined here

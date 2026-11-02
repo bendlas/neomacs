@@ -1,6 +1,7 @@
 //! Ordered real-owner calls, concurrent writers, and stopped definition lifetime.
 use super::*;
 use crate::tagged::gc::PlainSymbolBacking;
+use crate::tagged::gc::ProofEra as ParallelHeapEra;
 use std::num::NonZeroU32;
 mod gc;
 mod worker;
@@ -88,7 +89,8 @@ fn collect(
 ) -> Round {
     let journal_before = gc::ledger(era, stopped).journal;
     if reconcile {
-        stopped.symbols().unwrap().reconcile_functions().unwrap();
+        era.reconcile_functions(&mut stopped.symbols().unwrap())
+            .unwrap();
     }
     let roots = gc::ledger(era, stopped);
     let report = era.collect_stopped(stopped).unwrap();
@@ -237,7 +239,8 @@ fn scenario(kind: PlainSymbolBacking, count: usize) {
             drop(nil);
             let mut stopped = era.stop().unwrap();
             era.return_cons_storage(&stopped).unwrap();
-            stopped.symbols().unwrap().reconcile_functions().unwrap();
+            era.reconcile_functions(&mut stopped.symbols().unwrap())
+                .unwrap();
             stopped.trace(|_, _| Ok(())).unwrap();
             stopped.complete().unwrap();
             let (collector, keeper) = era.finish().unwrap();

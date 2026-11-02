@@ -1,114 +1,110 @@
 //! Compile-time contracts for the thread-safety ownership boundaries.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "contract-fixtures")]
+#[path = "thread_safety_ui/support/fixture_target.rs"]
+mod fixture_target;
 
-#[derive(Clone, Copy, Debug)]
-enum FixtureTarget {
-    Common,
-    Arm64MacOs,
-}
-
-impl FixtureTarget {
-    fn current() -> Self {
-        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
-            Self::Arm64MacOs
-        } else {
-            Self::Common
-        }
-    }
-
-    fn generic_case(self, common: PathBuf, flow: FlowRepresentation) -> PathBuf {
-        match self {
-            Self::Common if matches!(flow, FlowRepresentation::Enum) => {
-                // BufferManager's World includes the selected Flow carrier.
-                let overlay = Path::new("tests/thread_safety_ui/plain_flow")
-                    .join(common.file_name().expect("fixture filename"));
-                if overlay.is_file() { overlay } else { common }
-            }
-            Self::Common => common,
-            Self::Arm64MacOs => {
-                let overlay = Path::new("tests/thread_safety_ui/arm64_macos/generic")
-                    .join(common.file_name().expect("fixture filename"));
-                if overlay.is_file() { overlay } else { common }
-            }
-        }
-    }
-
-    fn context_cases(self, flow: FlowRepresentation) -> &'static str {
-        match (self, flow) {
-            (Self::Arm64MacOs, FlowRepresentation::Word) => {
-                "tests/thread_safety_ui/arm64_macos/flow_word/context_*.rs"
-            }
-            (Self::Arm64MacOs, FlowRepresentation::Enum) => {
-                "tests/thread_safety_ui/arm64_macos/plain_flow/context_*.rs"
-            }
-            (Self::Common, FlowRepresentation::Word) => {
-                "tests/thread_safety_ui/flow_word/context_*.rs"
-            }
-            (Self::Common, FlowRepresentation::Enum) => {
-                "tests/thread_safety_ui/plain_flow/context_*.rs"
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FlowRepresentation {
-    Word,
-    Enum,
-}
-
-impl FlowRepresentation {
-    fn current() -> Self {
-        if cfg!(feature = "flow-word") {
-            Self::Word
-        } else {
-            Self::Enum
-        }
+#[cfg(feature = "contract-fixtures")]
+fn context_cases(target: fixture_target::FixtureTarget) -> &'static str {
+    use fixture_target::FixtureTarget;
+    match target {
+        FixtureTarget::Arm64MacOs => "tests/thread_safety_ui/arm64_macos/flow_word/context_*.rs",
+        FixtureTarget::Common => "tests/thread_safety_ui/flow_word/context_*.rs",
     }
 }
 
 #[test]
-#[ignore = "compiles separate fixtures; run explicitly with the light gates"]
+#[cfg(feature = "contract-fixtures")]
 fn thread_safety_compile_contracts() {
+    use fixture_target::FixtureTarget;
+
     let cases = trybuild::TestCases::new();
     let target = FixtureTarget::current();
-    let flow = FlowRepresentation::current();
-    let mut generic: Vec<_> = std::fs::read_dir("tests/thread_safety_ui")
-        .expect("compile-contract fixture directory")
-        .map(|entry| entry.expect("compile-contract fixture entry").path())
-        .filter(|path| {
-            path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
-        })
-        .collect();
-    generic.sort();
-    for common in generic {
-        // An ARM diagnostic overlay includes the unchanged common fixture body.
-        // The source-to-case gate audits the exact approved overlay inventory.
-        cases.compile_fail(target.generic_case(common, flow));
+    // An ARM diagnostic overlay includes the unchanged common fixture body.
+    // Overlays compile only on their own target: the macOS compile-contracts
+    // job gates them, and a Linux bless can never rewrite a macOS golden.
+    for fixture in target.fixtures(
+        "tests/thread_safety_ui",
+        "tests/thread_safety_ui/arm64_macos/generic",
+    ) {
+        cases.compile_fail(fixture);
     }
     // This control must compile: missing GC shim dependencies must never be
     // accepted as a confinement failure, including during snapshot overwrite.
     cases.pass("tests/thread_safety_ui/support/scan_contract_pass.rs");
-    if matches!(target, FixtureTarget::Common) {
-        // These overlays depend only on portable confinement markers, not on
-        // platform fields. Exercise their include paths on every host too.
-        for fixture in [
-            "local_root_send",
-            "raw_value_send_payload",
-            "raw_value_static_cache",
-            "scan_storage_lease_sync",
-            "single_mutator_send",
-            "tls_scope_send",
-        ] {
-            cases.compile_fail(format!(
-                "tests/thread_safety_ui/arm64_macos/generic/{fixture}.rs"
-            ));
-        }
-    }
     // A completed method has no public retirement Drop obligation to leak.
     // This fixture type-checks only; runtime coherence is admission_header coverage.
     cases.pass("tests/thread_safety_pass/obarray_writer_method_forget.rs");
-    // Context's diagnostics select its Flow carrier and platform field bounds.
-    cases.compile_fail(target.context_cases(flow));
+    cases.pass("tests/thread_safety_pass/host_input_publisher.rs");
+    // Context's diagnostics reflect the platform's field bounds.
+    cases.compile_fail(context_cases(target));
+}
+
+// The sole-owner eval phase's fixtures sit next to its unit tests, but the
+// runner lives here: trybuild compiles them against the non-test lib, so the
+// contract jobs need no opt-level-2 build of the whole lib unit-test binary.
+#[test]
+#[cfg(feature = "contract-fixtures")]
+fn sole_owner_compile_contracts() {
+    let cases = trybuild::TestCases::new();
+    cases.pass("src/emacs_core/runtime/eval/tests/sole_owner_pass/*.rs");
+    cases.compile_fail("src/emacs_core/runtime/eval/tests/sole_owner_ui/*.rs");
+}
+
+// The parallel-Lisp contract runners below lived in the `core` binary, which
+// no contract job builds with `contract-fixtures`, so CI never ran them. Their
+// files and fixtures stay where they are.
+#[path = "p2ht_contracts.rs"]
+mod p2ht_contracts;
+
+#[path = "pentry_contracts.rs"]
+mod pentry_contracts;
+
+#[cfg(feature = "contract-fixtures")]
+#[test]
+fn nmjit_n1_sketch_compile_contracts() {
+    // The sketches have no engine dependency. A trybuild driver in this crate
+    // inherits all core dependencies and rebuilds them for its diagnostic flags,
+    // so use an isolated specification workspace without changing any client.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/nmjit-type-contracts/Cargo.toml");
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["test", "--locked", "--manifest-path"])
+        .arg(manifest)
+        .args([
+            "--test",
+            "contracts",
+            "--",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .status()
+        .expect("launch isolated N1 sketch contracts");
+    assert!(
+        status.success(),
+        "N1 sketch compiler contract failed: {status}"
+    );
+}
+
+#[path = "host_effect_contracts.rs"]
+mod host_effect_contracts;
+
+#[path = "intern_shared_contracts.rs"]
+mod intern_shared_contracts;
+
+#[test]
+#[cfg(feature = "contract-fixtures")]
+fn p15_threading_compile_contracts() {
+    let cases = trybuild::TestCases::new();
+    // The lower-source fixtures compile the production payload/id definitions;
+    // private facade fixtures additionally name the actual allocator/handles.
+    // The pass control ensures a missing shim dependency is never accepted as
+    // the intended identity, constructor or ownership rejection.
+    cases.pass("tests/p15_threading_pass/*.rs");
+    for fixture in fixture_target::FixtureTarget::current().fixtures(
+        "tests/p15_threading_ui",
+        "tests/p15_threading_ui/arm64_macos",
+    ) {
+        cases.compile_fail(fixture);
+    }
 }

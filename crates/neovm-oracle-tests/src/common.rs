@@ -6,12 +6,13 @@
 //! via `NEOVM_FORCE_ORACLE_PATH`).
 
 use colored::Colorize;
-use neomacs_parity_reference::{AttestationError, ReferenceUse};
+use neomacs_parity_reference::ReferenceUse;
+use neomacs_test_env::PinnedCommand;
 use neomacs_test_oracle::CapturedEvaluation;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 #[path = "oracle_sandbox.rs"]
@@ -20,23 +21,15 @@ pub(crate) mod oracle_sandbox;
 use oracle_sandbox::{OracleSandbox, ResultNormalization};
 
 #[cfg(unix)]
-fn apply_virtual_memory_limit(cmd: &mut Command, mem_limit: u64) {
-    unsafe {
-        cmd.pre_exec(move || {
-            let rlim = libc::rlimit {
-                rlim_cur: mem_limit as libc::rlim_t,
-                rlim_max: mem_limit as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &rlim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+fn apply_virtual_memory_limit(cmd: &mut PinnedCommand, mem_limit: u64) {
+    if !neomacs_infra::ADDRESS_SPACE_LIMIT_SUPPORTED {
+        return;
     }
+    cmd.limit_address_space(mem_limit);
 }
 
 #[cfg(not(unix))]
-fn apply_virtual_memory_limit(_cmd: &mut Command, _mem_limit: u64) {}
+fn apply_virtual_memory_limit(_cmd: &mut PinnedCommand, _mem_limit: u64) {}
 
 /// Maximum virtual address space (in bytes) for each spawned oracle Emacs
 /// process.  This prevents runaway evaluations from consuming unbounded
@@ -65,10 +58,18 @@ fn neomacs_binary_mem_limit_bytes() -> Option<u64> {
 
 pub(crate) const ORACLE_PROP_CASES: u32 = 10;
 
+/// Whether a test that embeds a GNU expectation may run.
+///
+/// Snapshot mode runs Neomacs only and needs no GNU.  Every other mode
+/// resolves the attested oracle here; a missing or mismatched oracle PANICS
+/// with the env var and the one-recipe build script.  There is deliberately no
+/// state in which this returns false.
 pub(crate) fn oracle_prop_enabled() -> bool {
     OracleMode::from_env() == OracleMode::Snapshot || oracle_emacs_available()
 }
 
+/// Whether a GNU-comparison test may run.  Live modes resolve-or-panic for the
+/// same reason; the false branch is unreachable.
 pub(crate) fn live_oracle_enabled() -> bool {
     OracleMode::from_env() != OracleMode::Snapshot && oracle_emacs_available()
 }
@@ -80,7 +81,7 @@ fn oracle_timing_enabled() -> bool {
 /// Execution strategy for oracle tests that embed GNU Emacs expectations in
 /// the Rust test source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OracleMode {
+pub(crate) enum OracleMode {
     /// Fast path: run only Neomacs and compare its result with the checked-in
     /// inline GNU expectation.
     Snapshot,
@@ -96,7 +97,7 @@ enum OracleMode {
 }
 
 impl OracleMode {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         match std::env::var("NEOVM_ORACLE_MODE")
             .unwrap_or_else(|_| "snapshot".to_string())
             .to_ascii_lowercase()
@@ -113,24 +114,44 @@ impl OracleMode {
     }
 }
 
+/// The skip diagnostic for
+/// [`return_if_neovm_enable_oracle_proptest_not_set!`], carried by one
+/// function instead of one `tracing::info!` per call site.
+///
+/// The guard is expanded in ~39k tests.  `tracing::info!` is not a cheap
+/// macro: each expansion lowers to a callsite static, a metadata block and a
+/// registration call (about 2.3 KiB of expanded source, measured on tracing
+/// 0.1.44), so repeating it per test site made the `oracle` test target's
+/// expansion ~85 MB of AST on top of the crate's own 54 MB of forms -- the
+/// single largest contributor to that rustc's 13 GB check peak.  `#[cold]`
+/// and non-generic: nothing is inlined into, or instantiated per, a test.
+///
+/// The guard's false branch is unreachable today (`oracle_prop_enabled` is
+/// always true: live modes resolve-or-panic), but its behaviour is kept
+/// exactly: the same module/line and the same message text.
+#[cold]
+#[inline(never)]
+pub(crate) fn report_unavailable_oracle_proptest(module_path: &'static str, line: u32) {
+    tracing::info!(
+        "skipping {}:{}: set NEOVM_FORCE_ORACLE_PATH=/path/to/emacs",
+        module_path,
+        line
+    );
+}
+
+// Historical call-site marker.  `oracle_prop_enabled` is always true now:
+// snapshot mode needs no GNU, and every live mode resolves the attested oracle
+// or panics.  The guard cannot skip a test.
 macro_rules! return_if_neovm_enable_oracle_proptest_not_set {
     () => {
         if !$crate::common::oracle_prop_enabled() {
-            tracing::info!(
-                "skipping {}:{}: set NEOVM_FORCE_ORACLE_PATH=/path/to/emacs",
-                module_path!(),
-                line!()
-            );
+            $crate::common::report_unavailable_oracle_proptest(module_path!(), line!());
             return;
         }
     };
     ($ret:expr) => {
         if !$crate::common::oracle_prop_enabled() {
-            tracing::info!(
-                "skipping {}:{}: set NEOVM_FORCE_ORACLE_PATH=/path/to/emacs",
-                module_path!(),
-                line!()
-            );
+            $crate::common::report_unavailable_oracle_proptest(module_path!(), line!());
             return $ret;
         }
     };
@@ -138,115 +159,291 @@ macro_rules! return_if_neovm_enable_oracle_proptest_not_set {
 
 pub(crate) use return_if_neovm_enable_oracle_proptest_not_set;
 
-/// Where the GNU oracle was asked for, and whether someone asked by name.
+/// The attested GNU this process may run.
 ///
-/// The distinction matters at exactly one point: an oracle that cannot be
-/// resolved.  If GNU is simply absent from `PATH`, skipping is right --- that is
-/// what lets the snapshot suite run on a machine without the mirror.  If an
-/// operator NAMED a binary in `NEOVM_FORCE_ORACLE_PATH`, silently skipping
-/// every live test is a green run that measured nothing, and ledger 210's
-/// lesson is to check the count rather than the colour.  Found while
-/// sensitivity-checking this file's own guard: a relative path in that variable
-/// resolves against nextest's working directory, not the shell's, so a typo
-/// produced 38826 skips and an `ok`.
-struct OracleRequest {
-    path: String,
-    named_explicitly: bool,
+/// Resolution and identity attestation are the workspace's one resolver,
+/// `neomacs_test_oracle::gnu`: `NEOVM_FORCE_ORACLE_PATH` when set, otherwise
+/// the pinned reference checked on the `emacs` found on `PATH`.  A missing or
+/// mismatched oracle PANICS with the env var and the one-recipe build script;
+/// a live oracle run must never skip.  Snapshot mode never reaches this
+/// function, which is what lets the snapshot suite run without GNU at all.
+fn attested_oracle_emacs() -> &'static ReferenceUse {
+    neomacs_test_oracle::gnu::gnu_oracle().reference()
 }
 
-fn oracle_emacs_request() -> OracleRequest {
-    match std::env::var("NEOVM_FORCE_ORACLE_PATH") {
-        Ok(path) => OracleRequest {
-            path,
-            named_explicitly: true,
-        },
-        Err(_) => OracleRequest {
-            path: "emacs".to_string(),
-            named_explicitly: false,
-        },
+/// The attested executable, for callers that only need the path.
+pub(crate) fn oracle_emacs_path() -> PathBuf {
+    neomacs_test_oracle::gnu::gnu_oracle().executable_path()
+}
+
+/// Whether this mode runs the live GNU oracle (everything but snapshot).
+///
+/// A test that needs a host input baked into the reference build must call
+/// this first: snapshot mode is deliberately able to run with no GNU and no
+/// manifest at all, and its recorded expectation is the pin for that input.
+pub(crate) fn oracle_mode_runs_live_gnu() -> bool {
+    OracleMode::from_env() != OracleMode::Snapshot
+}
+
+/// A value recorded by the reference build manifest beside the resolved
+/// oracle.
+///
+/// The manifest (`<prefix>/share/gnu-emacs-oracle/build-manifest`, written by
+/// scripts/ci/build-gnu-oracle.sh) is the recipe's own record.  Host inputs
+/// the oracle baked in at configure time -- `system-configuration` is the one
+/// the tests observe -- are pinned here instead of trusting whatever the
+/// running kernel says now.  Only call this in a live mode; snapshot mode may
+/// have no oracle installed and therefore no manifest.
+pub(crate) fn reference_manifest_value(key: &str) -> Option<String> {
+    let executable = oracle_emacs_path();
+    let prefix = executable.parent()?.parent()?;
+    let manifest = prefix
+        .join("share")
+        .join("gnu-emacs-oracle")
+        .join("build-manifest");
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let key_prefix = format!("{key}=");
+    text.lines().find_map(|line| {
+        line.strip_prefix(&key_prefix)
+            .map(std::borrow::ToOwned::to_owned)
+    })
+}
+
+/// The two pinned GNU 31.1 reference hosts whose per-host facts the oracle
+/// tests observe.
+///
+/// A per-host expectation names its discriminant and the value for every
+/// variant:
+///
+/// ```ignore
+/// let expect = crate::common::host_expect!(
+///     LinuxGnu => r#""OK ...linux answer...""#,
+///     MacosDarwin => r#""OK ...macOS answer...""#,
+/// );
+/// ```
+///
+/// The helper's match is exhaustive over this closed enum, so a call site that
+/// omits a reference does not compile.  An attested oracle outside the enum
+/// makes [`oracle_host_key`] panic: it never falls back to one host's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OracleHostKey {
+    /// The pinned linux-gtk3 reference (`x86_64-pc-linux-gnu`).
+    LinuxGnu,
+    /// The pinned macos-batch reference (`aarch64-apple-darwin*`).
+    MacosDarwin,
+}
+
+impl OracleHostKey {
+    /// Map a GNU `system-configuration` value to the pinned reference it
+    /// identifies.  `None` is the unknown-host answer; there is deliberately
+    /// no default.
+    fn from_system_configuration(triple: &str) -> Option<Self> {
+        if triple.contains("-linux-gnu") {
+            Some(Self::LinuxGnu)
+        } else if triple.contains("-apple-darwin") {
+            Some(Self::MacosDarwin)
+        } else {
+            None
+        }
     }
 }
 
-fn oracle_emacs_path() -> String {
-    oracle_emacs_request().path
+fn host_key_from_system_configuration(triple: &str) -> OracleHostKey {
+    OracleHostKey::from_system_configuration(triple).unwrap_or_else(|| {
+        panic!(
+            "host_expect: unknown GNU reference host {triple:?}; \
+             the per-host expectation helper knows only the pinned \
+             linux-gtk3 and macos-batch references"
+        )
+    })
 }
 
-/// The attested GNU this process may run, resolved once.
+/// The reference host whose per-host values apply.
 ///
-/// # Why this replaced a presence check (ledger 214)
-///
-/// This used to be `oracle_emacs_available`, which spawned `emacs --version`
-/// and looked only at the exit status --- it never even read the output.  That
-/// answers "can an emacs be run", not "is it OUR emacs", and the difference is
-/// not academic in every mode:
-///
-/// * `Snapshot` never runs GNU at all, so a changed reference cannot move the
-///   score.  Nothing below is reached, and the cost stays zero.
-/// * `Verify` and `Live` run GNU and compare, so a changed reference changes
-///   the verdict.  `Verify` would at least go red --- but red as if the PORT
-///   regressed, which is the wrong diagnosis and the expensive one to chase.
-/// * `Refresh` with `UPDATE_EXPECT=1` runs GNU and **rewrites the inline
-///   expectations from its answers**.  A changed reference there silently
-///   re-baselines the whole suite against a binary nobody chose, and NOTHING
-///   detects it.  That is the highest-stakes case in this project.
-///
-/// Attesting costs one 48-byte read of the dump header, which is cheaper than
-/// the process spawn it replaces (measured: ~35 ms for `emacs --version`), so
-/// the live modes got faster and gained a guarantee.  `Exhaustive` is
-/// deliberately NOT used here: nextest runs a process per test, and hashing
-/// 18.7 MB in each of a live run's tens of thousands of processes would cost
-/// tens of minutes to re-check a file that has not changed since the process
-/// before it looked.
-fn attested_oracle_emacs() -> Result<&'static ReferenceUse, &'static AttestationError> {
-    static ATTESTED: OnceLock<Result<ReferenceUse, AttestationError>> = OnceLock::new();
-    ATTESTED
-        .get_or_init(|| {
-            neomacs_parity_reference::attest(
-                Path::new(&oracle_emacs_path()),
-                neomacs_parity_reference::AttestationDepth::Fingerprint,
-            )
-        })
-        .as_ref()
-}
-
-/// Whether a GNU oracle may be run, and refuse loudly if one is present but
-/// wrong.
-///
-/// A missing GNU is still a SKIP --- that is what lets the snapshot suite run
-/// on a machine without the mirror --- but a GNU that is present and is not the
-/// pin is a panic, because silently scoring against it is the failure this
-/// check exists to prevent.
-fn oracle_emacs_available() -> bool {
-    match attested_oracle_emacs() {
-        Ok(reference) => {
-            tracing::debug!(reference = %reference.stamp(), "oracle reference attested");
-            true
+/// Live modes resolve it from the attested oracle: the build manifest's
+/// `system_configuration` when the recipe recorded it, otherwise the oracle's
+/// own `system-configuration`.  Snapshot mode has no oracle and uses the
+/// compile-time target, which is the host of the Neomacs binary under test.
+/// An unrecognized host panics; it never defaults to Linux.
+pub(crate) fn oracle_host_key() -> OracleHostKey {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<OracleHostKey> = OnceLock::new();
+    *KEY.get_or_init(|| {
+        if !oracle_mode_runs_live_gnu() {
+            return match std::env::consts::OS {
+                "linux" => OracleHostKey::LinuxGnu,
+                "macos" => OracleHostKey::MacosDarwin,
+                other => {
+                    panic!("host_expect: no pinned reference for snapshot host {other:?}")
+                }
+            };
         }
-        // The variant, not the message.  "There is no GNU here" and "the GNU
-        // here is the wrong one" have opposite consequences --- a skip and a
-        // panic --- so the thing that tells them apart must not be a string
-        // anyone could reword.
-        Err(error @ AttestationError::ExecutableUnresolved { .. }) => {
-            if oracle_emacs_request().named_explicitly {
+        let triple = reference_manifest_value("system_configuration")
+            .or_else(|| {
+                // The linux-gtk3 manifest predates the system_configuration
+                // row; ask the attested oracle itself (prin1 quotes it).
+                let output = run_oracle_eval("system-configuration").ok()?;
+                let value = output.trim().strip_prefix("OK ")?;
+                let value = value.strip_prefix('"')?.strip_suffix('"')?;
+                Some(value.to_string())
+            })
+            .unwrap_or_else(|| {
                 panic!(
-                    "NEOVM_FORCE_ORACLE_PATH names a GNU oracle that cannot be resolved, so \
-                     every live oracle test would SKIP and the run would be green having \
-                     measured nothing.  Note that a relative path here resolves against the \
-                     test process's working directory, not the shell's.\n{error}"
-                );
-            }
-            tracing::info!("no GNU oracle available: {error}");
-            false
+                    "host_expect: cannot resolve the GNU reference \
+                     system-configuration from the manifest or the oracle"
+                )
+            });
+        host_key_from_system_configuration(&triple)
+    })
+}
+
+/// Select the expectation for the running reference host.
+///
+/// Each entry names its [`OracleHostKey`] discriminant and the value; the
+/// match is exhaustive, so omitting a reference is a compile error.
+// The lib's non-test build compiles this module while the test modules that
+// use the macro are cfg(test)-gated; the macro is live in every test target.
+#[allow(unused_macros)]
+macro_rules! host_expect {
+    ($($key:ident => $lit:literal),+ $(,)?) => {{
+        match $crate::common::oracle_host_key() {
+            $($crate::common::OracleHostKey::$key => expect_test::expect![[$lit]],)+
         }
-        Err(error) => panic!(
-            "the GNU oracle is present but is NOT the pinned reference, so its answers \
-             are not comparable with this suite's expectations -- and in \
-             NEOVM_ORACLE_MODE=refresh they would be WRITTEN INTO them.\n{error}"
-        ),
+    }};
+}
+pub(crate) use host_expect;
+
+#[cfg(test)]
+mod host_key_tests {
+    use super::*;
+
+    #[test]
+    fn oracle_host_key_maps_the_two_pinned_references() {
+        assert_eq!(
+            OracleHostKey::from_system_configuration("x86_64-pc-linux-gnu"),
+            Some(OracleHostKey::LinuxGnu)
+        );
+        assert_eq!(
+            OracleHostKey::from_system_configuration("aarch64-apple-darwin27.0.0"),
+            Some(OracleHostKey::MacosDarwin)
+        );
+    }
+
+    #[test]
+    fn oracle_host_key_refuses_unknown_references_instead_of_defaulting() {
+        for triple in ["x86_64-w64-mingw32", "x86_64-unknown-freebsd", ""] {
+            assert_eq!(OracleHostKey::from_system_configuration(triple), None);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown GNU reference host")]
+    fn oracle_host_key_panics_on_an_unknown_reference() {
+        let _ = host_key_from_system_configuration("x86_64-w64-mingw32");
     }
 }
 
-fn neomacs_binary_path() -> String {
+/// The compile-time host a platform test belongs to.
+///
+/// This is a cfg-derived key, not a runtime `uname` probe.  The twin tests are
+/// compiled only for their own variant (see [`platform_twin_test`]), and the
+/// const assertions below reject the other host selecting a twin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlatformKey {
+    Linux,
+    Macos,
+}
+
+impl PlatformKey {
+    pub(crate) const fn current() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::Macos
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            panic!("platform twin: twins are defined only for linux and macos")
+        }
+    }
+}
+
+/// Which host a platform test (the Linux expectation or its mac twin) is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TwinHost {
+    Linux,
+    Macos,
+}
+
+impl TwinHost {
+    pub(crate) const fn runs_on(self, key: PlatformKey) -> bool {
+        matches!(
+            (self, key),
+            (TwinHost::Linux, PlatformKey::Linux) | (TwinHost::Macos, PlatformKey::Macos)
+        )
+    }
+}
+
+// Compile-time proof that the current host does not select the other twin.
+#[cfg(target_os = "linux")]
+const _: () = assert!(!TwinHost::Macos.runs_on(PlatformKey::current()));
+#[cfg(target_os = "macos")]
+const _: () = assert!(!TwinHost::Linux.runs_on(PlatformKey::current()));
+
+/// Emit a test compiled only for `$host`.
+///
+/// The host is a typed [`TwinHost`] variant; the macro maps it to the
+/// compile-time cfg, so the other host's binary does not contain the test at
+/// all.  The signed expectation stays with the Linux test; the twin carries
+/// the reference's no-feature answer.
+macro_rules! platform_twin_test {
+    (TwinHost::Linux, $name:ident, $body:block) => {
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn $name() $body
+    };
+    (TwinHost::Macos, $name:ident, $body:block) => {
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn $name() $body
+    };
+}
+pub(crate) use platform_twin_test;
+
+#[cfg(test)]
+mod platform_key_tests {
+    use super::*;
+
+    #[test]
+    fn platform_twins_run_only_on_their_host() {
+        assert!(TwinHost::Linux.runs_on(PlatformKey::Linux));
+        assert!(!TwinHost::Linux.runs_on(PlatformKey::Macos));
+        assert!(TwinHost::Macos.runs_on(PlatformKey::Macos));
+        assert!(!TwinHost::Macos.runs_on(PlatformKey::Linux));
+        assert_eq!(
+            PlatformKey::current(),
+            if cfg!(target_os = "linux") {
+                PlatformKey::Linux
+            } else {
+                PlatformKey::Macos
+            }
+        );
+    }
+}
+
+/// Whether a GNU oracle may be run.
+///
+/// Resolution either returns an attested oracle or fails loudly; there is no
+/// "present but unusable" state left to turn into a skip.
+fn oracle_emacs_available() -> bool {
+    let _ = attested_oracle_emacs();
+    true
+}
+
+pub(crate) fn neomacs_binary_path() -> String {
     std::env::var("NEOVM_BINARY_PATH").unwrap_or_else(|_| {
         oracle_sandbox::project_root()
             .join("target/release/neomacs")
@@ -282,11 +479,32 @@ fn neomacs_binary_path() -> String {
 /// runs. The leading `@` pins the clock (it does not advance from this instant).
 const ORACLE_FROZEN_TIME: &str = "@2026-06-15 12:00:00";
 
-/// Resolve `libfaketime.so.1`. Prefer the explicit `NEOVM_LIBFAKETIME_SO`
-/// override (set by the flake devShell for reproducibility); otherwise locate
-/// it relative to the `faketime` binary on `PATH`. Frozen-clock tests cannot be
-/// deterministic without it, so a missing library is a hard, clearly-explained
-/// error rather than a silently flaky pass.
+/// Library file names libfaketime installs under a prefix's `lib/`.
+///
+/// The interposer is a shared object on Linux and a dylib on Darwin; a harness
+/// that only knows the Linux name cannot freeze the clock on a Mac even when
+/// the library is installed there.
+const LIBFAKETIME_NAMES: &[&str] = if cfg!(target_os = "macos") {
+    &[
+        "lib/libfaketime.1.dylib",
+        "lib/faketime/libfaketime.1.dylib",
+        "lib/libfaketime.dylib",
+    ]
+} else {
+    &[
+        "lib/libfaketime.so.1",
+        "lib/faketime/libfaketime.so.1",
+        "lib64/libfaketime.so.1",
+        "lib64/faketime/libfaketime.so.1",
+    ]
+};
+
+/// Resolve the libfaketime shared library. Prefer the explicit
+/// `NEOVM_LIBFAKETIME_SO` override (set by the flake devShell for
+/// reproducibility); otherwise locate it relative to the `faketime` binary on
+/// `PATH`. Frozen-clock tests cannot be deterministic without it, so a missing
+/// library is a hard, clearly-explained error rather than a silently flaky
+/// pass.
 fn libfaketime_so_path() -> String {
     if let Ok(explicit) = std::env::var("NEOVM_LIBFAKETIME_SO")
         && !explicit.is_empty()
@@ -300,29 +518,26 @@ fn libfaketime_so_path() -> String {
                 continue;
             }
             // Canonicalize resolves the nix-profile symlink to the real
-            // <prefix>/bin/faketime, whose sibling <prefix>/lib holds the .so.
+            // <prefix>/bin/faketime, whose sibling <prefix>/lib holds the
+            // library.
             let Ok(real) = std::fs::canonicalize(&bin) else {
                 continue;
             };
             let Some(prefix) = real.parent().and_then(|p| p.parent()) else {
                 continue;
             };
-            for rel in [
-                "lib/libfaketime.so.1",
-                "lib/faketime/libfaketime.so.1",
-                "lib64/libfaketime.so.1",
-                "lib64/faketime/libfaketime.so.1",
-            ] {
-                let so = prefix.join(rel);
-                if so.is_file() {
-                    return so.to_string_lossy().into_owned();
+            for rel in LIBFAKETIME_NAMES {
+                let library = prefix.join(rel);
+                if library.is_file() {
+                    return library.to_string_lossy().into_owned();
                 }
             }
         }
     }
     panic!(
-        "frozen-time oracle tests require libfaketime, but libfaketime.so.1 could not be located. \
-         Set NEOVM_LIBFAKETIME_SO to its path, or run inside `nix develop` (the devShell provides it)."
+        "frozen-time oracle tests require libfaketime, but {} could not be located. \
+         Set NEOVM_LIBFAKETIME_SO to its path, or run inside `nix develop` (the devShell provides it).",
+        LIBFAKETIME_NAMES[0]
     );
 }
 
@@ -331,11 +546,20 @@ fn libfaketime_so_path() -> String {
 /// clock that leaks into timestamps) and leaves `CLOCK_MONOTONIC` real, so the
 /// subprocess's own `select`/timeout logic is unaffected.
 fn frozen_time_env() -> Vec<(String, String)> {
-    vec![
-        ("LD_PRELOAD".to_string(), libfaketime_so_path()),
-        ("FAKETIME".to_string(), ORACLE_FROZEN_TIME.to_string()),
-        ("FAKETIME_DONT_FAKE_MONOTONIC".to_string(), "1".to_string()),
-    ]
+    let library = libfaketime_so_path();
+    // Linux interposes through the dynamic loader's LD_PRELOAD; Darwin
+    // ignores that variable and uses dyld's flat-namespace insertion.
+    let mut env = if cfg!(target_os = "macos") {
+        vec![
+            ("DYLD_INSERT_LIBRARIES".to_string(), library),
+            ("DYLD_FORCE_FLAT_NAMESPACE".to_string(), "1".to_string()),
+        ]
+    } else {
+        vec![("LD_PRELOAD".to_string(), library)]
+    };
+    env.push(("FAKETIME".to_string(), ORACLE_FROZEN_TIME.to_string()));
+    env.push(("FAKETIME_DONT_FAKE_MONOTONIC".to_string(), "1".to_string()));
+    env
 }
 
 fn project_lisp_dir() -> PathBuf {
@@ -392,6 +616,16 @@ const EVAL_PROGRAM_WITH_NORMALIZER: &str = r#"(condition-case err
                             (list :mutex
                                   (and (fboundp 'mutex-name)
                                        (mutex-name m))))))))
+         ;; A raw frame object is an identity, not a value: GNU prints a real
+         ;; pointer (`#<frame F1 0x555555b467d8>') and Neomacs a synthetic id
+         ;; (`#<frame F1 0x100000000>').  The string branch below squashes
+         ;; addresses inside printed messages, but a frame embedded in a
+         ;; RESULT list never passes through a string, so normalize it to a
+         ;; stable semantic token.  Frame type and name remain observable.
+         ((and (fboundp 'framep) (framep v))
+          (list :frame
+                (and (fboundp 'frame-parameter)
+                     (frame-parameter v 'name))))
          ((and (functionp v) (eq (type-of v) 'interpreted-function))
           (let ((args (aref v 0))
                 (body (aref v 1))
@@ -546,6 +780,23 @@ const EVAL_PROGRAM_WITH_NORMALIZER: &str = r#"(condition-case err
                             "[ORACLE-LOAD-ROOT]")
                       pairs)
                 (push (cons load-abs "[ORACLE-LOAD-ROOT]") pairs))
+              ;; The engine's OWN lisp tree. GNU now runs on its installed
+              ;; share/emacs/<version>/lisp (the sibling of data-directory)
+              ;; rather than the project tree, and runtime-loaded files
+              ;; report that path (locate-library, autoload filenames, lazy
+              ;; doc references).  Squash it to the same load-root token as
+              ;; the project tree: WHICH tree is environment, while the path
+              ;; REMAINDER (emacs-lisp/cl-lib.el, ...) stays the parity lock.
+              (let ((own-lisp
+                     (and (boundp 'data-directory)
+                          (stringp data-directory)
+                          (let ((dir (expand-file-name "../lisp" data-directory)))
+                            (and (file-directory-p dir) dir)))))
+                (when own-lisp
+                  (push (cons (abbreviate-file-name own-lisp)
+                              "[ORACLE-LOAD-ROOT]")
+                        pairs)
+                  (push (cons own-lisp "[ORACLE-LOAD-ROOT]") pairs)))
               ;; HOME is nested beneath the random per-case root. Normalize
               ;; only its absolute spelling so tilde syntax remains observable.
               (when (and home-abs (> (length home-abs) 1))
@@ -589,7 +840,15 @@ const EVAL_PROGRAM_WITH_NORMALIZER: &str = r#"(condition-case err
             (let ((source-buf (generate-new-buffer " *neovm-oracle-form*")))
               (unwind-protect
                   (progn
-                    (when load-root
+                    ;; The project lisp/ tree is Neomacs's own runtime; for
+                    ;; GNU it is a foreign tree whose .elc are Neo's compiler
+                    ;; output (and may not even be generated).  GNU keeps its
+                    ;; installed load-path; probes that need a project file
+                    ;; pass it in load-files, which loads absolute paths.
+                    (when (and load-root
+                               (or (equal (getenv "NEOVM_ORACLE_ENGINE") "neomacs")
+                                   (equal (getenv "NEOVM_ORACLE_LOAD_ROOT_OWNER")
+                                          "probe")))
                       (let ((extra-load-path nil))
                         (dolist (sub '("" "emacs-lisp" "progmodes" "language"
                                        "international" "textmodes" "vc" "leim"
@@ -643,7 +902,12 @@ const EVAL_PROGRAM_RAW: &str = r#"(condition-case err
               (let ((source-buf (generate-new-buffer " *neovm-oracle-form*")))
                 (unwind-protect
                     (progn
-                      (when load-root
+                      ;; Same contract as EVAL_PROGRAM_WITH_NORMALIZER: only
+                      ;; the engine that owns the project tree prepends it.
+                      (when (and load-root
+                                 (or (equal (getenv "NEOVM_ORACLE_ENGINE") "neomacs")
+                                     (equal (getenv "NEOVM_ORACLE_LOAD_ROOT_OWNER")
+                                            "probe")))
                         (let ((extra-load-path nil))
                           (dolist (sub '("" "emacs-lisp" "progmodes" "language"
                                          "international" "textmodes" "vc" "leim"
@@ -705,7 +969,7 @@ impl EvalProgram {
         }
     }
 
-    fn configure_command(self, command: &mut Command) {
+    fn configure_command(self, command: &mut PinnedCommand, identity: WindowSystemIdentity) {
         command.args([
             "--batch",
             "-Q",
@@ -713,9 +977,230 @@ impl EvalProgram {
             NATIVE_COMP_SUPPRESSION_PRELUDE,
             "--eval",
             ORACLE_TEST_SUPPORT_PRELUDE,
-            "--eval",
-            self.source(),
         ]);
+        let identity_defvar = identity.prelude_defvar();
+        command.args(["--eval", identity_defvar.as_str(), "--eval", self.source()]);
+    }
+}
+
+/// Which editor the shared eval program is running inside.
+///
+/// The load-path setup is engine-specific on purpose.  The project's `lisp/`
+/// tree IS Neomacs's runtime, so Neomacs must be able to `(require ...)` the
+/// tree under test even when its dump was built in a different checkout (a
+/// nextest archive remaps the workspace).  For GNU that tree is FOREIGN:
+/// loading it runs Neomacs's byte-compiled `.elc` inside the oracle and makes
+/// "GNU" answers depend on Neo's compiler output -- and on generated files the
+/// checkout may not even contain.  GNU therefore keeps its installed
+/// load-path unless a probe explicitly loads a project file through the
+/// `load-files` API, which passes absolute paths to `load`.
+#[derive(Clone, Copy)]
+enum OracleEngine {
+    Gnu,
+    Neomacs,
+}
+
+impl OracleEngine {
+    /// Environment variable carrying [`OracleEngine`] into the eval program.
+    const ENV: &'static str = "NEOVM_ORACLE_ENGINE";
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Gnu => "gnu",
+            Self::Neomacs => "neomacs",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window-system identity
+// ---------------------------------------------------------------------------
+
+/// A GNU window system, as minted by the GNU build's C code.
+///
+/// GNU's window-system identity is not a Lisp constant: each backend's
+/// `syms_of_*` provides the build's own symbol, and `window-system`,
+/// `initial-window-system`, `framep`, `window-system-default-frame-alist`,
+/// `window-system-for-display` and the `display-*` predicates report it.  The
+/// symbol is an identity, not a capability: Neomacs answers its own `neo` for
+/// the same positions (user decision, 2026-11-01: `neo` is Neomacs's intended
+/// window-system identity).  A test therefore compares these positions against
+/// the running engine's symbol, never a literal.
+///
+/// This enum is the harness's single identity table.  Adding a GNU backend is
+/// adding a variant here; every variant cites the `Fprovide` that mints it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GnuWindowSystem {
+    /// `Fprovide (Qns)` at `src/nsterm.m:11749`.
+    Ns,
+    /// `Fprovide (Qpgtk)` at `src/pgtkterm.c:7557`.
+    Pgtk,
+    /// `Fprovide (Qx)` at `src/xfns.c:10498`.
+    X,
+    /// `Fprovide (Qw32)` at `src/w32term.c:8396`.
+    W32,
+    /// `Fprovide (Qhaiku)` at `src/haikuterm.c:4884`.
+    Haiku,
+    /// `Fprovide (Qandroid)` at `src/androidterm.c:6984`.
+    Android,
+}
+
+impl GnuWindowSystem {
+    /// Every GNU window system the harness maps, in detection priority order.
+    ///
+    /// The order is load-bearing: a pure-GTK build provides `pgtk` and not
+    /// `x`, while every X-toolkit build provides `x`; the rest are disjoint
+    /// system types.  `ns` and `pgtk` are checked before `x` for the same
+    /// reason.
+    pub(crate) const ALL: [GnuWindowSystem; 6] = [
+        Self::Ns,
+        Self::Pgtk,
+        Self::X,
+        Self::W32,
+        Self::Haiku,
+        Self::Android,
+    ];
+
+    /// The whole symbol GNU answers for this window system.
+    pub(crate) const fn symbol(self) -> &'static str {
+        match self {
+            Self::Ns => "ns",
+            Self::Pgtk => "pgtk",
+            Self::X => "x",
+            Self::W32 => "w32",
+            Self::Haiku => "haiku",
+            Self::Android => "android",
+        }
+    }
+
+    /// The feature GNU's build provides for it: the same symbol, minted by the
+    /// backend's `Fprovide`, so `(featurep 'ns)` is t on the NS oracle.
+    pub(crate) const fn feature(self) -> &'static str {
+        self.symbol()
+    }
+}
+
+/// The window-system identity a running engine answers.
+///
+/// The harness defines `neovm--oracle-window-system` in each engine to this
+/// value's symbol, so a form can state an identity position relative to the
+/// engine (`(eq (framep f) neovm--oracle-window-system)`) instead of a
+/// literal.  `Gnu(None)` is a GNU build without a window system (the opt-in
+/// `macos-batch` profile): it is explicit, not a guess -- the variable is then
+/// nil, and an identity assertion fails rather than silently accepting a
+/// wrong symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowSystemIdentity {
+    Gnu(Option<GnuWindowSystem>),
+    Neovm,
+}
+
+impl WindowSystemIdentity {
+    /// Neomacs's window-system symbol (its intended identity).
+    pub(crate) const NEOVM_SYMBOL: &'static str = "neo";
+
+    /// The whole symbol this engine answers for identity positions, or nil.
+    pub(crate) const fn symbol(self) -> Option<&'static str> {
+        match self {
+            Self::Gnu(Some(window_system)) => Some(window_system.symbol()),
+            Self::Gnu(None) => None,
+            Self::Neovm => Some(Self::NEOVM_SYMBOL),
+        }
+    }
+
+    /// The `--eval` form that defines the identity variable in one engine.
+    fn prelude_defvar(self) -> String {
+        let value = match self.symbol() {
+            Some(symbol) => format!("'{symbol}"),
+            None => "nil".to_string(),
+        };
+        format!(
+            "(defvar neovm--oracle-window-system {value} \
+             \"The running engine's window-system identity: GNU's build symbol \
+             (ns, x, pgtk, w32, haiku, android) or Neomacs's `neo`.  Identity-valued \
+             positions are compared against this whole symbol, never a literal.\")"
+        )
+    }
+}
+
+/// The attested GNU oracle's window system, detected once from its features.
+///
+/// GNU mints the symbol in C (the `Fprovide` sites on [`GnuWindowSystem`]);
+/// the feature set is the only runtime witness of which backend the attested
+/// binary was built with.  The probe is a fixed form run through the attested
+/// oracle (never a user form) and is cached for the process.  Like every
+/// oracle spawn it carries the canonical pins, so the detected identity does
+/// not depend on the host's HOME, locale or display variables.
+fn gnu_window_system(sandbox: &OracleSandbox, oracle_bin: &Path) -> Option<GnuWindowSystem> {
+    static DETECTED: OnceLock<Option<GnuWindowSystem>> = OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        const DETECT: &str = "(princ (cond ((featurep 'ns) \"ns\") \
+             ((featurep 'pgtk) \"pgtk\") ((featurep 'x) \"x\") \
+             ((featurep 'w32) \"w32\") ((featurep 'haiku) \"haiku\") \
+             ((featurep 'android) \"android\") (t \"\")))";
+        let output = sandbox
+            .pinned_command(oracle_bin)
+            .args(["--batch", "-Q", "--eval", DETECT])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let symbol = String::from_utf8_lossy(&output.stdout);
+        GnuWindowSystem::ALL
+            .iter()
+            .copied()
+            .find(|window_system| window_system.feature() == symbol.trim())
+    })
+}
+
+#[cfg(test)]
+mod window_system_identity_tests {
+    use super::*;
+
+    #[test]
+    fn the_mapping_is_the_typed_gnu_set() {
+        let symbols: Vec<&str> = GnuWindowSystem::ALL
+            .iter()
+            .map(|window_system| window_system.symbol())
+            .collect();
+        assert_eq!(symbols, ["ns", "pgtk", "x", "w32", "haiku", "android"]);
+        for window_system in GnuWindowSystem::ALL {
+            assert_eq!(window_system.feature(), window_system.symbol());
+        }
+    }
+
+    #[test]
+    fn the_mapping_matches_whole_symbols_only() {
+        // The table is an exact whole-symbol lookup: a value that merely
+        // starts with an identity symbol (or embeds one) is not tolerated.
+        assert!(
+            GnuWindowSystem::ALL
+                .iter()
+                .any(|window_system| window_system.symbol() == "ns")
+        );
+        assert!(
+            !GnuWindowSystem::ALL
+                .iter()
+                .any(|window_system| window_system.symbol() == "ns-other")
+        );
+    }
+
+    #[test]
+    fn the_prelude_defines_each_engines_own_symbol() {
+        let gnu = WindowSystemIdentity::Gnu(Some(GnuWindowSystem::Ns)).prelude_defvar();
+        assert!(gnu.contains("neovm--oracle-window-system 'ns"), "{gnu}");
+        let neovm = WindowSystemIdentity::Neovm.prelude_defvar();
+        assert!(
+            neovm.contains("neovm--oracle-window-system 'neo"),
+            "{neovm}"
+        );
+        let no_window_system = WindowSystemIdentity::Gnu(None).prelude_defvar();
+        assert!(
+            no_window_system.contains("neovm--oracle-window-system nil"),
+            "{no_window_system}"
+        );
     }
 }
 
@@ -729,14 +1214,16 @@ fn run_oracle_eval_with_sandbox(
 ) -> Result<CapturedEvaluation, String> {
     // Ledger 214: every GNU invocation in this crate goes through the attested
     // reference, so there is no path that runs an unchecked oracle.
-    let oracle = attested_oracle_emacs().map_err(|error| error.to_string())?;
+    let oracle = attested_oracle_emacs();
     let oracle_bin = oracle.executable().to_path_buf();
 
     let mem_limit = oracle_mem_limit_bytes();
-    let mut cmd = Command::new(&oracle_bin);
+    let mut cmd = sandbox.pinned_command(&oracle_bin);
     sandbox.configure(&mut cmd);
+    cmd.env(OracleEngine::ENV, OracleEngine::Gnu.as_env_value());
     cmd.env("EMACSNATIVELOADPATH", "/dev/null");
-    eval_program.configure_command(&mut cmd);
+    let identity = WindowSystemIdentity::Gnu(gnu_window_system(sandbox, &oracle_bin));
+    eval_program.configure_command(&mut cmd, identity);
 
     apply_virtual_memory_limit(&mut cmd, mem_limit);
 
@@ -819,7 +1306,7 @@ pub(crate) fn run_oracle_eval_with_load_root(
     load_files: &[&str],
     load_root: &Path,
 ) -> Result<String, String> {
-    let sandbox = OracleSandbox::new(form, load_files, load_root)?;
+    let sandbox = OracleSandbox::new(form, load_files, load_root)?.with_probe_load_root();
     match OracleMode::from_env() {
         OracleMode::Snapshot => {
             run_neomacs_binary_eval_with_sandbox(&sandbox, EvalProgram::Normalized)
@@ -842,9 +1329,10 @@ fn run_neomacs_binary_eval_with_sandbox(
 ) -> Result<CapturedEvaluation, String> {
     let neomacs_bin = neomacs_binary_path();
 
-    let mut cmd = Command::new(&neomacs_bin);
+    let mut cmd = sandbox.pinned_command(&neomacs_bin);
     sandbox.configure(&mut cmd);
-    eval_program.configure_command(&mut cmd);
+    cmd.env(OracleEngine::ENV, OracleEngine::Neomacs.as_env_value());
+    eval_program.configure_command(&mut cmd, WindowSystemIdentity::Neovm);
 
     if let Some(mem_limit) = neomacs_binary_mem_limit_bytes() {
         apply_virtual_memory_limit(&mut cmd, mem_limit);
@@ -1555,7 +2043,7 @@ pub(crate) fn assert_oracle_parity_with_load_root_expect(
     load_root: &Path,
     expected: expect_test::Expect,
 ) {
-    let sandbox = oracle_sandbox(form, load_files, load_root);
+    let sandbox = oracle_sandbox(form, load_files, load_root).with_probe_load_root();
     assert_oracle_parity_expect_with_sandbox(form, expected, &sandbox, EvalProgram::Normalized);
 }
 
@@ -1566,7 +2054,7 @@ pub(crate) fn assert_oracle_parity_with_load_root(
     load_files: &[&str],
     load_root: &Path,
 ) {
-    let sandbox = oracle_sandbox(form, load_files, load_root);
+    let sandbox = oracle_sandbox(form, load_files, load_root).with_probe_load_root();
     let neovm = run_neomacs_binary_eval_with_sandbox(&sandbox, EvalProgram::Normalized)
         .expect("neomacs binary eval should run");
     if OracleMode::from_env() == OracleMode::Snapshot {

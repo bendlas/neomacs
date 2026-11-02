@@ -4,10 +4,12 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AUCTEX_RUNTIME_EXCLUDED_PATHS, AUCTEX_RUNTIME_REQUIRED_FILES, LockedPackageCatalog,
-    LockedPackageSource, SourceBuild, SourceBuildTools, extract_docstrip_source,
-    prepare_cached_source_artifact_with_tools, prepare_source_checkout, prune_auctex_elpa_ignored,
-    runtime_tree_file_spec, verify_auctex_runtime_tree,
+    AUCTEX_RUNTIME_EXCLUDED_PATHS, AUCTEX_RUNTIME_REQUIRED_FILES, FETCH_MAX_ATTEMPTS,
+    FETCH_RETRY_BACKOFF, FetchFailureClass, LockedPackageCatalog, LockedPackageSource,
+    MirrorRepository, SourceAcquisition, SourceBuild, SourceBuildTools, SourceOrigin,
+    extract_docstrip_source, prepare_cached_source_artifact_with_tools, prepare_source_checkout,
+    prune_auctex_elpa_ignored, run_fetch_with_retry, runtime_tree_file_spec,
+    verify_auctex_runtime_tree,
 };
 use crate::packages::test_support::{TestRuntime, TestSandbox};
 
@@ -350,8 +352,13 @@ fn source_checkout_uses_the_mirror_when_the_primary_commit_is_unavailable() {
     };
     let checkout = fixture.root().join("checkout");
 
-    prepare_source_checkout(source, &checkout, Duration::from_secs(30))
+    let prepared = prepare_source_checkout(source, &checkout, Duration::from_secs(30))
         .expect("fall back to the exact mirrored commit");
+    assert_eq!(
+        prepared.origin,
+        SourceOrigin::Mirror(MirrorRepository::Recorded(&repository)),
+        "the checkout records the mirror that provided the revision"
+    );
 
     let actual_revision = Command::new("git")
         .arg("-C")
@@ -366,6 +373,273 @@ fn source_checkout_uses_the_mirror_when_the_primary_commit_is_unavailable() {
             .trim(),
         revision
     );
+}
+
+/// A Savannah-hosted GNU row with no recorded fallback derives the
+/// per-package emacsmirror repository, which carries the same commit sha as
+/// Savannah's elpa.git.  The mirror is typed and derived, never stored as a
+/// URL list in the lock.
+#[test]
+fn savannah_source_derives_the_per_package_mirror() {
+    let savannah = "https://git.savannah.gnu.org/git/emacs/elpa.git";
+    let revision = "a16e9d8b0952de1badf6da8e652b178a7f6c4498";
+    let source = LockedPackageSource {
+        name: "csv-mode",
+        version: "1.27",
+        upstream_repository: savannah,
+        upstream_revision: revision,
+        repository: savannah,
+        revision,
+        fallback_repository: None,
+        build: SourceBuild::DefaultFiles,
+    };
+    let origins = SourceAcquisition::for_source(source)
+        .origins()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        origins,
+        vec![
+            SourceOrigin::Savannah(savannah),
+            SourceOrigin::Mirror(MirrorRepository::EmacsPackage("csv-mode")),
+        ]
+    );
+    assert_eq!(
+        origins[1].repository(),
+        "https://github.com/emacsmirror/csv-mode",
+        "the mirror URL is derived from the package name"
+    );
+    assert_eq!(origins[1].to_string(), "Mirror(EmacsPackage(csv-mode))");
+}
+
+/// The lock's recorded per-package emacsmirror fallbacks are the typed
+/// package-mirror origin, not an opaque URL; a recorded mirror of a different
+/// repository stays recorded.
+#[test]
+fn recorded_emacs_mirror_fallbacks_keep_their_typed_meaning() {
+    let auctex = LockedPackageSource {
+        name: "auctex",
+        version: "14.1.2",
+        upstream_repository: "https://git.savannah.gnu.org/git/auctex.git",
+        upstream_revision: "5850499d0182b4ca53c078e74711a13995651337",
+        repository: "https://git.savannah.gnu.org/git/auctex.git",
+        revision: "5850499d0182b4ca53c078e74711a13995651337",
+        fallback_repository: Some("https://github.com/emacsmirror/auctex"),
+        build: SourceBuild::AuctexRuntime,
+    };
+    assert_eq!(
+        SourceAcquisition::for_source(auctex)
+            .origins()
+            .collect::<Vec<_>>(),
+        vec![
+            SourceOrigin::Savannah("https://git.savannah.gnu.org/git/auctex.git"),
+            SourceOrigin::Mirror(MirrorRepository::EmacsPackage("auctex")),
+        ]
+    );
+
+    let emacsql_sqlite = LockedPackageSource {
+        name: "emacsql-sqlite",
+        version: "20240825.1837",
+        upstream_repository: "https://github.com/magit/emacsql",
+        upstream_revision: "b9f19ac5e17a90d5b7314d67e3b790992be7d82d",
+        repository: "https://github.com/magit/emacsql",
+        revision: "b9f19ac5e17a90d5b7314d67e3b790992be7d82d",
+        fallback_repository: Some("https://github.com/emacsmirror/emacsql"),
+        build: SourceBuild::Files("emacsql-sqlite.el"),
+    };
+    assert_eq!(
+        SourceAcquisition::for_source(emacsql_sqlite)
+            .origins()
+            .collect::<Vec<_>>(),
+        vec![
+            SourceOrigin::Recorded("https://github.com/magit/emacsql"),
+            SourceOrigin::Mirror(MirrorRepository::Recorded(
+                "https://github.com/emacsmirror/emacsql"
+            )),
+        ],
+        "a mirror of a different package repository is recorded, not derived"
+    );
+}
+
+/// A non-Savannah row without a recorded mirror has exactly one origin.
+#[test]
+fn non_savannah_source_without_a_fallback_has_one_origin() {
+    let source = LockedPackageSource {
+        name: "example-package",
+        version: "1.0",
+        upstream_repository: "https://github.com/example/example-package",
+        upstream_revision: "0123456789abcdef0123456789abcdef01234567",
+        repository: "https://github.com/example/example-package",
+        revision: "0123456789abcdef0123456789abcdef01234567",
+        fallback_repository: None,
+        build: SourceBuild::DefaultFiles,
+    };
+    assert_eq!(
+        SourceAcquisition::for_source(source)
+            .origins()
+            .collect::<Vec<_>>(),
+        vec![SourceOrigin::Recorded(
+            "https://github.com/example/example-package"
+        )]
+    );
+}
+
+/// Both origins are tried before preparation fails, and the failure names
+/// every origin with its error.  Deleting the fallback would leave one origin
+/// and fail this contract.
+#[test]
+fn source_unavailable_reports_every_origin_tried() {
+    let fixture =
+        TestSandbox::new("source-unavailable-contract").expect("create unavailable sandbox");
+    let missing_primary = format!(
+        "file://{}",
+        fixture.root().join("missing-primary").display()
+    );
+    let missing_mirror = fixture
+        .root()
+        .join("missing-mirror")
+        .to_string_lossy()
+        .into_owned();
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+    let source = LockedPackageSource {
+        name: "source-unavailable-contract",
+        version: "0.0.1",
+        upstream_repository: &missing_primary,
+        upstream_revision: revision,
+        repository: &missing_primary,
+        revision,
+        fallback_repository: Some(&missing_mirror),
+        build: SourceBuild::DefaultFiles,
+    };
+    let checkout = fixture.root().join("checkout");
+
+    let error = prepare_source_checkout(source, &checkout, Duration::from_secs(30))
+        .expect_err("neither origin provides the revision");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("SourceUnavailable { package: \"source-unavailable-contract\""),
+        "{rendered}"
+    );
+    assert!(rendered.contains("origins: [Recorded("), "{rendered}");
+    assert!(rendered.contains("Mirror(Recorded("), "{rendered}");
+    assert!(
+        rendered.contains("Recorded(") && rendered.contains(" failed:"),
+        "each origin's failure is reported: {rendered}"
+    );
+    assert!(
+        format!("{error:?}").contains("SourceUnavailable"),
+        "the typed failure is what a harness reports: {error:?}"
+    );
+    assert_eq!(
+        error.attempts.len(),
+        2,
+        "removing an origin must change this contract: {rendered}"
+    );
+}
+
+/// The exact git stderr from the CI red on main ea687401ee: Savannah answered
+/// HTTP 500 while the MELPA package jobs prepared their source checkouts, and
+/// the fetch had no tolerance for a transient upstream failure.
+const TRANSIENT_HTTP_500: &str = "fatal: unable to access 'https://git.savannah.gnu.org/git/emacs/elpa.git/': The requested URL returned error: 500";
+
+#[test]
+fn fetch_failure_classifier_separates_transient_upstream_failures() {
+    for transient in [
+        TRANSIENT_HTTP_500,
+        "fatal: unable to access 'https://example.invalid/repo/': Could not resolve host: example.invalid",
+        "fatal: unable to access 'https://example.invalid/repo/': Failed to connect to example.invalid port 443 after 30001 ms: Connection timed out",
+        "fatal: unable to access 'https://example.invalid/repo/': Failed to connect to example.invalid port 443 after 30001 ms: Couldn't connect to server",
+        "shallow Git fetch timed out after 30s: `git -C /tmp/checkout fetch --depth=1 --no-tags origin 0123456789abcdef0123456789abcdef01234567`",
+        "error: RPC failed; curl 56 GnuTLS recv error (-9): Error decoding the received TLS packet.",
+        "fatal: the remote end hung up unexpectedly",
+        "fatal: early EOF",
+        "fatal: unable to access 'https://example.invalid/repo/': The requested URL returned error: 503",
+        "fatal: unable to access 'https://example.invalid/repo/': The requested URL returned error: 429",
+    ] {
+        assert_eq!(
+            FetchFailureClass::classify(transient),
+            FetchFailureClass::Transient,
+            "expected a transient classification for: {transient}"
+        );
+    }
+}
+
+#[test]
+fn fetch_failure_classifier_keeps_request_errors_permanent() {
+    for permanent in [
+        "fatal: couldn't find remote ref 0123456789abcdef0123456789abcdef01234567",
+        "fatal: unable to access 'https://example.invalid/repo/': The requested URL returned error: 404",
+        "fatal: Authentication failed for 'https://github.com/example/repo/'",
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        "remote: Repository not found.\nfatal: repository 'https://github.com/example/missing/' not found",
+        "fatal: some unexpected git failure with no retryable marker",
+    ] {
+        assert_eq!(
+            FetchFailureClass::classify(permanent),
+            FetchFailureClass::Permanent,
+            "expected a permanent classification for: {permanent}"
+        );
+    }
+}
+
+#[test]
+fn fetch_retry_retries_transient_failures_before_succeeding() {
+    assert_eq!(
+        FETCH_RETRY_BACKOFF,
+        [
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+        ],
+        "the bounded retry policy is part of the contract"
+    );
+    let no_backoff = [Duration::ZERO; FETCH_MAX_ATTEMPTS - 1];
+    let mut attempts = 0;
+    let result = run_fetch_with_retry(&no_backoff, |_| {
+        attempts += 1;
+        if attempts < 3 {
+            Err(TRANSIENT_HTTP_500.to_string())
+        } else {
+            Ok("fetched".to_string())
+        }
+    });
+    assert_eq!(
+        result.expect("two transient failures followed by success"),
+        "fetched"
+    );
+    assert_eq!(attempts, 3, "the transient failure is retried");
+}
+
+#[test]
+fn fetch_retry_does_not_repeat_a_permanent_failure() {
+    let no_backoff = [Duration::ZERO; FETCH_MAX_ATTEMPTS - 1];
+    let mut attempts = 0;
+    let error = run_fetch_with_retry(&no_backoff, |_| {
+        attempts += 1;
+        Err("fatal: couldn't find remote ref 0123456789abcdef0123456789abcdef01234567".to_string())
+    })
+    .expect_err("a permanent request error must not be retried");
+    assert_eq!(attempts, 1, "a permanent failure is attempted exactly once");
+    assert!(error.contains("after 1 attempt"), "{error}");
+    assert!(error.contains("couldn't find remote ref"), "{error}");
+}
+
+#[test]
+fn fetch_retry_bounds_transient_attempts_and_keeps_every_attempt() {
+    let no_backoff = [Duration::ZERO; FETCH_MAX_ATTEMPTS - 1];
+    let mut attempts = 0;
+    let error = run_fetch_with_retry(&no_backoff, |index| {
+        attempts += 1;
+        Err(format!("attempt marker {index}: {TRANSIENT_HTTP_500}"))
+    })
+    .expect_err("the bounded attempt budget is exhausted");
+    assert_eq!(attempts, FETCH_MAX_ATTEMPTS);
+    assert!(error.contains("after 4 attempts"), "{error}");
+    for index in 0..FETCH_MAX_ATTEMPTS {
+        assert!(
+            error.contains(&format!("attempt marker {index}:")),
+            "the final report must keep attempt {index}: {error}"
+        );
+    }
 }
 
 #[cfg(unix)]

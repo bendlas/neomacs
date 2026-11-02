@@ -15,6 +15,9 @@ use neomacs_display_protocol::glyph_matrix::FrameDisplayState;
 use neomacs_display_runtime::backend::tty::rif::TtyRif;
 use neomacs_display_runtime::redisplay::RedisplayRuntime;
 pub use neomacs_display_runtime::redisplay::{FrameLayoutPurpose, PreparedFrameDisplay};
+use neomacs_display_runtime::tty_input::{
+    TerminalCellSize, TerminalColumns, TerminalRows, TerminalSizeQuery,
+};
 use neovm_core::emacs_core::eval::Context;
 use neovm_core::window::{FrameId, RenderFrameScope, RenderFrameVisibility};
 use std::sync::Arc;
@@ -32,12 +35,49 @@ thread_local! {
     /// its ~19 KB were part of every thread's static TLS block, so each new
     /// field grew TLS and moved the `%fs` offsets of every later thread-local
     /// (no-new-TLS-bytes rule; b184 measured +16 bytes from two new fields).
-    pub static REDISPLAY_RUNTIME: Box<RedisplayRuntime> =
+    static REDISPLAY_RUNTIME: Box<RedisplayRuntime> =
         Box::new(RedisplayRuntime::new_without_font_metrics());
 }
 
 // The thread-local slot holds only the handle, whatever `RedisplayRuntime` grows to.
 const _: () = assert!(std::mem::size_of::<Box<RedisplayRuntime>>() == std::mem::size_of::<usize>());
+
+/// Configure the direct GUI owner without exposing its native runtime slot.
+#[inline(always)]
+pub(super) fn configure_gui_runtime(font_sizing: super::FontSizing) {
+    REDISPLAY_RUNTIME.with(|runtime| {
+        runtime.enable_cosmic_metrics();
+        runtime.set_font_sizing(font_sizing);
+    });
+}
+
+/// Resolve native preview work inside the frontend effect owner.
+#[inline(always)]
+pub(super) fn resolved_scroll_preview(
+    evaluator: &Context,
+    frame: FrameId,
+    window: neovm_core::window::WindowId,
+    inputs: Vec<neomacs_display_protocol::input_progress::InputReceipt>,
+) -> Option<neomacs_display_protocol::scroll_coverage::ResolvedScrollIntent> {
+    REDISPLAY_RUNTIME
+        .with(|runtime| runtime.resolved_scroll_preview(evaluator, frame, window, inputs))
+}
+
+#[cfg(test)]
+pub(super) fn enable_cosmic_metrics_for_test() {
+    REDISPLAY_RUNTIME.with(|runtime| runtime.enable_cosmic_metrics());
+}
+
+#[cfg(test)]
+pub(super) fn disable_cosmic_metrics_for_test() {
+    REDISPLAY_RUNTIME.with(|runtime| runtime.disable_cosmic_metrics());
+}
+
+#[cfg(test)]
+pub(super) fn last_layout_stats_for_test() -> neomacs_layout_engine::incremental_layout::LayoutStats
+{
+    REDISPLAY_RUNTIME.with(|runtime| runtime.last_layout_stats())
+}
 
 // ── Layout helpers ────────────────────────────────────────────────────────
 
@@ -350,7 +390,7 @@ fn prepare_tty_tree_before_activation(
 /// as non-nil here too.  One variable read per redisplay.
 pub(crate) fn very_visible_cursor(evaluator: &Context) -> bool {
     evaluator
-        .variable_value_by_name("visible-cursor")
+        .variable_value(neovm_core::emacs_core::intern::WellKnown::VisibleCursor.id())
         .is_none_or(|value| value.is_truthy())
 }
 
@@ -442,10 +482,16 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
         return;
     }
 
-    let (cols, rows) = tty_init::query_terminal_size_cells().unwrap_or((80, 25));
+    // This callback and TtyRif own the same lifetime. Retain the terminal
+    // resource, while every redisplay still samples its current dimensions.
+    let terminal_size_query = TerminalSizeQuery::new();
+    let size =
+        tty_init::query_terminal_size_cells_with(&terminal_size_query).unwrap_or_else(|| {
+            TerminalCellSize::new(TerminalColumns::from(80_u32), TerminalRows::from(25_u32))
+        });
     let mut tty_rif = TtyRif::new_with_caps(
-        cols as usize,
-        rows as usize,
+        u32::from(size.columns()) as usize,
+        u32::from(size.rows()) as usize,
         super::tty_init::detect_term_caps(),
     );
     // TTY frames use 1x1 character cell metrics (GNU Emacs
@@ -466,9 +512,9 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
         {
             return;
         }
-        if let Some((cols, rows)) = tty_init::query_terminal_size_cells() {
-            let cols = cols as usize;
-            let rows = rows as usize;
+        if let Some(size) = tty_init::query_terminal_size_cells_with(&terminal_size_query) {
+            let cols = u32::from(size.columns()) as usize;
+            let rows = u32::from(size.rows()) as usize;
             if tty_rif.width() != cols || tty_rif.height() != rows {
                 tty_rif.resize(cols, rows);
             }
@@ -510,3 +556,8 @@ pub fn install_tty_redisplay_callback_with_popup_redraw(
 #[cfg(test)]
 #[path = "tests/tty_mode_line_flow_test.rs"]
 mod tty_mode_line_flow_test;
+
+// `REDISPLAY_RUNTIME` is CarrierIntrinsic and is not reset at a Green carrier
+// park: it holds layout caches and the font metrics service, never a Lisp
+// `Value`, and rebuilding the font service per park is a system-font scan
+// (measured ~52M instructions per Lisp thread on the many_threads rows).

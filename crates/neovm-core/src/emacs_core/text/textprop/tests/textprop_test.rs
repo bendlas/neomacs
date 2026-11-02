@@ -239,7 +239,7 @@ fn indirect_buffers_share_text_property_updates() {
 
     builtin_remove_text_properties(
         &mut eval,
-        vec![
+        &vec![
             Value::fixnum(1),
             Value::fixnum(6),
             Value::list(vec![Value::symbol("face"), Value::NIL]),
@@ -527,7 +527,7 @@ fn get_char_property_and_overlay_shape() {
         (pair_car, pair_cdr)
     };
     assert!(value.is_bare_symbol_named("bar"));
-    let overlayp = builtin_overlayp(&mut eval, vec![overlay]).unwrap();
+    let overlayp = builtin_overlayp(&mut eval, &vec![overlay]).unwrap();
     assert!(overlayp.is_t());
 }
 
@@ -614,11 +614,27 @@ fn get_char_property_prefers_highest_priority_overlay() {
 }
 
 #[test]
-fn get_char_property_same_range_overlays_use_gnu_identity_tiebreaker() {
+fn get_char_property_same_range_overlays_use_the_creation_serial_tiebreaker() {
     crate::test_utils::init_test_tracing();
     let mut eval = eval_with_text("abcd");
     let first = builtin_make_overlay(&mut eval, vec![Value::fixnum(1), Value::fixnum(5)]).unwrap();
     let second = builtin_make_overlay(&mut eval, vec![Value::fixnum(1), Value::fixnum(5)]).unwrap();
+
+    // GNU's final precedence tiebreaker (buffer.c:3277-3281) compares the raw
+    // overlay address, an order GNU documents as arbitrary: "The result can
+    // still change between invocations of Emacs, but it won't change in the
+    // middle of `find_field'".  Neo keeps the same comparison's *shape* but
+    // compares the world-owned creation order (`OverlaySerial`, minted before
+    // the allocation), so the arbitrary order is deterministic on every
+    // platform instead of an allocator accident.  Assert that contract here:
+    // the later-created overlay wins, in the exact returned order, across
+    // repeated calls and across a collection.
+    let first_serial = first.as_overlay_data().expect("live overlay").serial;
+    let second_serial = second.as_overlay_data().expect("live overlay").serial;
+    assert!(
+        first_serial < second_serial,
+        "allocation must mint creation-ordered serials"
+    );
 
     builtin_overlay_put(
         &mut eval,
@@ -652,24 +668,46 @@ fn get_char_property_same_range_overlays_use_gnu_identity_tiebreaker() {
     );
     let raw = builtin_overlays_at(&mut eval, vec![Value::fixnum(2)]).unwrap();
     assert_eq!(list_to_vec(&raw).unwrap(), vec![second, first]);
+    // Sorted output is descending precedence (GNU sorts ascending and
+    // reverses, buffer.c:3917), so the later creation -- the greater serial --
+    // is first and is the winner.  The order is exact, not just stable.
     let sorted = builtin_overlays_at(&mut eval, vec![Value::fixnum(2), Value::T]).unwrap();
-    // GNU buffer.c:3281 uses raw tagged object identity, whose order is
-    // allocator-dependent rather than creation-dependent.
-    let winner = if first.bits() > second.bits() {
-        first
-    } else {
-        second
-    };
-    let loser = if winner == first { second } else { first };
-    assert_eq!(list_to_vec(&sorted).unwrap(), vec![winner, loser]);
+    let sorted_ids = list_to_vec(&sorted).unwrap();
+    assert_eq!(sorted_ids, vec![second, first]);
+    assert_eq!(
+        sorted_ids[0].as_overlay_data().unwrap().serial,
+        second_serial
+    );
+    assert_eq!(
+        sorted_ids[1].as_overlay_data().unwrap().serial,
+        first_serial
+    );
+    let repeated = builtin_overlays_at(&mut eval, vec![Value::fixnum(2), Value::T]).unwrap();
+    assert_eq!(list_to_vec(&repeated).unwrap(), sorted_ids);
 
     let result =
         builtin_get_char_property(&mut eval, vec![Value::fixnum(2), Value::symbol("face")])
             .unwrap();
+    assert_eq!(result.as_bare_symbol_name(), Some("second"));
+
+    // A full collection must not change either the serials (they live in the
+    // overlay objects, not in their addresses) or the order they induce.
+    eval.gc_collect_exact();
+    let after_gc = builtin_overlays_at(&mut eval, vec![Value::fixnum(2), Value::T]).unwrap();
+    let after_gc_ids = list_to_vec(&after_gc).unwrap();
+    assert_eq!(after_gc_ids, vec![second, first]);
     assert_eq!(
-        result.as_bare_symbol_name(),
-        Some(if winner == first { "first" } else { "second" })
+        after_gc_ids[0].as_overlay_data().unwrap().serial,
+        second_serial
     );
+    assert_eq!(
+        after_gc_ids[1].as_overlay_data().unwrap().serial,
+        first_serial
+    );
+    let after_gc_prop =
+        builtin_get_char_property(&mut eval, vec![Value::fixnum(2), Value::symbol("face")])
+            .unwrap();
+    assert_eq!(after_gc_prop.as_bare_symbol_name(), Some("second"));
 }
 
 #[test]
@@ -1192,7 +1230,7 @@ fn remove_text_properties_basic() {
     .unwrap();
 
     let props = Value::list(vec![Value::symbol("face"), Value::NIL]);
-    builtin_remove_text_properties(&mut eval, vec![Value::fixnum(1), Value::fixnum(6), props])
+    builtin_remove_text_properties(&mut eval, &vec![Value::fixnum(1), Value::fixnum(6), props])
         .unwrap();
 
     let result =
@@ -1752,7 +1790,7 @@ fn text_property_any_found() {
 
     let result = builtin_text_property_any(
         &mut eval,
-        vec![
+        &vec![
             Value::fixnum(1),
             Value::fixnum(10),
             Value::symbol("face"),
@@ -1770,7 +1808,7 @@ fn text_property_any_not_found() {
     let mut eval = eval_with_text("hello");
     let result = builtin_text_property_any(
         &mut eval,
-        vec![
+        &vec![
             Value::fixnum(1),
             Value::fixnum(6),
             Value::symbol("face"),
@@ -1951,7 +1989,7 @@ fn deleted_overlay_preserves_plist_and_identity() {
     .unwrap();
     builtin_delete_overlay(&mut eval, vec![ov]).unwrap();
 
-    let overlayp = builtin_overlayp(&mut eval, vec![ov]).unwrap();
+    let overlayp = builtin_overlayp(&mut eval, &vec![ov]).unwrap();
     assert!(overlayp.is_t());
 
     let face = builtin_overlay_get(&mut eval, vec![ov, Value::symbol("face")]).unwrap();
@@ -2008,7 +2046,7 @@ fn overlayp_true() {
     let mut eval = eval_with_text("hello");
     let ov = builtin_make_overlay(&mut eval, vec![Value::fixnum(1), Value::fixnum(6)]).unwrap();
 
-    let result = builtin_overlayp(&mut eval, vec![ov]).unwrap();
+    let result = builtin_overlayp(&mut eval, &vec![ov]).unwrap();
     assert!(result.is_t());
 }
 
@@ -2016,7 +2054,7 @@ fn overlayp_true() {
 fn overlayp_false() {
     crate::test_utils::init_test_tracing();
     let mut eval = Context::new();
-    let result = builtin_overlayp(&mut eval, vec![Value::fixnum(42)]).unwrap();
+    let result = builtin_overlayp(&mut eval, &vec![Value::fixnum(42)]).unwrap();
     assert!(result.is_nil());
 }
 
@@ -2614,7 +2652,7 @@ fn text_property_any_rejects_too_many_args() {
     let mut eval = eval_with_text("hello");
     let result = builtin_text_property_any(
         &mut eval,
-        vec![
+        &vec![
             Value::fixnum(1),
             Value::fixnum(2),
             Value::symbol("face"),
@@ -2915,7 +2953,7 @@ fn get_pos_property_resolves_window_object_to_buffer() {
     let results = eval
         .eval_str_each("(get-pos-property 2 'face (selected-window))")
         .into_iter()
-        .map(|r| crate::emacs_core::error::format_eval_result(&r))
+        .map(|r| crate::emacs_core::format_eval_result(&r))
         .collect::<Vec<_>>();
     assert_eq!(results, vec!["OK bold".to_string()]);
 }
@@ -2935,7 +2973,7 @@ fn next_single_char_property_change_resolves_window_object_to_buffer() {
     let results = eval
         .eval_str_each("(next-single-char-property-change 1 'face (selected-window))")
         .into_iter()
-        .map(|r| crate::emacs_core::error::format_eval_result(&r))
+        .map(|r| crate::emacs_core::format_eval_result(&r))
         .collect::<Vec<_>>();
     assert_eq!(results, vec!["OK 6".to_string()]);
 }
@@ -2953,7 +2991,7 @@ fn previous_single_char_property_change_resolves_window_object_to_buffer() {
     let results = eval
         .eval_str_each("(previous-single-char-property-change 11 'face (selected-window))")
         .into_iter()
-        .map(|r| crate::emacs_core::error::format_eval_result(&r))
+        .map(|r| crate::emacs_core::format_eval_result(&r))
         .collect::<Vec<_>>();
     assert_eq!(results, vec!["OK 6".to_string()]);
 }
@@ -2997,7 +3035,7 @@ fn previous_property_change_out_of_range_signal_uses_gnu_point_range_payload() {
                (previous-property-change 500 "abc")"#,
         )
         .into_iter()
-        .map(|r| crate::emacs_core::error::format_eval_result(&r))
+        .map(|r| crate::emacs_core::format_eval_result(&r))
         .collect::<Vec<_>>();
     assert_eq!(
         results,
@@ -3041,7 +3079,7 @@ fn get_pos_property_validates_position_through_its_stickiness_reads() {
                (get-pos-property 6 'face)"#,
         )
         .into_iter()
-        .map(|r| crate::emacs_core::error::format_eval_result(&r))
+        .map(|r| crate::emacs_core::format_eval_result(&r))
         .collect::<Vec<_>>();
     assert_eq!(
         results,
@@ -3085,7 +3123,7 @@ fn get_pos_property_validates_against_the_accessible_portion() {
                (get-pos-property 9 'face)"#,
         )
         .into_iter()
-        .map(|r| crate::emacs_core::error::format_eval_result(&r))
+        .map(|r| crate::emacs_core::format_eval_result(&r))
         .collect::<Vec<_>>();
     assert_eq!(
         results,

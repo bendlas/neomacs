@@ -15,6 +15,7 @@ members = [
     "crates/neomacs-perf",
     "crates/neomacs-renderer-wgpu",
     "crates/neomacs-test-fonts",
+    "crates/neomacs-test-env",
     "crates/neomacs-test-oracle",
     "crates/neomacs-infra",
     "crates/neomacs-tui-tests",
@@ -104,6 +105,7 @@ neomacs-webview = { path = "crates/neomacs-webview", default-features = false }
 neomacs-renderer-wgpu = { path = "crates/neomacs-renderer-wgpu", default-features = false }
 neomacs-diagnostics = { path = "crates/neomacs-diagnostics", default-features = false }
 neomacs-perf = { path = "crates/neomacs-perf", default-features = false }
+neomacs-test-env = { path = "crates/neomacs-test-env" }
 neomacs-test-oracle = { path = "crates/neomacs-test-oracle" }
 neomacs-infra = { path = "crates/neomacs-infra" }
 neomacs-melpa-test-support = { path = "crates/neomacs-melpa-test-support" }
@@ -346,6 +348,7 @@ gstreamer-allocators = "0.25"
 gstreamer-pbutils = "0.25"
 objc2-av-foundation = "0.3.2"
 objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
 objc2-core-text = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
@@ -454,12 +457,18 @@ opt-level = 2
 [profile.release-pgo]
 inherits = "release"
 
-# PGO build that keeps its symbols, for profiling the configuration actually
-# shipped: PGO changes inlining and block layout, so hotspots measured on a
-# plain release build do not necessarily hold for release-pgo.
+# PGO build in its own target directory, for profiling the configuration
+# actually shipped: PGO changes inlining and block layout, so hotspots measured
+# on a plain release build do not necessarily hold for release-pgo. Symbols
+# come from strip = "none". Debug info stays off because rustc's codegen depends
+# on it: on one commit, debug = true changed 15 of the 195 protected functions
+# against release, and line-tables-only changed Vm::run_loop. For source-line or
+# inline attribution, build a separate arm with
+# CARGO_PROFILE_RELEASE_PGO_PROFILING_DEBUG=line-tables-only and never gate
+# with it.
 [profile.release-pgo-profiling]
 inherits = "release-pgo"
-debug = true
+debug = false
 strip = "none"
 
 # Internal instrumented stage of native Linux x86_64 release PGO. xtask uses
@@ -478,9 +487,19 @@ strip = "none"
 [profile.release-pgo-gen]
 inherits = "release"
 
+# Measurement profile for benchmark and census arms. Its codegen matches
+# release exactly. The census on one commit found 0 of 195 protected functions
+# different with debug off. Full debug info changed 15 of them (Vm::run_loop
+# 18166 vs 18176 instructions) and line-tables-only changed run_loop alone, so
+# measurements on those builds do not describe the shipped code. Debug info
+# also dominated the fat link: peak RSS 22-24 GiB with full DWARF, 9.7 GiB with
+# line tables, 5.0 GiB without. Symbols come from strip = "none". For
+# source-line or DWARF-inline attribution, build a separate arm with
+# CARGO_PROFILE_PROFILING_DEBUG=line-tables-only (or true) and never use it as
+# an A/B gate arm.
 [profile.profiling]
 inherits = "release"
-debug = true
+debug = false
 strip = "none"
 
 [patch.crates-io]
@@ -489,6 +508,10 @@ strip = "none"
 # revision here and document the branch beside each dependency.
 # Fork branch: patch (includes Wayland/X11 fixes, continuous XI2 units, and Windows precision touchpad panning).
 winit = { git = "https://github.com/eval-exec/winit", rev = "2290f91c602f8efdf102972457a25e8b6e36f90c" }
+# Fork branch: patch (based on the 0.12.0 release, 1bddc226).
+# hide() pins the decoration buffer scale to 1 before detaching, so Weston does
+# not reject the coalesced state with wl_surface invalid_size at scale 2 (decorated fullscreen).
+sctk-adwaita = { git = "https://github.com/eval-exec/sctk-adwaita", rev = "2cf76b09b5c2044305baa493d9929fe8d5a8856c" }
 # Fork branch: neomacs-present-timing.
 # Native presentation IDs/timestamps; see the Vulkan timing seam in this fork.
 wgpu-hal = { git = "https://github.com/eval-exec/wgpu", rev = "9717f9fe277beec2c98df550662a626f8fc0248c" }

@@ -40,7 +40,7 @@ use super::undo;
 use super::visited_file_modtime::BaseVisitedFileModtime;
 use super::visited_file_modtime::{FirstChangeModtime, VisitedFileModtime, VisitedFileModtimeSlot};
 use crate::emacs_core::eval::world::WorldLease;
-use crate::emacs_core::intern::{SymId, intern};
+use crate::emacs_core::intern::{SymId, WellKnown, intern};
 use crate::emacs_core::symbol::SetInternalAlist;
 use crate::emacs_core::value::{RuntimeBindingValue, Value, ValueKind, eq_value};
 use crate::gc_trace::GcTrace;
@@ -86,52 +86,10 @@ pub(crate) fn local_var_alist_entry_probes() -> u64 {
     LOCAL_VAR_ALIST_ENTRY_PROBES.get()
 }
 
-// ---------------------------------------------------------------------------
-// BUFFER_SLOT_COUNT — sized to mirror GNU's `MAX_PER_BUFFER_VARS = 50`.
-// ---------------------------------------------------------------------------
-
-/// Number of `BUFFER_OBJFWD` slots in [`Buffer::slots`]. Mirrors GNU's
-/// `MAX_PER_BUFFER_VARS = 50` limit on per-buffer C-side variables
-/// (`buffer.h:311`). Bumped to 64 in Phase 10D so the conditional
-/// `BUFFER_OBJFWD` slots (mode-line-format, fill-column, …) have room
-/// alongside the always-local set already migrated in Phase 10A-C.
-/// Sized to a power of two so [`Buffer::local_flags`] (a `u64`
-/// bitmap) covers exactly one bit per slot. Bump again only after a
-/// careful audit — the number bounds every Buffer's memory footprint.
-pub const BUFFER_SLOT_COUNT: usize = 64;
-
-/// Index into [`Buffer::slots`].  This is a compact Rust representation of
-/// GNU's per-buffer slot domain: GNU stores byte offsets into `struct buffer`,
-/// while Neomacs stores dense slot indices into a fixed `[Value; 64]`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BufferSlot(u8);
-
-impl BufferSlot {
-    pub const fn new(index: usize) -> Self {
-        assert!(index < BUFFER_SLOT_COUNT);
-        Self(index as u8)
-    }
-
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-
-    pub const fn as_u16(self) -> u16 {
-        self.0 as u16
-    }
-
-    pub const fn local_flags_idx(self) -> i16 {
-        self.0 as i16
-    }
-
-    pub fn from_u16(index: u16) -> Option<Self> {
-        if usize::from(index) < BUFFER_SLOT_COUNT {
-            Some(Self(index as u8))
-        } else {
-            None
-        }
-    }
-}
+pub use crate::emacs_core::value::buffer_vocab::{
+    BUFFER_SLOT_COUNT, BufferId, BufferLocalView, BufferSlot, BufferSlotMeta, BufferSlotPredicate,
+    BufferSlotPredicateError,
+};
 
 // ---------------------------------------------------------------------------
 // Phase 8b slot offset constants for the four hardcoded Buffer fields
@@ -386,96 +344,6 @@ impl SlotDefault {
                 }
                 Value::unibyte_string(s)
             }
-        }
-    }
-}
-
-/// The closed predicate domain accepted by GNU's `DEFVAR_PER_BUFFER`.
-///
-/// GNU stores this as `enum Lisp_Fwd_Predicate`; keeping the same domain as a
-/// Rust enum prevents misspelled predicate names and makes new upstream
-/// variants an explicit exhaustiveness failure instead of a silent no-op.
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BufferSlotPredicate {
-    Unrestricted,
-    String,
-    Symbol,
-    Integer,
-    Number,
-    Fraction,
-    VerticalScrollBar,
-    OverwriteMode,
-}
-
-/// A predicate failure independent of the evaluator's non-local-control-flow
-/// representation.  The evaluator maps this typed result to GNU-compatible
-/// Lisp signal data at the storage boundary.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BufferSlotPredicateError {
-    WrongType(&'static str),
-    Choice(&'static str),
-    Range(&'static str),
-}
-
-impl BufferSlotPredicate {
-    /// Check a value before it is stored in a live buffer slot.
-    ///
-    /// GNU's `store_symval_forwarding` bypasses every predicate for nil, even
-    /// predicates such as `stringp` and `integerp` that would reject nil when
-    /// called as ordinary Lisp functions.
-    pub fn check(self, value: Value) -> Result<(), BufferSlotPredicateError> {
-        use BufferSlotPredicateError::{Choice, Range, WrongType};
-
-        if value.is_nil() || self == Self::Unrestricted {
-            return Ok(());
-        }
-
-        match self {
-            Self::Unrestricted => Ok(()),
-            Self::String if value.is_string() => Ok(()),
-            Self::String => Err(WrongType("stringp")),
-            Self::Symbol if value.is_bare_symbol() => Ok(()),
-            Self::Symbol => Err(WrongType("symbolp")),
-            Self::Integer if value.is_integer() => Ok(()),
-            Self::Integer => Err(WrongType("integerp")),
-            Self::Number if value.is_number() => Ok(()),
-            Self::Number => Err(WrongType("numberp")),
-            Self::Fraction if !value.is_number() => Err(WrongType("numberp")),
-            Self::Fraction => {
-                let in_range = match value.kind() {
-                    ValueKind::Fixnum(number) => (0..=1).contains(&number),
-                    ValueKind::Float => (0.0..=1.0).contains(&value.xfloat()),
-                    ValueKind::Veclike(crate::tagged::header::VecLikeType::Bignum) => value
-                        .as_bignum()
-                        .is_some_and(|number| (&0..=&1).contains(&number)),
-                    _ => unreachable!("numberp was checked above"),
-                };
-                if in_range {
-                    Ok(())
-                } else {
-                    Err(Range("Value should be from 0.0 to 1.0"))
-                }
-            }
-            Self::VerticalScrollBar
-                if value.is_t()
-                    || value.is_bare_symbol_named("left")
-                    || value.is_bare_symbol_named("right") =>
-            {
-                Ok(())
-            }
-            Self::VerticalScrollBar => {
-                Err(Choice("One of nil, t, left or right should be specified"))
-            }
-            Self::OverwriteMode
-                if value.is_bare_symbol_named("overwrite-mode-textual")
-                    || value.is_bare_symbol_named("overwrite-mode-binary") =>
-            {
-                Ok(())
-            }
-            Self::OverwriteMode => Err(Choice(
-                "One of nil, overwrite-mode-textual or overwrite-mode-binary should be specified",
-            )),
         }
     }
 }
@@ -1282,6 +1150,7 @@ fn buffer_slot_sym_map() -> &'static [Option<&'static BufferSlotInfo>] {
     BUFFER_SLOT_SYM_MAP
         .get_or_init(|| {
             let mut entries: Vec<Option<&'static BufferSlotInfo>> = Vec::new();
+            let mut metas: Vec<Option<BufferSlotMeta>> = Vec::new();
             for info in BUFFER_SLOT_INFO {
                 if !info.install_as_forwarder {
                     continue;
@@ -1290,12 +1159,27 @@ fn buffer_slot_sym_map() -> &'static [Option<&'static BufferSlotInfo>] {
                 let index = sym_id.0 as usize;
                 if entries.len() <= index {
                     entries.resize(index + 1, None);
+                    metas.resize(index + 1, None);
                 }
                 entries[index] = Some(info);
+                metas[index] = Some(BufferSlotMeta {
+                    offset: info.offset,
+                    local_flags_idx: info.local_flags_idx,
+                });
             }
+            crate::emacs_core::value::buffer_vocab::install_slot_meta_table(
+                metas.into_boxed_slice(),
+            );
             entries.into_boxed_slice()
         })
         .as_ref()
+}
+
+/// Force the buffer slot schema and its value-layer `BufferSlotMeta` registry to be
+/// built. Called during evaluator construction, before any value-layer slot
+/// reader can run.
+pub(crate) fn force_slot_schema_install() {
+    let _ = buffer_slot_sym_map();
 }
 
 pub fn lookup_buffer_slot_by_sym_id(sym_id: SymId) -> Option<&'static BufferSlotInfo> {
@@ -1926,9 +1810,116 @@ pub(crate) fn preserve_partial_permanent_local_hook_value(
 // BufferId
 // ---------------------------------------------------------------------------
 
-/// Opaque, cheaply-copyable identifier for a buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BufferId(pub u64);
+/// A non-owning reference to a live heap marker, identified by the
+/// `MarkerObj` pointer itself (GNU's marker identity is the Lisp object).
+///
+/// **Liveness contract.** A `MarkerRef` does not keep its marker alive. The
+/// container that stores it owns that duty:
+///
+/// * [`Buffer::mark_marker`] and [`BufferStateMarkers`] are GC roots —
+///   `BufferManager`'s `GcTrace` synthesizes a `Value` for each and seeds the
+///   root set (mirrors GNU `mark_buffer` marking `BVAR (buf, mark)` /
+///   `pt_marker` / `begv_marker` / `zv_marker`);
+/// * `SavedRestrictionState` / labeled restrictions are rooted the same way by
+///   `trace_marker_roots`;
+/// * window position markers retain their Lisp `Value` handle.
+///
+/// The referent never moves: markers are `ObjectArena<MarkerObj>` slots
+/// (fixed 64 KiB pages, never relocated) or pdump-mapped objects, and neither
+/// GC generation compacts. Clearing the owning field (buffer kill, `set-mark`
+/// replacement, restriction pop) drops the root; the chain's
+/// `unchain_dead_markers` then splices the unmarked marker and the sweep frees
+/// its slot. Reading a `MarkerRef` after its owner no longer roots it is a
+/// use-after-free, so owners must clear on the same operations that drop the
+/// marker's last root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(transparent)]
+pub struct MarkerRef(Option<NonNull<crate::tagged::header::MarkerObj>>);
+
+impl MarkerRef {
+    pub const NONE: Self = Self(None);
+
+    #[inline]
+    pub fn new(ptr: *mut crate::tagged::header::MarkerObj) -> Self {
+        Self(NonNull::new(ptr))
+    }
+
+    #[inline]
+    pub fn from_value(value: &Value) -> Option<Self> {
+        if !value.is_marker() {
+            return None;
+        }
+        value
+            .as_veclike_ptr()
+            .map(|ptr| Self::new(ptr as *mut crate::tagged::header::MarkerObj))
+    }
+
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.0.is_none()
+    }
+
+    #[inline]
+    pub const fn as_ptr(self) -> *mut crate::tagged::header::MarkerObj {
+        match self.0 {
+            Some(ptr) => ptr.as_ptr(),
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    #[inline]
+    pub fn as_value(self) -> Option<Value> {
+        self.0.map(|ptr| {
+            // SAFETY: the owner of this reference keeps the marker allocated
+            // (see the liveness contract above); `from_veclike_ptr` is a pure
+            // bit-cast to the tagged encoding.
+            unsafe {
+                Value::from_veclike_ptr(ptr.as_ptr() as *const crate::tagged::header::VecLikeHeader)
+            }
+        })
+    }
+
+    /// The marker's `(charpos, bytepos)` pair, or `None` for `NONE`.
+    #[inline]
+    pub fn anchor(self) -> Option<TextPositionAnchor> {
+        let ptr = self.0?;
+        // SAFETY: the reference's owner guarantees the marker is allocated;
+        // only its payload fields are read.
+        Some(unsafe { marker_data_anchor(&(*ptr.as_ptr()).data) })
+    }
+
+    #[inline]
+    pub fn insertion_type(self) -> InsertionType {
+        match self.0 {
+            // SAFETY: see `anchor`.
+            Some(ptr) => {
+                if unsafe { (*ptr.as_ptr()).data.insertion_type() } {
+                    InsertionType::After
+                } else {
+                    InsertionType::Before
+                }
+            }
+            None => InsertionType::Before,
+        }
+    }
+
+    #[inline]
+    pub fn buffer_id(self) -> Option<BufferId> {
+        let ptr = self.0?;
+        // SAFETY: see `anchor`.
+        unsafe { (*ptr.as_ptr()).data.buffer_id() }
+    }
+
+    /// Whether the marker is still spliced into a chain.
+    #[inline]
+    pub fn is_chained(self) -> bool {
+        match self.0 {
+            // SAFETY: see `anchor`.
+            Some(ptr) => unsafe { (*ptr.as_ptr()).data.chained() },
+            None => false,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // InsertionType
@@ -1948,42 +1939,29 @@ pub enum InsertionType {
 // BufferStateMarkers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferStateMarkers {
-    pub pt_marker: u64,
-    pub begv_marker: u64,
-    pub zv_marker: u64,
-    /// Non-Lisp-visible MarkerObj pointers for the three state markers.
+    /// Non-Lisp-visible marker references for the three state markers.
     /// Allocated once per buffer in `ensure_buffer_state_markers` and
     /// reused on every `record_buffer_state_markers` re-registration
     /// (via `chain_unlink` + `register_marker`) so the intrusive chain
     /// precondition is upheld.
     ///
-    /// These MarkerObjs stay alive because
+    /// These markers stay alive because
     /// `BufferManager::<GcTrace>::trace_roots` synthesises a tagged
-    /// `Value` for each of the three pointers and seeds them into the
-    /// GC's root set. Mirrors GNU `mark_buffer` marking the per-buffer
-    /// `pt_marker` / `begv_marker` / `zv_marker` BVAR `Lisp_Object`
-    /// slots in `alloc.c`.
+    /// `Value` for each reference and seeds them into the GC's root set.
+    /// Mirrors GNU `mark_buffer` marking the per-buffer `pt_marker` /
+    /// `begv_marker` / `zv_marker` BVAR `Lisp_Object` slots in `alloc.c`.
     ///
     /// The intrusive marker chain by itself is NOT a GC root:
     /// `unchain_dead_markers` splices out any MarkerObj whose mark bit
     /// is clear between `mark_all` and `sweep_objects`. Without the
     /// explicit root above, an unmarked state marker would be unlinked
-    /// and freed, leaving `BufferStateMarkers` with a dangling pointer.
-    pub pt_marker_ptr: *mut crate::tagged::header::MarkerObj,
-    pub begv_marker_ptr: *mut crate::tagged::header::MarkerObj,
-    pub zv_marker_ptr: *mut crate::tagged::header::MarkerObj,
+    /// and freed, leaving these references dangling.
+    pub pt_marker: MarkerRef,
+    pub begv_marker: MarkerRef,
+    pub zv_marker: MarkerRef,
 }
-
-impl PartialEq for BufferStateMarkers {
-    fn eq(&self, other: &Self) -> bool {
-        self.pt_marker == other.pt_marker
-            && self.begv_marker == other.begv_marker
-            && self.zv_marker == other.zv_marker
-    }
-}
-impl Eq for BufferStateMarkers {}
 
 /// Whether a line count may build the text line index when none exists.
 ///
@@ -2078,6 +2056,38 @@ impl BufferTextSnapshot {
         self.text.text_props_next_change_after_emacs_byte_pos(pos)
     }
 
+    pub fn text_props_has_property_anywhere(&self, name: Value) -> bool {
+        self.text.text_props_has_property_anywhere(name)
+    }
+
+    pub fn syntax_prop_free_run_end_at_char_pos(&self, pos: CharPos0, cap: CharPos0) -> CharPos0 {
+        self.text.syntax_prop_free_run_end_at_char_pos(pos, cap)
+    }
+
+    /// See [`buffer_text::BufferText::previous_syntax_prop_state_run_start_at_char_pos`].
+    pub fn previous_syntax_prop_state_run_start_at_char_pos(&self, pos: CharPos0) -> CharPos0 {
+        self.text
+            .previous_syntax_prop_state_run_start_at_char_pos(pos)
+    }
+
+    pub fn next_watched_property_state_change_after_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos> {
+        self.text
+            .next_watched_property_state_change_after_emacs_byte_pos(pos, keys)
+    }
+
+    pub fn previous_watched_property_state_change_before_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos> {
+        self.text
+            .previous_watched_property_state_change_before_emacs_byte_pos(pos, keys)
+    }
+
     pub fn next_single_text_prop_change_after_emacs_byte_pos(
         &self,
         pos: EmacsBytePos,
@@ -2157,14 +2167,17 @@ pub enum LabeledRestrictionLabel {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabeledRestriction {
     pub label: LabeledRestrictionLabel,
-    pub beg_marker: u64,
-    pub end_marker: u64,
+    pub beg_marker: MarkerRef,
+    pub end_marker: MarkerRef,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SavedRestrictionKind {
     None,
-    Markers { beg_marker: u64, end_marker: u64 },
+    Markers {
+        beg_marker: MarkerRef,
+        end_marker: MarkerRef,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2237,34 +2250,37 @@ impl SavedRestrictionState {
     }
 
     /// Root the restriction markers themselves. They are referenced only by
-    /// u64 ids here, and an unmarked marker is spliced out of its buffer's
-    /// chain and freed by `unchain_dead_markers` — after which the saved
-    /// bounds silently resolve to the full buffer. GNU keeps these markers
-    /// alive through the specpdl's Lisp save_restriction data (editfns.c);
-    /// this is the precise-GC equivalent. Called at seed time, before the
-    /// mark phase, so every marker is still findable in its chain.
+    /// `MarkerRef`s here, and an unmarked marker is spliced out of its
+    /// buffer's chain and freed by `unchain_dead_markers` — after which the
+    /// saved bounds silently resolve to the full buffer. GNU keeps these
+    /// markers alive through the specpdl's Lisp save_restriction data
+    /// (editfns.c); this is the precise-GC equivalent. Called at seed time,
+    /// before the mark phase, so every marker is still findable in its chain.
     pub fn trace_marker_roots(&self, buffers: &BufferManager, roots: &mut Vec<Value>) {
-        let Some(buffer) = buffers.get(self.buffer_id) else {
+        // Only a live buffer keeps its chain (and therefore these markers)
+        // allocated; a stale restriction entry must not synthesize Values
+        // for freed MarkerObj slots.
+        if buffers.get(self.buffer_id).is_none() {
             return;
-        };
+        }
         if let SavedRestrictionKind::Markers {
             beg_marker,
             end_marker,
         } = self.restriction
         {
-            if let Some(value) = buffer.marker_value_by_id(beg_marker) {
+            if let Some(value) = beg_marker.as_value() {
                 roots.push(value);
             }
-            if let Some(value) = buffer.marker_value_by_id(end_marker) {
+            if let Some(value) = end_marker.as_value() {
                 roots.push(value);
             }
         }
         if let Some(restrictions) = self.labeled_restrictions.as_slice() {
             for restriction in restrictions {
-                if let Some(value) = buffer.marker_value_by_id(restriction.beg_marker) {
+                if let Some(value) = restriction.beg_marker.as_value() {
                     roots.push(value);
                 }
-                if let Some(value) = buffer.marker_value_by_id(restriction.end_marker) {
+                if let Some(value) = restriction.end_marker.as_value() {
                     roots.push(value);
                 }
             }
@@ -2289,8 +2305,7 @@ pub(crate) struct BufferDumpParts {
     pub base_buffer: Option<BufferId>,
     pub text: BufferText,
     pub point: TextPositionAnchor,
-    pub mark_marker_id: Option<u64>,
-    pub mark_marker_ptr: *mut crate::tagged::header::MarkerObj,
+    pub mark_marker: MarkerRef,
     pub accessible_start: TextPositionAnchor,
     pub accessible_end: TextPositionAnchor,
     pub autosave_modified_tick: i64,
@@ -2343,11 +2358,9 @@ pub struct Buffer {
     /// GNU `BVAR(buf, mark)` — a real Lisp_Marker.  This IS the mark;
     /// there are no separate mark position fields (matching GNU's design).
     /// The marker tracks its own position through the chain; read it via
-    /// `mark_byte()` / `mark_char()` / `mark()`.
-    pub(crate) mark_marker_id: Option<u64>,
-    /// Cached raw pointer to the mark MarkerObj, for fast position reads
-    /// and GC root tracing (mirrors BufferStateMarkers pointers).
-    pub(crate) mark_marker_ptr: *mut crate::tagged::header::MarkerObj,
+    /// `mark_byte()` / `mark_char()` / `mark()`. The reference is a GC root:
+    /// `BufferManager`'s trace synthesizes its `Value`.
+    pub(crate) mark_marker: MarkerRef,
     /// Beginning of accessible (narrowed) portion, inclusive.
     pub(crate) accessible_start: TextPositionAnchor,
     /// End of accessible (narrowed) portion, exclusive.
@@ -2421,6 +2434,10 @@ pub struct Buffer {
     /// Not part of the buffer's identity: it is derived state, so clones and
     /// dumps may leave it empty and it recomputes on demand.
     pub(crate) overlay_digest_cache: std::cell::Cell<Option<(i64, u64)>>,
+    /// Derived native wrap rules with mutator-local collection dependencies.
+    /// No Lisp objects are retained; dumps start with an empty cache.
+    pub(crate) word_wrap_policy_cache:
+        std::cell::RefCell<Option<std::rc::Rc<crate::window::CachedWordWrapPolicy>>>,
     /// Memo for [`Self::automatic_composition_spans`], keyed on everything
     /// the scan reads. Derived state: clones and dumps may leave it empty and
     /// it recomputes on demand.
@@ -2515,8 +2532,7 @@ impl Buffer {
         mem::swap(&mut self.point, &mut other.point);
         mem::swap(&mut self.accessible_start, &mut other.accessible_start);
         mem::swap(&mut self.accessible_end, &mut other.accessible_end);
-        mem::swap(&mut self.mark_marker_id, &mut other.mark_marker_id);
-        mem::swap(&mut self.mark_marker_ptr, &mut other.mark_marker_ptr);
+        mem::swap(&mut self.mark_marker, &mut other.mark_marker);
         mem::swap(&mut self.state_markers, &mut other.state_markers);
         mem::swap(&mut self.undo_state, &mut other.undo_state);
         mem::swap(&mut self.overlays, &mut other.overlays);
@@ -2624,8 +2640,7 @@ impl Buffer {
             base_buffer: None,
             text: BufferText::new_with_backend_kind(text_backend_kind),
             point: TextPositionAnchor::new(CharPos0::ZERO, EmacsBytePos::ZERO),
-            mark_marker_id: None,
-            mark_marker_ptr: std::ptr::null_mut(),
+            mark_marker: MarkerRef::NONE,
             accessible_start: TextPositionAnchor::new(CharPos0::ZERO, EmacsBytePos::ZERO),
             accessible_end: TextPositionAnchor::new(CharPos0::ZERO, EmacsBytePos::ZERO),
             autosave_modified_tick: 1,
@@ -2658,6 +2673,7 @@ impl Buffer {
             overlays: OverlayList::new(),
             overlay_modified_tick: 1,
             overlay_digest_cache: std::cell::Cell::new(None),
+            word_wrap_policy_cache: std::cell::RefCell::new(None),
             automatic_composition_cache: std::cell::RefCell::new(None),
             automatic_composition_visible_cache: std::cell::RefCell::new(None),
             undo_state: SharedUndoState::new(),
@@ -2675,8 +2691,7 @@ impl Buffer {
             base_buffer: parts.base_buffer,
             text: parts.text,
             point: parts.point,
-            mark_marker_id: parts.mark_marker_id,
-            mark_marker_ptr: parts.mark_marker_ptr,
+            mark_marker: parts.mark_marker,
             accessible_start: parts.accessible_start,
             accessible_end: parts.accessible_end,
             autosave_modified_tick: parts.autosave_modified_tick,
@@ -2693,6 +2708,7 @@ impl Buffer {
             overlays: parts.overlays,
             overlay_modified_tick: parts.overlay_modified_tick,
             overlay_digest_cache: std::cell::Cell::new(None),
+            word_wrap_policy_cache: std::cell::RefCell::new(None),
             automatic_composition_cache: std::cell::RefCell::new(None),
             automatic_composition_visible_cache: std::cell::RefCell::new(None),
             undo_state: parts.undo_state,
@@ -2733,6 +2749,45 @@ impl Buffer {
 
     pub fn overlays_mut(&mut self) -> &mut OverlayList {
         &mut self.overlays
+    }
+
+    /// True when every live overlay can only change appearance, never row
+    /// geometry: at most 32 overlays whose plists carry only `face`,
+    /// `priority` or `window`. The bounded shape mirrors the layout engine's
+    /// face-overlay coverage so both consumers accept the same set.
+    ///
+    /// This certifies the properties present, not the metrics of the faces they
+    /// name. Callers must still invalidate retained row geometry when overlays
+    /// change, since face-only overlays can affect font metrics and wrapping.
+    pub fn overlays_are_face_only(&self) -> bool {
+        let overlays = &self.overlays;
+        if overlays.len() > 32 {
+            return false;
+        }
+        for overlay in overlays.overlays_in_gnu_lists_order() {
+            let Some(mut plist) = overlays.overlay_plist(overlay) else {
+                return false;
+            };
+            let mut pairs = 0;
+            while !plist.is_nil() {
+                if pairs == 16 || !plist.is_cons() {
+                    return false;
+                }
+                let key = plist.cons_car();
+                let rest = plist.cons_cdr();
+                if !rest.is_cons()
+                    || !matches!(
+                        key.as_bare_symbol_name().as_deref(),
+                        Some("face" | "priority" | "window")
+                    )
+                {
+                    return false;
+                }
+                plist = rest.cons_cdr();
+                pairs += 1;
+            }
+        }
+        true
     }
 
     pub fn last_name_value(&self) -> Value {
@@ -2794,8 +2849,7 @@ impl Buffer {
         self.keymap = Value::NIL;
         self.overlays.delete_all_overlays();
         self.text = BufferText::new();
-        self.mark_marker_id = None;
-        self.mark_marker_ptr = std::ptr::null_mut();
+        self.mark_marker = MarkerRef::NONE;
         self.state_markers = None;
         self.undo_state = SharedUndoState::new();
         self.narrow_to_emacs_byte_range(EmacsByteRange::EMPTY);
@@ -2914,6 +2968,14 @@ impl Buffer {
     /// `BVAR(buf, read_only)`. A non-nil slot maps to `true`.
     pub fn get_read_only(&self) -> bool {
         self.slots[BUFFER_SLOT_READ_ONLY.index()].is_truthy()
+    }
+
+    /// The raw `buffer-read-only` slot, for callers that must publish the
+    /// exact Lisp value rather than its truthiness. GNU
+    /// `frame-or-buffer-changed-p` stores `BVAR (buf, read_only)` itself in
+    /// its state vector (src/dispnew.c:7098).
+    pub fn read_only_value(&self) -> Value {
+        self.slots[BUFFER_SLOT_READ_ONLY.index()]
     }
 
     /// Write `buffer-read-only`. `true` stores `Value::T`, `false`
@@ -3412,9 +3474,39 @@ impl Buffer {
             .next_watched_property_change_at_char_pos(pos, cap, keys)
     }
 
+    /// True when `name` may occur in any interval of this buffer's text.
+    pub fn text_props_has_property_anywhere(&self, name: Value) -> bool {
+        self.text.text_props_has_property_anywhere(name)
+    }
+
+    /// See [`buffer_text::BufferText::next_watched_property_state_change_after_emacs_byte_pos`].
+    pub fn next_watched_property_state_change_after_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos> {
+        self.text
+            .next_watched_property_state_change_after_emacs_byte_pos(pos, keys)
+    }
+
+    /// See [`buffer_text::BufferText::previous_watched_property_state_change_before_emacs_byte_pos`].
+    pub fn previous_watched_property_state_change_before_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos> {
+        self.text
+            .previous_watched_property_state_change_before_emacs_byte_pos(pos, keys)
+    }
+
     /// See [`text_props::TextPropertyTable::syntax_prop_free_run_end`].
     pub fn syntax_prop_free_run_end_at_char_pos(&self, pos: CharPos0, cap: CharPos0) -> CharPos0 {
         self.text.syntax_prop_free_run_end_at_char_pos(pos, cap)
+    }
+
+    pub fn previous_syntax_prop_state_run_start_at_char_pos(&self, pos: CharPos0) -> CharPos0 {
+        self.text
+            .previous_syntax_prop_state_run_start_at_char_pos(pos)
     }
 
     /// See [`crate::buffer::buffer_text::BufferText::syntax_content_key`].
@@ -3734,8 +3826,20 @@ impl Buffer {
         self.text.remap_marker_anchors(f);
     }
 
-    pub(crate) fn walk_marker_data_for_dump<F: FnMut(&crate::heap_types::LispMarker)>(&self, f: F) {
-        self.text.chain_walk_data(f);
+    /// Walk the intrusive marker chain head→tail, passing each node's raw
+    /// `MarkerObj` pointer together with its payload. Used by pdump to assign
+    /// dump-local marker ids in chain order and serialize the chain entries.
+    pub(crate) fn walk_marker_chain_for_dump<
+        F: FnMut(*mut crate::tagged::header::MarkerObj, &crate::heap_types::LispMarker),
+    >(
+        &self,
+        mut f: F,
+    ) {
+        self.text.chain_walk_nodes(|ptr| {
+            // SAFETY: `chain_walk_nodes` yields live chain-owned MarkerObjs;
+            // the payload reference is valid for the duration of the call.
+            f(ptr, unsafe { &(*ptr).data });
+        });
     }
 
     pub fn emacs_byte_range_contains_char_code(&self, range: EmacsByteRange, code: u32) -> bool {
@@ -4175,24 +4279,22 @@ impl Buffer {
     pub fn register_marker_at_emacs_byte_pos(
         &mut self,
         marker_ptr: *mut crate::tagged::header::MarkerObj,
-        marker_id: u64,
         pos: EmacsBytePos,
         insertion_type: InsertionType,
     ) {
         let position = self.marker_anchor_for_emacs_byte_pos(pos);
-        self.register_marker_at_anchor(marker_ptr, marker_id, position, insertion_type);
+        self.register_marker_at_anchor(marker_ptr, position, insertion_type);
     }
 
     pub fn register_marker_at_anchor(
         &mut self,
         marker_ptr: *mut crate::tagged::header::MarkerObj,
-        marker_id: u64,
         position: TextPositionAnchor,
         insertion_type: InsertionType,
     ) {
         let position = self.canonical_marker_anchor(position);
         self.text
-            .register_marker(marker_ptr, self.id, marker_id, position, insertion_type);
+            .register_marker(marker_ptr, self.id, position, insertion_type);
     }
 
     fn marker_anchor_for_emacs_byte_pos(&self, pos: EmacsBytePos) -> TextPositionAnchor {
@@ -4258,19 +4360,19 @@ impl Buffer {
         self.marker_anchor_for_emacs_byte_pos(position.emacs_byte_pos())
     }
 
-    pub fn remove_marker_entry(&mut self, marker_id: u64) {
-        self.text.remove_marker(marker_id);
+    pub fn remove_marker_entry(&mut self, marker: MarkerRef) {
+        let _ = self.text.remove_marker_ptr(marker.as_ptr());
     }
 
-    pub fn has_marker(&self, marker_id: u64) -> bool {
-        self.text.has_marker(marker_id)
+    pub fn has_marker(&self, marker: MarkerRef) -> bool {
+        self.text.has_marker_ptr(marker.as_ptr())
     }
 
     pub fn marker_chain_anchor_lookup(
         &self,
-        marker_id: u64,
+        marker: MarkerRef,
     ) -> Option<(TextPositionAnchor, InsertionType)> {
-        self.text.marker_chain_anchor_lookup(marker_id)
+        self.text.marker_chain_anchor_of(marker.as_ptr())
     }
 
     #[cfg(test)]
@@ -4278,19 +4380,14 @@ impl Buffer {
         self.text.chain_walk_collect().len()
     }
 
-    /// The chain's marker ids, head to tail.
+    /// The chain's marker identities, head to tail.
     ///
     /// Chain ORDER is how "did this operation re-chain the marker?" becomes
-    /// observable: a re-splice always lands at the head.
+    /// observable: a re-splice always lands at the head. Marker identity is
+    /// the `MarkerObj` pointer, so tests compare these instead of ids.
     #[cfg(test)]
-    pub(crate) fn marker_chain_ids(&self) -> Vec<Option<u64>> {
-        self.text
-            .chain_walk_collect()
-            .into_iter()
-            // SAFETY: `chain_walk_collect` yields live chain-owned MarkerObj
-            // pointers and nothing mutates the chain in between.
-            .map(|ptr| unsafe { (*ptr).data.marker_id })
-            .collect()
+    pub(crate) fn marker_chain_ptrs(&self) -> Vec<*mut crate::tagged::header::MarkerObj> {
+        self.text.chain_walk_collect()
     }
 
     #[cfg(test)]
@@ -4308,34 +4405,26 @@ impl Buffer {
                     contains[index] = true;
                 }
             }
-            curr = unsafe { (*curr).data.next_marker };
+            curr = unsafe { (*curr).data.next_marker_ptr() };
             guard += 1;
         }
         contains
     }
 
-    pub fn marker_value_by_id(&self, marker_id: u64) -> Option<Value> {
-        let ptr = self.text.chain_find_by_id(marker_id);
-        if ptr.is_null() {
-            None
-        } else {
-            // SAFETY: `ptr` was found by walking this buffer's live marker
-            // chain. The returned Value is only a Lisp handle to that live
-            // MarkerObj; callers do not retain the raw pointer.
-            unsafe {
-                Some(Value::from_veclike_ptr(
-                    ptr as *const crate::tagged::header::VecLikeHeader,
-                ))
-            }
+    pub fn marker_value(&self, marker: MarkerRef) -> Option<Value> {
+        if marker.is_null() || !self.text.has_marker_ptr(marker.as_ptr()) {
+            return None;
         }
+        marker.as_value()
     }
 
     pub fn unlink_marker_ptr(&self, ptr: *mut crate::tagged::header::MarkerObj) {
         self.text.chain_unlink(ptr);
     }
 
-    pub fn move_marker_to_anchor(&self, marker_id: u64, position: TextPositionAnchor) {
-        self.text.move_marker_to_anchor(marker_id, position);
+    pub fn move_marker_ref_to_anchor(&self, marker: MarkerRef, position: TextPositionAnchor) {
+        self.text
+            .move_marker_ptr_to_anchor(marker.as_ptr(), position);
     }
 
     /// Move a marker that is ALREADY on this buffer's chain to `pos`, GNU
@@ -4361,12 +4450,11 @@ impl Buffer {
     /// Set the mark to Emacs-byte position `pos`, creating the marker if needed.
     pub fn set_mark_emacs_byte_pos(&mut self, pos: EmacsBytePos) {
         let position = self.marker_anchor_for_emacs_byte_pos(pos);
-        if self.mark_marker_ptr.is_null() {
+        if self.mark_marker.is_null() {
             // Create the marker eagerly and register in the chain so it
             // auto-adjusts on edits.
             let marker = crate::emacs_core::value::Value::make_marker(positioned_marker_data(
                 self.id,
-                crate::emacs_core::marker::MARK_MARKER_ID,
                 position,
                 super::InsertionType::Before,
             ));
@@ -4374,45 +4462,52 @@ impl Buffer {
                 .as_veclike_ptr()
                 .expect("freshly allocated marker should have veclike ptr")
                 as *mut crate::tagged::header::MarkerObj;
-            self.text.register_marker(
-                ptr,
-                self.id,
-                crate::emacs_core::marker::MARK_MARKER_ID,
-                position,
-                super::InsertionType::Before,
-            );
-            self.mark_marker_ptr = ptr;
-        } else {
-            // Update existing marker position via the chain
-            let ptr = self.mark_marker_ptr;
+            self.text
+                .register_marker(ptr, self.id, position, super::InsertionType::Before);
+            self.mark_marker = MarkerRef::new(ptr);
+            return;
+        }
+        let ptr = self.mark_marker.as_ptr();
+        if self.mark_marker.buffer_id() == Some(self.id) && self.mark_marker.is_chained() {
+            // Update existing marker position via the chain.
             unsafe {
                 set_marker_data_anchor(&mut (*ptr).data, position);
             }
+            return;
         }
+        // GNU `set_marker_both (BVAR (buf, mark), buf, ...)`: the buffer's
+        // mark is a real marker from birth (`Fmake_marker` in
+        // `reset_buffer`), so setting the mark attaches that detached object
+        // instead of replacing it. The manager unlinks a mark marker that
+        // currently sits on another buffer's chain.
+        self.text
+            .register_marker(ptr, self.id, position, self.mark_marker.insertion_type());
     }
 
     /// Return the mark as an Emacs byte position, None if mark inactive.
     pub fn mark_emacs_byte_pos(&self) -> Option<EmacsBytePos> {
-        if self.mark_marker_ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(marker_data_anchor(&(*self.mark_marker_ptr).data).emacs_byte_pos()) }
+        // GNU `marker_position` reports nil for a detached marker: a mark
+        // marker that `set-marker` moved out of this buffer (or detached)
+        // does not name a position here.
+        if self.mark_marker.buffer_id() != Some(self.id) {
+            return None;
         }
+        self.mark_marker
+            .anchor()
+            .map(TextPositionAnchor::emacs_byte_pos)
     }
 
     /// Return the mark character position, None if mark inactive.
     pub fn mark_char_pos(&self) -> Option<CharPos0> {
-        if self.mark_marker_ptr.is_null() {
-            None
-        } else {
-            unsafe { Some(marker_data_anchor(&(*self.mark_marker_ptr).data).char_pos()) }
+        if self.mark_marker.buffer_id() != Some(self.id) {
+            return None;
         }
+        self.mark_marker.anchor().map(TextPositionAnchor::char_pos)
     }
 
     /// Deactivate the mark.
     pub fn clear_mark(&mut self) {
-        self.mark_marker_id = None;
-        self.mark_marker_ptr = std::ptr::null_mut();
+        self.mark_marker = MarkerRef::NONE;
     }
 
     /// GNU `buffer_visited_file_modtime (current_buffer)`
@@ -5735,7 +5830,6 @@ pub struct BufferStorage {
     dead_buffers: FxHashMap<BufferId, Buffer>,
     buffer_order: Vec<BufferId>,
     next_id: u64,
-    next_marker_id: u64,
     labeled_restrictions: FxHashMap<BufferId, Vec<LabeledRestriction>>,
     default_text_backend_kind: ImplementedBufferTextBackendKind,
     /// Global default values for `BUFFER_OBJFWD` slots. Mirrors GNU's
@@ -5966,7 +6060,6 @@ impl BufferStorage {
             dead_buffers: self.dead_buffers.clone(),
             buffer_order: self.buffer_order.clone(),
             next_id: self.next_id,
-            next_marker_id: self.next_marker_id,
             labeled_restrictions: self.labeled_restrictions.clone(),
             default_text_backend_kind: self.default_text_backend_kind,
             buffer_defaults: self.buffer_defaults,
@@ -6292,7 +6385,6 @@ impl BufferManager {
             dead_buffers: FxHashMap::default(),
             buffer_order: Vec::new(),
             next_id: 1,
-            next_marker_id: 1,
             labeled_restrictions: FxHashMap::default(),
             default_text_backend_kind: ImplementedBufferTextBackendKind::GAP_BUFFER,
             buffer_defaults,
@@ -6492,8 +6584,7 @@ impl BufferManager {
             // slots by building fresh markers owned by the new buffer.  Raw
             // marker pointers copied from the base would make the indirect
             // buffer share point/narrowing/mark state with its base.
-            cloned.mark_marker_id = None;
-            cloned.mark_marker_ptr = std::ptr::null_mut();
+            cloned.mark_marker = MarkerRef::NONE;
             cloned.state_markers = None;
             cloned
         } else {
@@ -6521,8 +6612,7 @@ impl BufferManager {
         indirect.slots[BUFFER_SLOT_FILE_NAME.index()] = Value::NIL;
         if !clone {
             indirect.overlays = OverlayList::new();
-            indirect.mark_marker_id = None;
-            indirect.mark_marker_ptr = std::ptr::null_mut();
+            indirect.mark_marker = MarkerRef::NONE;
             /* mark_byte removed */
         }
 
@@ -6729,22 +6819,17 @@ impl BufferManager {
                 buffer.point_max_emacs_byte_pos(),
             )
         };
-        let (pt_marker, pt_marker_ptr) =
-            self.create_marker_at_emacs_byte_pos(buffer_id, pt, InsertionType::Before);
-        let (begv_marker, begv_marker_ptr) =
+        let pt_marker = self.create_marker_at_emacs_byte_pos(buffer_id, pt, InsertionType::Before);
+        let begv_marker =
             self.create_marker_at_emacs_byte_pos(buffer_id, begv, InsertionType::Before);
-        let (zv_marker, zv_marker_ptr) =
-            self.create_marker_at_emacs_byte_pos(buffer_id, zv, InsertionType::After);
+        let zv_marker = self.create_marker_at_emacs_byte_pos(buffer_id, zv, InsertionType::After);
         self.storage_mut()
             .buffers
             .get_mut(&buffer_id)?
             .state_markers = Some(BufferStateMarkers {
-            pt_marker,
-            begv_marker,
-            zv_marker,
-            pt_marker_ptr,
-            begv_marker_ptr,
-            zv_marker_ptr,
+            pt_marker: MarkerRef::new(pt_marker),
+            begv_marker: MarkerRef::new(begv_marker),
+            zv_marker: MarkerRef::new(zv_marker),
         });
         Some(())
     }
@@ -6762,28 +6847,25 @@ impl BufferManager {
         // State markers live on this buffer's chain already; unlink before
         // re-registering so chain_splice_at_head's precondition holds.
         if let Some(buf) = self.buffers.get(&buffer_id) {
-            buf.text.chain_unlink(markers.pt_marker_ptr);
-            buf.text.chain_unlink(markers.begv_marker_ptr);
-            buf.text.chain_unlink(markers.zv_marker_ptr);
+            buf.text.chain_unlink(markers.pt_marker.as_ptr());
+            buf.text.chain_unlink(markers.begv_marker.as_ptr());
+            buf.text.chain_unlink(markers.zv_marker.as_ptr());
         }
-        self.register_marker_id_at_emacs_byte_pos(
-            markers.pt_marker_ptr,
+        self.register_marker_at_emacs_byte_pos(
+            markers.pt_marker.as_ptr(),
             buffer_id,
-            markers.pt_marker,
             pt,
             InsertionType::Before,
         )?;
-        self.register_marker_id_at_emacs_byte_pos(
-            markers.begv_marker_ptr,
+        self.register_marker_at_emacs_byte_pos(
+            markers.begv_marker.as_ptr(),
             buffer_id,
-            markers.begv_marker,
             begv,
             InsertionType::Before,
         )?;
-        self.register_marker_id_at_emacs_byte_pos(
-            markers.zv_marker_ptr,
+        self.register_marker_at_emacs_byte_pos(
+            markers.zv_marker.as_ptr(),
             buffer_id,
-            markers.zv_marker,
             zv,
             InsertionType::After,
         )?;
@@ -6795,9 +6877,9 @@ impl BufferManager {
         buffer_id: BufferId,
     ) -> Option<()> {
         let markers = self.buffers.get(&buffer_id)?.state_markers?;
-        let pt = self.marker_anchor_position(buffer_id, markers.pt_marker)?;
-        let begv = self.marker_anchor_position(buffer_id, markers.begv_marker)?;
-        let zv = self.marker_anchor_position(buffer_id, markers.zv_marker)?;
+        let pt = markers.pt_marker.anchor()?;
+        let begv = markers.begv_marker.anchor()?;
+        let zv = markers.zv_marker.anchor()?;
         let buffer = self.storage_mut().buffers.get_mut(&buffer_id)?;
         // GNU buffer.c:795-802 restores the three paired coordinates
         // independently. Transposition moves the state markers along with
@@ -7010,8 +7092,8 @@ impl BufferManager {
         outermost: bool,
     ) -> Option<EmacsByteRange> {
         let restriction = self.labeled_restriction_at(id, outermost)?;
-        let beg = self.marker_emacs_byte_pos(id, restriction.beg_marker)?;
-        let end = self.marker_emacs_byte_pos(id, restriction.end_marker)?;
+        let beg = self.marker_emacs_byte_pos(restriction.beg_marker)?;
+        let end = self.marker_emacs_byte_pos(restriction.end_marker)?;
         Some(EmacsByteRange::new(beg, end))
     }
 
@@ -7021,8 +7103,8 @@ impl BufferManager {
 
     pub fn current_labeled_restriction_char_bounds(&self, id: BufferId) -> Option<CharRange> {
         let restriction = self.labeled_restriction_at(id, false)?;
-        let beg = self.marker_char_pos(id, restriction.beg_marker)?;
-        let end = self.marker_char_pos(id, restriction.end_marker)?;
+        let beg = self.marker_char_pos(restriction.beg_marker)?;
+        let end = self.marker_char_pos(restriction.end_marker)?;
         Some(CharRange::new(beg, end))
     }
 
@@ -7038,14 +7120,17 @@ impl BufferManager {
         }
     }
 
-    fn clone_marker_in_buffer(&mut self, buffer_id: BufferId, marker_id: u64) -> Option<u64> {
+    fn clone_marker_in_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        marker: MarkerRef,
+    ) -> Option<MarkerRef> {
         let (position, insertion_type) = {
             let buf = self.buffers.get(&buffer_id)?;
-            buf.marker_chain_anchor_lookup(marker_id)?
+            buf.marker_chain_anchor_lookup(marker)?
         };
-        let (marker_id, _marker_ptr) =
-            self.create_marker_at_anchor(buffer_id, position, insertion_type);
-        Some(marker_id)
+        let marker_ptr = self.create_marker_at_anchor(buffer_id, position, insertion_type);
+        Some(MarkerRef::new(marker_ptr))
     }
 
     fn clone_labeled_restrictions(
@@ -7071,20 +7156,20 @@ impl BufferManager {
         buffer_id: BufferId,
         restrictions: Option<Vec<LabeledRestriction>>,
     ) {
-        let mut live_marker_ids = std::collections::HashSet::new();
+        let mut live_markers = std::collections::HashSet::new();
         if let Some(ref restrictions) = restrictions {
             for restriction in restrictions {
-                live_marker_ids.insert(restriction.beg_marker);
-                live_marker_ids.insert(restriction.end_marker);
+                live_markers.insert(restriction.beg_marker);
+                live_markers.insert(restriction.end_marker);
             }
         }
 
         if let Some(old) = self.storage_mut().labeled_restrictions.remove(&buffer_id) {
             for restriction in old {
-                if !live_marker_ids.contains(&restriction.beg_marker) {
+                if !live_markers.contains(&restriction.beg_marker) {
                     self.remove_marker(restriction.beg_marker);
                 }
-                if !live_marker_ids.contains(&restriction.end_marker) {
+                if !live_markers.contains(&restriction.end_marker) {
                     self.remove_marker(restriction.end_marker);
                 }
             }
@@ -7117,18 +7202,17 @@ impl BufferManager {
                 buf.point_max_emacs_byte_pos(),
             )
         };
-        let (beg_marker, _) =
+        let beg_marker =
             self.create_marker_at_emacs_byte_pos(buffer_id, begv, InsertionType::Before);
-        let (end_marker, _) =
-            self.create_marker_at_emacs_byte_pos(buffer_id, zv, InsertionType::After);
+        let end_marker = self.create_marker_at_emacs_byte_pos(buffer_id, zv, InsertionType::After);
         self.storage_mut()
             .labeled_restrictions
             .entry(buffer_id)
             .or_default()
             .push(LabeledRestriction {
                 label,
-                beg_marker,
-                end_marker,
+                beg_marker: MarkerRef::new(beg_marker),
+                end_marker: MarkerRef::new(end_marker),
             });
         Some(())
     }
@@ -7649,6 +7733,15 @@ impl BufferManager {
         id: BufferId,
         pos: EmacsBytePos,
     ) -> Option<()> {
+        // GNU `set_marker_both` on `BVAR (buf, mark)` attaches THAT marker to
+        // `buf`; if a previous `set-marker` moved the mark marker into another
+        // buffer, `attach_marker` unchains it there first.
+        let mark = self.get(id)?.mark_marker;
+        if let Some(other) = mark.buffer_id()
+            && other != id
+        {
+            let _ = self.unlink_marker_ptr(other, mark.as_ptr());
+        }
         self.storage_mut()
             .buffers
             .get_mut(&id)?
@@ -7694,8 +7787,7 @@ impl BufferManager {
 
     pub fn clear_buffer_mark(&mut self, id: BufferId) -> Option<()> {
         let buf = self.storage_mut().buffers.get_mut(&id)?;
-        buf.mark_marker_id = None;
-        buf.mark_marker_ptr = std::ptr::null_mut();
+        buf.mark_marker = MarkerRef::NONE;
         /* mark_byte removed */
         Some(())
     }
@@ -7880,13 +7972,13 @@ impl BufferManager {
         let restriction = if begv == EmacsBytePos::ZERO && zv.get() == len.get() {
             SavedRestrictionKind::None
         } else {
-            let (beg_marker, _) =
+            let beg_marker =
                 self.create_marker_at_emacs_byte_pos(buffer_id, begv, InsertionType::Before);
-            let (end_marker, _) =
+            let end_marker =
                 self.create_marker_at_emacs_byte_pos(buffer_id, zv, InsertionType::After);
             SavedRestrictionKind::Markers {
-                beg_marker,
-                end_marker,
+                beg_marker: MarkerRef::new(beg_marker),
+                end_marker: MarkerRef::new(end_marker),
             }
         };
         let labeled_restrictions = self.clone_labeled_restrictions(buffer_id).unwrap_or(None);
@@ -7950,8 +8042,8 @@ impl BufferManager {
                 beg_marker,
                 end_marker,
             } => {
-                let beg = self.marker_emacs_byte_pos(buffer_id, beg_marker);
-                let end = self.marker_emacs_byte_pos(buffer_id, end_marker);
+                let beg = self.marker_emacs_byte_pos(beg_marker);
+                let end = self.marker_emacs_byte_pos(end_marker);
                 if let (Some(begv), Some(zv), Some(len)) = (
                     beg,
                     end,
@@ -8010,10 +8102,10 @@ impl BufferManager {
             let buf = self.storage_mut().buffers.get_mut(&id)?;
             match value.kind() {
                 ValueKind::T => {
-                    buf.set_buffer_local(BUFFER_UNDO_LIST_NAME, Value::T);
+                    buf.set_buffer_local_by_sym_id(WellKnown::BufferUndoList.id(), Value::T);
                 }
                 ValueKind::Nil => {
-                    buf.set_buffer_local(BUFFER_UNDO_LIST_NAME, Value::NIL);
+                    buf.set_buffer_local_by_sym_id(WellKnown::BufferUndoList.id(), Value::NIL);
                     buf.undo_state.set_recorded_first_change(false);
                 }
                 _other => {
@@ -8103,13 +8195,6 @@ impl BufferManager {
         }
     }
 
-    /// Allocate a unique marker id without associating it with a buffer.
-    pub fn allocate_marker_id(&mut self) -> u64 {
-        let id = self.next_marker_id;
-        self.storage_mut().next_marker_id += 1;
-        id
-    }
-
     /// Create a marker in `buffer_id` at byte position `pos` with the given
     /// insertion type.  Returns the new marker's id and the raw
     /// `MarkerObj` pointer for the backing allocation.
@@ -8131,18 +8216,10 @@ impl BufferManager {
         buffer_id: BufferId,
         pos: EmacsBytePos,
         insertion_type: InsertionType,
-    ) -> (u64, *mut crate::tagged::header::MarkerObj) {
-        let marker_id = self.next_marker_id;
-        self.storage_mut().next_marker_id += 1;
-        let marker_ptr = Self::allocate_marker_node(buffer_id, marker_id, insertion_type);
-        let _ = self.register_marker_id_at_emacs_byte_pos(
-            marker_ptr,
-            buffer_id,
-            marker_id,
-            pos,
-            insertion_type,
-        );
-        (marker_id, marker_ptr)
+    ) -> *mut crate::tagged::header::MarkerObj {
+        let marker_ptr = Self::allocate_marker_node(buffer_id, insertion_type);
+        let _ = self.register_marker_at_emacs_byte_pos(marker_ptr, buffer_id, pos, insertion_type);
+        marker_ptr
     }
 
     pub fn create_marker_at_anchor(
@@ -8150,100 +8227,71 @@ impl BufferManager {
         buffer_id: BufferId,
         position: TextPositionAnchor,
         insertion_type: InsertionType,
-    ) -> (u64, *mut crate::tagged::header::MarkerObj) {
-        let marker_id = self.next_marker_id;
-        self.storage_mut().next_marker_id += 1;
-        let marker_ptr = Self::allocate_marker_node(buffer_id, marker_id, insertion_type);
-        let _ = self.register_marker_id_at_anchor(
-            marker_ptr,
-            buffer_id,
-            marker_id,
-            position,
-            insertion_type,
-        );
-        (marker_id, marker_ptr)
+    ) -> *mut crate::tagged::header::MarkerObj {
+        let marker_ptr = Self::allocate_marker_node(buffer_id, insertion_type);
+        let _ = self.register_marker_at_anchor(marker_ptr, buffer_id, position, insertion_type);
+        marker_ptr
     }
 
     fn allocate_marker_node(
         buffer_id: BufferId,
-        marker_id: u64,
         insertion_type: InsertionType,
     ) -> *mut crate::tagged::header::MarkerObj {
         // Allocate a backing MarkerObj so the new chain has a valid node.
         // Position fields are overwritten inside register_marker; starting
         // values are placeholders.
         let marker_value =
-            crate::emacs_core::value::Value::make_marker(crate::heap_types::LispMarker {
-                buffer: Some(buffer_id),
-                insertion_type: insertion_type == InsertionType::After,
-                marker_id: Some(marker_id),
-                bytepos: 0,
-                charpos: 0,
-                last_position_valid: true,
-                next_marker: std::ptr::null_mut(),
-                chained: false,
-            });
+            crate::emacs_core::value::Value::make_marker(crate::heap_types::LispMarker::new(
+                crate::heap_types::MarkerBuffer::attached(buffer_id),
+                CharPos0::default(),
+                EmacsBytePos::default(),
+                insertion_type == InsertionType::After,
+                true,
+            ));
         marker_value
             .as_veclike_ptr()
             .expect("freshly allocated marker should have a veclike ptr")
             as *mut crate::tagged::header::MarkerObj
     }
 
-    pub fn register_marker_id_at_emacs_byte_pos(
+    pub fn register_marker_at_emacs_byte_pos(
         &mut self,
         marker_ptr: *mut crate::tagged::header::MarkerObj,
         buffer_id: BufferId,
-        marker_id: u64,
         pos: EmacsBytePos,
         insertion_type: InsertionType,
     ) -> Option<()> {
         let buf = self.storage_mut().buffers.get_mut(&buffer_id)?;
-        buf.register_marker_at_emacs_byte_pos(marker_ptr, marker_id, pos, insertion_type);
+        buf.register_marker_at_emacs_byte_pos(marker_ptr, pos, insertion_type);
         Some(())
     }
 
-    pub fn register_marker_id_at_anchor(
+    pub fn register_marker_at_anchor(
         &mut self,
         marker_ptr: *mut crate::tagged::header::MarkerObj,
         buffer_id: BufferId,
-        marker_id: u64,
         position: TextPositionAnchor,
         insertion_type: InsertionType,
     ) -> Option<()> {
         let buf = self.storage_mut().buffers.get_mut(&buffer_id)?;
-        buf.register_marker_at_anchor(marker_ptr, marker_id, position, insertion_type);
+        buf.register_marker_at_anchor(marker_ptr, position, insertion_type);
         Some(())
     }
 
-    pub fn marker_anchor_position(
-        &self,
-        buffer_id: BufferId,
-        marker_id: u64,
-    ) -> Option<TextPositionAnchor> {
-        self.buffers
-            .get(&buffer_id)
-            .and_then(|buf| buf.marker_chain_anchor_lookup(marker_id))
-            .map(|(position, _ins)| position)
+    pub fn marker_anchor_position(&self, marker: MarkerRef) -> Option<TextPositionAnchor> {
+        marker.anchor()
     }
 
-    pub fn marker_emacs_byte_pos(
-        &self,
-        buffer_id: BufferId,
-        marker_id: u64,
-    ) -> Option<EmacsBytePos> {
-        self.marker_anchor_position(buffer_id, marker_id)
-            .map(TextPositionAnchor::emacs_byte_pos)
+    pub fn marker_emacs_byte_pos(&self, marker: MarkerRef) -> Option<EmacsBytePos> {
+        marker.anchor().map(TextPositionAnchor::emacs_byte_pos)
     }
 
-    pub fn marker_char_pos(&self, buffer_id: BufferId, marker_id: u64) -> Option<CharPos0> {
-        self.marker_anchor_position(buffer_id, marker_id)
-            .map(TextPositionAnchor::char_pos)
+    pub fn marker_char_pos(&self, marker: MarkerRef) -> Option<CharPos0> {
+        marker.anchor().map(TextPositionAnchor::char_pos)
     }
 
-    pub fn marker_value(&self, buffer_id: BufferId, marker_id: u64) -> Option<Value> {
-        self.buffers
-            .get(&buffer_id)
-            .and_then(|buf| buf.marker_value_by_id(marker_id))
+    pub fn marker_value(&self, marker: MarkerRef) -> Option<Value> {
+        marker.as_value()
     }
 
     pub fn unlink_marker_ptr(
@@ -8268,16 +8316,16 @@ impl BufferManager {
         Some(())
     }
 
-    pub fn move_marker_to_anchor(
+    pub fn move_marker_ref_to_anchor(
         &mut self,
         buffer_id: BufferId,
-        marker_id: u64,
+        marker: MarkerRef,
         position: TextPositionAnchor,
     ) -> Option<()> {
         self.storage_mut()
             .buffers
             .get_mut(&buffer_id)?
-            .move_marker_to_anchor(marker_id, position);
+            .move_marker_ref_to_anchor(marker, position);
         Some(())
     }
 
@@ -8306,9 +8354,9 @@ impl BufferManager {
     }
 
     /// Remove a marker registration from any live buffer.
-    pub fn remove_marker(&mut self, marker_id: u64) {
+    pub fn remove_marker(&mut self, marker: MarkerRef) {
         for buf in self.storage_mut().buffers.values_mut() {
-            buf.remove_marker_entry(marker_id);
+            buf.remove_marker_entry(marker);
         }
     }
 
@@ -8326,15 +8374,11 @@ impl BufferManager {
     pub(crate) fn dump_next_id(&self) -> u64 {
         self.next_id
     }
-    pub(crate) fn dump_next_marker_id(&self) -> u64 {
-        self.next_marker_id
-    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_dump(
         mut buffers: FxHashMap<BufferId, Buffer>,
         current: Option<BufferId>,
         next_id: u64,
-        next_marker_id: u64,
         dumped_buffer_order: Option<&[BufferId]>,
         dumped_buffer_defaults: Option<&[crate::emacs_core::value::Value]>,
         default_text_backend_kind: ImplementedBufferTextBackendKind,
@@ -8402,7 +8446,6 @@ impl BufferManager {
             buffers: LiveBuffers::from_map(buffers),
             buffer_order: Vec::new(),
             next_id,
-            next_marker_id,
             labeled_restrictions: FxHashMap::default(),
             dead_buffers: FxHashMap::default(),
             default_text_backend_kind,
@@ -8476,12 +8519,8 @@ impl GcTrace for BufferManager {
             // same live marker as a raw pointer in Buffer; synthesize the
             // tagged Value here so GC does not reclaim it while the buffer
             // remains live.
-            unsafe {
-                if !buffer.mark_marker_ptr.is_null() {
-                    visit(Value::from_veclike_ptr(
-                        buffer.mark_marker_ptr as *const crate::tagged::header::VecLikeHeader,
-                    ));
-                }
+            if let Some(value) = buffer.mark_marker.as_value() {
+                visit(value);
             }
             // T8 C-1: the noncurrent PT/BEGV/ZV markers stashed in
             // `state_markers` are referenced only by raw pointers and
@@ -8501,21 +8540,9 @@ impl GcTrace for BufferManager {
                 // `state_markers`; they remain valid as long as the
                 // buffer exists. `from_veclike_ptr` is a pure bit-cast
                 // to the tagged encoding.
-                unsafe {
-                    if !sm.pt_marker_ptr.is_null() {
-                        visit(Value::from_veclike_ptr(
-                            sm.pt_marker_ptr as *const crate::tagged::header::VecLikeHeader,
-                        ));
-                    }
-                    if !sm.begv_marker_ptr.is_null() {
-                        visit(Value::from_veclike_ptr(
-                            sm.begv_marker_ptr as *const crate::tagged::header::VecLikeHeader,
-                        ));
-                    }
-                    if !sm.zv_marker_ptr.is_null() {
-                        visit(Value::from_veclike_ptr(
-                            sm.zv_marker_ptr as *const crate::tagged::header::VecLikeHeader,
-                        ));
+                for marker in [sm.pt_marker, sm.begv_marker, sm.zv_marker] {
+                    if let Some(value) = marker.as_value() {
+                        visit(value);
                     }
                 }
             }
@@ -8538,25 +8565,22 @@ impl GcTrace for BufferManager {
         for slot in &self.buffer_defaults {
             visit(*slot);
         }
-        for (buffer_id, restrictions) in &self.labeled_restrictions {
-            let buffer = self.buffers.get(buffer_id);
+        for restrictions in self.labeled_restrictions.values() {
             for restriction in restrictions {
                 if let LabeledRestrictionLabel::User(label) = restriction.label {
                     visit(label);
                 }
-                // The bounds markers are referenced only by u64 id from this
-                // map; an unmarked marker is spliced out and freed by
-                // unchain_dead_markers, silently widening the restriction.
-                // Synthesize Lisp handles so the mark phase walks them
-                // (same hazard and fix as state_markers above; GNU keeps
-                // these alive via staticpro'd narrowing_locks, editfns.c).
-                if let Some(buffer) = buffer {
-                    if let Some(value) = buffer.marker_value_by_id(restriction.beg_marker) {
-                        visit(value);
-                    }
-                    if let Some(value) = buffer.marker_value_by_id(restriction.end_marker) {
-                        visit(value);
-                    }
+                // The bounds markers are non-owning references; an unmarked
+                // marker is spliced out and freed by unchain_dead_markers,
+                // silently widening the restriction. Synthesize Lisp handles
+                // so the mark phase walks them (same hazard and fix as
+                // state_markers above; GNU keeps these alive via staticpro'd
+                // narrowing_locks, editfns.c).
+                if let Some(value) = restriction.beg_marker.as_value() {
+                    visit(value);
+                }
+                if let Some(value) = restriction.end_marker.as_value() {
+                    visit(value);
                 }
             }
         }
@@ -8578,3 +8602,25 @@ mod world_storage_tests;
 // Cold proof-1 collector projection; no change to the serial root walk.
 #[path = "parallel_roots.rs"]
 mod parallel_roots;
+
+impl BufferLocalView for Buffer {
+    #[inline]
+    fn buffer_id(&self) -> BufferId {
+        self.id
+    }
+
+    #[inline]
+    fn slot_value(&self, slot: BufferSlot) -> Value {
+        self.slots[slot.index()]
+    }
+
+    #[inline]
+    fn local_binding(&self, id: SymId, localized: bool) -> Option<Value> {
+        self.get_buffer_local_by_sym_id_gated(id, localized)
+    }
+
+    #[inline]
+    fn local_binding_cell(&self, id: SymId) -> Option<Value> {
+        self.local_variable_binding_cell(id)
+    }
+}

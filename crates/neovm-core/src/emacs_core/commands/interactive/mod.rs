@@ -40,6 +40,7 @@ use super::symbol::Obarray;
 use super::value::*;
 use crate::buffer::EmacsBytePos;
 use crate::emacs_core::SymId;
+use crate::emacs_core::intern::WellKnown;
 
 /// GNU's predeclared `Qinteractive_form` identity.
 ///
@@ -460,7 +461,10 @@ impl Default for InteractiveRegistry {
 }
 
 fn interactive_form_from_spec_value(spec: Value) -> Value {
-    Value::list(vec![Value::symbol("interactive"), spec])
+    Value::list(vec![
+        Value::symbol(crate::emacs_core::intern::WellKnown::Interactive),
+        spec,
+    ])
 }
 
 pub(crate) fn registry_interactive_form(
@@ -534,7 +538,7 @@ pub(crate) fn validate_call_interactively_args(args: &[Value]) -> Result<(), Flo
 /// `(call-interactively FUNCTION &optional RECORD-FLAG KEYS)`
 /// Call FUNCTION interactively, reading arguments according to its
 /// interactive spec.
-pub(crate) fn builtin_call_interactively(eval: &mut Context, args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_call_interactively(eval: &mut Context, args: &[Value]) -> EvalResult {
     let symbol_mode = eval.symbol_mode();
     validate_call_interactively_args(&args)?;
     let func_val = args[0];
@@ -928,7 +932,7 @@ fn value_is_interactive_form(value: &Value, symbol_mode: SymbolMode) -> bool {
         ValueKind::Cons => {
             let pair_car = value.cons_car();
             let _pair_cdr = value.cons_cdr();
-            pair_car.as_symbol_id(symbol_mode) == Some(intern("interactive"))
+            pair_car.as_symbol_id(symbol_mode) == Some(INTERACTIVE_SYMBOL.id())
         }
         _ => false,
     }
@@ -1611,13 +1615,23 @@ fn dynamic_or_global_symbol_value(eval: &Context, name: &str) -> Option<Value> {
     eval.eval_symbol_by_id(id).ok()
 }
 
-fn dynamic_or_global_symbol_value_in_state(
-    vars: VariableView<'_>,
-    _dynamic: &[OrderedRuntimeBindingMap],
-    name: &str,
-) -> Option<Value> {
-    vars.value_by_name(name)
+/// [`dynamic_or_global_symbol_value`] with a pre-resolved identity.
+fn dynamic_or_global_symbol_value_by_id(eval: &Context, id: SymId) -> Option<Value> {
+    eval.eval_symbol_by_id(id).ok()
 }
+
+// Fixed GNU spellings the interactive self-insert path probes on every
+// command. Each previously went through a fresh `intern` at the call site;
+// each handle is a compile-time id and caches no value.
+static LAST_COMMAND_EVENT: WellKnown = WellKnown::LastCommandEvent;
+static ABBREV_MODE: WellKnown = WellKnown::AbbrevMode;
+static EXPAND_ABBREV: WellKnown = WellKnown::ExpandAbbrev;
+static NO_SELF_INSERT: WellKnown = WellKnown::NoSelfInsert;
+static OVERWRITE_MODE: WellKnown = WellKnown::OverwriteMode;
+static OVERWRITE_MODE_BINARY: WellKnown = WellKnown::OverwriteModeBinary;
+static UNDO_AUTO_AMALGAMATE: WellKnown = WellKnown::UndoAutoAmalgamate;
+static BARF_IF_BUFFER_READ_ONLY: WellKnown = WellKnown::BarfIfBufferReadOnly;
+static INTERACTIVE_SYMBOL: WellKnown = WellKnown::Interactive;
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
 fn dynamic_buffer_or_global_symbol_value(
@@ -1642,6 +1656,29 @@ fn dynamic_buffer_or_global_symbol_value_in_state(
     vars.value_by_name(name)
 }
 
+/// [`dynamic_or_global_symbol_value_in_state`] for a fixed GNU spelling.
+fn dynamic_or_global_symbol_value_fixed(
+    vars: VariableView<'_>,
+    symbol: crate::emacs_core::intern::WellKnown,
+) -> Option<Value> {
+    vars.value(symbol.id())
+}
+
+/// [`dynamic_buffer_or_global_symbol_value_in_state`] for a fixed GNU
+/// spelling: same buffer-slot / buffer-local / global precedence, by identity.
+fn dynamic_buffer_or_global_symbol_value_fixed(
+    vars: VariableView<'_>,
+    buf: &crate::buffer::Buffer,
+    symbol: crate::emacs_core::intern::WellKnown,
+) -> Option<Value> {
+    let obarray = vars.obarray();
+    let id = symbol.id();
+    if let Some(v) = buf.get_buffer_local_by_sym_id_gated(id, obarray.is_localized(id)) {
+        return Some(v);
+    }
+    vars.value(id)
+}
+
 fn prefix_numeric_value(value: &Value) -> i64 {
     crate::emacs_core::prefix::prefix_numeric_value(value)
 }
@@ -1656,10 +1693,13 @@ fn interactive_prefix_raw_arg_in_state(
     kind: CommandInvocationKind,
 ) -> Value {
     let symbol = match kind {
-        CommandInvocationKind::CallInteractively => "current-prefix-arg",
-        CommandInvocationKind::CommandExecute => "prefix-arg",
+        CommandInvocationKind::CallInteractively => {
+            crate::emacs_core::intern::WellKnown::CurrentPrefixArg
+        }
+        CommandInvocationKind::CommandExecute => crate::emacs_core::intern::WellKnown::PrefixArg,
     };
-    dynamic_or_global_symbol_value_in_state(vars, dynamic, symbol).unwrap_or(Value::NIL)
+    let _ = dynamic;
+    dynamic_or_global_symbol_value_fixed(vars, symbol).unwrap_or(Value::NIL)
 }
 
 fn interactive_prefix_numeric_arg(eval: &Context, kind: CommandInvocationKind) -> Value {
@@ -1750,7 +1790,10 @@ fn interactive_last_input_event_with_parameters_in_state(
     vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
 ) -> Option<Value> {
-    let event = dynamic_or_global_symbol_value_in_state(vars, dynamic, "last-input-event")?;
+    let event = dynamic_or_global_symbol_value_fixed(
+        vars,
+        crate::emacs_core::intern::WellKnown::LastInputEvent,
+    )?;
     interactive_event_with_parameters_p(&event).then_some(event)
 }
 
@@ -2191,8 +2234,12 @@ fn interactive_buffer_read_only_active_in_state(
     if buf.get_read_only() {
         return true;
     }
-    dynamic_buffer_or_global_symbol_value_in_state(vars, dynamic, buf, "buffer-read-only")
-        .is_some_and(|v| v.is_truthy())
+    dynamic_buffer_or_global_symbol_value_fixed(
+        vars,
+        buf,
+        crate::emacs_core::intern::WellKnown::BufferReadOnly,
+    )
+    .is_some_and(|v| v.is_truthy())
 }
 
 fn interactive_require_writable_current_buffer_in_state(
@@ -2203,8 +2250,12 @@ fn interactive_require_writable_current_buffer_in_state(
     let Some(buf) = buffers.current_buffer() else {
         return Ok(());
     };
-    if dynamic_buffer_or_global_symbol_value_in_state(vars, dynamic, buf, "inhibit-read-only")
-        .is_some_and(|v| v.is_truthy())
+    if dynamic_buffer_or_global_symbol_value_fixed(
+        vars,
+        buf,
+        crate::emacs_core::intern::WellKnown::InhibitReadOnly,
+    )
+    .is_some_and(|v| v.is_truthy())
     {
         return Ok(());
     }
@@ -2313,7 +2364,10 @@ fn interactive_apply_prefix_flags(
                 // GNU callint.c calls the Lisp policy before acquiring arguments.
                 // It owns temporary activation, anchor preservation, mark hooks,
                 // and restoration of buffer-local transient-mark-mode.
-                eval.apply(Value::symbol("handle-shift-selection"), vec![])?;
+                eval.apply(
+                    Value::symbol(crate::emacs_core::intern::WellKnown::HandleShiftSelection),
+                    vec![],
+                )?;
             }
         }
     }
@@ -2520,8 +2574,12 @@ fn interactive_prompt_with_visible_args(
     for value in &format_args {
         eval.push_specpdl_root(*value);
     }
-    let formatted = super::builtins::dispatch_builtin(eval, "format-message", format_args)
-        .expect("format-message builtin should be registered");
+    let formatted = super::builtins::dispatch_builtin_by_id(
+        eval,
+        crate::emacs_core::intern::WellKnown::FormatMessage.id(),
+        format_args,
+    )
+    .expect("format-message builtin should be registered");
     eval.restore_specpdl_roots(roots);
     let formatted = formatted?;
     formatted.as_lisp_string().cloned().ok_or_else(|| {
@@ -2822,13 +2880,22 @@ pub(crate) struct CallInteractivelyCommandIdentity {
 
 impl CallInteractivelyCommandIdentity {
     pub(crate) fn capture(eval: &Context) -> Self {
+        // GNU's `Fcall_interactively` saves these four DEFVAR_LISP cells by
+        // identity; the command-loop enum is their one native spelling set.
+        use crate::emacs_core::eval::command_loop::CommandLoopSymbol;
         Self {
-            this_command: eval.eval_symbol("this-command").unwrap_or(Value::NIL),
-            this_original_command: eval
-                .eval_symbol("this-original-command")
+            this_command: eval
+                .eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id())
                 .unwrap_or(Value::NIL),
-            real_this_command: eval.eval_symbol("real-this-command").unwrap_or(Value::NIL),
-            last_command: eval.eval_symbol("last-command").unwrap_or(Value::NIL),
+            this_original_command: eval
+                .eval_symbol_by_id(CommandLoopSymbol::ThisOriginalCommand.id())
+                .unwrap_or(Value::NIL),
+            real_this_command: eval
+                .eval_symbol_by_id(CommandLoopSymbol::RealThisCommand.id())
+                .unwrap_or(Value::NIL),
+            last_command: eval
+                .eval_symbol_by_id(CommandLoopSymbol::LastCommand.id())
+                .unwrap_or(Value::NIL),
         }
     }
 
@@ -2848,10 +2915,17 @@ impl CallInteractivelyCommandIdentity {
     }
 
     fn restore(self, eval: &mut Context) {
-        eval.assign("this-command", self.this_command);
-        eval.assign("this-original-command", self.this_original_command);
-        eval.assign("real-this-command", self.real_this_command);
-        eval.assign("last-command", self.last_command);
+        use crate::emacs_core::eval::command_loop::CommandLoopSymbol;
+        eval.assign_by_id(CommandLoopSymbol::ThisCommand.id(), self.this_command);
+        eval.assign_by_id(
+            CommandLoopSymbol::ThisOriginalCommand.id(),
+            self.this_original_command,
+        );
+        eval.assign_by_id(
+            CommandLoopSymbol::RealThisCommand.id(),
+            self.real_this_command,
+        );
+        eval.assign_by_id(CommandLoopSymbol::LastCommand.id(), self.last_command);
     }
 }
 
@@ -3110,7 +3184,10 @@ pub(crate) fn finish_call_interactively_in_eval(
         // target function runs (src/callint.c:340-343,796-799).
         let invocation = plan.restore_for_invocation(eval);
         let funcall_args = invocation.into_funcall_args(call_args);
-        eval.apply(Value::symbol("funcall-interactively"), funcall_args)
+        // GNU's `Qfuncall_interactively`; every command invocation applied
+        // this fixed symbol after re-interning its spelling.
+        static FUNCALL_INTERACTIVELY: WellKnown = WellKnown::FuncallInteractively;
+        eval.apply(Value::symbol(&FUNCALL_INTERACTIVELY), funcall_args)
     })();
     eval.restore_specpdl_roots(roots);
     result
@@ -3238,9 +3315,9 @@ pub(crate) fn builtin_self_insert_command(eval: &mut Context, args: Vec<Value>) 
     // GNU: if (NILP (c)) c = last_command_event; else last_command_event = c;
     let c_arg = args.get(1).copied().unwrap_or(Value::NIL);
     let c = if c_arg.is_nil() {
-        dynamic_or_global_symbol_value(eval, "last-command-event").unwrap_or(Value::NIL)
+        dynamic_or_global_symbol_value_by_id(eval, LAST_COMMAND_EVENT.id()).unwrap_or(Value::NIL)
     } else {
-        eval.assign("last-command-event", c_arg);
+        eval.assign_by_id(LAST_COMMAND_EVENT.id(), c_arg);
         c_arg
     };
 
@@ -3252,7 +3329,7 @@ pub(crate) fn builtin_self_insert_command(eval: &mut Context, args: Vec<Value>) 
     // for single-char interactive insertions so repeated typing groups
     // correctly while still leaving command boundaries for `undo`.
     if repeats < 2 {
-        eval.apply(Value::symbol("undo-auto-amalgamate"), vec![])?;
+        eval.apply(Value::symbol(&UNDO_AUTO_AMALGAMATE), vec![])?;
     }
 
     // Barf if the key that invoked this was not a character.
@@ -3275,7 +3352,7 @@ pub(crate) fn builtin_self_insert_command(eval: &mut Context, args: Vec<Value>) 
         }
     };
 
-    eval.apply(Value::symbol("barf-if-buffer-read-only"), vec![])?;
+    eval.apply(Value::symbol(&BARF_IF_BUFFER_READ_ONLY), vec![])?;
 
     // GNU `internal_self_insert` (cmds.c) implements overwrite-mode by deleting
     // (and, where a wider char would shift text, padding) the characters that C
@@ -3361,11 +3438,11 @@ pub(crate) fn builtin_self_insert_command(eval: &mut Context, args: Vec<Value>) 
             // in overwrite mode (cmds.c), so the replacement inherits text
             // properties from the surrounding text.
             eval.apply(
-                Value::symbol("insert-and-inherit"),
+                Value::symbol(crate::emacs_core::intern::WellKnown::InsertAndInherit),
                 vec![Value::string(text.clone())],
             )?;
             eval.apply(
-                Value::symbol("goto-char"),
+                Value::symbol(crate::emacs_core::intern::WellKnown::GotoChar),
                 vec![Value::fixnum(start_char + repeats)],
             )?;
         } else {
@@ -3375,7 +3452,7 @@ pub(crate) fn builtin_self_insert_command(eval: &mut Context, args: Vec<Value>) 
             // `insert-and-inherit' runs the before/after-change signals itself
             // and advances point past the inserted text.
             eval.apply(
-                Value::symbol("insert-and-inherit"),
+                Value::symbol(crate::emacs_core::intern::WellKnown::InsertAndInherit),
                 vec![Value::string(text.clone())],
             )?;
         }
@@ -3393,17 +3470,25 @@ pub(crate) fn builtin_self_insert_command(eval: &mut Context, args: Vec<Value>) 
         // terminated, not the empty line it opened.
         let straddle = NewlineFillStraddle::for_self_inserted_char(ch);
         straddle.step(eval, NewlineFillStep::BeforeFill)?;
-        eval.apply(Value::symbol("internal-auto-fill"), vec![])?;
+        eval.apply(
+            Value::symbol(crate::emacs_core::intern::WellKnown::InternalAutoFill),
+            vec![],
+        )?;
         straddle.step(eval, NewlineFillStep::AfterFill)?;
     }
     eval.apply(
-        Value::symbol("run-hooks"),
-        vec![Value::symbol("post-self-insert-hook")],
+        Value::symbol(crate::emacs_core::intern::WellKnown::RunHooks),
+        vec![Value::symbol(
+            crate::emacs_core::intern::WellKnown::PostSelfInsertHook,
+        )],
     )?;
     if abbrev.expanded {
         // GNU returns the "needs undo boundary" result from
         // `internal_self_insert` when `expand-abbrev` changed the buffer.
-        eval.assign("undo-auto--this-command-amalgamating", Value::NIL);
+        eval.assign_by_id(
+            crate::emacs_core::intern::WellKnown::UndoAutoThisCommandAmalgamating.id(),
+            Value::NIL,
+        );
     }
     Ok(Value::NIL)
 }
@@ -3421,7 +3506,9 @@ fn self_insert_expand_abbrev_at_word_boundary(
     eval: &mut Context,
     inserted: char,
 ) -> Result<SelfInsertAbbrevOutcome, Flow> {
-    if dynamic_or_global_symbol_value(eval, "abbrev-mode").is_none_or(|value| value.is_nil()) {
+    if dynamic_or_global_symbol_value_by_id(eval, ABBREV_MODE.id())
+        .is_none_or(|value| value.is_nil())
+    {
         return Ok(SelfInsertAbbrevOutcome::default());
     }
 
@@ -3444,7 +3531,7 @@ fn self_insert_expand_abbrev_at_word_boundary(
         return Ok(SelfInsertAbbrevOutcome::default());
     }
 
-    let expanded = eval.apply(Value::symbol("expand-abbrev"), vec![])?;
+    let expanded = eval.apply(Value::symbol(&EXPAND_ABBREV), vec![])?;
     if expanded.is_nil() {
         return Ok(SelfInsertAbbrevOutcome::default());
     }
@@ -3457,7 +3544,7 @@ fn self_insert_expand_abbrev_at_word_boundary(
             .and_then(|hook| match symbol_mode.unwrap(hook).kind() {
                 ValueKind::Symbol(hook_symbol) => eval
                     .obarray()
-                    .get_property_id(hook_symbol, intern("no-self-insert")),
+                    .get_property_id(hook_symbol, NO_SELF_INSERT.id()),
                 _ => None,
             })
             .is_some_and(|property| property.is_truthy()),
@@ -3480,7 +3567,7 @@ fn self_insert_expand_abbrev_at_word_boundary(
 fn self_insert_overwrite_plan(eval: &mut Context, c: char, n: i64) -> Result<(usize, usize), Flow> {
     // overwrite = BVAR (current_buffer, overwrite_mode)
     let overwrite = eval
-        .eval_symbol_by_id(crate::emacs_core::intern::intern("overwrite-mode"))
+        .eval_symbol_by_id(OVERWRITE_MODE.id())
         .unwrap_or(Value::NIL);
     if overwrite.is_nil() {
         return Ok((0, 0));
@@ -3505,7 +3592,7 @@ fn self_insert_overwrite_plan(eval: &mut Context, c: char, n: i64) -> Result<(us
         return Ok((0, 0));
     };
 
-    let binary = overwrite == Value::symbol("overwrite-mode-binary");
+    let binary = overwrite == Value::symbol(&OVERWRITE_MODE_BINARY);
     if binary {
         // chars_to_delete = min (n, PTRDIFF_MAX)
         return Ok((n.max(0) as usize, 0));
@@ -3650,13 +3737,19 @@ impl NewlineFillStraddle {
             NewlineFillStep::AfterFill if point < point_max => point + 1,
             _ => return Ok(()),
         };
-        eval.apply(Value::symbol("goto-char"), vec![Value::fixnum(target)])?;
+        eval.apply(
+            Value::symbol(crate::emacs_core::intern::WellKnown::GotoChar),
+            vec![Value::fixnum(target)],
+        )?;
         Ok(())
     }
 }
 
 fn self_insert_should_auto_fill(eval: &Context, ch: char) -> bool {
-    let Some(auto_fill_chars) = dynamic_or_global_symbol_value(eval, "auto-fill-chars") else {
+    let Some(auto_fill_chars) = eval
+        .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::AutoFillChars.id())
+        .ok()
+    else {
         return ch == ' ' || ch == '\n';
     };
     if crate::emacs_core::chartable::is_char_table(&auto_fill_chars) {

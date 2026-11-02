@@ -503,7 +503,7 @@ fn call_interactively_evaluates_registry_form_specs() {
         InteractiveSpec::from_value(Value::list(vec![Value::symbol("list"), Value::fixnum(7)])),
     );
 
-    let result = builtin_call_interactively(&mut ev, vec![Value::symbol("registry-form-command")])
+    let result = builtin_call_interactively(&mut ev, &vec![Value::symbol("registry-form-command")])
         .expect("call-interactively should evaluate registry form spec");
     assert_eq!(result, Value::fixnum(7));
 }
@@ -618,7 +618,7 @@ fn defalias_replaces_stale_noarg_registry_spec_with_live_interactive_form() {
     .expect("install live interactive form");
 
     let result =
-        builtin_call_interactively(&mut ev, vec![Value::symbol("vm-stale-interactive-form")])
+        builtin_call_interactively(&mut ev, &vec![Value::symbol("vm-stale-interactive-form")])
             .expect("call-interactively should use the live interactive form");
     assert_eq!(result, Value::fixnum(7));
 }
@@ -2690,6 +2690,196 @@ fn define_key_normalizes_lucid_events_in_keyboard_macro_definitions() {
 }
 
 #[test]
+fn define_key_resolves_filtered_toolbar_prefix_for_define_and_remove() {
+    crate::test_utils::init_test_tracing();
+    assert_eq!(
+        eval_one(
+            r#"(let* ((m (make-sparse-keymap))
+                      (tool (make-sparse-keymap))
+                      (calls 0)
+                      (item (list 'menu-item "tool bar" 'ignore :filter
+                                  (lambda (_command)
+                                    (setq calls (1+ calls))
+                                    tool))))
+                 (define-key m [tool-bar] item)
+                 (let ((stored (cdr (assq 'tool-bar m)))
+                       (defined (define-key m [tool-bar S-back-button]
+                                  'back-button-local-backward)))
+                   (list defined
+                         (lookup-key tool [S-back-button])
+                         (eq (cdr (assq 'tool-bar m)) stored)
+                         calls
+                         (define-key m [tool-bar S-back-button] nil t)
+                         (lookup-key tool [S-back-button])
+                         calls)))"#,
+        ),
+        "OK (back-button-local-backward back-button-local-backward t 1 nil nil 2)"
+    );
+}
+
+#[test]
+fn define_key_resolved_filter_preserves_nil_and_nonprefix_behavior() {
+    crate::test_utils::init_test_tracing();
+    assert_eq!(
+        eval_one(
+            r#"(let ((m (make-sparse-keymap)))
+                 (define-key m [empty]
+                   '(menu-item "empty" ignore :filter (lambda (_) nil)))
+                 (define-key m [command]
+                   '(menu-item "command" nil :filter (lambda (_) 'ignore)))
+                 (define-key m [empty leaf] 'leaf-command)
+                 (list (lookup-key m [empty leaf])
+                       (condition-case err
+                           (define-key m [command leaf] 'ignore)
+                         (error (car err)))))"#,
+        ),
+        "OK (leaf-command error)"
+    );
+}
+
+#[test]
+fn define_key_filtered_prefix_does_not_modify_parent_bindings() {
+    crate::test_utils::init_test_tracing();
+    assert_eq!(
+        eval_one(
+            r#"(let ((m (make-sparse-keymap))
+                     (parent (make-sparse-keymap))
+                     (tool (make-sparse-keymap))
+                     (parent-tool (make-sparse-keymap)))
+                 (define-key parent-tool [leaf] 'parent-command)
+                 (define-key parent [tool-bar]
+                   (list 'menu-item "parent tool bar" 'ignore :filter
+                         (lambda (_) parent-tool)))
+                 (set-keymap-parent m parent)
+                 (define-key m [tool-bar leaf] 'child-command)
+                 (define-key m [filtered]
+                   (list 'menu-item "tool bar" 'ignore :filter (lambda (_) tool)))
+                 (define-key m [filtered leaf] 'filtered-command)
+                 (list (lookup-key m [tool-bar leaf])
+                       (lookup-key parent-tool [leaf])
+                       (lookup-key tool [leaf])))"#,
+        ),
+        "OK (child-command parent-command filtered-command)"
+    );
+}
+
+#[test]
+fn define_key_swallows_menu_item_filter_errors_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    // GNU evaluates a menu-item `:filter` through `menu_item_eval_property`
+    // (src/keyboard.c:8873-8884), which binds `inhibit-redisplay` and catches
+    // `error` (returning nil); only quit and other nonlocal exits propagate.
+    // Expected values measured under GNU Emacs 31.1.
+    assert_eq!(
+        eval_one(
+            r#"(let ((m (make-sparse-keymap))
+                     (tool (make-sparse-keymap))
+                     (saw-inhibit nil))
+                 (define-key m [boom]
+                   (list 'menu-item "boom" 'ignore
+                         :filter (lambda (_command) (car 1))))
+                 (let ((defined (condition-case err
+                                    (progn (define-key m [boom leaf] 'leaf-command)
+                                           :no-error)
+                                  (error :signalled)))
+                       (wrapper (cdr (assq 'boom m))))
+                   (define-key m [leaf]
+                     (list 'menu-item "leaf" 'ignore
+                           :filter (lambda (_command) (car 1))))
+                   (define-key m [tool-bar]
+                     (list 'menu-item "tool bar" 'ignore
+                           :filter (lambda (_command)
+                                     (setq saw-inhibit inhibit-redisplay)
+                                     tool)))
+                   (define-key m [tool-bar open] 'open-command)
+                   (list defined
+                         (keymapp wrapper)
+                         (lookup-key m [boom leaf])
+                         (eq (lookup-key m [boom]) wrapper)
+                         (lookup-key m [leaf])
+                         saw-inhibit
+                         (lookup-key tool [open]))))"#,
+        ),
+        "OK (:no-error t leaf-command t nil t open-command)"
+    );
+}
+
+#[test]
+fn remove_through_filtered_prefix_invalidates_where_is_cache() {
+    crate::test_utils::init_test_tracing();
+    // GNU `store_in_keymap` clears the reverse-keymap cache on every store,
+    // including REMOVE (src/keymap.c:733-736). A filter that runs the
+    // where-is reverse index before the removal must not leave a stale
+    // `[remap ...]` target behind.
+    assert_eq!(
+        eval_one(
+            r#"(let* ((m (make-sparse-keymap))
+                      (tool (make-sparse-keymap))
+                      (first-call t))
+                 (define-key tool [x] 'pr627-alt)
+                 (define-key m [direct] tool)
+                 (define-key m [remap pr627-target] 'pr627-alt)
+                 (define-key m [tool-bar]
+                   (list 'menu-item "tool" 'ignore
+                         :filter (lambda (_command)
+                                   (when first-call
+                                     (setq first-call nil)
+                                     (where-is-internal 'pr627-target m t))
+                                   m)))
+                 (define-key m [tool-bar remap pr627-target] nil t)
+                 (list (where-is-internal 'pr627-target m t)
+                       (where-is-internal 'pr627-alt m t)
+                       (lookup-key m [remap pr627-target])))"#,
+        ),
+        "OK (nil [direct x] nil)"
+    );
+}
+
+#[test]
+fn menu_item_filter_nonlocal_exits_propagate_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    // `menu_item_eval_property` catches only `error` (src/keyboard.c:8873-8885),
+    // so quit and a throw with an outer catch stay nonlocal -- the behavior
+    // that requires a separate `MenuItemProperty` barrier instead of
+    // `safe_funcall`'s Qt barrier. A throw with no matching catch becomes the
+    // `no-catch` error and is muted like any other error. The quit also has to
+    // unwind the `inhibit-redisplay` binding. Expected values measured under
+    // GNU Emacs 31.1.
+    assert_eq!(
+        eval_one(
+            r#"(let ((m (make-sparse-keymap)))
+                 (define-key m [q]
+                   (list 'menu-item "q" 'ignore
+                         :filter (lambda (_command) (signal 'quit nil))))
+                 (define-key m [t]
+                   (list 'menu-item "t" 'ignore
+                         :filter (lambda (_command) (throw 'pr627-tag :thrown))))
+                 (define-key m [u]
+                   (list 'menu-item "u" 'ignore
+                         :filter (lambda (_command) (throw 'pr627-none 1))))
+                 (list
+                  (let ((inhibit-redisplay t))
+                    (condition-case nil
+                        (progn (define-key m [q leaf] 'q-command) :no-error)
+                      (quit (list :quit inhibit-redisplay))
+                      (error :error)))
+                  (catch 'pr627-tag
+                    (condition-case nil
+                        (progn (define-key m [t leaf] 't-command) :no-error)
+                      (error :error)))
+                  (condition-case nil
+                      (progn (define-key m [u leaf] 'u-command) :no-error)
+                    (error :error))
+                  (condition-case nil
+                      (lookup-key m [q])
+                    (quit :quit)
+                    (error :error))))"#,
+        ),
+        "OK ((:quit t) :thrown :no-error :quit)"
+    );
+}
+
+#[test]
 fn define_key_sequence_preserves_gnu_prefix_symbol_bindings() {
     crate::test_utils::init_test_tracing();
     assert_eq!(
@@ -3197,7 +3387,7 @@ fn call_interactively_rejects_non_vector_keys_argument() {
     let mut ev = Context::new();
     let result = builtin_call_interactively(
         &mut ev,
-        vec![Value::symbol("ignore"), Value::NIL, Value::string("b")],
+        &vec![Value::symbol("ignore"), Value::NIL, Value::string("b")],
     )
     .expect_err("call-interactively should reject non-vector keys argument");
     match result.into_kind() {
@@ -3218,7 +3408,7 @@ fn call_interactively_accepts_vector_keys_argument() {
         .expect("quoted lambda command");
     let result = builtin_call_interactively(
         &mut ev,
-        vec![command, Value::NIL, Value::vector(vec![Value::fixnum(98)])],
+        &vec![command, Value::NIL, Value::vector(vec![Value::fixnum(98)])],
     )
     .expect("call-interactively should accept vector keys argument");
     assert!(result.is_nil());
@@ -3233,7 +3423,7 @@ fn call_interactively_does_not_record_keys_argument_in_recent_history() {
         .expect("quoted lambda command");
     let result = builtin_call_interactively(
         &mut ev,
-        vec![command, Value::NIL, Value::vector(vec![Value::fixnum(98)])],
+        &vec![command, Value::NIL, Value::vector(vec![Value::fixnum(98)])],
     )
     .expect("call-interactively should accept vector keys argument");
     assert!(result.is_nil());
@@ -3254,7 +3444,7 @@ fn call_interactively_keys_vector_keeps_this_command_keys_empty_in_batch() {
 
     let result = builtin_call_interactively(
         &mut ev,
-        vec![
+        &vec![
             Value::symbol("neo-rk-loop-probe"),
             Value::NIL,
             Value::vector(vec![Value::symbol("foo")]),
@@ -3272,7 +3462,7 @@ fn call_interactively_rejects_list_keys_argument_without_recording_recent_histor
     let mut ev = Context::new();
     let keys = Value::list(vec![Value::fixnum(97), Value::fixnum(98)]);
     let result =
-        builtin_call_interactively(&mut ev, vec![Value::symbol("ignore"), Value::NIL, keys])
+        builtin_call_interactively(&mut ev, &vec![Value::symbol("ignore"), Value::NIL, keys])
             .expect_err("call-interactively should reject list keys argument");
     match result.into_kind() {
         FlowKind::Signal(sig) => {
@@ -3290,7 +3480,7 @@ fn call_interactively_rejects_too_many_arguments() {
     let mut ev = Context::new();
     let result = builtin_call_interactively(
         &mut ev,
-        vec![Value::symbol("ignore"), Value::NIL, Value::NIL, Value::NIL],
+        &vec![Value::symbol("ignore"), Value::NIL, Value::NIL, Value::NIL],
     )
     .expect_err("call-interactively should reject too many arguments");
     match result.into_kind() {
@@ -4812,7 +5002,7 @@ fn interactive_lambda_e_spec_prefers_existing_command_keys_context() {
 fn call_interactively_non_command_signals_commandp_error() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let result = builtin_call_interactively(&mut ev, vec![Value::symbol("car")])
+    let result = builtin_call_interactively(&mut ev, &vec![Value::symbol("car")])
         .expect_err("call-interactively should reject non-command symbols");
     match result.into_kind() {
         FlowKind::Signal(sig) => {
@@ -4837,8 +5027,9 @@ fn call_interactively_propagates_noninteractive_autoload_failure_before_commandp
     )
     .expect("install non-interactive autoload");
 
-    let result = builtin_call_interactively(&mut ev, vec![Value::symbol("neovm-ci-missing-plain")])
-        .expect_err("call-interactively should propagate the autoload failure");
+    let result =
+        builtin_call_interactively(&mut ev, &vec![Value::symbol("neovm-ci-missing-plain")])
+            .expect_err("call-interactively should propagate the autoload failure");
     match result.into_kind() {
         FlowKind::Signal(sig) => assert_eq!(sig.symbol_name(), "file-missing"),
         other => panic!("unexpected flow: {other:?}"),
@@ -4849,7 +5040,7 @@ fn call_interactively_propagates_noninteractive_autoload_failure_before_commandp
 fn call_interactively_eval_expression_reads_stdin_in_batch() {
     crate::test_utils::init_test_tracing();
     let mut ev = gnu_simple_eval_expression_eval();
-    let result = builtin_call_interactively(&mut ev, vec![Value::symbol("eval-expression")])
+    let result = builtin_call_interactively(&mut ev, &vec![Value::symbol("eval-expression")])
         .expect_err("call-interactively eval-expression should signal end-of-file in batch");
     match result.into_kind() {
         FlowKind::Signal(sig) => {
@@ -4943,7 +5134,7 @@ fn call_interactively_eval_expression_executes_read_expression_result() {
         "#,
     );
 
-    let result = builtin_call_interactively(&mut ev, vec![Value::symbol("eval-expression")])
+    let result = builtin_call_interactively(&mut ev, &vec![Value::symbol("eval-expression")])
         .expect("call-interactively eval-expression should succeed");
     let rendered = crate::emacs_core::print::print_value(&result);
     let current_message = ev

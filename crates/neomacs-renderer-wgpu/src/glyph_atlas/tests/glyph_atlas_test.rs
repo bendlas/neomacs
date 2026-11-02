@@ -1,9 +1,9 @@
 use super::{
-    AnyAtlasEntry, BitmapFontReplayCache, ComposedGlyphKey, FontconfigSubpixelOrder,
-    GlyphAtlasError, GlyphKey, GlyphPixelKind, RasterizeResult, SampledSubGlyph, SingleCharGlyph,
-    SubGlyph, SubpixelBin, SubpixelRequest, WgpuGlyphAtlas, effective_font_size,
-    frame_font_bindings_identity, glyph_font_identity, key_uses_default_font_metrics,
-    normalize_subpixel_mask, rasterize_missing_glyph_box, resolved_glyph_stream_identity,
+    AnyAtlasEntry, ComposedGlyphKey, FontconfigSubpixelOrder, GlyphAtlasError, GlyphKey,
+    GlyphPixelKind, RasterizeResult, SampledSubGlyph, SingleCharGlyph, SubGlyph, SubpixelBin,
+    SubpixelRequest, WgpuGlyphAtlas, effective_font_size, frame_font_bindings_identity,
+    glyph_font_identity, key_uses_default_font_metrics, normalize_subpixel_mask,
+    rasterize_missing_glyph_box, resolved_glyph_stream_identity,
 };
 use neomacs_display_protocol::face::Face;
 use neomacs_display_protocol::font::{
@@ -11,6 +11,9 @@ use neomacs_display_protocol::font::{
     ResolvedFont, ResolvedFontId, ResolvedFontIdentity, ResolvedGlyph, ResolvedGlyphId,
 };
 use neomacs_display_protocol::types::FaceId;
+
+#[cfg(target_os = "linux")]
+use super::BitmapFontReplayCache;
 
 fn test_font_path(path: std::path::PathBuf) -> String {
     path.to_string_lossy().into_owned()
@@ -379,7 +382,7 @@ fn glyph_font_identity_discriminates_resolved_font_id() {
     use neomacs_display_protocol::font::ResolvedFontId;
 
     let mut a = Face::new(FaceId::new(5));
-    a.font_family = "Mono".to_string();
+    a.font_family = std::sync::Arc::from("Mono");
     let mut b = a.clone();
 
     // Same request fields, different realized fonts -> different identity.
@@ -398,7 +401,7 @@ fn glyph_font_identity_discriminates_resolved_font_id() {
     // Emergency non-ASCII fallback semantics are also part of an unresolved
     // face's raster identity.
     a.default_resolved_font_id = None;
-    b.font_family = "Different Effective Family".to_string();
+    b.font_family = std::sync::Arc::from("Different Effective Family");
     assert_ne!(glyph_font_identity(Some(&a)), glyph_font_identity(Some(&b)));
 }
 
@@ -427,6 +430,177 @@ fn try_test_atlas() -> Option<WgpuGlyphAtlas> {
         atlas.set_current_frame_fonts(frame.font_bindings());
         atlas
     })
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_atlas_uses_native_monaco_masks() {
+    let Some(mut atlas) = try_test_atlas() else {
+        eprintln!("SKIP: no Metal device available for native atlas routing test");
+        return;
+    };
+    assert!(!atlas.subpixel_enabled());
+    let id = atlas
+        .font_system
+        .db()
+        .query(&fontdb::Query {
+            families: &[fontdb::Family::Name("Monaco")],
+            ..Default::default()
+        })
+        .expect("macOS supplies Monaco");
+    let name = atlas
+        .font_system
+        .db()
+        .face(id)
+        .unwrap()
+        .post_script_name
+        .clone();
+    let font = atlas
+        .font_system
+        .get_font(id, fontdb::Weight::NORMAL)
+        .unwrap();
+    let mut reference = super::macos::NativeRasterizer::default();
+    for size in [16.0f32, 32.0] {
+        let key = cosmic_text::CacheKey {
+            font_id: id,
+            glyph_id: font.as_swash().charmap().map('t'),
+            font_size_bits: size.to_bits(),
+            x_bin: SubpixelBin::Zero,
+            y_bin: SubpixelBin::Zero,
+            font_weight: fontdb::Weight::NORMAL,
+            flags: cosmic_text::CacheKeyFlags::empty(),
+        };
+        let expected = reference.rasterize(&font, &name, key).unwrap();
+        let actual = atlas.render_cache_key_image(key, false).unwrap();
+        assert_eq!(actual.content, super::RasterContent::Mask);
+        assert!(
+            !actual.data.is_empty() && actual.data.iter().any(|&p| p > 0),
+            "native routing must produce ink, not an empty mask"
+        );
+        assert_eq!((actual.left, actual.top), (expected.left, expected.top));
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.data, expected.data);
+
+        // Synthetic styles must decline the native path and keep Swash's skew;
+        // otherwise the fallback silently renders an upright glyph.
+        let mut synthetic = key;
+        synthetic.flags = cosmic_text::CacheKeyFlags::FAKE_ITALIC;
+        let slanted = atlas
+            .render_cache_key_image(synthetic, false)
+            .expect("fake italic still renders through Swash");
+        assert!(slanted.data.iter().any(|&p| p > 0));
+        assert_ne!(
+            slanted.data, actual.data,
+            "native path must not serve the upright mask for a fake-italic key"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_resolved_cluster_applies_backing_scale() {
+    use neomacs_display_protocol::font::FontSlantKind;
+
+    let Some(mut atlas) = try_test_atlas() else {
+        eprintln!("SKIP: no Metal device available for backing-scale test");
+        return;
+    };
+    let source_id = atlas
+        .font_system
+        .db()
+        .query(&fontdb::Query {
+            families: &[fontdb::Family::Name("Monaco")],
+            ..Default::default()
+        })
+        .expect("macOS supplies Monaco");
+    let (path, face_index, post_script_name) = {
+        let source_face = atlas.font_system.db().face(source_id).unwrap();
+        let path = match &source_face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.clone(),
+            fontdb::Source::Binary(_) => panic!("Monaco is a file-backed face"),
+        };
+        (
+            path,
+            source_face.index,
+            source_face.post_script_name.clone(),
+        )
+    };
+    let identity = ResolvedFontIdentity::from_file(&path.to_string_lossy(), face_index, None);
+    let id = ResolvedFontId(91);
+    let font = ResolvedFont {
+        id,
+        identity: identity.clone(),
+        replay: file_replay_for(&identity),
+        family: "Monaco".to_owned(),
+        full_name: None,
+        postscript_name: Some(post_script_name),
+        weight: 400,
+        slant: FontSlantKind::Normal,
+        width: 5,
+        pixel_size: 16.0,
+        ascent_px: 12.0,
+        descent_px: 4.0,
+        space_advance_px: 8.0,
+        glyph_advance: Default::default(),
+    };
+    atlas.install_frame_fonts(
+        &Default::default(),
+        &[(id, font.clone())].into_iter().collect(),
+        &Default::default(),
+        &Default::default(),
+    );
+    let local_id = atlas
+        .local_fontdb_id_for(id)
+        .expect("renderer installs the exact Monaco face");
+    let glyph_id = atlas
+        .font_system
+        .get_font(local_id, fontdb::Weight::NORMAL)
+        .expect("installed Monaco face is reachable")
+        .as_swash()
+        .charmap()
+        .map('H');
+    let glyph = ResolvedGlyph {
+        resolved_font_id: id,
+        glyph_id: ResolvedGlyphId::new(u32::from(glyph_id)),
+        x: 0.0,
+        y: 0.0,
+        x_advance: 8.0,
+        cluster_start: 0,
+        cluster_end: 1,
+    };
+    let rasterize = |atlas: &mut WgpuGlyphAtlas| {
+        atlas
+            .rasterize_resolved_cluster(
+                std::slice::from_ref(&glyph),
+                None,
+                16.0,
+                SubpixelBin::Zero,
+                SubpixelBin::Zero,
+                false,
+            )
+            .and_then(|mut parts| (parts.len() == 1).then(|| parts.remove(0)))
+            .expect("rasterize the installed Monaco glyph")
+    };
+    let at_one = rasterize(&mut atlas);
+    atlas.set_scale_factor(2.0);
+    let at_two = rasterize(&mut atlas);
+    assert!(at_one.width > 0 && at_one.height > 0);
+    assert!(
+        at_two.width.abs_diff(at_one.width * 2) <= 2,
+        "2x scale must double the physical mask width: {} -> {}",
+        at_one.width,
+        at_two.width
+    );
+    assert!(
+        at_two.height.abs_diff(at_one.height * 2) <= 2,
+        "2x scale must double the physical mask height: {} -> {}",
+        at_one.height,
+        at_two.height
+    );
+    assert!((at_two.advance_width - at_one.advance_width * 2.0).abs() < 0.01);
 }
 
 #[test]
@@ -546,7 +720,7 @@ fn renderer_keeps_missing_ascii_on_primary_font() {
         &Default::default(),
     );
     let mut face = Face::new(FaceId::new(7));
-    face.font_family = requested_family.to_string();
+    face.font_family = std::sync::Arc::from(requested_family);
     face.font_size = 10.0;
     face.font_ascent = 8;
     face.font_descent = 2;
@@ -1213,7 +1387,7 @@ fn color_rasters_are_not_shared_across_foregrounds() {
 
     let face_with = |foreground: neomacs_display_protocol::Color| {
         let mut face = Face::new(FaceId::new(11));
-        face.font_family = "Noto Color Emoji".to_owned();
+        face.font_family = std::sync::Arc::from("Noto Color Emoji");
         face.font_size = 16.0;
         face.default_resolved_font_id = Some(id);
         face.foreground = foreground;
@@ -1308,7 +1482,7 @@ fn mask_glyph_identities_ignore_the_foreground() {
 
     let face_for = |resolved: ResolvedFontId, foreground: neomacs_display_protocol::Color| {
         let mut face = Face::new(FaceId::new(21));
-        face.font_family = "Fixture".to_owned();
+        face.font_family = std::sync::Arc::from("Fixture");
         face.font_size = 16.0;
         face.default_resolved_font_id = Some(resolved);
         face.foreground = foreground;

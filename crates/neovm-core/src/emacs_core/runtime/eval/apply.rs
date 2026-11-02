@@ -5,8 +5,99 @@
 
 use super::*;
 
+/// The GC root that keeps an interpreted callable alive for one
+/// [`Context::apply_lambda`] call.
+#[derive(Clone, Copy)]
+pub(crate) enum CallableRoot<'a> {
+    /// No traced carrier holds the callable: `apply_lambda` pushes a
+    /// specpdl `GcRoot` for the closure, its body and its environment.
+    Specpdl,
+    /// The caller witnessed the callable in a GC-traced carrier that
+    /// outlives the call, so no specpdl root is pushed.
+    Witnessed(RootedCallable<'a>),
+}
+
+/// Zero-sized proof that a callable is held by a GC-traced carrier for the
+/// whole call: the caller's `bc_buf` operand span, or the specpdl
+/// `Backtrace` entry recorded for this call.
+///
+/// Constructible only through the carrier-named constructors below. A
+/// borrowed lifetime cannot express the invariant: the witness has to
+/// survive into `&mut Context` dispatch, so it borrows nothing. The
+/// constructors verify the carrier in debug builds and compile away in
+/// release; the type makes every call site state which carrier roots its
+/// callable, and an unrooted site must spell out [`CallableRoot::Specpdl`].
+#[derive(Clone, Copy)]
+pub(crate) struct RootedCallable<'a> {
+    _scope: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> RootedCallable<'a> {
+    /// `ctx.bc_buf[func_slot]` holds `function` inside the caller's live
+    /// span; the "bc" root group traces every slot for the whole call.
+    #[inline(always)]
+    pub(crate) fn from_bc_span(ctx: &Context, func_slot: usize, function: Value) -> Self {
+        debug_assert_eq!(
+            ctx.bc_buf.get(func_slot).map(|value| value.bits()),
+            Some(function.bits()),
+            "the witnessed bc_buf slot must hold the callable"
+        );
+        Self {
+            _scope: std::marker::PhantomData,
+        }
+    }
+
+    /// The specpdl `Backtrace` entry at `base` records `function`; the
+    /// "specpdl" root group traces it until the call's token is popped.
+    #[inline(always)]
+    pub(crate) fn from_backtrace(ctx: &Context, base: usize, function: Value) -> Self {
+        debug_assert!(
+            matches!(
+                ctx.specpdl.get(base),
+                Some(
+                    SpecBinding::Backtrace { function: recorded, .. }
+                        | SpecBinding::Backtrace1 { function: recorded, .. }
+                        | SpecBinding::Backtrace2 { function: recorded, .. }
+                        | SpecBinding::BacktraceNative { function: recorded, .. }
+                ) if recorded.bits() == function.bits()
+            ),
+            "the witnessed specpdl entry must hold the callable"
+        );
+        Self {
+            _scope: std::marker::PhantomData,
+        }
+    }
+}
+
 cached_symbol_id!(optional_arg_symbol, "&optional");
 cached_symbol_id!(rest_arg_symbol, "&rest");
+
+/// One traced slot holding a body sequence's rest across one form's
+/// evaluation: GNU Fprogn's `body` local (eval.c:433-446), which lives in
+/// the C frame and stays conservatively scanned while the form runs.
+///
+/// Constructible only by [`Context::push_saved_continuation`], and its slot
+/// index is private, so no other code can re-point an arbitrary arena entry.
+/// The token is valid only inside the sequence temp-root scope that created
+/// it; that scope's restore releases the slot on success, error and
+/// thread-block returns. It must not outlive that scope or move to another
+/// Context.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SavedContinuationRoot {
+    slot: usize,
+}
+
+impl SavedContinuationRoot {
+    #[inline]
+    fn new(slot: usize) -> Self {
+        Self { slot }
+    }
+
+    #[inline]
+    fn slot(self) -> usize {
+        self.slot
+    }
+}
 
 /// Restore only this synchronous callback's failed native activation. Its
 /// saved prefix belongs to the current mutator thread's existing scratch roots;
@@ -486,13 +577,23 @@ impl Context {
     /// [`Self::push_unevalled_backtrace_frame`] for the cons form `eval_sub`
     /// is evaluating (GNU `record_in_backtrace`): its argument forms are a
     /// cons's cdr, so the reserved-tag check is debug-only.
+    ///
+    /// Written into its final slot like [`Self::record_save_excursion`]:
+    /// `Vec::push` built a wide stack temporary for the entry and copied it,
+    /// which stalls on the narrow stores every cons form pays.
     #[inline(always)]
     pub(super) fn push_unevalled_form_frame(&mut self, function: Value, original_args: Value) {
-        self.specpdl.push(SpecBinding::Backtrace {
+        let count = self.specpdl.len();
+        self.specpdl.reserve(1);
+        self.specpdl.spare_capacity_mut()[0].write(SpecBinding::Backtrace {
             function,
             args: BacktraceArgs::unevalled_form_args(original_args),
             debug_on_exit: false,
         });
+        // SAFETY: reserve ensured a spare slot and write initialized it above.
+        // Publishing the length makes the entry visible to the root walk;
+        // reserving Rust memory and writing the entry cannot run Lisp or GC.
+        unsafe { self.specpdl.set_len(count + 1) };
     }
 
     #[inline]
@@ -1146,9 +1247,14 @@ impl Context {
     }
 
     /// A special form returned: its temps stay visible to the rest of the
-    /// body sequence, the way GNU's freed-but-still-scanned stack slots do,
-    /// and the residue of the PREVIOUS such form in this sequence stops
-    /// being rooted.
+    /// body sequence, and the retained run of the PREVIOUS such form in this
+    /// sequence stops being rooted.  This visibility is Neo's own
+    /// deterministic, conservative rule for temporary roots: the enclosing
+    /// body sequence owns a returned form's temps until the sequence ends
+    /// (an explicit evaluation ends its run earlier, see
+    /// `EvalBoundaryRoots`).  It is a rule we chose, not an emulation of any
+    /// particular GNU stack-slot state; GNU documents no weak-entry
+    /// collection timing.
     ///
     /// The retained run is compacted down onto the dead one when the two are
     /// adjacent.  When something live sits between them -- an enclosing
@@ -1159,32 +1265,42 @@ impl Context {
         let current_len = self.eval_temp_roots.len();
         let base = scope.saved_len.min(current_len);
         let keep = current_len - base;
-        let mut dst = base;
-        if let Some(&frame) = self.sequence_temp_root_frames.last()
-            && base >= frame.eval_base
-        {
-            // Clamp against a boundary restore that truncated below the run.
-            let old_lo = frame.let_floor.min(current_len);
-            let old_hi = (frame.let_floor + frame.let_len)
-                .min(current_len)
-                .max(old_lo);
-            if base == old_hi {
-                dst = old_lo;
-                if dst != base && keep > 0 {
-                    self.eval_temp_roots.copy_within(base..current_len, dst);
-                }
-            } else {
-                for root in &mut self.eval_temp_roots[old_lo..old_hi] {
-                    *root = Value::NIL;
-                }
-            }
-            let frame = self
-                .sequence_temp_root_frames
-                .last_mut()
-                .expect("frame observed above");
-            frame.let_floor = dst;
-            frame.let_len = keep;
+        let Some(&frame) = self.sequence_temp_root_frames.last() else {
+            // No body sequence owns a run past this form: its scope is over.
+            // GNU drops the range here (SAFE_ALLOCA_LISP in Flet,
+            // exec_byte_code's stack discipline), so retaining it would keep
+            // the form's values alive past their binding scope.
+            self.eval_temp_roots.truncate(base);
+            return;
+        };
+        if base < frame.eval_base {
+            // The run starts below the enclosing sequence frame: no frame
+            // bookkeeping can ever retire it, so end its scope here.
+            self.eval_temp_roots.truncate(base);
+            return;
         }
+        // Clamp against a boundary restore that truncated below the run.
+        let mut dst = base;
+        let old_lo = frame.let_floor.min(current_len);
+        let old_hi = (frame.let_floor + frame.let_len)
+            .min(current_len)
+            .max(old_lo);
+        if base == old_hi {
+            dst = old_lo;
+            if dst != base && keep > 0 {
+                self.eval_temp_roots.copy_within(base..current_len, dst);
+            }
+        } else {
+            for root in &mut self.eval_temp_roots[old_lo..old_hi] {
+                *root = Value::NIL;
+            }
+        }
+        let frame = self
+            .sequence_temp_root_frames
+            .last_mut()
+            .expect("frame observed above");
+        frame.let_floor = dst;
+        frame.let_len = keep;
         self.eval_temp_roots.truncate(dst + keep);
     }
 
@@ -1196,6 +1312,27 @@ impl Context {
         let slot = self.eval_temp_roots.len();
         self.eval_temp_roots.push(value);
         slot
+    }
+
+    /// Publish a body sequence's prefetched continuation into its traced
+    /// root slot. The slot is created and updated by the body loop, whose
+    /// enclosing sequence scope releases it on every exit.
+    #[inline]
+    pub(super) fn set_saved_continuation(&mut self, root: SavedContinuationRoot, value: Value) {
+        self.set_eval_temp_root_slot(root.slot(), value);
+    }
+
+    /// Take a traced slot for the rest of a body sequence across one form's
+    /// evaluation: GNU Fprogn's `body` local (eval.c:433-446), a Lisp_Object
+    /// in the C frame that the conservative stack scan keeps visible while a
+    /// form runs. Neo's GC is precise, so the same visibility has to be an
+    /// explicit root. Call only inside a sequence temp-root scope
+    /// ([`Self::push_saved_continuation`] is paired with
+    /// `save_sequence_temp_roots`); that scope's restore releases the slot on
+    /// success, error and thread-block returns.
+    #[inline]
+    pub(super) fn push_saved_continuation(&mut self, value: Value) -> SavedContinuationRoot {
+        SavedContinuationRoot::new(self.push_eval_temp_root_slot(value))
     }
 
     pub(super) fn set_eval_temp_root_slot(&mut self, slot: usize, value: Value) {
@@ -1244,6 +1381,34 @@ impl Context {
     /// The copy out of `bc_buf` is load-bearing: `eval_sub_cons` truncates
     /// the operand stack a few lines later, so a span into it would go dead
     /// immediately (see the weak-hash-table regressions).
+    /// Publish a finished call's evaluated arguments as this sequence
+    /// frame's root run: the same values `record_sequence_call_roots` keeps
+    /// visible, written with one reserve and one bulk copy.  The generic
+    /// `extend_from_slice` path dominated the per-call cost of the residue
+    /// copy (it goes through `Vec::append_elements` for one or two words).
+    #[inline]
+    pub(super) fn publish_bc_span_call_roots(&mut self, base: usize, start: usize, end: usize) {
+        self.eval_call_roots.truncate(base);
+        if start > end || end > self.bc_buf.len() {
+            return;
+        }
+        let len = end - start;
+        self.eval_call_roots.reserve(len);
+        // SAFETY: the two runs are distinct allocations; `reserve` guarantees
+        // `len` spare slots; Value is Copy so no destructor runs; the length
+        // is published only after the copy, and nothing between the reserve
+        // and the publication can run Lisp or collect.
+        unsafe {
+            let dst = self
+                .eval_call_roots
+                .as_mut_ptr()
+                .add(self.eval_call_roots.len());
+            std::ptr::copy_nonoverlapping(self.bc_buf.as_ptr().add(start), dst, len);
+            let old = self.eval_call_roots.len();
+            self.eval_call_roots.set_len(old + len);
+        }
+    }
+
     #[inline]
     pub(super) fn record_sequence_call_roots(&mut self, count: usize) {
         let Some(&frame) = self.sequence_temp_root_frames.last() else {
@@ -1265,11 +1430,7 @@ impl Context {
             BacktraceArgsView::EvaluatedBcStack(span) => {
                 let start = span.start();
                 let end = start.saturating_add(span.len());
-                ctx.eval_call_roots.truncate(base);
-                if end <= ctx.bc_buf.len() {
-                    let (bc_buf, eval_call_roots) = (&ctx.bc_buf, &mut ctx.eval_call_roots);
-                    eval_call_roots.extend_from_slice(&bc_buf[start..end]);
-                }
+                ctx.publish_bc_span_call_roots(base, start, end);
             }
             BacktraceArgsView::Evaluated(_) => ctx.record_sequence_call_roots_slow(count, base),
         }
@@ -1296,7 +1457,7 @@ impl Context {
     #[inline(never)]
     pub(crate) fn record_save_excursion(&mut self) -> Option<usize> {
         let buffer_id = self.buffers.current_buffer_id()?;
-        let (marker, _marker_id) =
+        let marker =
             super::super::marker::make_registered_point_marker(&mut self.buffers, buffer_id)
                 .expect("the current buffer is live, so its point marker registers");
         let saved_window = super::ExcursionWindow::capture(&self.frames, buffer_id);
@@ -2114,9 +2275,14 @@ impl Context {
         self.maybe_quit_before_gc()?;
         self.enter_interpreted_eval_depth()?;
         let bt_count = self.specpdl.len();
-        if record_backtrace {
+        let call_root = if record_backtrace {
             self.push_backtrace_frame(function, &args);
-        }
+            // The entry at BT_COUNT records FUNCTION for the whole call and
+            // the specpdl walk traces it, so a lambda callee needs no root.
+            CallableRoot::Witnessed(RootedCallable::from_backtrace(self, bt_count, function))
+        } else {
+            CallableRoot::Specpdl
+        };
         let result = {
             if self.gc_safe_point_exact_should_collect() {
                 self.gc_collect_from_current_roots();
@@ -2141,9 +2307,9 @@ impl Context {
             // in stacker::maybe_grow.
             match entered {
                 Err(flow) => Err(flow),
-                Ok(()) => {
-                    self.maybe_grow_eval_stack(|ctx| ctx.funcall_general_untraced(function, args))
-                }
+                Ok(()) => self.maybe_grow_eval_stack(|ctx| {
+                    ctx.funcall_general_with_root(call_root, function, args)
+                }),
             }
         };
         self.depth -= 1;
@@ -2202,6 +2368,43 @@ impl Context {
         // GNU removes the condition handler before the callback's error is
         // muted and before safe_funcall restores inhibit-redisplay
         // (eval.c:1787-1788, 1794, 3241). Errors from this restoration escape.
+        self.unbind_to_with_result(specpdl_count, result)
+    }
+
+    /// GNU `menu_item_eval_property` (`src/keyboard.c:8873-8884`): evaluate
+    /// a dynamic menu-item property with `inhibit-redisplay` bound and
+    /// `error` (and its subclasses) caught to nil. GNU wraps the evaluation
+    /// in `internal_condition_case_1 (..., Qerror, ...)`, so `quit`, and
+    /// throws with a matching outer catch, remain nonlocal. Unlike
+    /// [`Self::safe_funcall`] this must not swallow quit.
+    pub(crate) fn eval_menu_item_property<A>(&mut self, function: Value, args: A) -> EvalResult
+    where
+        A: Into<LispArgVec>,
+    {
+        let specpdl_count = self.specpdl.len();
+        self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-redisplay"), Value::T)?;
+        let condition_stack_base = self.condition_stack_len();
+        let resume = ResumeTarget::MenuItemProperty {
+            condition_stack_base,
+        };
+        self.push_condition_frame(ConditionFrame::ConditionCase {
+            // `error` is the root of every ordinary error condition; quit's
+            // error-conditions are `(quit)`, so it does not match.
+            conditions: Value::symbol(intern("error")),
+            resume: resume.clone(),
+        });
+        let result = self.apply(function, args);
+        let result = self.dispatch_signal_result_if_needed(result);
+        self.truncate_condition_stack(condition_stack_base);
+        let result = match result.kinded() {
+            Err(FlowKind::Signal(flow)) if flow.selected_resume.as_ref() == Some(&resume) => {
+                tracing::debug!(?flow, "menu-item property error muted");
+                Ok(Value::NIL)
+            }
+            other => other.map_err(Flow::from_kind),
+        };
+        // GNU removes the condition handler before muting the error and
+        // before restoring inhibit-redisplay, matching safe_funcall.
         self.unbind_to_with_result(specpdl_count, result)
     }
 
@@ -2424,8 +2627,11 @@ impl Context {
                 let saved_roots = save_scratch_gc_roots();
                 push_scratch_gc_root(func_value);
                 let ctx_ptr = self as *mut Context;
-                let native =
-                    crate::emacs_core::jit::try_run_compiled(ctx_ptr, bc_data, func_value, &args);
+                // SAFETY: `ctx_ptr` is this live `Context`; the call runs in
+                // this thread under the dormant-Context contract.
+                let native = unsafe {
+                    crate::emacs_core::jit::try_run_compiled(ctx_ptr, bc_data, func_value, &args)
+                };
                 // Arm the direct entry once its leaf actually ran, so the
                 // next call of this arity skips the dispatcher and the
                 // cache probe above — the same hand-off
@@ -2965,12 +3171,25 @@ impl Context {
                 push_scratch_gc_root(func_value);
                 let nil = Value::NIL.bits() as i64;
                 let fixed = nargs.min(nonrest);
-                let mut bits: smallvec::SmallVec<[i64; 8]> = self.bc_buf
-                    [args_start..args_start + fixed]
-                    .iter()
-                    .map(|v| v.bits() as i64)
-                    .chain(std::iter::repeat_n(nil, nonrest - fixed))
-                    .collect();
+                // Fill the leaf ABI slots directly: the common arities need
+                // no growable vector, and the fallback keeps larger formal
+                // lists working.
+                let slot_count = nonrest + usize::from(has_rest);
+                let mut stack_bits = [0i64; 9];
+                let mut heap_bits: smallvec::SmallVec<[i64; 8]>;
+                let bits: &mut [i64] = if slot_count <= stack_bits.len() {
+                    &mut stack_bits[..slot_count]
+                } else {
+                    heap_bits = std::iter::repeat_n(0i64, slot_count).collect();
+                    &mut heap_bits[..]
+                };
+                for (slot, value) in bits[..fixed]
+                    .iter_mut()
+                    .zip(&self.bc_buf[args_start..args_start + fixed])
+                {
+                    *slot = value.bits() as i64;
+                }
+                bits[fixed..nonrest].fill(nil);
                 if has_rest {
                     // Consed after the fixed slots are read; nothing allocates
                     // between here and the leaf's prologue, which roots it (the
@@ -2981,7 +3200,7 @@ impl Context {
                     } else {
                         Value::NIL
                     };
-                    bits.push(rest.bits() as i64);
+                    bits[nonrest] = rest.bits() as i64;
                 }
                 let native =
                     cache::run_armed_leaf(ctx_ptr, bc_data, func_value, leaf, bits.as_ptr());
@@ -2999,9 +3218,13 @@ impl Context {
                     let saved_roots = save_scratch_gc_roots();
                     push_scratch_gc_root(func_value);
                     let args = LispArgVec::from_slice(&self.bc_buf[args_start..args_start + nargs]);
-                    let native = crate::emacs_core::jit::try_run_compiled(
-                        ctx_ptr, bc_data, func_value, &args,
-                    );
+                    // SAFETY: `ctx_ptr` is this live `Context`; the call runs
+                    // in this thread under the dormant-Context contract.
+                    let native = unsafe {
+                        crate::emacs_core::jit::try_run_compiled(
+                            ctx_ptr, bc_data, func_value, &args,
+                        )
+                    };
                     if matches!(native, Ok(Some(_))) {
                         cache::arm_leaf_slot(ctx_ptr, bc_data);
                     }
@@ -3041,6 +3264,18 @@ impl Context {
         function: Value,
         args: impl Into<LispArgVec>,
     ) -> EvalResult {
+        self.funcall_general_with_root(CallableRoot::Specpdl, function, args)
+    }
+
+    /// [`Self::funcall_general_untraced`] for a callable the caller holds in
+    /// a GC-traced carrier; lambda, macro and cons-lambda callees skip the
+    /// specpdl `GcRoot` and run through [`Self::apply_lambda`].
+    pub(crate) fn funcall_general_with_root(
+        &mut self,
+        root: CallableRoot<'_>,
+        function: Value,
+        args: impl Into<LispArgVec>,
+    ) -> EvalResult {
         let args = args.into();
         match function.kind() {
             ValueKind::Veclike(VecLikeType::ByteCode) => {
@@ -3053,8 +3288,8 @@ impl Context {
                 let bc_data = function.get_bytecode_data().unwrap();
                 self.execute_bytecode_call(bc_data, args, function)
             }
-            ValueKind::Veclike(VecLikeType::Lambda) => self.apply_lambda(function, args),
-            ValueKind::Veclike(VecLikeType::Macro) => self.apply_lambda(function, args),
+            ValueKind::Veclike(VecLikeType::Lambda) => self.apply_lambda(root, function, args),
+            ValueKind::Veclike(VecLikeType::Macro) => self.apply_lambda(root, function, args),
             ValueKind::Subr(_) => self.apply_subr_object(function, args, true),
             ValueKind::Veclike(VecLikeType::Subr) => self.apply_subr_object(function, args, true),
             ValueKind::Veclike(VecLikeType::ModuleFunction) => {
@@ -3124,7 +3359,7 @@ impl Context {
                 } else if cons_head_symbol_id(&function, self.symbol_mode())
                     == Some(lambda_symbol())
                 {
-                    self.apply_lambda(function, args)
+                    self.apply_lambda(root, function, args)
                 } else {
                     Err(signal(LispCondition::InvalidFunction, vec![function]))
                 }
@@ -3645,8 +3880,8 @@ impl Context {
         // Deliberately NOT value-first: destructuring here moved the result
         // copy into `call_sort_predicate`/`merge_at`/`<` instead of removing it
         // (a `(sort l #'<)` probe: store-forward blocks 10.8M -> 23.1M, cycles
-        // +24%). The `flow-word` feature gives `EvalResult` a register return;
-        // the enum carrier keeps the established lowering when it is off.
+        // +24%). The one-word Flow carrier gives `EvalResult` a register
+        // return; keep this established lowering.
         if let Some(result) = self.dispatch_subr_entry_internal(entry, args, function) {
             result.map_err(|flow| self.validate_throw(flow))
         } else {
@@ -4024,8 +4259,48 @@ impl Context {
         walk_lambda_formals(fun, arglist, args, &mut DynamicFormalBindings(self))
     }
 
+    /// Retire the call's specpdl root, if it has one. The witnessed root
+    /// lives in a caller-owned traced carrier and is dropped by the caller;
+    /// the body runners restore the specpdl to their entry length on every
+    /// result, and for a witnessed callable that entry length is `count`
+    /// (ROOT_COUNT), so the skip is a no-op.
+    ///
+    /// The skip's premise is checked here, at the decision point, in debug
+    /// builds: a body runner (or the bind-error path) that ever stopped
+    /// restoring the specpdl fails this assert before the skip could leave
+    /// bindings behind. `debug_assert_eq!` compiles out, so release code is
+    /// unchanged.
+    #[inline(always)]
+    fn unwind_call_root(
+        &mut self,
+        root: CallableRoot<'_>,
+        count: usize,
+        result: EvalResult,
+    ) -> EvalResult {
+        match root {
+            CallableRoot::Specpdl => self.unbind_to_with_result(count, result),
+            CallableRoot::Witnessed(_) => {
+                debug_assert_eq!(
+                    self.specpdl.len(),
+                    count,
+                    "witnessed lexical call left specpdl entries above ROOT_COUNT"
+                );
+                result
+            }
+        }
+    }
+
+    /// Apply FUNC_VALUE to ARGS. `root` names the GC root that keeps the
+    /// callable alive for the whole call: the specpdl `GcRoot` pushed here
+    /// ([`CallableRoot::Specpdl`]), or a caller-witnessed traced carrier
+    /// ([`CallableRoot::Witnessed`]), in which case none is pushed.
     #[inline(never)]
-    pub(super) fn apply_lambda(&mut self, func_value: Value, args: LispArgVec) -> EvalResult {
+    pub(super) fn apply_lambda(
+        &mut self,
+        root: CallableRoot<'_>,
+        func_value: Value,
+        args: LispArgVec,
+    ) -> EvalResult {
         let raw_cons_lambda = func_value.is_cons();
         let (arglist, body, env) = if raw_cons_lambda {
             let tail = func_value.cons_cdr();
@@ -4034,19 +4309,37 @@ impl Context {
             }
             (tail.cons_car(), tail.cons_cdr(), None)
         } else {
-            let Some(arglist) = func_value.closure_slot(CLOSURE_ARGLIST) else {
+            // One slot-vector dispatch for all three slots: each accessor
+            // (`closure_slot`) re-validates the closure kind and re-derives
+            // the slice, so this read the vector three times. GNU reads the
+            // three AREFs once each.
+            let Some(slots) = func_value.closure_slots() else {
                 return Err(signal(LispCondition::InvalidFunction, vec![func_value]));
             };
-            let Some(body) = func_value.closure_body_value() else {
+            let (Some(arglist), Some(body)) = (
+                slots.get(crate::tagged::header::CLOSURE_ARGLIST).copied(),
+                slots.get(crate::tagged::header::CLOSURE_CODE).copied(),
+            ) else {
                 return Err(signal(LispCondition::InvalidFunction, vec![func_value]));
             };
-            (arglist, body, func_value.closure_env().unwrap_or(None))
+            // A missing constants slot is "no captured environment", not an
+            // invalid function (the accessor returned None there too).
+            let env = slots
+                .get(crate::tagged::header::CLOSURE_CONSTANTS)
+                .copied()
+                .filter(|env| !env.is_nil());
+            (arglist, body, env)
         };
 
-        // Root the function value on the specpdl so GC can trace it
-        // (keeping body, env, and params alive through the call).
         let root_count = self.specpdl.len();
-        self.push_specpdl_with(|| SpecBinding::GcRoot { value: func_value });
+        match root {
+            CallableRoot::Specpdl => {
+                // Root the function value on the specpdl so GC can trace it
+                // (keeping body, env, and params alive through the call).
+                self.push_specpdl_with(|| SpecBinding::GcRoot { value: func_value });
+            }
+            CallableRoot::Witnessed(_) => {}
+        }
         // A lexical closure, in GNU `funcall_lambda`'s shape: the formals
         // are consed onto the captured environment in a local, which is then
         // installed with one `LexicalEnv` entry (GNU's one `specbind` of
@@ -4054,14 +4347,19 @@ impl Context {
         if !raw_cons_lambda && let Some(env) = env {
             let new_env = match bind_lexical_formals(env, func_value, arglist, &args, self) {
                 Ok(new_env) => new_env,
-                Err(flow) => return self.unbind_to_with_result(root_count, Err(flow)),
+                Err(flow) => return self.unwind_call_root(root, root_count, Err(flow)),
             };
             let result = if self.tier_i.engaged() {
                 self.tier_i_run_lexical_body(arglist, new_env, body)
             } else {
                 self.run_lexical_closure_body(new_env, body)
             };
-            return self.unbind_to_with_result(root_count, result);
+            // `run_lexical_closure_body` / `tier_i_run_lexical_body` retire
+            // their LexicalEnv entry and restore the specpdl to their entry
+            // length on every result. When the callable was witnessed that
+            // length is ROOT_COUNT, so this second truncate is a no-op; the
+            // specpdl variant still has its own GcRoot entry to pop.
+            return self.unwind_call_root(root, root_count, result);
         }
         if raw_cons_lambda {
             let old_lexenv = std::mem::replace(&mut self.lexenv, Value::NIL);
@@ -4113,9 +4411,13 @@ impl Context {
             return Err(signal(LispCondition::InvalidFunction, vec![func]));
         };
         let Some(env) = env else {
-            // A dynamic closure: `apply_lambda`'s whole dynamic path.
+            // A dynamic closure: `apply_lambda`'s whole dynamic path. The
+            // function slot below its arguments stays in the caller's traced
+            // span for the whole call, so no specpdl GcRoot is pushed.
             let args = LispArgVec::from_slice(&self.bc_buf[first_arg..first_arg + nargs]);
-            return self.apply_lambda(func, args);
+            let root =
+                CallableRoot::Witnessed(RootedCallable::from_bc_span(self, first_arg - 1, func));
+            return self.apply_lambda(root, func, args);
         };
         let new_env = bind_lexical_formals(
             env,

@@ -9,6 +9,9 @@
 //! layout that decode will confirm. Redisplay picks that layout up on its next
 //! `try_lock` probe — it never waits for it — which is what lets a large image
 //! reserve its real box while its pixels are still being decoded.
+//!
+//! Synchronous Lisp metadata queries observe the shared CPU decoder directly;
+//! GPU acquisition and texture residency do not gate full image validation.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -21,8 +24,8 @@ use neomacs_display_protocol::{
     ImageSequenceId, ImageSequenceRetirement, ProvisionalExtent, SlotChange,
 };
 use neomacs_display_runtime::render_thread::{
-    ImageDecodeTerminal, ImageProbeSource, ImageTerminalProbe, SharedImageRenderState,
-    probe_image_layout,
+    ImageDecodeClient, ImageDecodeTerminal, ImageProbeSource, ImageTerminalProbe,
+    SharedImageRenderState, probe_image_layout,
 };
 use neomacs_display_runtime::thread_comm::{AssetCommand, RenderCommand};
 use neovm_core::emacs_core::image_catalog::{
@@ -104,43 +107,30 @@ type HeaderLayouts =
 /// happened next — exactly the wait this step removes.
 #[derive(Clone)]
 pub(super) struct RedisplayWaker {
-    input: crossbeam_channel::Sender<neovm_core::keyboard::InputEvent>,
-    notifier: Option<neovm_core::emacs_core::process::WaitNotifier>,
+    input: neovm_core::host_input::HostInputPublisher,
 }
 
 impl RedisplayWaker {
-    pub(super) fn new(
-        input: crossbeam_channel::Sender<neovm_core::keyboard::InputEvent>,
-        notifier: Option<neovm_core::emacs_core::process::WaitNotifier>,
-    ) -> Self {
-        Self { input, notifier }
+    pub(super) fn new(input: neovm_core::host_input::HostInputPublisher) -> Self {
+        Self { input }
     }
 
-    /// `LayoutInvalidated` is this codebase's "a display dependency changed and
-    /// evaluator layout must be republished": the image's geometry just became
-    /// known, and the slot it reserved is stale.
+    /// Only the evaluator republishes layout after off-thread image geometry.
     fn request_redisplay(&self) {
-        if self
-            .input
-            .send(neovm_core::keyboard::InputEvent::LayoutInvalidated)
-            .is_err()
-        {
-            return;
-        }
-        if let Some(notifier) = &self.notifier
-            && let Err(error) = notifier.notify()
-        {
-            tracing::warn!(%error, "failed to wake the evaluator for resolved image geometry");
-        }
+        let _ = super::input_bridge::finish_host_input_publication(
+            self.input
+                .send(neovm_core::keyboard::InputEvent::LayoutInvalidated),
+        );
     }
 }
 
 /// Deep host-side module that owns image request identity, state transitions,
 /// renderer scheduling, and completion observation.
 pub(super) struct AsyncImageCatalog {
-    cmd_tx: crossbeam_channel::Sender<RenderCommand>,
+    cmd_tx: neomacs_display_runtime::thread_comm::RenderCommandSender,
     render_waker: Option<GuiEventLoopWaker>,
     image_metadata: SharedImageRenderState,
+    image_decode_client: ImageDecodeClient,
     /// Geometry read from encoded headers, off-thread (see [`HeaderProbeRequest`]).
     header_layouts: HeaderLayouts,
     /// Woken once per header probe that produced geometry.
@@ -200,15 +190,17 @@ pub(super) struct AsyncImageCatalog {
 
 impl AsyncImageCatalog {
     pub(super) fn new(
-        cmd_tx: crossbeam_channel::Sender<RenderCommand>,
+        cmd_tx: neomacs_display_runtime::thread_comm::RenderCommandSender,
         render_waker: Option<GuiEventLoopWaker>,
         image_metadata: SharedImageRenderState,
         redisplay_waker: Option<RedisplayWaker>,
+        image_decode_client: ImageDecodeClient,
     ) -> Self {
         Self {
             cmd_tx,
             render_waker,
             image_metadata,
+            image_decode_client,
             header_layouts: Arc::new(Mutex::new(HashMap::new())),
             redisplay_waker,
             entries: RefCell::new(HashMap::new()),
@@ -320,6 +312,7 @@ impl AsyncImageCatalog {
                 self.render_waker.as_ref(),
                 command,
                 resolution.as_ref(),
+                &self.image_decode_client,
             ) {
                 Ok(()) => CatalogEntry::Pending(pending),
                 Err(error) => {
@@ -339,8 +332,7 @@ impl AsyncImageCatalog {
         request: ImageResolveRequest,
         limit: ImageSizeLimit,
     ) -> Result<Option<ReadyImage>, String> {
-        let normalized_request = self.classify_request(request.clone()).0;
-        let pending = match self.lookup_inner(request.clone(), limit) {
+        let pending = match self.lookup_inner(request, limit) {
             ImageLookup::Ready(image) => return Ok(Some(image)),
             ImageLookup::Pending(image) => image,
             ImageLookup::Failed(failed) => {
@@ -353,8 +345,9 @@ impl AsyncImageCatalog {
         };
         let placement = pending.placement();
 
-        let Some(terminal) =
-            wait_for_image_metadata(&self.image_metadata, pending.load(), Duration::from_secs(1))
+        let Some(terminal) = self
+            .image_decode_client
+            .wait_for_terminal(pending.load(), Duration::from_secs(1))
         else {
             // Bounded wait: do not invent dimensions. Callers (image-size, etc.)
             // surface this as a failed resolve rather than a wrong pixel size.
@@ -363,15 +356,22 @@ impl AsyncImageCatalog {
                 placement.image_id()
             ));
         };
-        let state = image_lookup_from_terminal(pending, terminal);
-        self.entries
-            .borrow_mut()
-            .insert(normalized_request, CatalogEntry::from_lookup(state.clone()));
-
-        match state {
-            ImageLookup::Ready(image) => Ok(Some(image)),
-            ImageLookup::Failed(failed) => Err(failed.error.message()),
-            ImageLookup::Pending(_) => unreachable!("terminal decode cannot remain pending"),
+        // CPU decoding answers Lisp metadata queries independently of texture
+        // upload. Leave the catalog's residency pending until the renderer's
+        // normal completion event reconciles it.
+        match terminal {
+            Ok(metadata) => Ok(Some(ReadyImage {
+                load: pending.load(),
+                metadata: neovm_core::emacs_core::image_catalog::ResolvedImageMetadata {
+                    layout: metadata.layout,
+                    reported: metadata.reported,
+                    background: metadata.background,
+                    background_transparent: metadata.background_transparent,
+                    mask: metadata.mask,
+                    embedded: metadata.embedded,
+                },
+            })),
+            Err(error) => Err(error.message()),
         }
     }
 }
@@ -395,137 +395,6 @@ impl ImageCatalog for AsyncImageCatalog {
             .map(|diagnostic| diagnostic.message())
             .collect()
     }
-}
-
-impl AsyncImageCatalog {
-    /// Report a failure unless this load attempt has already been reported.
-    fn record_failure(&self, failed: &FailedImage) {
-        let image = failed.load().image();
-        let mut reported = self.reported_failures.borrow_mut();
-        if reported.get(&image) == Some(&failed.load()) {
-            return;
-        }
-        reported.insert(image, failed.load());
-        self.failed_diagnostics
-            .borrow_mut()
-            .push(failed.error.clone());
-    }
-
-    /// Report a failure regardless of whether it has been reported before.
-    ///
-    /// For the synchronous path, where the caller asked about this one image
-    /// and GNU answers with `image_error` every time it is asked.
-    fn record_failure_always(&self, failed: &FailedImage) {
-        self.reported_failures
-            .borrow_mut()
-            .insert(failed.load().image(), failed.load());
-        self.failed_diagnostics
-            .borrow_mut()
-            .push(failed.error.clone());
-    }
-
-    fn lookup_inner(&self, request: ImageResolveRequest, limit: ImageSizeLimit) -> ImageLookup {
-        self.size_limit.set(limit);
-        let (request, resolution) = self.classify_request(request);
-        let mut entries = self.entries.borrow_mut();
-        if !entries.contains_key(&request) {
-            let image_id = next_host_image_id();
-            let load = self.next_load(image_id);
-            // Another frame of the same image may already have resolved this
-            // geometry: reserving the resolved extent means this slot never
-            // moves, and the probe below has nothing left to learn.
-            let known = self.known_geometry(&request);
-            let layout = known.unwrap_or_else(|| placeholder_image_extent(&request));
-            let pending = PendingImage::new(load, layout);
-            let command =
-                image_load_command(&request, load, self.sequence_id(&request.source), limit);
-            let state = match schedule_image_command(
-                &self.cmd_tx,
-                self.render_waker.as_ref(),
-                command,
-                resolution.as_ref(),
-            ) {
-                Ok(()) => CatalogEntry::Pending(pending),
-                Err(error) => {
-                    // Not a decode failure: the render thread could not be
-                    // handed the job at all. GNU has no sentence for this,
-                    // because it has no second thread to lose.
-                    tracing::warn!(%error, "image load command could not be scheduled");
-                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
-                }
-            };
-            entries.insert(request.clone(), state);
-            if known.is_none() {
-                self.schedule_header_probe(&request, resolution.as_ref(), load);
-            }
-        }
-
-        let state = entries
-            .get_mut(&request)
-            .expect("image catalog entry inserted above");
-        if let CatalogEntry::Evicted(placement) = state {
-            let load = self.next_load(placement.image_id());
-            let pending = PendingImage::new(load, placement.layout());
-            let command =
-                image_load_command(&request, load, self.sequence_id(&request.source), limit);
-            *state = match schedule_image_command(
-                &self.cmd_tx,
-                self.render_waker.as_ref(),
-                command,
-                resolution.as_ref(),
-            ) {
-                Ok(()) => CatalogEntry::Pending(pending),
-                Err(error) => {
-                    // Not a decode failure: the render thread could not be
-                    // handed the job at all. GNU has no sentence for this,
-                    // because it has no second thread to lose.
-                    tracing::warn!(%error, "image load command could not be scheduled");
-                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
-                }
-            };
-            self.schedule_header_probe(&request, resolution.as_ref(), load);
-        }
-        let CatalogEntry::Pending(pending) = state else {
-            return state
-                .as_lookup()
-                .expect("evicted entry was transitioned above");
-        };
-        let load = pending.load();
-        // Header geometry may have landed since the slot was reserved: adopt it
-        // by narrowing the slot in place. The identity is unchanged, so glyphs
-        // already published against this image keep pointing at it.
-        //
-        // This is the only place a reserved slot may move, and the move is
-        // classified and counted here rather than left to be inferred from a
-        // frame that shifted. A slot that already holds resolved geometry
-        // (renewed from a known layout, or reserved from another frame's
-        // answer) finalizes as Unchanged, so a move is counted once per
-        // reservation, not once per lookup.
-        if let Some(layout) = self.header_layout(&request, load) {
-            let settled = ProvisionalExtent::new(pending.placement().layout()).finalize(layout);
-            if let SlotChange::Moved { from, to } = settled {
-                self.record_slot_move(&request, from, to);
-                *pending = PendingImage::new(load, layout);
-            }
-            self.remember_geometry(&request, layout);
-        }
-        let terminal = match self.image_metadata.try_terminal(load) {
-            ImageTerminalProbe::Busy => {
-                return state.as_lookup().expect("pending state is observable");
-            }
-            ImageTerminalProbe::Available(terminal) => terminal,
-        };
-        let Some(terminal) = terminal else {
-            return state.as_lookup().expect("pending state is observable");
-        };
-        let resolved = image_lookup_from_terminal(pending.clone(), terminal);
-        self.report_header_disagreement(&request, &resolved);
-        *state = CatalogEntry::from_lookup(resolved);
-        state
-            .as_lookup()
-            .expect("terminal state is observable through the catalog")
-    }
-
     fn invalidate(&self, target: ImageInvalidation) -> ImageInvalidationResult {
         let target = match target {
             ImageInvalidation::Dependency(source) => {
@@ -609,9 +478,13 @@ impl AsyncImageCatalog {
             }
         };
         let command = RenderCommand::Asset(AssetCommand::ImageSequenceRetire { retirement });
-        if let Err(error) =
-            schedule_image_command(&self.cmd_tx, self.render_waker.as_ref(), command, None)
-        {
+        if let Err(error) = schedule_image_command(
+            &self.cmd_tx,
+            self.render_waker.as_ref(),
+            command,
+            None,
+            &self.image_decode_client,
+        ) {
             tracing::warn!(%error, "failed to retire image sequence cache entry");
         }
         ImageInvalidationResult::Changed
@@ -648,6 +521,138 @@ impl AsyncImageCatalog {
                 *state = CatalogEntry::Evicted(placement);
             }
         }
+    }
+}
+
+impl AsyncImageCatalog {
+    /// Report a failure unless this load attempt has already been reported.
+    fn record_failure(&self, failed: &FailedImage) {
+        let image = failed.load().image();
+        let mut reported = self.reported_failures.borrow_mut();
+        if reported.get(&image) == Some(&failed.load()) {
+            return;
+        }
+        reported.insert(image, failed.load());
+        self.failed_diagnostics
+            .borrow_mut()
+            .push(failed.error.clone());
+    }
+
+    /// Report a failure regardless of whether it has been reported before.
+    ///
+    /// For the synchronous path, where the caller asked about this one image
+    /// and GNU answers with `image_error` every time it is asked.
+    fn record_failure_always(&self, failed: &FailedImage) {
+        self.reported_failures
+            .borrow_mut()
+            .insert(failed.load().image(), failed.load());
+        self.failed_diagnostics
+            .borrow_mut()
+            .push(failed.error.clone());
+    }
+
+    fn lookup_inner(&self, request: ImageResolveRequest, limit: ImageSizeLimit) -> ImageLookup {
+        self.size_limit.set(limit);
+        let (request, resolution) = self.classify_request(request);
+        let mut entries = self.entries.borrow_mut();
+        if !entries.contains_key(&request) {
+            let image_id = next_host_image_id();
+            let load = self.next_load(image_id);
+            // Another frame of the same image may already have resolved this
+            // geometry: reserving the resolved extent means this slot never
+            // moves, and the probe below has nothing left to learn.
+            let known = self.known_geometry(&request);
+            let layout = known.unwrap_or_else(|| placeholder_image_extent(&request));
+            let pending = PendingImage::new(load, layout);
+            let command =
+                image_load_command(&request, load, self.sequence_id(&request.source), limit);
+            let state = match schedule_image_command(
+                &self.cmd_tx,
+                self.render_waker.as_ref(),
+                command,
+                resolution.as_ref(),
+                &self.image_decode_client,
+            ) {
+                Ok(()) => CatalogEntry::Pending(pending),
+                Err(error) => {
+                    // Not a decode failure: the render thread could not be
+                    // handed the job at all. GNU has no sentence for this,
+                    // because it has no second thread to lose.
+                    tracing::warn!(%error, "image load command could not be scheduled");
+                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
+                }
+            };
+            entries.insert(request.clone(), state);
+            if known.is_none() {
+                self.schedule_header_probe(&request, resolution.as_ref(), load);
+            }
+        }
+
+        let state = entries
+            .get_mut(&request)
+            .expect("image catalog entry inserted above");
+        if let CatalogEntry::Evicted(placement) = state {
+            let load = self.next_load(placement.image_id());
+            let pending = PendingImage::new(load, placement.layout());
+            let command =
+                image_load_command(&request, load, self.sequence_id(&request.source), limit);
+            *state = match schedule_image_command(
+                &self.cmd_tx,
+                self.render_waker.as_ref(),
+                command,
+                resolution.as_ref(),
+                &self.image_decode_client,
+            ) {
+                Ok(()) => CatalogEntry::Pending(pending),
+                Err(error) => {
+                    // Not a decode failure: the render thread could not be
+                    // handed the job at all. GNU has no sentence for this,
+                    // because it has no second thread to lose.
+                    tracing::warn!(%error, "image load command could not be scheduled");
+                    CatalogEntry::Failed(pending.failed(ImageDiagnostic::NotDrawable))
+                }
+            };
+            self.schedule_header_probe(&request, resolution.as_ref(), load);
+        }
+        let CatalogEntry::Pending(pending) = state else {
+            return state
+                .as_lookup()
+                .expect("evicted entry was transitioned above");
+        };
+        let load = pending.load();
+        // Header geometry may have landed since the slot was reserved: adopt it
+        // by narrowing the slot in place. The identity is unchanged, so glyphs
+        // already published against this image keep pointing at it.
+        //
+        // This is the only place a reserved slot may move, and the move is
+        // classified and counted here rather than left to be inferred from a
+        // frame that shifted. A slot that already holds resolved geometry
+        // (renewed from a known layout, or reserved from another frame's
+        // answer) finalizes as Unchanged, so a move is counted once per
+        // reservation, not once per lookup.
+        if let Some(layout) = self.header_layout(&request, load) {
+            let settled = ProvisionalExtent::new(pending.placement().layout()).finalize(layout);
+            if let SlotChange::Moved { from, to } = settled {
+                self.record_slot_move(&request, from, to);
+                *pending = PendingImage::new(load, layout);
+            }
+            self.remember_geometry(&request, layout);
+        }
+        let terminal = match self.image_metadata.try_terminal(load) {
+            ImageTerminalProbe::Busy => {
+                return state.as_lookup().expect("pending state is observable");
+            }
+            ImageTerminalProbe::Available(terminal) => terminal,
+        };
+        let Some(terminal) = terminal else {
+            return state.as_lookup().expect("pending state is observable");
+        };
+        let resolved = image_lookup_from_terminal(pending.clone(), terminal);
+        self.report_header_disagreement(&request, &resolved);
+        *state = CatalogEntry::from_lookup(resolved);
+        state
+            .as_lookup()
+            .expect("terminal state is observable through the catalog")
     }
 }
 
@@ -804,9 +809,13 @@ impl AsyncImageCatalog {
         }
         for image in removed {
             let command = RenderCommand::Asset(AssetCommand::ImageRetire { image });
-            if let Err(error) =
-                schedule_image_command(&self.cmd_tx, self.render_waker.as_ref(), command, None)
-            {
+            if let Err(error) = schedule_image_command(
+                &self.cmd_tx,
+                self.render_waker.as_ref(),
+                command,
+                None,
+                &self.image_decode_client,
+            ) {
                 tracing::warn!(image = %image, %error, "failed to schedule invalidated image release");
             }
         }
@@ -824,6 +833,7 @@ fn image_lookup_from_terminal(pending: PendingImage, terminal: ImageDecodeTermin
     }
 }
 
+#[cfg(test)]
 pub(super) fn wait_for_image_metadata(
     shared: &SharedImageRenderState,
     load: ImageLoadToken,
@@ -929,12 +939,13 @@ fn probed_layout(
 }
 
 struct DeferredRenderCommand {
-    target: crossbeam_channel::Sender<RenderCommand>,
+    target: neomacs_display_runtime::thread_comm::RenderCommandSender,
     waker: Option<GuiEventLoopWaker>,
     command: RenderCommand,
     /// How to turn the command's raw `:file` into an absolute path off-thread,
     /// or `None` for `:data` loads and inline-resolved absolute paths.
     resolution: Option<ImageFileRequest>,
+    decoder: ImageDecodeClient,
 }
 
 fn deferred_render_command_sender() -> &'static crossbeam_channel::Sender<DeferredRenderCommand> {
@@ -947,6 +958,7 @@ fn deferred_render_command_sender() -> &'static crossbeam_channel::Sender<Deferr
                 while let Ok(deferred) = rx.recv() {
                     let command =
                         resolve_deferred_image_path(deferred.command, deferred.resolution.as_ref());
+                    submit_image_decode(&deferred.decoder, &command);
                     if deferred.target.send(command).is_ok()
                         && let Some(waker) = deferred.waker
                     {
@@ -962,14 +974,16 @@ fn deferred_render_command_sender() -> &'static crossbeam_channel::Sender<Deferr
 /// the `:file` needs off-thread resolution (relative search, `~user` NSS) or
 /// when the renderer channel is full.
 fn schedule_image_command(
-    target: &crossbeam_channel::Sender<RenderCommand>,
+    target: &neomacs_display_runtime::thread_comm::RenderCommandSender,
     waker: Option<&GuiEventLoopWaker>,
     command: RenderCommand,
     resolution: Option<&ImageFileRequest>,
+    decoder: &ImageDecodeClient,
 ) -> Result<(), String> {
     if resolution.is_some_and(ImageFileRequest::needs_off_thread) {
-        return defer_render_command(target, waker, command, resolution.cloned());
+        return defer_render_command(target, waker, command, resolution.cloned(), decoder);
     }
+    submit_image_decode(decoder, &command);
     match target.try_send(command) {
         Ok(()) => {
             if let Some(waker) = waker {
@@ -978,7 +992,7 @@ fn schedule_image_command(
             Ok(())
         }
         Err(crossbeam_channel::TrySendError::Full(command)) => {
-            defer_render_command(target, waker, command, resolution.cloned())
+            defer_render_command(target, waker, command, resolution.cloned(), decoder)
         }
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
             Err("failed to queue image load: channel disconnected".to_owned())
@@ -987,10 +1001,11 @@ fn schedule_image_command(
 }
 
 fn defer_render_command(
-    target: &crossbeam_channel::Sender<RenderCommand>,
+    target: &neomacs_display_runtime::thread_comm::RenderCommandSender,
     waker: Option<&GuiEventLoopWaker>,
     command: RenderCommand,
     resolution: Option<ImageFileRequest>,
+    decoder: &ImageDecodeClient,
 ) -> Result<(), String> {
     deferred_render_command_sender()
         .send(DeferredRenderCommand {
@@ -998,8 +1013,94 @@ fn defer_render_command(
             waker: waker.cloned(),
             command,
             resolution,
+            decoder: decoder.clone(),
         })
         .map_err(|error| format!("failed to defer image load command: {error}"))
+}
+
+/// Submit CPU work before renderer queue backpressure or GPU acquisition can
+/// delay it. The renderer adopts the same load token and receives these pixels
+/// once; repeated admission of a deferred command cannot start a second decode.
+fn submit_image_decode(decoder: &ImageDecodeClient, command: &RenderCommand) {
+    use neomacs_display_runtime::render_thread::SvgResourceContext;
+    match command {
+        RenderCommand::Asset(AssetCommand::ImageLoadFile {
+            load,
+            path,
+            size,
+            rotation,
+            realization,
+            colors,
+            mask,
+            animation,
+            frame,
+            sequence,
+            identity,
+            limit,
+        }) => decoder.load_file_with_id(
+            *load,
+            path,
+            *size,
+            *rotation,
+            *realization,
+            *colors,
+            *mask,
+            *animation,
+            *frame,
+            *sequence,
+            identity.clone(),
+            *limit,
+        ),
+        RenderCommand::Asset(AssetCommand::ImageLoadData {
+            load,
+            data,
+            size,
+            rotation,
+            realization,
+            colors,
+            mask,
+            animation,
+            frame,
+            sequence,
+            identity,
+            limit,
+        }) => {
+            let (data, resources) = match data {
+                neovm_core::emacs_core::image_catalog::ImageDataSource::Isolated(data) => {
+                    (data.clone(), SvgResourceContext::Isolated)
+                }
+                neovm_core::emacs_core::image_catalog::ImageDataSource::WithBaseUri {
+                    data,
+                    base_uri,
+                } => (
+                    data.clone(),
+                    SvgResourceContext::BaseUri(
+                        base_uri.as_utf8_str().unwrap_or_default().to_owned(),
+                    ),
+                ),
+            };
+            decoder.load_data_with_id(
+                *load,
+                data,
+                *size,
+                *rotation,
+                *realization,
+                *colors,
+                *mask,
+                *animation,
+                *frame,
+                *sequence,
+                resources,
+                identity.clone(),
+                *limit,
+            );
+        }
+        RenderCommand::Asset(AssetCommand::ImageRetire { image }) => decoder.retire_image(*image),
+        RenderCommand::Asset(AssetCommand::ImageSequenceRetire { retirement }) => {
+            decoder.retire_sequence(*retirement)
+        }
+        _ => {}
+    }
 }
 
 /// The single off-thread resolution step: resolve the [`ImageFileRequest`] and

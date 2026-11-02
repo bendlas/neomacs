@@ -4,8 +4,10 @@
 //! dump/load code share the same payload structs without reviving old heap
 //! module boundaries.
 
+pub(crate) mod threading;
+
 use crate::buffer::text_props::{EmptyTextProperties, TextPropertiesRef};
-use crate::buffer::{BufferId, CharLen, CharPos0, CharRange, TextPropertyTable};
+use crate::buffer::{BufferId, CharLen, CharPos0, CharRange, EmacsBytePos, TextPropertyTable};
 use crate::emacs_core::emacs_char;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1537,13 +1539,89 @@ mod clear_string_in_place_tests;
 #[path = "heap_types/tests/declared_string_safety.rs"]
 mod declared_string_safety_tests;
 
+/// Creation-order identity of one overlay, used only for the final
+/// precedence tie-break in GNU `compare_overlays` (`src/buffer.c:3256-3282`).
+///
+/// GNU breaks a fully equal tie (same priority, same range, same secondary
+/// priority) by the overlay object's address and documents that ordering as
+/// arbitrary and possibly different between invocations. Neomacs keeps the
+/// branch deterministic: every freshly created overlay is minted a strictly
+/// larger serial from its World's counter, so later creation sorts later and
+/// wins. Distinct-key precedence is untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct OverlaySerial(std::num::NonZeroU64);
+
+impl OverlaySerial {
+    /// An identity read back from an image. Zero was never a valid serial.
+    #[inline]
+    pub fn from_u64(raw: u64) -> Option<Self> {
+        std::num::NonZeroU64::new(raw).map(Self)
+    }
+
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+// The serial rides inside `OverlayData`; it must not grow the overlay object.
+const _: () = assert!(std::mem::size_of::<OverlaySerial>() == 8);
+const _: () = assert!(std::mem::size_of::<Option<OverlaySerial>>() == 8);
+// The World-owned counter is one atomic word appended to the heap's tail.
+const _: () = assert!(std::mem::size_of::<OverlaySerialCounter>() == 8);
+
+/// Which precedence identity a not-yet-published overlay gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlaySerialSource {
+    /// A new Lisp object: mint the World's next creation serial.
+    Mint,
+    /// A redisplay observer copy, buffered copy or loaded image keeps the
+    /// identity it already carries.
+    Preserved(OverlaySerial),
+}
+
+/// The World's overlay creation counter. Exactly one per `TaggedHeap`, which
+/// is itself owned by the World allocation: not process-global, not TLS. It
+/// is atomic so the World is ready for several mutators; ordering between
+/// distinct serials only needs the atomic read-modify-write, hence `Relaxed`.
+#[derive(Debug, Default)]
+pub struct OverlaySerialCounter(std::sync::atomic::AtomicU64);
+
+impl OverlaySerialCounter {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// Issue the next creation serial. The counter stores the last issued
+    /// value; a `fetch_add` therefore yields the successor.
+    #[inline]
+    pub fn mint(&self) -> OverlaySerial {
+        let next = self
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .checked_add(1)
+            .expect("overlay serial space exhausted");
+        OverlaySerial(
+            std::num::NonZeroU64::new(next).expect("a minted overlay serial is never zero"),
+        )
+    }
+
+    /// Resume above an image's largest preserved serial, so every later
+    /// creation still sorts after every restored overlay.
+    #[inline]
+    pub fn observe(&self, serial: OverlaySerial) {
+        self.0
+            .fetch_max(serial.get(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 pub struct OverlayData {
-    /// Original tagged object identity used by GNU's `compare_overlays`
-    /// (`XLI (overlay)`). Initialized before the owning mutator publishes its
-    /// fresh allocation; immutable observer copies preserve this scalar key.
-    /// Address ordering is arbitrary and need not follow allocation order.
-    pub serial: u64,
+    /// Creation-order identity for the final precedence tie-break. Minted
+    /// before the owning mutator publishes a fresh allocation; observer
+    /// copies and loaded images preserve it (see [`OverlaySerial`]).
+    pub serial: OverlaySerial,
     pub plist: crate::emacs_core::value::Value,
     pub buffer: Option<BufferId>,
     pub start: usize,
@@ -1565,7 +1643,9 @@ pub struct OverlayData {
 /// authority until an overlay list attaches it.
 #[derive(Clone, Debug)]
 pub struct OverlayDataInit {
-    pub serial: u64,
+    /// `Mint` for a new Lisp object; `Preserved` for observer copies,
+    /// buffered copies and image loads.
+    pub serial: OverlaySerialSource,
     pub plist: crate::emacs_core::value::Value,
     pub buffer: Option<BufferId>,
     pub start: usize,
@@ -1574,10 +1654,13 @@ pub struct OverlayDataInit {
     pub rear_advance: bool,
 }
 
-impl From<OverlayDataInit> for OverlayData {
-    fn from(init: OverlayDataInit) -> Self {
+impl OverlayData {
+    /// Build the live payload with the identity the allocator resolved for it.
+    /// The serial is passed separately because `Mint` needs the World's
+    /// counter, which only the heap owns.
+    pub(crate) fn from_init(init: OverlayDataInit, serial: OverlaySerial) -> Self {
         Self {
-            serial: init.serial,
+            serial,
             plist: init.plist,
             buffer: init.buffer,
             start: init.start,
@@ -1613,41 +1696,249 @@ impl OverlayData {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct LispMarker {
-    pub buffer: Option<BufferId>,
-    pub insertion_type: bool,
-    pub marker_id: Option<u64>,
-    /// Byte offset in buffer (authoritative after T6/T7).
-    pub bytepos: usize,
-    /// Char offset in buffer (authoritative after T6/T7).
-    pub charpos: usize,
-    /// True once this marker has been positioned at a real location.
-    /// GNU's `unchain_marker` (marker.c:684) preserves a marker's
-    /// `charpos` across detach, so `Fmarker_last_position` can report
-    /// the last position even after the buffer is killed.  Neomacs
-    /// stores positions in 0-based form, which collides with the
-    /// "fresh" sentinel for a marker once attached at Lisp position 1.
-    /// This flag disambiguates: false for `make-marker` results, true
-    /// once `set-marker` (or insertion) has placed the marker.
-    pub last_position_valid: bool,
-    /// Intrusive link to next marker in the owning buffer's chain.
-    /// `null` if not on a chain. GC sweep order: `unchain_dead_markers`
-    /// walks these BEFORE `sweep_objects` frees unmarked markers.
-    pub next_marker: *mut crate::tagged::header::MarkerObj,
-    /// Whether this marker is currently spliced into a buffer's chain.
-    ///
-    /// `next_marker` cannot answer this: the chain's TAIL also has a null
-    /// link. Without a bit, "is this marker chained?" costs a walk of the
-    /// whole chain, and the registration path asked it on every marker
-    /// creation -- quadratic against a buffer holding thousands of markers.
-    ///
-    /// Maintained at the only three places chain membership changes:
-    /// `chain_splice_at_head` sets it, `chain_unlink` and the two
-    /// unchain-by-id paths clear it.
-    pub chained: bool,
+/// Where a marker points, in one 8-byte word: `None` (the whole word is
+/// zero) or the owning buffer's id as a `NonZeroU64`.
+///
+/// `BufferManager` ids start at 1 (`next_id: 1`) and only real buffers get
+/// one, so every attached marker's id has a nonzero niche. The constructor
+/// keeps that as a debug assertion instead of a checked return because the
+/// alternative -- storing `Option<BufferId>` -- costs a second word on every
+/// marker, and rejecting a null buffer id is a caller bug, never a runtime
+/// condition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MarkerBuffer(Option<std::num::NonZeroU64>);
+
+impl MarkerBuffer {
+    /// A marker that points nowhere (GNU `marker->buffer == NULL`).
+    pub const DETACHED: Self = Self(None);
+
+    #[inline]
+    pub fn attached(buffer: BufferId) -> Self {
+        debug_assert_ne!(
+            buffer.0, 0,
+            "BufferId(0) is not a live buffer; a marker buffer must name a real buffer"
+        );
+        Self(std::num::NonZeroU64::new(buffer.0))
+    }
+
+    #[inline]
+    pub const fn is_attached(self) -> bool {
+        self.0.is_some()
+    }
+
+    #[inline]
+    pub fn buffer_id(self) -> Option<BufferId> {
+        self.0.map(|id| BufferId(id.get()))
+    }
+
+    #[inline]
+    pub fn detach(&mut self) {
+        self.0 = None;
+    }
 }
 
+/// The intrusive marker-chain link, 8 bytes: three flag bits in an
+/// 8-byte-aligned `MarkerObj` pointer. A null pointer with flags set is the
+/// chain tail of a marker whose flags are on; it is a valid encoded value.
+///
+/// All pointer/flag bit arithmetic lives here. Marker objects are allocated
+/// by `ObjectArena<MarkerObj>` (64-byte slots) or mapped by the pdump at a
+/// `MarkerObj` alignment boundary, so the low three bits are always free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct MarkerLink(usize);
+
+const MARKER_LINK_FLAG_BITS: usize = 0b111;
+const MARKER_LINK_INSERTION_TYPE: usize = 0b001;
+const MARKER_LINK_LAST_POSITION_VALID: usize = 0b010;
+const MARKER_LINK_CHAINED: usize = 0b100;
+
+impl MarkerLink {
+    pub const NONE: Self = Self(0);
+
+    #[inline]
+    pub fn from_ptr(next: *mut crate::tagged::header::MarkerObj) -> Self {
+        debug_assert_eq!(
+            next as usize & MARKER_LINK_FLAG_BITS,
+            0,
+            "MarkerObj pointer must be 8-byte aligned for flag tagging"
+        );
+        Self(next as usize)
+    }
+
+    #[inline]
+    pub const fn next_ptr(self) -> *mut crate::tagged::header::MarkerObj {
+        (self.0 & !MARKER_LINK_FLAG_BITS) as *mut _
+    }
+
+    /// GNU `Lisp_Marker.insertion_type`: true advances over text inserted at
+    /// the marker's position.
+    #[inline]
+    pub const fn insertion_type(self) -> bool {
+        self.0 & MARKER_LINK_INSERTION_TYPE != 0
+    }
+
+    /// True once the marker has had a real position (GNU keeps `charpos`
+    /// across detach; this bit separates "never positioned" from position 0).
+    #[inline]
+    pub const fn last_position_valid(self) -> bool {
+        self.0 & MARKER_LINK_LAST_POSITION_VALID != 0
+    }
+
+    /// Whether this marker is currently spliced into a buffer's chain. The
+    /// tail's null `next` cannot answer this, so the bit is maintained at
+    /// every chain-membership change.
+    #[inline]
+    pub const fn chained(self) -> bool {
+        self.0 & MARKER_LINK_CHAINED != 0
+    }
+
+    #[inline]
+    pub fn with_next(self, next: *mut crate::tagged::header::MarkerObj) -> Self {
+        debug_assert_eq!(
+            next as usize & MARKER_LINK_FLAG_BITS,
+            0,
+            "MarkerObj pointer must be 8-byte aligned for flag tagging"
+        );
+        Self((self.0 & MARKER_LINK_FLAG_BITS) | next as usize)
+    }
+
+    #[inline]
+    pub const fn with_insertion_type(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | MARKER_LINK_INSERTION_TYPE)
+        } else {
+            Self(self.0 & !MARKER_LINK_INSERTION_TYPE)
+        }
+    }
+
+    #[inline]
+    pub const fn with_last_position_valid(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | MARKER_LINK_LAST_POSITION_VALID)
+        } else {
+            Self(self.0 & !MARKER_LINK_LAST_POSITION_VALID)
+        }
+    }
+
+    #[inline]
+    pub const fn with_chained(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | MARKER_LINK_CHAINED)
+        } else {
+            Self(self.0 & !MARKER_LINK_CHAINED)
+        }
+    }
+}
+
+/// One marker object's Lisp-visible state: 32 bytes, so `MarkerObj` (24-byte
+/// header + this) is 56 bytes and fits the zero-slack 64-byte arena class.
+///
+/// GNU's `struct Lisp_Marker` (lisp.h) is the same shape: a buffer identity,
+/// a chain link carrying `insertion_type`/`need_adjustment`, `charpos` and
+/// `bytepos`. Marker identity is the `MarkerObj` pointer; the object carries
+/// no integer id. Dump/load allocates ephemeral ids (see pdump convert) and
+/// the loader resolves them to these pointers.
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct LispMarker {
+    /// Owning buffer, or detached.
+    pub buffer: MarkerBuffer,
+    /// Intrusive chain link plus the three marker flags. `next_ptr()` is null
+    /// at the chain tail. `unchain_dead_markers` walks these before
+    /// `sweep_objects` frees unmarked markers. Crate-private: the link's
+    /// representation (pointer + flag bits) may only be handled by
+    /// [`MarkerLink`], never by a struct-literal field write.
+    pub(crate) next_marker: MarkerLink,
+    /// Char offset in buffer (0-based; authoritative after T6/T7).
+    pub charpos: CharPos0,
+    /// Byte offset in buffer (0-based Emacs byte position; authoritative).
+    pub bytepos: EmacsBytePos,
+}
+
+impl LispMarker {
+    pub fn new(
+        buffer: MarkerBuffer,
+        charpos: CharPos0,
+        bytepos: EmacsBytePos,
+        insertion_type: bool,
+        last_position_valid: bool,
+    ) -> Self {
+        Self {
+            buffer,
+            next_marker: MarkerLink::NONE
+                .with_insertion_type(insertion_type)
+                .with_last_position_valid(last_position_valid),
+            charpos,
+            bytepos,
+        }
+    }
+
+    #[inline]
+    pub const fn insertion_type(&self) -> bool {
+        self.next_marker.insertion_type()
+    }
+
+    #[inline]
+    pub fn set_insertion_type(&mut self, value: bool) {
+        self.next_marker = self.next_marker.with_insertion_type(value);
+    }
+
+    #[inline]
+    pub const fn last_position_valid(&self) -> bool {
+        self.next_marker.last_position_valid()
+    }
+
+    #[inline]
+    pub fn set_last_position_valid(&mut self, value: bool) {
+        self.next_marker = self.next_marker.with_last_position_valid(value);
+    }
+
+    #[inline]
+    pub const fn chained(&self) -> bool {
+        self.next_marker.chained()
+    }
+
+    #[inline]
+    pub fn set_chained(&mut self, value: bool) {
+        self.next_marker = self.next_marker.with_chained(value);
+    }
+
+    #[inline]
+    pub const fn next_marker_ptr(&self) -> *mut crate::tagged::header::MarkerObj {
+        self.next_marker.next_ptr()
+    }
+
+    #[inline]
+    pub fn set_next_marker(&mut self, next: *mut crate::tagged::header::MarkerObj) {
+        self.next_marker = self.next_marker.with_next(next);
+    }
+
+    #[inline]
+    pub fn buffer_id(&self) -> Option<BufferId> {
+        self.buffer.buffer_id()
+    }
+
+    #[inline]
+    pub fn attach_to(&mut self, buffer: BufferId) {
+        self.buffer = MarkerBuffer::attached(buffer);
+    }
+
+    #[inline]
+    pub fn detach(&mut self) {
+        self.buffer.detach();
+    }
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<LispMarker>() == 32);
+    assert!(std::mem::align_of::<LispMarker>() >= 8);
+    assert!(std::mem::size_of::<MarkerBuffer>() == 8);
+    assert!(std::mem::size_of::<MarkerLink>() == 8);
+    assert!(std::mem::size_of::<crate::tagged::header::MarkerObj>() <= 56);
+    assert!(std::mem::align_of::<crate::tagged::header::MarkerObj>() >= 8);
+};
 #[cfg(test)]
 #[path = "tests/heap_types_marker_test.rs"]
 mod marker_test;

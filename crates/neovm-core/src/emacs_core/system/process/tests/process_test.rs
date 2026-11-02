@@ -1066,19 +1066,75 @@ fn continue_process_cancels_a_pending_stop_transition_like_gnu() {
     assert!(!process.status_notify_pending);
 }
 
+/// Wait for an observable event, never for an assumed duration.
+///
+/// `probe` returns `Some` once the event has happened. The guard only turns a
+/// broken protocol (a helper that died before reporting) into a named failure
+/// instead of nextest's slow-timeout; the protocol itself never depends on it,
+/// so a starved runner that takes seconds to start Python still passes.
+#[cfg(unix)]
+fn wait_for_process_test_event<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    const HANG_GUARD: Duration = Duration::from_secs(300);
+    let started = Instant::now();
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            started.elapsed() < HANG_GUARD,
+            "{what}: no progress within the {HANG_GUARD:?} hang guard"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Whether `pid` still names a process (a zombie counts until it is reaped).
+#[cfg(unix)]
+fn process_test_pid_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs only the existence/permission check.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// GNU `internal-default-signal-process` sends the signal to the named PID
+/// (process.c `Finternal_default_signal_process` -> `kill (pid, signo)`), not
+/// to its process group.
+///
+/// The parent reports its descendant's PID only after spawning it, and the
+/// descendant finishes only after the test releases it, which happens strictly
+/// after the TERM was sent. A group-wide signal is therefore already pending
+/// in the descendant before it can observe the release, so it dies without
+/// writing `done`; a PID-only signal leaves it to finish normally. Every wait
+/// is on an event (a file appearing, the descendant exiting), so CPU
+/// starvation can delay the test but cannot change its verdict.
 #[cfg(unix)]
 #[test]
 fn internal_default_signal_process_targets_only_the_named_pid_like_gnu() {
     crate::test_utils::init_test_tracing();
     let directory = tempfile::tempdir().expect("tempdir");
     let ready = directory.path().join("ready");
-    let descendant_finished = directory.path().join("descendant-finished");
+    let release = directory.path().join("release");
+    let done = directory.path().join("done");
     let python = find_bin("python3");
+    // The descendant's own deadline only bounds an orphan if the test dies
+    // before releasing it; the verdict never depends on it.
     let descendant = format!(
-        "import time; from pathlib import Path; time.sleep(0.2); Path({descendant_finished:?}).write_text('done')"
+        "import time; from pathlib import Path\n\
+         release, done = Path({release:?}), Path({done:?})\n\
+         limit = time.monotonic() + 600\n\
+         while not release.exists():\n    \
+             if time.monotonic() > limit: raise SystemExit(3)\n    \
+             time.sleep(0.01)\n\
+         tmp = done.with_suffix('.tmp'); tmp.write_text('done'); tmp.replace(done)\n"
     );
     let parent = format!(
-        "import subprocess, time; from pathlib import Path; subprocess.Popen([{python:?}, '-c', {descendant:?}]); Path({ready:?}).write_text('ready'); time.sleep(30)"
+        "import subprocess, time; from pathlib import Path\n\
+         child = subprocess.Popen([{python:?}, '-c', {descendant:?}])\n\
+         ready = Path({ready:?}); tmp = ready.with_suffix('.tmp')\n\
+         tmp.write_text(str(child.pid)); tmp.replace(ready)\n\
+         time.sleep(3600)\n"
     );
 
     let mut processes = ProcessManager::new();
@@ -1091,13 +1147,12 @@ fn internal_default_signal_process_targets_only_the_named_pid_like_gnu() {
         crate::emacs_core::process::ProcessCodingSystems::gnu_make_process_initial(),
     );
     processes.spawn_child(id, false).expect("spawn parent");
-    for _ in 0..100 {
-        if ready.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(ready.exists(), "parent did not spawn its descendant");
+    let descendant_pid: libc::pid_t =
+        wait_for_process_test_event("parent reporting its descendant", || {
+            std::fs::read_to_string(&ready)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+        });
 
     builtin_internal_default_signal_process_impl(
         &mut processes,
@@ -1105,15 +1160,21 @@ fn internal_default_signal_process_targets_only_the_named_pid_like_gnu() {
         vec![Value::make_process(id), Value::symbol("TERM")],
     )
     .expect("internal-default-signal-process");
+    std::fs::write(&release, "go").expect("release the descendant");
 
-    for _ in 0..100 {
-        if descendant_finished.exists() {
-            break;
+    let finished = wait_for_process_test_event("descendant finishing or dying", || {
+        if done.exists() {
+            Some(true)
+        } else if !process_test_pid_exists(descendant_pid) {
+            // Re-check after observing the exit: `done` is renamed into place
+            // before the descendant exits.
+            Some(done.exists())
+        } else {
+            None
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    });
     assert!(
-        descendant_finished.exists(),
+        finished,
         "signal-process killed the process group instead of only the named PID"
     );
     processes.delete_process(id);
@@ -3367,6 +3428,11 @@ fn process_send_string_sends_euc_jp_dictionary_query_over_tcp() {
                 Err(error) => panic!("dictionary connection failed: {error}"),
             }
         };
+        // BSD/macOS accept() makes the new socket inherit the listener's
+        // non-blocking flag; Linux accept() does not.  The listener above is
+        // non-blocking only to poll for the connection, so clear the flag on
+        // the accepted stream before the blocking read.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -3468,6 +3534,55 @@ fn pty_process_output_does_not_translate_lf_to_crlf_like_gnu() {
     processes.kill_process(pid);
 
     assert_eq!(output.as_slice(), b"x\n");
+}
+
+/// GNU `process_send_signal` types the pty's VQUIT character into the
+/// master when CURRENT-GROUP is non-nil (src/process.c:7100-7138), instead
+/// of calling `kill`.  With `stty -isig` the line discipline hands the byte
+/// to the child as data, so `quit-process` must not kill it: the child reads
+/// 0x1c and exits normally.  Before the SIGNALS_VIA_CHARACTERS port this
+/// always did `kill (- p->pid, SIGQUIT)`, and the child died before reading
+/// a byte.
+#[cfg(target_os = "linux")]
+#[test]
+fn quit_process_with_current_group_types_vquit_into_the_pty() {
+    crate::test_utils::init_test_tracing();
+    let sh = find_bin("sh");
+    // The runtime-startup evaluator, like the sibling make-process tests:
+    // this exercises the builtins through the same Lisp environment.
+    let result = eval_one(&format!(
+        r#"(let* ((buffer (get-buffer-create " *signal-char-pty*"))
+                      (process (make-process
+                                :name "signal-char-pty"
+                                :buffer buffer
+                                :connection-type 'pty
+                                :command (list "{sh}" "-c"
+                                               "stty -echo -icanon -isig min 1 time 0; printf 'READY'; dd bs=1 count=1 2>/dev/null | od -An -tu1"))))
+                 (unwind-protect
+                     (progn
+                       (set-process-query-on-exit-flag process nil)
+                       (let ((attempts 0))
+                         (while (and (null (progn (set-buffer buffer)
+                                                  (string-match "READY"
+                                                                (buffer-string))))
+                                     (< attempts 100))
+                           (accept-process-output process 0.1)
+                           (setq attempts (1+ attempts))))
+                       (quit-process process t)
+                       (let ((attempts 0))
+                         (while (and (memq process (process-list))
+                                     (< attempts 100))
+                           (accept-process-output process 0.1)
+                           (setq attempts (1+ attempts))))
+                       (list (process-status process)
+                             (process-exit-status process)
+                             (progn (set-buffer buffer)
+                                    (and (string-match "28" (buffer-string)) t))))
+                   (if (memq process (process-list))
+                       (delete-process process))
+                   (kill-buffer buffer)))"#
+    ));
+    assert_eq!(result, "OK (exit 0 t)");
 }
 
 #[cfg(target_os = "linux")]
@@ -5371,9 +5486,16 @@ fn signal_process_observes_stop_continue_output_and_exit_like_gnu() {
     ));
 
     // GNU process.c:780-811 uses the host's strsignal text; both branches
-    // were observed with GNU 31.1 on their respective platforms.
+    // were observed with GNU 31.1 on their respective platforms.  The mac
+    // branch also carries a kernel fact: Darwin raises `SIGCHLD` for the
+    // stop but not for the `SIGCONT` that continues a stopped child, and GNU
+    // learns child transitions only from `SIGCHLD` (`handle_child_signal`,
+    // src/process.c:7691-7749).  So GNU on macOS never sees the continuation:
+    // the child stays `stop`, the sentinel does not run again, and `resumed`
+    // is not sent.  Measured against GNU 31.1 on macOS 27; a polling port
+    // must answer the same (`platform_facts::SIGCHLD_ON_CHILD_CONTINUE`).
     let expected = if cfg!(target_os = "macos") {
-        "OK (t t exit \"resumed\n\" ((stop \"suspended (signal): 17\n\") (run \"run\") (exit \"finished\n\")))"
+        "OK (t nil stop \"\" ((stop \"suspended (signal): 17\n\")))"
     } else {
         "OK (t t exit \"resumed\n\" ((stop \"stopped (signal)\n\") (run \"run\") (exit \"finished\n\")))"
     };
@@ -5567,6 +5689,12 @@ fn process_attributes_pipe_child_args_ttname_and_running_child_match_oracle() {
                 r#"(equal args "/bin/sh -c sleep 300")"#,
             )
             .replace(r#"(equal ttname "")"#, "(null ttname)")
+            // Darwin's TIOCGPGRP on the pipe read fd succeeds and answers
+            // process group 0; GNU reports that fixnum (src/process.c:7003).
+            .replace(
+                "(eq (process-running-child-p proc) t)",
+                "(eq (process-running-child-p proc) 0)",
+            )
     } else {
         source.to_owned()
     };
@@ -5647,8 +5775,8 @@ fn accept_process_output_and_get_process_runtime_surface() {
 fn accept_process_output_yields_to_pending_command_input() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Focus {
         focused: true,
         emacs_frame_id: 0,
@@ -5681,9 +5809,9 @@ fn accept_process_output_drains_ready_output_before_yielding_to_command_input() 
     //
     // This can only be reproduced in Rust, not from elisp/batch: an elisp
     // `sleep-for`/`sit-for` pumps the wait loop and drains the bytes early.  A
-    // plain Rust `sleep` lets the child's output land in the pipe *without*
-    // running the wait loop, so the bytes stay undrained until the
-    // `accept-process-output` under test — exactly the starvation window.
+    // non-consuming native readiness observation proves the child's bytes
+    // are buffered *without* running the wait loop. They remain undrained
+    // until the `accept-process-output` under test — the starvation window.
     crate::test_utils::init_test_tracing();
     let printf = find_bin("printf");
     let mut ev = Context::new();
@@ -5717,17 +5845,17 @@ fn accept_process_output_drains_ready_output_before_yielding_to_command_input() 
     )
     .expect("install ready-output filter");
 
-    // Let the child write its bytes into the pipe WITHOUT running the wait
-    // loop.  A Rust sleep does not pump neomacs's wait loop, so the bytes are
-    // not drained early (an elisp sleep-for WOULD drain them, which is why this
-    // can't be reproduced from elisp/batch).
-    std::thread::sleep(Duration::from_millis(200));
+    // Observe actual buffered pipe output without running the wait loop,
+    // draining bytes or dispatching a filter; only then publish command input.
+    ev.processes
+        .wait_for_child_stdout_readable_for_test(pid, Duration::from_secs(5))
+        .expect("actual undrained READY output before command input");
 
     // Inject pending command input.  Without the fix, this makes
     // `service_wait_request_processes` early-return before draining the ready
     // process fd.
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::KeyPress {
         key: crate::keyboard::KeyEvent::char('j'),
         emacs_frame_id: 0,
@@ -6024,9 +6152,8 @@ fn command_input_preempts_self_rescheduling_zero_idle_timer_between_batches() {
         }
     }));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let notifier = ev.wait_notifier();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     let sender = std::thread::spawn(move || {
         first_batch_rx
             .recv_timeout(Duration::from_secs(1))
@@ -6035,9 +6162,6 @@ fn command_input_preempts_self_rescheduling_zero_idle_timer_between_batches() {
             crate::keyboard::KeyEvent::char('f'),
         ))
         .expect("send command input while idle timer reschedules");
-        if let Some(notifier) = notifier {
-            notifier.notify().expect("wake command-input wait");
-        }
         input_sent_tx
             .send(())
             .expect("acknowledge queued command input");
@@ -6231,27 +6355,26 @@ fn accept_process_output_request_uses_gnu_wait_deadlines() {
 
 #[test]
 fn wait_scheduler_can_block_until_command_input_arrives() {
+    use crate::test_utils::input_wait::{InputGateOwner, WaitWitness};
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let notifier = ev.wait_notifier();
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('z'),
+    )]);
+    gate.arm(&mut ev, WaitWitness::InputWaitEntered);
 
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('z'),
-        ))
-        .expect("send delayed keypress");
-        if let Some(notifier) = notifier {
-            notifier.notify().expect("wake command-input wait");
-        }
-    });
+    let completion =
+        ev.wait_for_command_input(Some(std::time::Instant::now() + Duration::from_secs(1)));
 
-    let completion: CommandInputWaitOutcome = ev
-        .wait_for_command_input(Some(std::time::Instant::now() + Duration::from_secs(1)))
-        .expect("wait for command input");
-
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::InputWaitEntered
+    );
+    let completion: CommandInputWaitOutcome = completion.expect("wait for command input");
     assert_eq!(completion, CommandInputWaitOutcome::InputPending);
     assert_eq!(ev.command_loop.keyboard.pending_input_events.len(), 1);
 }
@@ -7629,6 +7752,27 @@ fn sleep_for_uses_shared_wait_request_for_process_output_and_timers() {
         ],
     )
     .expect("install sleep-for process filter");
+    // The claim is that sleep-for services output that is ready, not that the
+    // host execs `echo` within the 50 ms sleep: under a loaded gate it may not
+    // have written yet, and GNU would then run no filter either. Wait for the
+    // kernel to report the child exited, so its output and EOF are already in
+    // the pipe when the sleep starts.
+    #[cfg(unix)]
+    {
+        let os_pid = ev
+            .processes
+            .get(pid)
+            .and_then(|process| process.os_pid)
+            .expect("a spawned child has an OS pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !pw187_is_zombie(os_pid, 0) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            pw187_is_zombie(os_pid, 0),
+            "echo must have exited, unreaped, before sleep-for starts"
+        );
+    }
     ev.set_variable(
         "timer-list",
         Value::list(vec![gnu_timer_before(
@@ -7664,8 +7808,8 @@ fn accept_process_output_services_pending_resize_from_shared_wait_request() {
         .expect("frame should exist")
         .set_parameter(Value::symbol("window-system"), Value::symbol("x"));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Focus {
         focused: true,
         emacs_frame_id: 0,
@@ -7695,6 +7839,7 @@ fn accept_process_output_services_pending_resize_from_shared_wait_request() {
 
 #[test]
 fn accept_process_output_services_resize_arriving_during_wait() {
+    use crate::test_utils::input_wait::{InputGateOwner, WaitWitness};
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
     let fid = ev
@@ -7705,25 +7850,24 @@ fn accept_process_output_services_resize_arriving_during_wait() {
         .expect("frame should exist")
         .set_parameter(Value::symbol("window-system"), Value::symbol("x"));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let sender = tx.clone();
-    let resize_thread = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(5));
-        sender
-            .send(crate::keyboard::InputEvent::Resize {
-                width: 710,
-                height: 820,
-                scale_factor: 1.0,
-                emacs_frame_id: 0,
-            })
-            .expect("queue resize event during wait");
-    });
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::Resize {
+        width: 710,
+        height: 820,
+        scale_factor: 1.0,
+        emacs_frame_id: 0,
+    }]);
+    gate.arm(&mut ev, WaitWitness::InputWaitEntered);
 
-    let result = builtin_accept_process_output(&mut ev, vec![Value::NIL, Value::make_float(0.05)])
-        .expect("accept-process-output should service resize arriving during wait");
-    resize_thread.join().expect("resize sender thread");
-    drop(tx);
+    let result = builtin_accept_process_output(&mut ev, vec![Value::NIL, Value::make_float(0.05)]);
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::InputWaitEntered
+    );
+    let result = result.expect("accept-process-output should service resize arriving during wait");
 
     let width = crate::emacs_core::frame::builtin_frame_native_width(&mut ev, vec![])
         .expect("frame-native-width should succeed");
@@ -7744,12 +7888,12 @@ fn accept_process_output_window_close_uses_special_event_map_handler_when_loaded
     let frame = ev.frames.create_frame("F1", 80, 24, scratch);
     install_minimal_special_event_command_runtime(&mut ev);
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::WindowClose {
         emacs_frame_id: frame.0,
     })
     .expect("queue window close");
-    ev.input_rx = Some(rx);
+
     ev.command_loop.running = true;
 
     let result = builtin_accept_process_output(&mut ev, vec![Value::NIL, Value::make_float(0.0)])
@@ -7773,10 +7917,9 @@ fn accept_process_output_window_close_uses_special_event_map_handler_when_loaded
 fn accept_process_output_window_close_quits_without_special_handler() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::WindowClose { emacs_frame_id: 0 })
         .expect("queue window close");
-    ev.input_rx = Some(rx);
 
     let flow = builtin_accept_process_output(&mut ev, vec![Value::NIL, Value::make_float(0.0)])
         .expect_err("unhandled window close should still quit");
@@ -7789,10 +7932,10 @@ fn accept_process_output_window_close_quits_without_special_handler() {
 fn accept_process_output_window_close_honors_throw_on_input_before_quit() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::WindowClose { emacs_frame_id: 0 })
         .expect("queue window close");
-    ev.input_rx = Some(rx);
+
     ev.obarray
         .set_symbol_value("throw-on-input", Value::symbol("tag"));
 
@@ -8919,7 +9062,7 @@ fn process_send_string_waits_for_nowait_local_stream_connect_like_gnu() {
                    (let ((initial (list (process-status cli)
                                         (process-live-p cli)
                                         (stringp (process-contact cli :remote))
-                                        (equal (process-contact cli :local) ""))))
+                                        (let ((local (process-contact cli :local))) (and (stringp local) (equal local (make-string (length local) 0)))))))
                      (process-send-string cli "ping-local-nowait")
                      (dotimes (_ 20)
                        (accept-process-output nil 0.05))
@@ -8929,7 +9072,7 @@ fn process_send_string_waits_for_nowait_local_stream_connect_like_gnu() {
                            recv
                            events
                            (stringp (process-contact cli :remote))
-                           (equal (process-contact cli :local) ""))))
+                           (let ((local (process-contact cli :local))) (and (stringp local) (equal local (make-string (length local) 0)))))))
                (when cli (delete-process cli))
                (when srv (delete-process srv))
                (ignore-errors (delete-file path))))"#,
@@ -8979,6 +9122,55 @@ fn make_network_process_nowait_tcp_refusal_fails_like_gnu() {
     assert_eq!(
         results[0],
         "OK ((connect (connect stop)) failed nil 111 ((:cli \"failed with code 111\" failed 111)))"
+    );
+}
+
+/// Killing a buffer whose network process already reported a failed connect
+/// must run that process's sentinel a second time, synchronously, before the
+/// buffer dies.  GNU: `kill-buffer` -> `kill_buffer_processes` ->
+/// `Fdelete_process` (src/process.c:1123-1129) stamps `(exit . 0)` and a fresh
+/// tick, then calls `status_notify (p, NULL)`; the tick moved, so the process
+/// is visited and `exec_sentinel` (:7937) runs with the "deleted" message
+/// while the buffer is still live.  url-http's retry relies on this nested
+/// sentinel (it prepends the second `:error` to `url-callback-arguments`).
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_buffer_reruns_the_sentinel_of_a_failed_connection_like_gnu() {
+    crate::test_utils::init_test_tracing();
+    let results = eval_all(
+        r#"(let ((events nil) (srv nil) (cli nil) (buf nil) (port nil))
+             (unwind-protect
+                 (progn
+                   (setq srv (make-network-process
+                              :name "kb-fail-srv" :server t :service 0
+                              :host 'local :noquery t))
+                   (setq port (process-contact srv :service))
+                   (delete-process srv)
+                   (setq srv nil)
+                   (setq buf (generate-new-buffer " *kb-fail*"))
+                   (setq cli (make-network-process
+                              :name "kb-fail-cli" :host 'local :service port
+                              :nowait t :noquery t :buffer buf
+                              :sentinel (lambda (p e)
+                                          (push (list (substring e 0 -1)
+                                                      (buffer-live-p (process-buffer p))
+                                                      (buffer-name (process-buffer p)))
+                                                events))))
+                   (dotimes (_ 20) (accept-process-output cli 0.05))
+                   (let ((before (nreverse events)))
+                     (setq events nil)
+                     (kill-buffer buf)
+                     (dotimes (_ 20) (accept-process-output nil 0.05))
+                     (list before (nreverse events)
+                           (buffer-live-p buf) (process-live-p cli))))
+               (when buf (ignore-errors (kill-buffer buf)))
+               (when cli (delete-process cli))
+               (when srv (delete-process srv))))"#,
+    );
+
+    assert_eq!(
+        results[0],
+        "OK (((\"failed with code 111\" t \" *kb-fail*\")) ((\"deleted\" t \" *kb-fail*\")) nil nil)"
     );
 }
 
@@ -9383,7 +9575,7 @@ fn make_network_process_local_datagram_loopback_like_gnu() {
                    (list recv
                          (process-status srv)
                          (process-status cli)
-                         (equal (process-contact cli :local) "")
+                         (let ((local (process-contact cli :local))) (and (stringp local) (equal local (make-string (length local) 0))))
                          (equal (process-contact cli :remote) path)
                          (equal (process-datagram-address cli) path)
                          (consp (process-datagram-address srv))
@@ -9464,7 +9656,7 @@ fn make_network_process_local_seqpacket_loopback_like_gnu() {
                          (process-status srv)
                          (process-status cli)
                          (length events)
-                         (equal (process-contact cli :local) "")
+                         (let ((local (process-contact cli :local))) (and (stringp local) (equal local (make-string (length local) 0))))
                          (equal (process-contact cli :remote) path)
                          (null (process-datagram-address srv))
                          (null (process-datagram-address cli))))
@@ -9548,6 +9740,11 @@ fn make_network_process_explicit_inet_address_skips_host_service_family_like_gnu
     assert_eq!(results[0], "OK (listen t t t 42 bogus open t t 42 nil)");
 }
 
+/// GNU fills an unbound Unix socket's name from `getsockname`, so the answer
+/// is the kernel's: an empty string where the kernel returns a two-byte
+/// address (Linux), fourteen NUL bytes where it returns a zero-filled path
+/// (Darwin).  Both are "a name of NUL bytes"; asserting that shape is what
+/// stays GNU-true on every host.
 #[cfg(unix)]
 #[test]
 fn make_network_process_local_stream_server_accepts_client_like_gnu() {
@@ -9577,13 +9774,13 @@ fn make_network_process_local_stream_server_accepts_client_like_gnu() {
                                  (equal (process-contact srv :service) path)
                                  (process-status cli)
                                  (equal (process-contact cli :remote) path)
-                                 (equal (process-contact cli :local) "")
+                                 (let ((local (process-contact cli :local))) (and (stringp local) (equal local (make-string (length local) 0))))
                                  (length events)
                                  (and events
                                       (not (null (string-match-p "^srv <[0-9]+>$"
                                                                  (caar events)))))
                                  (and events (equal (cadar events) "accept from -\n"))
-                                 (and events (equal (nth 2 (car events)) ""))
+                                 (and events (let ((remote (nth 2 (car events)))) (and (stringp remote) (equal remote (make-string (length remote) 0)))))
                                  (and events (equal (nth 3 (car events)) path))
                                  (and events (nth 4 (car events))))
                          (delete-process cli)
@@ -9849,7 +10046,7 @@ fn make_network_process_explicit_local_address_skips_family_like_gnu() {
                              (process-contact srv :service)
                              (process-status cli)
                              (equal (process-contact cli :remote) path)
-                             (equal (process-contact cli :local) "")
+                             (let ((local (process-contact cli :local))) (and (stringp local) (equal local (make-string (length local) 0))))
                              (process-contact cli :host)
                              (process-contact cli :service)))
                    (error err))
@@ -10084,10 +10281,13 @@ fn process_network_interface_and_signal_runtime_surface() {
                      network-interface-info
                      network-lookup-address-info
                      signal-names))
-           (let* ((ifname (or (and (fboundp 'network-interface-list)
-                                   (stringp (car (car (network-interface-list))))
-                                   (car (car (network-interface-list))))
-                              "lo")))
+           ;; A name this host actually reports.  GNU's primitives answer only
+           ;; what the kernel reports (src/process.c:4324-4400, 4485-4505), so
+           ;; the host's first IPv4 interface stands in for the old
+           ;; hard-coded "lo", a Linux-only name.  On a host with no IPv4
+           ;; interface the dependent probes are skipped rather than failing.
+           (let* ((ifname (and (fboundp 'network-interface-list)
+                               (car (car (network-interface-list nil 'ipv4))))))
              (list
               (format-network-address [127 0 0 1 80])
               (format-network-address [127 0 0 1 80] t)
@@ -10167,21 +10367,23 @@ fn process_network_interface_and_signal_runtime_surface() {
                     (setq ok (and (vectorp addr) (= (length addr) 9))))
                   (setq entries (cdr entries)))
                 ok)
-              (let ((info (network-interface-info ifname)))
-                (and (listp info)
-                     (= (length info) 5)
-                     (vectorp (car info))
-                     (vectorp (nth 1 info))
-                     (vectorp (nth 2 info))
-                     (or (null (nth 3 info))
-                         (consp (nth 3 info)))
-                     (listp (nth 4 info))))
-              (let ((lo-info (network-interface-info "lo")))
-                (and (listp lo-info)
-                     (= (length lo-info) 5)
-                     (vectorp (car lo-info))
-                     (vectorp (nth 1 lo-info))
-                     (vectorp (nth 2 lo-info))))
+              (or (null ifname)
+                  (let ((info (network-interface-info ifname)))
+                    (and (listp info)
+                         (= (length info) 5)
+                         (vectorp (car info))
+                         (vectorp (nth 1 info))
+                         (vectorp (nth 2 info))
+                         (or (null (nth 3 info))
+                             (consp (nth 3 info)))
+                         (listp (nth 4 info)))))
+              (or (null ifname)
+                  (let ((lo-info (network-interface-info ifname)))
+                    (and (listp lo-info)
+                         (= (length lo-info) 5)
+                         (vectorp (car lo-info))
+                         (vectorp (nth 1 lo-info))
+                         (vectorp (nth 2 lo-info)))))
               (let* ((ifname (car (car (network-interface-list nil 'ipv4))))
                      (info (and ifname (network-interface-info ifname)))
                      (entries (network-interface-list nil 'ipv4))
@@ -10193,22 +10395,25 @@ fn process_network_interface_and_signal_runtime_surface() {
                         (setq found t)))
                   (setq entries (cdr entries)))
                 (or (null ifname) found))
-              (let* ((info (network-interface-info ifname))
-                     (addr (car info))
-                     (bc (nth 1 info))
-                     (mask (nth 2 info))
-                     (len (length addr)))
-                (and (or (= len 5) (= len 9))
-                     (= (length bc) len)
-                     (= (length mask) len)))
-              (let* ((lo-info (network-interface-info "lo"))
-                     (addr (car lo-info))
-                     (bc (nth 1 lo-info))
-                     (mask (nth 2 lo-info)))
-                (and (= (length addr) (length bc))
-                     (= (length addr) (length mask))))
-              (equal (network-interface-info (concat "lo" (string 0) "x"))
-                     (network-interface-info "lo"))
+              (or (null ifname)
+                  (let* ((info (network-interface-info ifname))
+                         (addr (car info))
+                         (bc (nth 1 info))
+                         (mask (nth 2 info))
+                         (len (length addr)))
+                    (and (or (= len 5) (= len 9))
+                         (= (length bc) len)
+                         (= (length mask) len))))
+              (or (null ifname)
+                  (let* ((lo-info (network-interface-info ifname))
+                         (addr (car lo-info))
+                         (bc (nth 1 lo-info))
+                         (mask (nth 2 lo-info)))
+                    (and (= (length addr) (length bc))
+                         (= (length addr) (length mask)))))
+              (or (null ifname)
+                  (equal (network-interface-info (concat ifname (string 0) "x"))
+                         (network-interface-info ifname)))
               (condition-case err (network-interface-info nil) (error err))
               (condition-case err (network-interface-info "abcdefghijklmnop") (error err))
               (condition-case err (network-interface-info (concat "abcdefghijklmnop" (string 0))) (error err))
@@ -14214,26 +14419,62 @@ fn stderr_pipe_sentinel_neighbour_audit() {
 /// A bare integer argument to `signal-process` is an OS pid, and GNU never
 /// looks it up: `internal-default-signal-process` calls `get_process` only for
 /// a NON-number (src/process.c:7369-7370), and a number goes straight to
-/// `CONS_TO_INTEGER (process, pid_t, pid)` (:7375-7376).  The docstring says so
-/// too (:7405-7407).
+/// `CONS_TO_INTEGER (process, pid_t, pid)` (:7375-7376) and `kill` (:7397).
 ///
-/// This port consulted the live process table first, so a small integer
-/// answered for whichever process happened to hold that internal `ProcessId`.
-/// Measured, `-Q --batch`, with exactly one live child:
-///
-/// ```text
-///                          GNU 31.0.90   Neomacs, before
-/// (signal-process 1 0)     -1            0      <- this port's process #1
-/// (signal-process 2 0)     -1            -1
-/// (signal-process 3 0)     -1            -1
-/// ```
-///
-/// `-1` is `kill (1, 0)` failing with EPERM against init.  Signal 0 only, so
-/// nothing is actually signalled.  Found by ledger 169's neighbour audit, not
-/// by the bug it set out to fix.
+/// Internal ProcessIds 1/2/3 must not capture the corresponding literal PID
+/// arguments. Prove that domain distinction through the canonical resolver
+/// with unbacked records, without probing unowned OS PIDs. In a PID namespace,
+/// even PID1 can belong to this test's supervisor, so its signal0 result is
+/// not a portable oracle. The public syscall path below probes only our own
+/// live child and retains its liveness and cleanup checks.
 #[test]
 fn signal_process_reads_an_integer_as_an_os_pid_like_gnu() {
     crate::test_utils::init_test_tracing();
+    {
+        let mut processes = ProcessManager::new();
+        let buffers = crate::buffer::BufferManager::new();
+        for expected_id in [1_u64, 2, 3] {
+            let id = processes.create_process(
+                format!("pw169-unbacked-{expected_id}"),
+                Value::NIL,
+                "unbacked".into(),
+                vec![],
+                ProcessCodingSystems::gnu_make_process_initial(),
+            );
+            assert_eq!(id, expected_id);
+            let record = processes.get(id).expect("our synthetic process record");
+            assert!(record.os_pid.is_none());
+            assert!(!record.live_io.child.has_child());
+
+            let pid = i64::try_from(id).expect("small ProcessId fits literal PID domain");
+            let literal = Value::fixnum(pid);
+            match resolve_signal_process_target_in_state(&processes, &buffers, Some(&literal))
+                .expect("resolve the numeric PID without a syscall")
+            {
+                SignalProcessTarget::Pid(actual) => assert_eq!(actual, pid),
+                SignalProcessTarget::Process(actual) => {
+                    panic!("literal PID {pid} selected internal ProcessId {actual}")
+                }
+                SignalProcessTarget::MissingNamedProcess => {
+                    panic!("literal PID {pid} entered the named-process domain")
+                }
+            }
+
+            let object = Value::make_process(id);
+            match resolve_signal_process_target_in_state(&processes, &buffers, Some(&object))
+                .expect("resolve the actual process object without a syscall")
+            {
+                SignalProcessTarget::Process(actual) => assert_eq!(actual, id),
+                SignalProcessTarget::Pid(actual) => {
+                    panic!("process object {id} selected literal PID {actual}")
+                }
+                SignalProcessTarget::MissingNamedProcess => {
+                    panic!("our process object {id} was not found")
+                }
+            }
+        }
+    }
+
     let sh = find_bin("sh");
     let result = eval_one(&format!(
         r#"(let* ((p (make-process
@@ -14242,23 +14483,15 @@ fn signal_process_reads_an_integer_as_an_os_pid_like_gnu() {
                       :command '("{sh}" "-c" "sleep 30")
                       :noquery t
                       :sentinel #'ignore))
-                  (answers (mapcar (lambda (n)
-                                     (condition-case e (signal-process n 0)
-                                       (error (list 'error (cadr e)))))
-                                   '(1 2 3)))
                   (own (condition-case e (signal-process (process-id p) 0)
                          (error (list 'error (cadr e))))))
-             (prog1 (list :small answers
-                          :own own
-                          :own-pid-is-large (and (> (process-id p) 100) t)
+             (prog1 (list :own own
+                          :own-pid-is-positive (and (> (process-id p) 0) t)
                           :still-live (and (process-live-p p) t))
                (delete-process p)))"#
     ));
 
-    assert_eq!(
-        result,
-        "OK (:small (-1 -1 -1) :own 0 :own-pid-is-large t :still-live t)"
-    );
+    assert_eq!(result, "OK (:own 0 :own-pid-is-positive t :still-live t)");
 }
 
 /// GNU's PROCESS argument to `internal-default-signal-process` is a NUMBER
@@ -15526,30 +15759,33 @@ fn gnus_eight_update_status_sites_are_enumerated_and_four_are_the_asynchronous_o
     );
 }
 
-/// GNU's EIGHT `p->tick = ++process_tick;` sites, as a table.
+/// The release lineage's NINE `p->tick = ++process_tick;` sites, as a table.
 ///
 /// The citations pinned below are the release lineage's line numbers, which
 /// the rest of `child_status.rs` uses: `grep -n '++process_tick'
 /// src/process.c` on emacs-31.0.90 and emacs-31.1 (a360712c9d, 2026-08-24;
 /// identical numbering) gives 1128, 1148, 6058, 6075, 6084, 6141, 7178,
 /// 7746 -- and a ninth, 6927, in `send_process`'s EPIPE arm, which is the
-/// `(exit . 256)` behavior GNU commit 4d7e6e51dd4 introduced in 2012.  That
-/// ninth line is deliberately NOT in the table: master commit e381cf1fc97
-/// (2025-08-15) removed it, leaving exactly eight sites (master snapshot
-/// 98165ff73e8, 2026-08-30: 1169, 1189, 6075, 6092, 6101, 6158, 7193, 7752,
-/// the same eight sites renumbered), and master's arm -- close the write fd,
-/// touch neither status nor tick -- is the one this port follows.  **Seven
-/// of the eight are not `handle_child_signal`'s**, which is the whole point
-/// of [`StatusChangeSite`].  The citations are spelled out here so a
-/// renumbered line is a failing test rather than a stale comment, and the
-/// count is asserted so a ninth site cannot appear without one.
+/// `(exit . 256)` behavior GNU commit 4d7e6e51dd4 introduced in 2012.  GNU
+/// master commit e381cf1fc97 (2025-08-15) removed that bump, leaving eight
+/// sites (master snapshot 98165ff73e8, 2026-08-30: 1169, 1189, 6075, 6092,
+/// 6101, 6158, 7193, 7752, the same sites renumbered).  This port follows
+/// master for real children -- their own exit status must survive the write
+/// failure -- and applies the ninth site only to a network connection's
+/// EPIPE, where there is no child status to preserve and clients such as
+/// dsh-emacs depend on the reference build's closed status, tick, and
+/// `deactivate_process`.  **Eight of the nine are not
+/// `handle_child_signal`'s**, which is the whole point of
+/// [`StatusChangeSite`].  The citations are spelled out here so a renumbered
+/// line is a failing test rather than a stale comment, and the count is
+/// asserted so a tenth site cannot appear without one.
 #[test]
-fn the_status_change_sites_are_gnus_eight_tick_bumps() {
+fn the_status_change_sites_are_the_release_lineages_tick_bumps() {
     use crate::emacs_core::process::StatusChangeSite;
     use crate::emacs_core::process::child_status::{StatusChangeNotifier, StatusChangeRecorder};
 
-    assert_eq!(StatusChangeSite::COUNT, 8);
-    assert_eq!(StatusChangeSite::ALL.len(), 8);
+    assert_eq!(StatusChangeSite::COUNT, 9);
+    assert_eq!(StatusChangeSite::ALL.len(), 9);
 
     let cited: Vec<&'static str> = StatusChangeSite::ALL.iter().map(|s| s.gnu()).collect();
     assert_eq!(
@@ -15561,6 +15797,7 @@ fn the_status_change_sites_are_gnus_eight_tick_bumps() {
             "src/process.c:6075",
             "src/process.c:6084",
             "src/process.c:6141",
+            "src/process.c:6927",
             "src/process.c:7178",
             "src/process.c:7746",
         ]
@@ -15574,7 +15811,7 @@ fn the_status_change_sites_are_gnus_eight_tick_bumps() {
         assert!(!site.what().is_empty(), "{site:?} needs a status");
     }
 
-    // GNU consumes four of the eight on the spot -- `status_notify` is called
+    // GNU consumes four of the nine on the spot -- `status_notify` is called
     // within a few lines of the bump -- and leaves the rest for the wait's own
     // `status_notify` at :5554 / :5854.
     let synchronous: Vec<StatusChangeSite> = StatusChangeSite::ALL
@@ -15596,7 +15833,7 @@ fn the_status_change_sites_are_gnus_eight_tick_bumps() {
         ]
     );
 
-    // And exactly one of the eight has no analogue in this port, with a reason.
+    // And exactly one of the nine has no analogue in this port, with a reason.
     let without: Vec<StatusChangeSite> = StatusChangeSite::ALL
         .into_iter()
         .filter(|site| matches!(site.recorder(), StatusChangeRecorder::NoAnalogue { .. }))
@@ -16143,7 +16380,7 @@ fn a_childs_own_descriptor_returns_the_block_which_is_what_gnu_uses_sigchld_for(
     let prompt = Duration::from_millis(1500);
 
     // PHASE 1, the assertion: a real child, whose `pidfd` IS registered with
-    // this poller, dies 200ms into a 3s block.
+    // this poller, exits only after the backend commits to a 3s wait.
     let mut eval = Context::new();
     let child = eval.processes.create_process_lisp(
         LispString::from_utf8("pw200-control"),
@@ -16151,18 +16388,42 @@ fn a_childs_own_descriptor_returns_the_block_which_is_what_gnu_uses_sigchld_for(
         LispString::from_utf8(&sh),
         vec![
             LispString::from_utf8("-c"),
-            LispString::from_utf8("sleep 0.2; exit 7"),
+            LispString::from_utf8("IFS= read -r release; exit 7"),
         ],
         crate::emacs_core::process::ProcessCodingSystems::gnu_make_process_initial(),
     );
     eval.processes
         .spawn_child(child, false)
         .expect("spawn child");
+    let mut child_input = eval
+        .processes
+        .get(child)
+        .expect("owned child")
+        .live_io
+        .child
+        .stdin()
+        .expect("owned child gate input")
+        .try_clone()
+        .expect("clone only the gate-input descriptor");
+    let (child_ready, child_wait) = std::sync::mpsc::channel();
+    eval.processes
+        .before_next_backend_wait_for_test(move |entry| {
+            let _ = child_ready.send(entry);
+        });
+    let child_releaser = std::thread::spawn(move || -> std::io::Result<BackendWaitEntry> {
+        let entry = process_only_wait_entry_for_test(child_wait, block)?;
+        std::io::Write::write_all(&mut child_input, b"release\n")?;
+        Ok(entry)
+    });
     let started = Instant::now();
     let events = eval
         .processes
         .wait_for_backend_events(block, ProcessWaitBackendInterest::ProcessesOnly);
     let control_elapsed = started.elapsed();
+    child_releaser
+        .join()
+        .expect("child-control publisher joined")
+        .expect("child released only after actual pre-poll entry");
     assert!(
         control_elapsed < prompt,
         "a child's own `pidfd' must return the block when it dies -- waited \
@@ -16184,24 +16445,58 @@ fn a_childs_own_descriptor_returns_the_block_which_is_what_gnu_uses_sigchld_for(
     // `ErrorKind::Interrupted` and re-enters (polling-3.11.0/src/lib.rs:
     // 751-764), so even a delivery that DID interrupt the syscall would not
     // shorten the block.
-    let eval = Context::new();
+    let mut eval = Context::new();
     assert_no_sigchld_handler_is_installed();
-    let waker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
+    let (signal_ready, signal_wait) = std::sync::mpsc::channel();
+    eval.processes
+        .before_next_backend_wait_for_test(move |entry| {
+            let _ = signal_ready.send(entry);
+        });
+    let waker = std::thread::spawn(move || -> std::io::Result<BackendWaitEntry> {
+        let entry = process_only_wait_entry_for_test(signal_wait, block)?;
         // SAFETY: `kill` with this process's own pid and a valid signal.
-        unsafe { libc::kill(libc::getpid(), libc::SIGCHLD) };
+        if unsafe { libc::kill(libc::getpid(), libc::SIGCHLD) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(entry)
     });
     let started = Instant::now();
     let _events = eval
         .processes
         .wait_for_backend_events(block, ProcessWaitBackendInterest::ProcessesOnly);
     let signal_elapsed = started.elapsed();
-    waker.join().expect("waker thread");
+    waker
+        .join()
+        .expect("waker thread")
+        .expect("SIGCHLD sent only after actual pre-poll entry");
     eprintln!(
         "PW208 wake: pidfd returned a {block:?} block in {control_elapsed:?}; \
          a SIGCHLD delivered into the same block left it running \
          {signal_elapsed:?}"
     );
+}
+
+/// Consumes one actual backend-entry token before any signal/child release.
+/// Missing or mismatched witnesses fail without publishing substitute input.
+#[cfg(unix)]
+fn process_only_wait_entry_for_test(
+    receiver: std::sync::mpsc::Receiver<BackendWaitEntry>,
+    requested_timeout: Duration,
+) -> std::io::Result<BackendWaitEntry> {
+    let entry = receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "actual process pre-poll witness missing",
+        )
+    })?;
+    if entry.interest() != ProcessWaitBackendInterest::ProcessesOnly
+        || entry.requested_timeout() != requested_timeout
+    {
+        return Err(std::io::Error::other(
+            "unexpected process pre-poll interest/timeout",
+        ));
+    }
+    Ok(entry)
 }
 
 /// A signal arriving on another thread must wake a real idle evaluator poll,
@@ -16211,24 +16506,32 @@ fn a_childs_own_descriptor_returns_the_block_which_is_what_gnu_uses_sigchld_for(
 #[test]
 #[cfg(all(unix, not(target_os = "android")))]
 fn captured_os_signal_wakes_idle_process_poller() {
-    let eval = Context::new();
+    let mut eval = Context::new();
     let report = crate::emacs_core::os_signal::install();
     crate::emacs_core::os_signal::take_pending();
     crate::emacs_core::os_signal::drain_wake_pipe(report.self_pipe_read_fd().unwrap());
     let (ready, start) = std::sync::mpsc::channel();
-    let sender = std::thread::spawn(move || {
-        start.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+    eval.processes
+        .before_next_backend_wait_for_test(move |entry| {
+            let _ = ready.send(entry);
+        });
+    let sender = std::thread::spawn(move || -> std::io::Result<BackendWaitEntry> {
+        let entry = process_only_wait_entry_for_test(start, Duration::from_secs(5))?;
         // SAFETY: signal this test process after dispositions are installed.
-        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
+        if unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(entry)
     });
-    ready.send(()).unwrap();
     let started = Instant::now();
     let events = eval.processes.wait_for_backend_events(
         Duration::from_secs(5),
         ProcessWaitBackendInterest::ProcessesOnly,
     );
-    sender.join().unwrap();
+    sender
+        .join()
+        .expect("signal producer joined")
+        .expect("USR1 sent only after actual pre-poll entry");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "signal did not wake idle poll: {events:?}"
@@ -16676,6 +16979,83 @@ fn epipe_on_send_leaves_the_real_child_status_for_the_next_wait_to_reap() {
     );
 }
 
+/// GNU emacs-31.1's EPIPE arm settles a connection's status, bumps its tick,
+/// and deactivates it before signalling (src/process.c:6923-6931), so Lisp
+/// sees the peer as closed while handling the send error AND the next wait
+/// runs the "connection broken by remote peer" sentinel even though the
+/// consumer suspended reads with a filter of `t`.  Send-error handlers in
+/// clients such as dsh-emacs test `process-live-p`: a still-live sender is
+/// reported as an unexpected WebSocket frame error on every peer close, and
+/// a process left listed after the failure leaks one socket per reconnect.
+/// GNU master (e381cf1fc97) leaves a real child's status for the reaper --
+/// this port follows that for children -- but a network connection has no
+/// child, so it keeps the reference build's complete EPIPE arm.
+#[test]
+fn epipe_on_network_send_closes_notifies_and_retires_the_connection() {
+    crate::test_utils::init_test_tracing();
+    let result = eval_one(
+        r#"(let (conn err sentinel-events)
+             (let* ((srv (make-network-process
+                          :name "epipe-net-srv" :server t
+                          :host "127.0.0.1" :service 0
+                          :log (lambda (_s proc _m) (setq conn proc))))
+                    (port (process-contact srv :service))
+                    (cli (make-network-process
+                          :name "epipe-net-cli"
+                          :host "127.0.0.1" :service port
+                          :coding 'no-conversion
+                          :sentinel (lambda (_p event)
+                                      (push (string-trim event)
+                                            sentinel-events)))))
+               (unwind-protect
+                   (progn
+                     (let ((deadline (+ (float-time) 3)))
+                       (while (and (not conn) (< (float-time) deadline))
+                         (accept-process-output nil 0.01)))
+                     ;; The peer leaves client bytes unread and closes, which
+                     ;; makes the kernel answer the next write with EPIPE.
+                     (set-process-filter conn t)
+                     (process-send-string cli "unread-at-peer")
+                     (sleep-for 0.2)
+                     (delete-process conn)
+                     ;; dsh-emacs suspends reads with a filter of `t` and never
+                     ;; restores it after the frame error: the EPIPE arm alone
+                     ;; has to schedule the sentinel.
+                     (set-process-filter cli t)
+                     (let ((i 0))
+                       (while (and (< i 200) (not err))
+                         (condition-case e
+                             (process-send-string cli (make-string 4096 ?q))
+                           (error
+                            ;; Linux can report ECONNRESET on the first write
+                            ;; after a reset; only the EPIPE arm settles the
+                            ;; status, so keep writing until it is reached.
+                            (when (string-match-p
+                                   "no longer connected to pipe"
+                                   (error-message-string e))
+                              (setq err e))))
+                         (setq i (1+ i))))
+                     (let ((at-error
+                            (list (and err (error-message-string err))
+                                  (process-live-p cli)
+                                  (process-status cli))))
+                       (accept-process-output nil 0.3)
+                       (list at-error
+                             (nreverse sentinel-events)
+                             (process-live-p cli)
+                             (process-status cli)
+                             (and (memq cli (process-list)) t))))
+                 (ignore-errors (delete-process cli))
+                 (ignore-errors (delete-process srv)))))"#,
+    );
+    assert_eq!(
+        result,
+        r#"OK (("Process epipe-net-cli no longer connected to pipe; closed it" nil closed) ("connection broken by remote peer") nil closed nil)"#,
+        "GNU 31.1 publishes closed, notifies the sentinel once, and retires the \
+         connection even while its filter is `t`"
+    );
+}
+
 /// GNU's documented idle-timer contract (Elisp manual, "Idle Timers"): an
 /// idle timer fires "when SECS seconds have elapsed since the last user
 /// command was finished, **even if subprocess output has been accepted**"
@@ -16688,43 +17068,65 @@ fn epipe_on_send_leaves_the_real_child_status_for_the_next_wait_to_reap() {
 /// not assert an exact wall-clock firing time.
 #[test]
 fn subprocess_output_during_idle_does_not_reset_the_idle_epoch() {
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = crate::emacs_core::eval::RedisplayHookPolicyGuard::legacy();
     let mut ev = crate::test_utils::runtime_startup_context();
+    crate::test_utils::input_wait::select_visible_fixture(&mut ev, "*vm-chatter*");
     ev.eval_str(
         r#"(progn
            (setq vm-chatter-idle-fired nil)
            (run-with-idle-timer 0.05 nil
-             (lambda () (setq vm-chatter-idle-fired 'done)))
+             (lambda ()
+               (message "idle timer completed")
+               (setq vm-chatter-idle-fired 'done)))
            (start-process "chatter" "*vm-chatter*"
                           "sh" "-c"
                           "i=0; while [ $i -lt 100 ]; do echo tick; sleep 0.01; i=$((i + 1)); done"))"#,
     )
     .expect("schedule idle timer and chatty subprocess");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let _tx_keepalive = tx.clone();
-    let notifier = ev.wait_notifier();
-    let sender = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('a'),
-        ))
-        .expect("send keypress");
-        if let Some(notifier) = notifier {
-            notifier.notify().expect("wake command-input wait");
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('a'),
+    )]);
+    install_after_redisplay(&mut ev, gate, |context| {
+        let idle = context.eval_symbol("vm-chatter-idle-fired").ok();
+        let output = context
+            .buffers
+            .find_buffer_by_name("*vm-chatter*")
+            .and_then(|id| context.buffers.get(id))
+            .map(|buffer| buffer.buffer_string());
+        match (idle, output) {
+            (Some(value), Some(output))
+                if value == Value::symbol("done")
+                    && output.lines().any(|line| line.starts_with("tick")) =>
+            {
+                Readiness::Ready(WaitWitness::ProcessOutputAndIdleCompleted)
+            }
+            (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) | (None, None) => {
+                Readiness::Pending
+            }
         }
     });
 
     let event = ev.read_char();
+    let observation = publication.finish();
+    match &observation {
+        Ok(_) => {}
+        Err(_) => ev.quit_requested.clear(),
+    }
     let idle_fired = ev.eval_symbol("vm-chatter-idle-fired");
     let ticks = ev.eval_str(
         r#"(with-current-buffer "*vm-chatter*"
             (count-matches "^tick" (point-min) (point-max)))"#,
     );
-    sender.join().expect("input sender should finish");
     ev.eval_str(r#"(delete-process "chatter")"#)
         .expect("stop and reap the bounded chatter subprocess");
+    let observed = observation.expect("required observed wait publication");
+    assert_eq!(observed.witness, WaitWitness::ProcessOutputAndIdleCompleted);
     let event = event.expect("read_char returns the queued keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(
@@ -16770,7 +17172,7 @@ fn stalled_tls_handshake_services_lisp_timers_and_timeout() {
 }
 
 #[test]
-fn deleting_tls_during_an_open_sentinel_does_not_reenter_the_sentinel() {
+fn deleting_tls_during_an_open_sentinel_reenters_the_sentinel_like_gnu() {
     let peer = crate::emacs_core::tls_test::loopback::StalledPeer::spawn();
     let port = peer.port;
     let result = eval_one(&format!(
@@ -16795,7 +17197,19 @@ fn deleting_tls_during_an_open_sentinel_does_not_reenter_the_sentinel() {
 "#
     ));
     drop(peer);
-    assert_eq!(result, "OK (t closed 1 nil)");
+    // GNU re-enters: Fdelete_process stamps a fresh tick and calls
+    // `status_notify (p, NULL)` (src/process.c:1128-1129), whose per-process
+    // guard is `p->tick != p->update_tick` -- and the tick was just moved --
+    // so it reaches `exec_sentinel` (:7937) for THIS process even though the
+    // outer sentinel is still on the stack.  `exec_sentinel` only refuses when
+    // the global `inhibit_sentinels` is set, which happens at shutdown
+    // (emacs.c:3155), never mid-session.  Measured on GNU 31.1 with the same
+    // open-then-timer-delete shape on a plain network process (the TLS wrapper
+    // does not change the process arm): `CALLS 2`, events
+    // `((1 . "open\n") timer-delete (2 . "deleted\n"))`.  Neomacs used to
+    // suppress the nested call with a per-process recursion guard, which also
+    // swallowed url-http's retry sentinel (anaconda-mode parity).
+    assert_eq!(result, "OK (t closed 2 nil)");
 }
 
 #[test]
@@ -17052,4 +17466,40 @@ fn deinitializing_pending_tls_wakes_the_negotiation_owner() {
         peer.port
     ));
     assert_eq!(result, "OK (closed t)");
+}
+
+#[test]
+fn temporary_green_select_capture_does_not_retire_the_backend() {
+    use crate::host_effect::wake::{ControlNudge, ControlWakeOutcome};
+    let manager = ProcessManager::new();
+    drop(manager.green_select_handle());
+    let selector = manager
+        .green_select_handle()
+        .expect("backend control observer");
+    let registration = selector
+        .arm()
+        .expect("temporary capture did not retire backend");
+    selector.notify();
+    assert_eq!(
+        registration.poll(),
+        Some(ControlWakeOutcome::ControlReady(
+            ControlNudge::HostServiceReady
+        ))
+    );
+}
+
+#[test]
+fn backend_retirement_closes_surviving_green_control_observers() {
+    use crate::host_effect::wake::{ControlWakeOutcome, HostClosure};
+    let manager = ProcessManager::new();
+    let selector = manager
+        .green_select_handle()
+        .expect("backend control observer");
+    let registration = selector.arm().expect("live backend");
+    drop(manager);
+    assert_eq!(
+        registration.poll(),
+        Some(ControlWakeOutcome::HostClosed(HostClosure::RetiredSession))
+    );
+    assert!(matches!(selector.arm(), Err(HostClosure::RetiredSession)));
 }

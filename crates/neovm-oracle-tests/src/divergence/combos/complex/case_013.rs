@@ -27,11 +27,10 @@ fn div_cx13_process_send_receive_binary() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx13_buffer_narrow_marker_undo_stack_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""ERR (args-out-of-range 1 1)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (with-temp-buffer
@@ -52,7 +51,7 @@ fn div_cx13_buffer_narrow_marker_undo_stack_deep() {
       (list state (point-min) (point-max)
             (marker-position m1) (marker-position m2)
             (buffer-string) (text-properties-at 1))))
-"##,
+)"##,
         expect,
     );
 }
@@ -200,9 +199,16 @@ fn div_cx13_set_process_filter_receive_multiline() {
     crate::common::assert_oracle_parity_expect(
         r##"
 (let (got)
-  (let ((p (make-process :name "neo-cx13-ml" :command '("printf" "line1\\nline2\\nline3")
-                         :buffer nil
-                         :filter (lambda (proc str) (push str got)))))
+  (let* ((ready (make-temp-file "neo-cx13-ml-gate-"))
+         (p (make-process :name "neo-cx13-ml"
+                          :command (append (list "sh" "-c"
+                                                 "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                                 "sh" ready)
+                                           '("printf" "line1\\nline2\\nline3"))
+                          :buffer nil
+                          :filter (lambda (proc str) (push str got)))))
+    ;; The child writes only after READY is deleted, while this form is waiting.
+    (delete-file ready)
     (neovm--oracle-settle-process p 600))
   (apply #'concat (nreverse got)))
 "##,

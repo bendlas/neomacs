@@ -1111,7 +1111,9 @@ fn inlined_callee_redefinition_rejits() {
     f.max_stack = crate::emacs_core::bytecode::StackDepth::for_test(16);
     let f_val = Value::make_bytecode(f.clone());
     prepare_entry(ctx, &f);
-    let r1 = crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(5)]);
+    // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+    let r1 =
+        unsafe { crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(5)]) };
     assert!(
         matches!(r1, Ok(Some(b)) if b == Value::make_int(25).bits()),
         "inlined (* 5 5) should be 25, got {r1:?}"
@@ -1123,7 +1125,9 @@ fn inlined_callee_redefinition_rejits() {
         crate::emacs_core::symbol::FunctionEpochBump::SubrRewrite,
     );
     prepare_entry(ctx, &f);
-    let r2 = crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(5)]);
+    // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+    let r2 =
+        unsafe { crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(5)]) };
     assert!(
         matches!(r2, Ok(Some(b)) if b == Value::make_int(6).bits()),
         "after redefinition + epoch bump, re-JIT inlines the new C: (1+ 5) = 6, got {r2:?}"
@@ -1668,8 +1672,10 @@ fn mir_loop_overflow_after_a_poll_deopts_at_the_current_iteration() {
     assert_eq!(ev.jit_root_stack_top, 0);
 }
 
-/// A poll can run Lisp that redefines a callee. The next inlined call must
-/// deopt to its original boundary, preserving iterations already completed.
+/// A poll can run Lisp that redefines a callee. The poll's release
+/// revalidation deopts at the loop head — preserving iterations already
+/// completed — and the resumed interpreter resolves the callee through the
+/// symbol, so the new definition wins.
 #[test]
 fn mir_loop_does_not_keep_an_inlined_callee_across_a_gc_hook() {
     let _backend = crate::emacs_core::jit::compile::opt_mode_scope_for_test(
@@ -1728,11 +1734,21 @@ fn mir_loop_does_not_keep_an_inlined_callee_across_a_gc_hook() {
     let NativeRun::DeoptAt(frame) = &result else {
         panic!("{result:?}")
     };
-    assert_eq!(frame.pc, 6);
+    // The redefinition happened INSIDE the poll's own GC service, so the
+    // poll's release revalidation is the first release point that can see
+    // it: the deopt lands at the LOOP HEAD (pc 0, the goto's target), with
+    // the edge stack — the state the goto itself would have produced. The
+    // interpreter then resolves the next call through the symbol, so the
+    // resumed loop delivers the new definition (asserted below). Before
+    // release-point revalidation the loop instead ran on into the next
+    // iteration and deopted at the inlined call's entry guard (pc 6); that
+    // mechanism pin is superseded, the observable contract is unchanged.
+    assert_eq!(frame.pc, 0);
     assert!(
         frame.stack[0].as_fixnum().unwrap() < 1000,
         "completed iterations are retained"
     );
+    assert_eq!(frame.stack.len(), 1);
     assert_eq!(
         mir_inline_guards::resume(&mut ev, &f, result),
         Value::make_int(-7)
@@ -5241,7 +5257,8 @@ fn cleanup_flow_does_not_pop_an_outer_callers_handler() {
     stash_pending_flow(Flow::throw(inner_tag, Value::make_int(1)));
     let mut out = 0i64;
     let ctx_ptr = &mut ctx as *mut crate::emacs_core::eval::Context as *mut u8;
-    assert_eq!(neovm_jit_match_handler(ctx_ptr, 2, &mut out), -1);
+    // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+    assert_eq!(unsafe { neovm_jit_match_handler(ctx_ptr, 2, &mut out) }, -1);
     assert_eq!(ctx.condition_stack.len(), 1, "caller handler survives");
     assert_eq!(ctx.specpdl.len(), 0, "cleanup extent fully unwound");
     let flow = take_pending_flow().expect("cleanup throw propagated to caller");
@@ -6179,10 +6196,11 @@ fn jit_matches_interpreter_with_args() {
 // serve as the oracle for the slow path.
 
 /// Phase-8 micro-benchmark: the hot fixnum countdown loop, Tier 0 vs JIT.
-/// `#[ignore]`d (timing does not belong in CI); run explicitly, in release:
-/// `cargo nextest run --cargo-profile release --features jit --run-ignored all jit_bench`
+/// Compiled only under the `perf-probes` feature (timing does not belong in
+/// CI); run explicitly, in release:
+/// `cargo nextest run -p neovm-core --release --features jit,perf-probes jit_bench`
 #[test]
-#[ignore = "manual perf measurement; run in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_countdown_loop() {
     use crate::emacs_core::bytecode::Vm;
     use crate::emacs_core::eval::Context;
@@ -6247,7 +6265,7 @@ fn jit_bench_countdown_loop() {
 /// process. The same Elisp workloads for GNU live in scripts/mir-loop-bench.el.
 /// Compilation and warmup are excluded; alternate order and report medians.
 #[test]
-#[ignore = "manual perf measurement; pin to an idle core"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_mir_loops_against_baseline() {
     use crate::emacs_core::eval::Context;
     use crate::emacs_core::intern::SymId;
@@ -9947,7 +9965,8 @@ fn an_unrelated_redefinition_keeps_an_inlining_leaf_compiled() {
     );
     let f_val = Value::make_bytecode(f.clone());
     let run = |ctx: *mut Context| {
-        crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(4)])
+        // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+        unsafe { crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(4)]) }
     };
     prepare_entry(ctx, &f);
     let first = run(ctx);
@@ -10024,12 +10043,10 @@ fn refsetting_the_same_function_and_repeated_redefinitions_stop_recompiling() {
     let f_val = Value::make_bytecode(f.clone());
     // `None` when F ran interpreted: once C is only called, a call-only
     // body may stay below the JIT's profit gate.
-    let run = |ctx: *mut Context| match crate::emacs_core::jit::try_run_compiled(
-        ctx,
-        &f,
-        f_val,
-        &[Value::make_int(4)],
-    ) {
+    // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+    let run = |ctx: *mut Context| match unsafe {
+        crate::emacs_core::jit::try_run_compiled(ctx, &f, f_val, &[Value::make_int(4)])
+    } {
         Ok(bits) => bits,
         Err(flow) => panic!("F signalled: {flow:?}"),
     };

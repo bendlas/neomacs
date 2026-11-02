@@ -114,11 +114,12 @@ fn direct_help_echo_rows() -> String {
 
 #[test]
 fn gnu_help_echo_substitution_direct_helper_matches_actual_event_path() {
-    let Some(emacs) = std::env::var_os("NEOVM_FORCE_ORACLE_PATH") else {
-        tracing::debug!("skipping help-echo GNU oracle: set NEOVM_FORCE_ORACLE_PATH");
-        return;
-    };
-    let output = std::process::Command::new(emacs)
+    // The fixture was recorded under the canonical oracle environment; the
+    // builder pins the locale (which also fixes GNU's `text-quoting-style'
+    // nil default and stdout coding, src/emacs.c:415,1656), TZ, identity,
+    // HOME, TMPDIR and umask.
+    let mut command = crate::test_utils::gnu_probe_command();
+    let output = command
         .args(["-Q", "--batch", "--eval", GNU_HELP_ECHO_FORM])
         .output()
         .expect("run explicitly configured GNU Emacs oracle");

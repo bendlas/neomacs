@@ -11,9 +11,15 @@ fn div_cx148_process_mark_position_query() {
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((buf (get-buffer-create " *neo-cx148-mark*"))
+       (ready (make-temp-file "neo-cx148-mark-gate-"))
        (p (make-process :name "neo-cx148-mark"
-                        :command '("echo" "hi")
+                        :command (append (list "sh" "-c"
+                                               "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                               "sh" ready)
+                                         '("echo" "hi"))
                         :buffer buf)))
+  ;; The child writes only after READY is deleted, while this form is waiting.
+  (delete-file ready)
   (neovm--oracle-settle-process p 600)
   (sit-for 0.05)
   (let ((mark (process-mark p)))
@@ -49,11 +55,11 @@ fn div_cx148_process_list_after_multiple_make() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx148_process_query_before_exit() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect =
+        expect_test::expect![[r#""OK ((run open listen connect stop) t (run exit signal))""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((p (make-process :name "neo-cx148-query"
@@ -61,7 +67,7 @@ fn div_cx148_process_query_before_exit() {
   (list (process-live-p p)
         (eq (process-status p) 'run)
         (memq (process-status p) '(run exit signal)))
-"##,
+)"##,
         expect,
     );
 }
@@ -76,10 +82,16 @@ fn div_cx148_process_filter_vs_buffer_append() {
         r##"
 (let* ((filter-collected nil)
        (buf (get-buffer-create " *neo-cx148-flt*"))
+       (ready (make-temp-file "neo-cx148-flt-gate-"))
        (p (make-process :name "neo-cx148-flt"
-                        :command '("echo" "via-filter")
+                        :command (append (list "sh" "-c"
+                                               "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                               "sh" ready)
+                                         '("echo" "via-filter"))
                         :buffer buf
                         :filter (lambda (proc data) (push data filter-collected)))))
+  ;; The child writes only after READY is deleted, while this form is waiting.
+  (delete-file ready)
   (neovm--oracle-settle-process p 600)
   (sit-for 0.05)
   (let ((buf-content (with-current-buffer buf (buffer-string))))
@@ -99,9 +111,15 @@ fn div_cx148_process_default_filter_appends_to_buffer() {
     crate::common::assert_oracle_parity_expect(
         r##"
 (let* ((buf (get-buffer-create " *neo-cx148-defflt*"))
+       (ready (make-temp-file "neo-cx148-defflt-gate-"))
        (p (make-process :name "neo-cx148-defflt"
-                        :command '("echo" "default-filter")
+                        :command (append (list "sh" "-c"
+                                               "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                               "sh" ready)
+                                         '("echo" "default-filter"))
                         :buffer buf)))
+  ;; The child writes only after READY is deleted, while this form is waiting.
+  (delete-file ready)
   (neovm--oracle-settle-process p 600)
   (sit-for 0.05)
   (let ((content (string-trim (with-current-buffer buf (buffer-string)))))

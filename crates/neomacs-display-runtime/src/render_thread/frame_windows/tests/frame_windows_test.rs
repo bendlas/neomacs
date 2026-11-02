@@ -252,7 +252,7 @@ fn terminal_expansion_replacement_is_atomic_and_invalidates_the_scene() {
     );
     assert!(composed.faces.contains_key(&face_id));
 
-    render.begin_presentable_render();
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
     let installed_generation = render.compositor.current_scene_generation;
     assert_eq!(
         render.replace_terminal_expansion(expansion),
@@ -310,7 +310,7 @@ fn terminal_expansion_rejects_editor_face_collisions_without_partial_installatio
         render.replace_terminal_expansion(retained),
         TerminalExpansionUpdate::Replaced
     );
-    render.begin_presentable_render();
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
     let installed_generation = render.compositor.current_scene_generation;
 
     let collision = TerminalExpansion::new(
@@ -463,6 +463,7 @@ fn suspended_surface_cannot_retain_a_drawable_present_mapping() {
 #[test]
 fn zero_size_observation_stays_suspended_after_scale_refresh() {
     let mut window = GuiFrameWindowState {
+        visibility: crate::thread_comm::WindowVisibility::Visible,
         pending_scale_factor: None,
         lifecycle: FrameLifecycle::Pending {
             width: 800,
@@ -771,7 +772,7 @@ fn beginning_presentable_render_consumes_dirty_content() {
     );
     render.mark_dirty();
 
-    render.begin_presentable_render();
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
 
     assert!(!render.compositor.dirty);
     assert!(!render.has_presentable_dirty_content());
@@ -1313,6 +1314,48 @@ fn clear_primary_mapping_removes_adopted_primary_identity() {
 // =======================================================================
 
 #[test]
+fn primary_visibility_survives_pending_identity_adoption_and_detachment() {
+    let mut mgr = GuiFrameWindowManager::new();
+    mgr.set_primary_pending(GuiFrameWindowState {
+        visibility: WindowVisibility::Visible,
+        pending_scale_factor: None,
+        lifecycle: FrameLifecycle::Pending {
+            width: 800,
+            height: 600,
+            scale_factor: 1.0,
+            mouse_hidden_for_typing: false,
+            ime_enabled: false,
+            last_ime_cursor_area: None,
+            chrome: Default::default(),
+            geometry_hints: None,
+        },
+        render: GuiFrameRenderState::new_without_device(
+            42,
+            false,
+            neomacs_display_protocol::frame_time::observe_platform_now(),
+        ),
+    });
+    mgr.adopt_primary_frame_id(42);
+
+    // A visibility command can arrive before a native window exists. Its
+    // intent belongs to the logical frame, independently of native ownership.
+    assert!(mgr.set_visibility(42, WindowVisibility::Invisible));
+    let mut detached = mgr.take_primary_window().expect("adopted primary state");
+    assert_eq!(detached.visibility, WindowVisibility::Invisible);
+    assert!(detached.window().is_none());
+
+    detached.set_visibility(WindowVisibility::Iconified);
+    mgr.clear_primary_mapping();
+    mgr.set_primary_pending(detached);
+    mgr.adopt_primary_frame_id(42);
+
+    let primary = mgr.get(42).expect("restored primary state");
+    assert_eq!(primary.visibility, WindowVisibility::Iconified);
+    assert_eq!(primary.content_size(), (800, 600));
+    assert!(primary.window().is_none());
+}
+
+#[test]
 fn request_create_adds_to_pending() {
     let mut mgr = GuiFrameWindowManager::new();
     mgr.request_create(
@@ -1322,6 +1365,7 @@ fn request_create_adds_to_pending() {
         "Test Window".to_string(),
         default_geometry_hints(),
         false,
+        crate::thread_comm::WindowVisibility::Visible,
     );
 
     assert_eq!(mgr.pending_creates.len(), 1);
@@ -1341,6 +1385,7 @@ fn request_create_multiple_preserves_order() {
         "Window 1".to_string(),
         default_geometry_hints(),
         false,
+        crate::thread_comm::WindowVisibility::Visible,
     );
     mgr.request_create(
         2,
@@ -1349,6 +1394,7 @@ fn request_create_multiple_preserves_order() {
         "Window 2".to_string(),
         default_geometry_hints(),
         false,
+        crate::thread_comm::WindowVisibility::Visible,
     );
     mgr.request_create(
         3,
@@ -1357,6 +1403,7 @@ fn request_create_multiple_preserves_order() {
         "Window 3".to_string(),
         default_geometry_hints(),
         false,
+        crate::thread_comm::WindowVisibility::Visible,
     );
 
     assert_eq!(mgr.pending_creates.len(), 3);
@@ -1368,7 +1415,15 @@ fn request_create_multiple_preserves_order() {
 #[test]
 fn request_create_does_not_modify_windows_map() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 800, 600, "Test".to_string(), default_geometry_hints(), false);
+    mgr.request_create(
+        1,
+        800,
+        600,
+        "Test".to_string(),
+        default_geometry_hints(),
+        false,
+        crate::thread_comm::WindowVisibility::Visible,
+    );
 
     // The window should NOT be in the windows map yet —
     // only in the pending queue until process_creates runs
@@ -1379,7 +1434,15 @@ fn request_create_does_not_modify_windows_map() {
 #[test]
 fn request_create_allows_duplicate_frame_ids() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 800, 600, "First".to_string(), default_geometry_hints(), false);
+    mgr.request_create(
+        1,
+        800,
+        600,
+        "First".to_string(),
+        default_geometry_hints(),
+        false,
+        crate::thread_comm::WindowVisibility::Visible,
+    );
     mgr.request_create(
         1,
         1024,
@@ -1387,6 +1450,7 @@ fn request_create_allows_duplicate_frame_ids() {
         "Duplicate".to_string(),
         default_geometry_hints(),
         false,
+        crate::thread_comm::WindowVisibility::Visible,
     );
 
     // Both are queued (process_creates will skip duplicates)
@@ -1396,7 +1460,15 @@ fn request_create_allows_duplicate_frame_ids() {
 #[test]
 fn request_create_zero_dimensions() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 0, 0, "Zero".to_string(), default_geometry_hints(), false);
+    mgr.request_create(
+        1,
+        0,
+        0,
+        "Zero".to_string(),
+        default_geometry_hints(),
+        false,
+        crate::thread_comm::WindowVisibility::Visible,
+    );
 
     assert_eq!(mgr.pending_creates.len(), 1);
     assert_eq!(mgr.pending_creates[0].width, 0);
@@ -1406,7 +1478,15 @@ fn request_create_zero_dimensions() {
 #[test]
 fn request_create_empty_title() {
     let mut mgr = GuiFrameWindowManager::new();
-    mgr.request_create(1, 800, 600, String::new(), default_geometry_hints(), false);
+    mgr.request_create(
+        1,
+        800,
+        600,
+        String::new(),
+        default_geometry_hints(),
+        false,
+        crate::thread_comm::WindowVisibility::Visible,
+    );
 
     assert_eq!(mgr.pending_creates[0].title, "");
 }
@@ -1422,6 +1502,7 @@ fn request_create_large_frame_id() {
         "Max ID".to_string(),
         default_geometry_hints(),
         false,
+        crate::thread_comm::WindowVisibility::Visible,
     );
 
     assert_eq!(mgr.pending_creates[0].emacs_frame_id, large_id);
@@ -1560,6 +1641,7 @@ fn pending_window_stores_all_fields() {
         title: "My Emacs Frame".to_string(),
         geometry_hints: default_geometry_hints(),
         override_redirect: false,
+        visibility: WindowVisibility::Visible,
     };
 
     assert_eq!(pw.emacs_frame_id, 123);
@@ -1577,6 +1659,7 @@ fn pending_window_unicode_title() {
         title: "Emacs \u{2014} \u{1F680} Neomacs".to_string(),
         geometry_hints: default_geometry_hints(),
         override_redirect: false,
+        visibility: WindowVisibility::Visible,
     };
 
     assert!(pw.title.contains('\u{2014}')); // em dash
@@ -1591,8 +1674,24 @@ fn pending_window_unicode_title() {
 fn create_and_destroy_queues_are_independent() {
     let mut mgr = GuiFrameWindowManager::new();
 
-    mgr.request_create(1, 800, 600, "Win1".to_string(), default_geometry_hints(), false);
-    mgr.request_create(2, 1024, 768, "Win2".to_string(), default_geometry_hints(), false);
+    mgr.request_create(
+        1,
+        800,
+        600,
+        "Win1".to_string(),
+        default_geometry_hints(),
+        false,
+        crate::thread_comm::WindowVisibility::Visible,
+    );
+    mgr.request_create(
+        2,
+        1024,
+        768,
+        "Win2".to_string(),
+        default_geometry_hints(),
+        false,
+        crate::thread_comm::WindowVisibility::Visible,
+    );
     mgr.request_destroy(3);
     mgr.request_destroy(4);
 
@@ -1680,6 +1779,7 @@ fn many_pending_creates() {
             format!("Window {}", i),
             default_geometry_hints(),
             false,
+            crate::thread_comm::WindowVisibility::Visible,
         );
     }
     assert_eq!(mgr.pending_creates.len(), 1000);
@@ -1734,7 +1834,7 @@ fn cursor_blink_toggle_asks_for_a_cursor_frame_not_a_repaint() {
     );
     render.cursor.blink_enabled = true;
     render.cursor.blink_interval = std::time::Duration::from_millis(1);
-    render.begin_presentable_render();
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
     assert!(!render.has_presentable_dirty_content());
 
     let toggled = render.tick_cursor_blink(
@@ -1756,7 +1856,7 @@ fn cursor_blink_toggle_asks_for_a_cursor_frame_not_a_repaint() {
 
     // Starting any frame satisfies both channels: every render path draws the
     // cursor at its current blink state.
-    render.begin_presentable_render();
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
     assert!(!render.has_presentable_cursor_change());
 }
 
@@ -1785,7 +1885,7 @@ fn content_change_outranks_a_pending_cursor_change() {
     assert!(render.has_presentable_cursor_change());
     // The demand model merges strongest-invalidation-wins, so the repaint the
     // content owes covers the cursor layer too.
-    render.begin_presentable_render();
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
     assert!(!render.has_presentable_dirty_content());
     assert!(!render.has_presentable_cursor_change());
 }
@@ -2033,4 +2133,239 @@ fn a_pointer_outside_every_scroll_bar_highlights_none_of_them() {
     let render = render_at_pointer(&frame, 150.0, 40.0);
 
     assert_eq!(render.hovered_scroll_bar(&frame), None);
+}
+
+#[test]
+fn cursor_motion_tick_does_not_damage_editor_content() {
+    let Some(device) = make_test_device() else {
+        return;
+    };
+    let now = neomacs_display_protocol::frame_time::observe_platform_now();
+    let mut render = GuiFrameRenderState::new(0x42, &device, 1.0, false, now);
+    render.set_current_frame(
+        Some(make_frame(0x42, 0)),
+        None,
+        Default::default(),
+        Default::default(),
+    );
+    render.cursor.anim_enabled = true;
+    let target = crate::render_thread::cursor::CursorTarget {
+        window_id: 7,
+        x: 10.0,
+        y: 20.0,
+        width: 8.0,
+        height: 16.0,
+        style: CursorStyle::FilledBox,
+        frame_id: 0x42,
+    };
+    render.cursor.set_target(target.clone(), now);
+    render.cursor.set_target(
+        crate::render_thread::cursor::CursorTarget { y: 36.0, ..target },
+        now,
+    );
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
+    assert!(render.tick_cursor_animation(now.plus(std::time::Duration::from_millis(16))));
+    assert!(
+        !render.has_presentable_dirty_content(),
+        "cursor motion must not repaint the editor scene (#607)"
+    );
+    assert!(render.has_presentable_cursor_change());
+}
+
+#[test]
+fn cursor_size_tick_does_not_damage_editor_content() {
+    let Some(device) = make_test_device() else {
+        return;
+    };
+    let now = neomacs_display_protocol::frame_time::observe_platform_now();
+    let mut render = GuiFrameRenderState::new(0x42, &device, 1.0, false, now);
+    render.set_current_frame(
+        Some(make_frame(0x42, 0)),
+        None,
+        Default::default(),
+        Default::default(),
+    );
+    render.cursor.size_transition_enabled = true;
+    let target = crate::render_thread::cursor::CursorTarget {
+        window_id: 7,
+        x: 10.0,
+        y: 20.0,
+        width: 8.0,
+        height: 16.0,
+        style: CursorStyle::FilledBox,
+        frame_id: 0x42,
+    };
+    render.cursor.set_target(target.clone(), now);
+    render.cursor.set_target(
+        crate::render_thread::cursor::CursorTarget {
+            width: 16.0,
+            ..target
+        },
+        now,
+    );
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
+    assert!(render.tick_cursor_size_animation(now.plus(std::time::Duration::from_millis(16))));
+    assert!(!render.has_presentable_dirty_content());
+    assert!(render.has_presentable_cursor_change());
+    // The final sample still owes a cursor frame when continuous demand ends.
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
+    assert!(render.tick_cursor_size_animation(now.plus(std::time::Duration::from_secs(2))));
+    assert!(render.has_presentable_cursor_change());
+    assert!(!render.has_presentable_dirty_content());
+}
+
+/// A popup cursor is drawn inside the retained child scene, so interpolation
+/// must repaint that scene even though the primary cursor also changed.
+fn assert_child_cursor_interpolation_repaints(
+    tick: impl Fn(&mut GuiFrameRenderState, neomacs_display_protocol::frame_time::EventTime) -> bool,
+) {
+    let Some(device) = make_test_device() else {
+        return;
+    };
+    let now = neomacs_display_protocol::frame_time::observe_platform_now();
+    let mut render = GuiFrameRenderState::new(0x42, &device, 1.0, false, now);
+    render.set_current_frame(
+        Some(make_frame(0x42, 0)),
+        None,
+        Default::default(),
+        Default::default(),
+    );
+    render.cursor.anim_enabled = true;
+    render.cursor.size_transition_enabled = true;
+    let target = CursorTarget {
+        window_id: 7,
+        x: 10.0,
+        y: 20.0,
+        width: 8.0,
+        height: 16.0,
+        style: CursorStyle::FilledBox,
+        frame_id: 0x43,
+    };
+    render.cursor.set_target(target.clone(), now);
+    render.cursor.set_target(
+        CursorTarget {
+            y: 36.0,
+            width: 16.0,
+            ..target
+        },
+        now,
+    );
+    for elapsed in [
+        std::time::Duration::from_millis(16),
+        std::time::Duration::from_secs(2),
+    ] {
+        render
+            .begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
+        assert!(tick(&mut render, now.plus(elapsed)));
+        assert!(render.has_presentable_cursor_change());
+        assert!(
+            render.has_presentable_dirty_content(),
+            "child-frame cursor interpolation must repaint the child scene, including its final sample"
+        );
+    }
+}
+
+/// Child position samples must invalidate the scene that contains their pixels.
+#[test]
+fn child_frame_cursor_motion_tick_repaints_child_scene() {
+    assert_child_cursor_interpolation_repaints(|render, at| render.tick_cursor_animation(at));
+}
+
+/// Child size samples, including completion, must invalidate their scene.
+#[test]
+fn child_frame_cursor_size_tick_repaints_child_scene() {
+    assert_child_cursor_interpolation_repaints(|render, at| render.tick_cursor_size_animation(at));
+}
+
+/// A cursor deadline can precede a scheduled scene repaint. In particular,
+/// the final child cursor sample must survive that earlier composite frame.
+#[test]
+fn composite_frame_preserves_final_child_cursor_scene_damage() {
+    use crate::render_thread::frame_sched::{
+        Cadence, ClockSource, Damage, DemandReason, FrameCoordinator, FrameDemand, FrameTick,
+        Invalidation, LayerMask, NativeWindowId, RenderWork,
+    };
+    let now = neomacs_display_protocol::frame_time::observe_platform_now();
+    let rate = std::num::NonZeroU16::new(60).unwrap();
+    let id = NativeWindowId(0x42);
+    let mut coordinator = FrameCoordinator::new();
+    let redisplay = FrameDemand {
+        invalidation: Invalidation::RepaintLayers {
+            layers: LayerMask::all(),
+            damage: Damage::FullLayer,
+        },
+        cadence: Cadence::MaxRate(rate),
+        reason: DemandReason::Redisplay,
+    };
+    let tick = |at| FrameTick {
+        frame_time: at,
+        target_presentation_time: at,
+        estimated_interval: std::time::Duration::from_millis(16),
+        source: ClockSource::Synthetic,
+    };
+    coordinator.submit_demand(id, redisplay, now);
+    coordinator.begin_frame(id, tick(now));
+
+    let mut render = GuiFrameRenderState::new_without_device(0x42, false, now);
+    render.set_current_frame(
+        Some(make_frame(0x42, 0)),
+        None,
+        Default::default(),
+        Default::default(),
+    );
+    render.begin_presentable_render(crate::render_thread::frame_sched::RenderWork::RebuildScene);
+    render.cursor.anim_enabled = false;
+    render.cursor.size_transition_enabled = true;
+    render.cursor.size_transition_duration = 0.001;
+    let target = CursorTarget {
+        window_id: 7,
+        x: 10.0,
+        y: 20.0,
+        width: 8.0,
+        height: 16.0,
+        style: CursorStyle::FilledBox,
+        frame_id: 0x43,
+    };
+    render.cursor.set_target(target.clone(), now);
+    render.cursor.set_target(
+        CursorTarget {
+            width: 16.0,
+            ..target
+        },
+        now,
+    );
+    let at = now.plus(std::time::Duration::from_millis(2));
+    assert!(render.tick_cursor_size_animation(at));
+    assert!(
+        !render.cursor.is_animating(),
+        "this is the final size sample"
+    );
+    assert!(render.has_presentable_dirty_content());
+    coordinator.submit_demand(id, redisplay, at);
+    coordinator.submit_demand(
+        id,
+        FrameDemand {
+            invalidation: Invalidation::CompositeOnly {
+                layers: LayerMask::CURSOR_EFFECTS,
+            },
+            cadence: Cadence::NextPresentation,
+            reason: DemandReason::CursorAnimation,
+        },
+        at,
+    );
+    let plan = coordinator.begin_frame(id, tick(at));
+    assert!(matches!(plan.work, RenderWork::CompositeOnly { .. }));
+    render.begin_presentable_render(plan.work);
+    assert!(!render.has_presentable_cursor_change());
+    assert!(
+        render.has_presentable_dirty_content(),
+        "a cursor-only frame must preserve the final child cursor scene sample"
+    );
+    let repaint = coordinator.begin_frame(id, tick(now.plus(std::time::Duration::from_millis(20))));
+    assert!(matches!(repaint.work, RenderWork::RepaintLayers { .. }));
+    render.begin_presentable_render(repaint.work);
+    assert!(
+        !render.has_presentable_dirty_content(),
+        "a full repaint satisfies pending scene damage"
+    );
 }

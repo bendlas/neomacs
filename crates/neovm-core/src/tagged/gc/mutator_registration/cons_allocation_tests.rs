@@ -165,30 +165,7 @@ impl Drop for PoisonOnUnwind<'_> {
 /// proceed.
 #[test]
 pub(super) fn in_slice_admission_word_refuses_catalog_transition() {
-    Context::with_test_collection_era(roots, |era, (_cars, _nil)| {
-        let permit = era.register(1731, 1).unwrap();
-        permit
-            .entry
-            .admission
-            .store(AdmissionWord::in_slice(0), Ordering::Release);
-        assert_eq!(
-            era.start_cons_storage(),
-            Err(RegistrationError::OutstandingLoan)
-        );
-        permit
-            .entry
-            .admission
-            .store(AdmissionWord::OUT, Ordering::Release);
-        era.start_cons_storage().unwrap();
-        let mut stopped = retry(|| era.stop());
-        retry_registration(|| era.return_cons_storage(&stopped));
-        era.collect_stopped(&mut stopped).unwrap();
-        complete(stopped);
-        drop(permit);
-        let (collector, keeper) = era.finish().unwrap();
-        drop(collector);
-        drop(keeper);
-    });
+    super::admission_probe::in_slice_admission_word_refuses_catalog_transition();
 }
 
 #[test]
@@ -772,11 +749,23 @@ fn partial_cons_grant_refunds_owner_and_global_credits_then_merges_history_once(
             )
         },
         |era, ((cars, nil), base_live, base_memory, base_bytes)| {
+            let table_charge = era.symbol_table_admission_charge_for_test();
+            assert!(
+                table_charge.get() > 0,
+                "admission retains the published table"
+            );
             era.start_cons_storage().unwrap();
             let before = era.cons_catalog_snapshot_for_test().unwrap();
             assert_eq!(before.live_count, base_live);
             let mut owner = activate(era.register(1720, 0).unwrap(), era.heap_identity(), 1720);
             let mut run = owner.run_access().unwrap();
+            assert_eq!(
+                table_charge,
+                run.initial_table_statistics_for_test()
+                    .unwrap()
+                    .retained_bytes,
+                "admission charged exactly the published table's retained storage"
+            );
             let mut allocated = Vec::new();
             // Bootstrap free lists may offer one-cell runs. Keep actual cells
             // rooted until a genuine partial region is observed; never inject
@@ -822,7 +811,12 @@ fn partial_cons_grant_refunds_owner_and_global_credits_then_merges_history_once(
             drop(run);
             let mut expected_memory = base_memory;
             expected_memory[slot] = expected_memory[slot].wrapping_add(handed as u64);
-            let expected_bytes = base_bytes + (handed * size_of::<ConsCell>()) as u64;
+            // The cons owner refunds only its unused region. Owner 0 also
+            // retains admission's separately charged immutable pointer table;
+            // both histories merge into the stopped cumulative byte total.
+            let expected_bytes = base_bytes
+                + (handed * size_of::<ConsCell>()) as u64
+                + u64::try_from(table_charge.get()).unwrap();
             owner.enter_native(&allocated).unwrap();
             let acked = era.cons_catalog_snapshot_for_test().unwrap();
             assert_eq!(acked.active_regions, 0, "the ACK published the tail");

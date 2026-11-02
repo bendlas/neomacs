@@ -14,12 +14,19 @@ fn div_cx24_process_output_to_narrowed_buffer() {
     ]];
     crate::common::assert_oracle_parity_expect(
         r##"
-(let ((buf (get-buffer-create " *neo-cx24-pn*")))
+(let* ((buf (get-buffer-create " *neo-cx24-pn*"))
+       (ready (make-temp-file "neo-cx24-pn-gate-")))
   (with-current-buffer buf
     (insert "PRE-")
     (narrow-to-region 1 4))
-  (let ((p (make-process :name "neo-cx24-pn" :command '("echo" "output")
+  (let ((p (make-process :name "neo-cx24-pn"
+                         :command (append (list "sh" "-c"
+                                                "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                                "sh" ready)
+                                          '("echo" "output"))
                          :buffer buf)))
+    ;; The child writes only after READY is deleted, while this form is waiting.
+    (delete-file ready)
     (let ((attempts 0))
       (while (and (process-live-p p) (< attempts 100))
         (accept-process-output p 0.05)
@@ -323,14 +330,13 @@ fn div_cx24_cl_loop_maximize_minimize_into() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx24_string_bytes_vs_length_various() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK ((5 5) (4 5) (2 6) (1 4) (4 5) (8 16))""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
-(let ((strs '("ascii" "café" "世界" "😀" "aéb"c" "mixéd中文😀")))
+(let ((strs '("ascii" "café" "世界" "😀" "aébc" "mixéd中文😀")))
   (mapcar (lambda (s) (list (length s) (string-bytes s))) strs))
 "##,
         expect,

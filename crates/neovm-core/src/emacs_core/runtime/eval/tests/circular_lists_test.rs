@@ -12,20 +12,9 @@ fn gnu_fixture(case: &str, form: &str, cached: &str) -> String {
         .join("../../tmp")
         .join(format!("circular-fixture-{case}-{}.el", std::process::id(),));
     std::fs::write(&script, format!("(prin1 {form})\n")).expect("GNU fixture input");
-    let emacs = std::env::var_os("EMACS").unwrap_or_else(|| {
-        std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".local/bin/emacs")
-            .into_os_string()
-    });
     // Campaign probes supply the PID/memory sandbox; ordinary fixture refreshes
     // remain portable to checkouts that do not contain the campaign tooling.
-    let mut command = if let Some(sandbox) = std::env::var_os("NEOVM_LISP_SANDBOX") {
-        let mut command = std::process::Command::new(sandbox);
-        command.arg(emacs);
-        command
-    } else {
-        std::process::Command::new(emacs)
-    };
+    let mut command = crate::test_utils::gnu_probe_command();
     let output = command
         .args(["-Q", "--batch", "-l"])
         .arg(script)

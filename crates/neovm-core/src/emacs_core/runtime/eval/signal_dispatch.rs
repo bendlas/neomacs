@@ -203,7 +203,9 @@ impl Context {
         // Native leaves defer this specpdl mutation until their witness is gone.
         // The selected handler/function unwinder owns the frame from here on.
         if let Some(frame) = sig.bytecode_error_backtrace.take() {
-            frame.record(self);
+            frame.record(&mut |function: Value, args: &[Value]| {
+                self.push_backtrace_frame(function, args)
+            });
         }
         self.run_signal_hook(&sig)?;
         let original_delivery = sig.delivery();
@@ -531,7 +533,7 @@ impl Context {
                 let message = if let Some(message) = error_message {
                     message
                 } else {
-                    let rendered = crate::emacs_core::errors::builtin_error_message_string(
+                    let rendered = crate::emacs_core::print::builtin_error_message_string(
                         self,
                         vec![error_data],
                     )?;
@@ -632,7 +634,7 @@ impl Context {
         tracing::error!(
             "entering Lisp debugger for signal: symbol={} data={}",
             format_symbol_name_for_diagnostic(sig.symbol),
-            super::super::error::format_signal_data_with_eval(self, sig)
+            crate::emacs_core::print::format_signal_data_with_eval(self, sig)
         );
         // GNU `call_debugger (list2 (Qdebug, ...))` from `maybe_call_debugger`:
         // one shared entry point with the `debug-on-next-call` and

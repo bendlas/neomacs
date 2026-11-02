@@ -1,7 +1,12 @@
 //! Narrow backing for proof-3 authority. No serial accessor calls this module.
 #![allow(dead_code)]
 
+mod keeper;
+pub(crate) use keeper::KeeperWorldDesignator;
 mod functions;
+mod parameters;
+mod roots;
+mod table;
 pub(crate) use functions::FunctionUpdate;
 mod intern;
 mod write;

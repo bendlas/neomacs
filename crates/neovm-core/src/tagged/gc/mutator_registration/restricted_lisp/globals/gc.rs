@@ -2,6 +2,7 @@
 use super::tests::{case_many, drive, words};
 use super::*;
 use crate::tagged::gc::PlainSymbolBacking;
+use crate::tagged::gc::ProofEra as ParallelHeapEra;
 
 #[derive(Default)]
 pub(super) struct Ledger {
@@ -12,9 +13,9 @@ pub(super) struct Ledger {
     pub(super) extra_work: usize,
 }
 
-pub(super) fn ledger(era: &ParallelHeapEra<'_>, stopped: &AllStopped<'_>) -> Ledger {
+pub(super) fn ledger(era: &ParallelHeapEra<'_>, stopped: &mut AllStopped<'_>) -> Ledger {
     let mut result = Ledger::default();
-    let keeper = era.keeper.as_ref().unwrap();
+    let keeper = era.core.keeper.as_ref().unwrap();
     let mut world = Vec::new();
     keeper
         .collect_parallel_world_roots(stopped, &mut world)
@@ -22,7 +23,8 @@ pub(super) fn ledger(era: &ParallelHeapEra<'_>, stopped: &AllStopped<'_>) -> Led
     result.world = world.into_iter().map(TaggedValue::bits).collect();
     (result.symbols, result.projections) = keeper.symbol_root_ledger_for_test(stopped).unwrap();
     let mut external = Vec::new();
-    era.legacy_roots
+    era.core
+        .legacy_roots
         .as_ref()
         .unwrap()
         .append_words(&mut external);
@@ -65,7 +67,7 @@ fn round(
     owner.enter_native(&[]).unwrap();
     let mut stopped = era.stop().unwrap();
     era.return_cons_storage(&stopped).unwrap();
-    let before = ledger(era, &stopped);
+    let before = ledger(era, &mut stopped);
     let report = era.collect_stopped(&mut stopped).unwrap();
     let live = era
         .with_stopped_heap_for_test(&stopped, |heap| {

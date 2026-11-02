@@ -40,6 +40,7 @@ use crate::emacs_core::eval::Context;
 use crate::emacs_core::intern::SymId;
 use crate::emacs_core::value::Value;
 use std::cell::RefCell;
+crate::emacs_core::subr::world_registry!(LeafId);
 
 /// Independent effects, rather than a strongest-effect ordering. Allocating
 /// does not imply collecting, and signaling does not subsume state mutation.
@@ -414,24 +415,13 @@ pub(crate) fn subr_leaf(sym: SymId) -> Option<&'static LeafSpec> {
 // Release builds compile all of it away.
 // ---------------------------------------------------------------------------
 
-#[cfg(debug_assertions)]
-thread_local! {
-    /// How many leaf bodies are running on this thread.
-    static LEAF_ACTIVE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 /// Debug builds: panic when a leaf body is running. `site` names a GC safe
 /// point, a Lisp entry or a binding push -- a place the leaf contract says
 /// no leaf can reach.
 #[cfg(debug_assertions)]
 #[track_caller]
 pub(crate) fn assert_no_leaf_active(site: &'static str) {
-    let active = LEAF_ACTIVE.with(std::cell::Cell::get);
-    assert!(
-        active == 0,
-        "{site} reached from inside a leaf builtin: the leaf contract \
-         (no GC, no Lisp, no bindings) is broken"
-    );
+    crate::emacs_core::symbol::leaf_activity::assert_no_leaf_active(site);
 }
 
 /// `debug_assert_no_leaf_active!("site")`: [`assert_no_leaf_active`] in
@@ -520,7 +510,7 @@ pub(crate) struct LeafActive {
     #[cfg(debug_assertions)]
     before: LeafWitness,
     #[cfg(debug_assertions)]
-    _scope: crate::tls_scope::TlsScope<u32, std::cell::Cell<u32>>,
+    _scope: crate::emacs_core::symbol::leaf_activity::LeafActiveScope,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 static_assertions::assert_not_impl_any!(LeafActive: Send, Sync);
@@ -543,10 +533,7 @@ impl LeafActive {
     pub(crate) fn enter(spec: &'static LeafSpec, ctx: &Context) -> Self {
         #[cfg(debug_assertions)]
         {
-            let scope = crate::tls_scope::TlsScope::restore(
-                &LEAF_ACTIVE,
-                LEAF_ACTIVE.with(|depth| depth.replace(depth.get().saturating_add(1))),
-            );
+            let scope = crate::emacs_core::symbol::leaf_activity::LeafActiveScope::enter();
             Self {
                 spec,
                 before: LeafWitness::take(ctx),
@@ -614,3 +601,14 @@ pub(crate) fn call_checked(spec: &'static LeafSpec, ctx: &Context, args: &[Value
 #[cfg(test)]
 #[path = "tests/leaf_contract_test.rs"]
 mod leaf_contract_tests;
+
+/// Carrier park: drop the per-thread leaf table.
+pub(crate) fn reset_carrier_tls() {
+    LEAF_BY_SUBR.with(|table| table.borrow_mut().clear());
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(h, LEAF_BY_SUBR.with(|slot| slot.borrow().len() as u64));
+}

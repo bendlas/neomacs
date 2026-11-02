@@ -41,24 +41,39 @@ impl Context {
 
     #[inline(always)]
     fn eval_lambda_body_forms(&mut self, body: Value) -> EvalResult {
-        let mut cursor = body;
-        let mut last = Value::NIL;
-        while cursor.is_cons() {
-            match self.eval_sub(cursor.cons_car()).kinded() {
-                Ok(value) => last = value,
-                Err(FlowKind::ThreadBlocked(blocked)) => {
-                    let remaining_forms = if blocked.remaining_forms.is_nil() {
-                        cursor.cons_cdr()
-                    } else {
-                        blocked.remaining_forms
-                    };
-                    return Err(Flow::thread_blocked(blocked.blocker, remaining_forms));
+        // GNU `funcall_lambda` evaluates the body with `Fprogn`
+        // (eval.c:3448-3455, 433-446): the body is a sequence owner, the
+        // rest is read BEFORE the form runs, and the saved continuation is a
+        // Lisp_Object in the C frame that stays visible to GC while the form
+        // runs.  The traced slot is that visibility for a precise GC; an
+        // improper tail ends the loop without a signal.
+        let temp_scope = self.save_sequence_temp_roots();
+        let continuation = self.push_saved_continuation(body);
+        let result = (|| {
+            let mut cursor = body;
+            let mut last = Value::NIL;
+            while cursor.is_cons() {
+                let form = cursor.cons_car();
+                let rest = cursor.cons_cdr();
+                self.set_saved_continuation(continuation, rest);
+                cursor = rest;
+                match self.eval_sub(form).kinded() {
+                    Ok(value) => last = value,
+                    Err(FlowKind::ThreadBlocked(blocked)) => {
+                        let remaining_forms = if blocked.remaining_forms.is_nil() {
+                            rest
+                        } else {
+                            blocked.remaining_forms
+                        };
+                        return Err(Flow::thread_blocked(blocked.blocker, remaining_forms));
+                    }
+                    Err(flow) => return Err(Flow::from_kind(flow)),
                 }
-                Err(flow) => return Err(Flow::from_kind(flow)),
             }
-            cursor = cursor.cons_cdr();
-        }
-        Ok(last)
+            Ok(last)
+        })();
+        self.restore_sequence_temp_roots(temp_scope);
+        result
     }
 
     /// Evaluate a runtime Value form, matching GNU Emacs's `eval_sub` in eval.c.
@@ -70,6 +85,14 @@ impl Context {
     #[inline(never)]
     pub fn eval_sub(&mut self, form: Value) -> EvalResult {
         crate::emacs_core::subr::leaf::debug_assert_no_leaf_active!("eval");
+        // Cons forms are the common case, and `SymbolMode::unwrap` never turns
+        // a cons into anything else (a symbol-with-pos wraps a symbol, and a
+        // bare/disabled value passes through: tagged/value.rs:1353-1362), so
+        // the policy projection can be skipped for them.  Everything else
+        // goes through the unwrap first.
+        if form.is_cons() {
+            return self.eval_cons_dispatch(form);
+        }
         // 1. Symbol → variable lookup (GNU eval.c:2554-2562)
         // Also unwrap symbol-with-pos when symbols-with-pos-enabled is true.
         let form_unwrapped = self.unwrap_symbol(form);
@@ -87,22 +110,45 @@ impl Context {
             return self.dispatch_signal_result_if_needed(result);
         }
 
-        // 2. Non-cons → self-evaluating (GNU eval.c:2564-2565)
-        if !form_unwrapped.is_cons() {
-            return Ok(form_unwrapped);
-        }
+        // 2. Non-cons → self-evaluating (GNU eval.c:2564-2565).  A wrapper
+        // unwraps only to a symbol (handled above), so nothing here can be a
+        // cons.
+        Ok(form_unwrapped)
+    }
 
+    /// The cons-form entry: GNU `eval_sub`'s depth count and the depth-sampled
+    /// stack probe around the one cons dispatcher.
+    #[inline(always)]
+    fn eval_cons_dispatch(&mut self, form: Value) -> EvalResult {
         self.enter_interpreted_eval_depth()?;
 
-        let result = self.maybe_grow_eval_stack(|ctx| {
-            ctx.maybe_quit_before_gc()?;
-            if ctx.gc_safe_point_exact_should_collect() {
-                ctx.collect_at_eval_safe_point(form);
-            }
-            ctx.eval_sub_cons(form)
-        });
+        // The depth-sampled stack probe is the rare arm; its enough-stack
+        // half runs the body directly, so a sampled form pays one predicate
+        // instead of the grow wrapper when the stack has room.
+        let depth = self.depth;
+        let result = if depth < STACK_GROWTH_PROBE_START_DEPTH
+            || !depth.is_multiple_of(STACK_GROWTH_PROBE_INTERVAL)
+            || native_stack::stack_has_room(EVAL_STACK_RED_ZONE)
+        {
+            self.eval_cons_form(form)
+        } else {
+            self.eval_cons_form_probing(form)
+        };
         self.depth -= 1;
         result
+    }
+
+    /// [`Self::eval_cons_form`] at a depth that probes the native stack, where
+    /// it may grow.
+    #[inline(never)]
+    fn eval_cons_form_probing(&mut self, form: Value) -> EvalResult {
+        super::native_stack::maybe_grow_tracking_jit_limit(
+            self,
+            Context::jit_stack_limit_mut,
+            EVAL_STACK_RED_ZONE,
+            EVAL_STACK_SEGMENT,
+            |ctx| ctx.eval_cons_form(form),
+        )
     }
 
     /// GNU `maybe_gc` inside `eval_sub`, with FORM rooted for the collection
@@ -128,16 +174,13 @@ impl Context {
     /// does (ledger 196). The gate is one `Vec` index and one flag byte, on a
     /// path that then dispatches a whole form.
     #[inline]
-    fn current_max_lisp_eval_depth(&self) -> Option<usize> {
+    fn current_max_lisp_eval_depth(&self) -> Option<i64> {
         if !self.obarray.is_localized(max_lisp_eval_depth_symbol()) {
             return None;
         }
         self.variables()
             .value_in_buffer_by_name(self.buffers.current_buffer(), "max-lisp-eval-depth")
             .and_then(|value| value.as_fixnum())
-            // GNU raises a limit below 100 before it signals
-            // (`src/eval.c:2587-2588`) so a handler has room to run.
-            .map(|n| n.max(100) as usize)
     }
 
     /// GNU `eval_sub` (`src/eval.c:2585`): `lisp_eval_depth++` and one
@@ -160,13 +203,20 @@ impl Context {
     #[cold]
     #[inline(never)]
     fn enter_interpreted_eval_depth_slow(&mut self) -> Result<(), Flow> {
-        if let Some(buffer_limit) = self.current_max_lisp_eval_depth() {
-            if self.depth > buffer_limit {
+        if let Some(raw_limit) = self.current_max_lisp_eval_depth() {
+            // GNU raises a limit below 100 before it signals
+            // (`src/eval.c:2604-2608`) so a handler has room to run, and the
+            // raise is visible through the variable afterwards.  Mirror that
+            // cell write through the current (buffer-local) binding.
+            if self.depth as i64 > raw_limit.max(100) {
                 let overflow_depth = self.depth as i64;
                 return Err(self.finish_lisp_depth_overflow(signal(
                     "excessive-lisp-nesting",
                     vec![Value::fixnum(overflow_depth)],
                 )));
+            }
+            if raw_limit < 100 && self.depth as i64 > raw_limit {
+                self.raise_lisp_eval_depth_floor();
             }
             return Ok(());
         }
@@ -182,6 +232,10 @@ impl Context {
             if new_max != self.max_depth {
                 self.max_depth = new_max;
             }
+            if n < 100 {
+                // Same GNU cell write for the global/dynamic binding.
+                self.raise_lisp_eval_depth_floor();
+            }
         }
         if self.depth > self.max_depth {
             let overflow_depth = self.depth as i64;
@@ -193,29 +247,229 @@ impl Context {
         Ok(())
     }
 
-    fn eval_sub_cons(&mut self, form: Value) -> EvalResult {
+    /// GNU's `if (max_lisp_eval_depth < 100) max_lisp_eval_depth = 100;`
+    /// (`src/eval.c:2604-2608`) writes the `DEFVAR_INT` cell, so the raised
+    /// value stays visible through the variable's current binding after a
+    /// failed nesting attempt.  The cell can never be a constant, so a
+    /// rejected write can only mean the surrounding unwind is already in
+    /// progress; the nesting signal then reports the failure as GNU does.
+    ///
+    /// The condition must read the cell, not the evaluator caches:
+    /// `sync_cached_runtime_binding_by_id` clamps `max_depth` to 100
+    /// (`src/eval.c:2604`), so a binding of 99 leaves the cache at 100 and
+    /// the cache cannot tell that the variable still holds 99.
+    ///
+    /// Cold and out of line on purpose: the callers sit inside
+    /// `#[inline(always)]` depth checks on the call paths, and inlining this
+    /// binding lookup would move run_loop's frame size and register pressure.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn raise_lisp_eval_depth_floor(&mut self) {
+        let current = if self.obarray.is_localized(max_lisp_eval_depth_symbol()) {
+            self.variables()
+                .value_in_buffer_by_name(self.buffers.current_buffer(), "max-lisp-eval-depth")
+                .and_then(|value| value.as_fixnum())
+        } else {
+            self.variable_value(max_lisp_eval_depth_symbol())
+                .and_then(|value| value.as_fixnum())
+        };
+        if current.is_some_and(|limit| limit < 100) {
+            let _ = self
+                .try_set_runtime_binding_by_id(max_lisp_eval_depth_symbol(), Value::fixnum(100));
+        }
+    }
+
+    /// GNU `eval_sub`'s cons path in one frame: quit/GC, the backtrace frame,
+    /// the debug-on-next-call arm, one head classification and one match.
+    ///
+    /// Everything below the literal test follows GNU's dispatch order
+    /// (eval.c:2585-2766).  The full resolution (overrides, aliases,
+    /// autoloads, aliased special forms, macros, callable validation and the
+    /// generic call) lives out of line in [`Self::eval_cons_slow`]: it is the
+    /// rare arm, and the hot dispatcher should not carry its body.
+    fn eval_cons_form(&mut self, form: Value) -> EvalResult {
+        // GNU eval.c:2600-2602: `maybe_quit` and `maybe_gc` run before the
+        // frame is recorded, exactly at the point `eval_sub` runs them.
+        self.maybe_quit_before_gc()?;
+        if self.gc_safe_point_exact_should_collect() {
+            self.collect_at_eval_safe_point(form);
+        }
+
+        // GNU eval.c:2583-2585 records an UNEVALLED backtrace frame on every
+        // `eval_sub` cons-form evaluation.  The frame starts in UNEVALLED
+        // shape holding the surface function symbol and the raw argument-form
+        // cons list, then transitions to EVALD in place via
+        // `set_backtrace_args` once arguments have been evaluated
+        // (eval.c:2638, 2660, 3299).  Special forms leave the frame UNEVALLED
+        // throughout.
         let original_fun = self.unwrap_symbol(form.cons_car());
         let original_args = form.cons_cdr();
-
-        // GNU eval.c:2583-2585 records an UNEVALLED backtrace frame on
-        // every `eval_sub` cons-form evaluation. The frame starts in
-        // UNEVALLED shape holding the surface function symbol and the
-        // raw argument-form cons list, then transitions to EVALD in
-        // place via `set_backtrace_args` once arguments have been
-        // evaluated (eval.c:2638, 2660, 3299). Special forms leave
-        // the frame UNEVALLED throughout.
         let outer_bt_count = self.specpdl.len();
         let stack_base = self.bc_buf.len();
         self.push_unevalled_form_frame(original_fun, original_args);
         // GNU eval.c:2601-2602, immediately after `record_in_backtrace` and
         // before any dispatch: `if (debug_on_next_call) do_debug_on_call (Qt,
         // count)`.  Taking the arm IS the disarm (see `debug_on_call`), and
-        // the same call flags this frame's `debug_on_exit`.
-        let dispatch_result = match self.take_debug_on_call_arm(DebugOnCallCode::EvalForm) {
-            Some(arm) => self.do_debug_on_call(arm).and_then(|()| {
-                self.eval_sub_cons_dispatch(original_fun, original_args, outer_bt_count)
-            }),
-            None => self.eval_sub_cons_dispatch(original_fun, original_args, outer_bt_count),
+        // the same call flags this frame's `debug_on_exit`.  A failing arm
+        // still retires the frame through the one exit below.
+        if let Some(arm) = self.take_debug_on_call_arm(DebugOnCallCode::EvalForm)
+            && let Err(flow) = self.do_debug_on_call(arm)
+        {
+            let result = self.dispatch_signal_result_if_needed(Err(flow));
+            return self.retire_cons_frame(outer_bt_count, stack_base, result);
+        }
+
+        // GNU eval.c:2604-2605: read the function cell once, then classify it
+        // once.  Everything the head decides -- whether it is an
+        // evaluator-internal literal form, what its function cell holds, and
+        // what dispatch does with that cell -- depends only on the symbol and
+        // the function epoch, so the epoch cache answers the repeat
+        // evaluations (a form is evaluated 32.5 times on average on
+        // magit-status).  `symbol_mode` is read here, after the debug arm, at
+        // the same point the dispatcher always read it.
+        let symbol_mode = self.symbol_mode();
+        let dispatch_result: EvalResult = 'dispatch: {
+            let sym_id = original_fun.as_symbol_id(symbol_mode);
+            // The cache is bypassed entirely while compiler function
+            // overrides are active, exactly as the direct resolution below
+            // was.
+            let overrides_active = self.compiler_function_overrides_active();
+            let head: Option<FormHead> = match sym_id {
+                Some(sym_id) if !overrides_active => {
+                    let epoch = self.obarray.function_epoch();
+                    Some(match self.form_head_cache.find(sym_id, epoch) {
+                        Some(head) => head,
+                        None => {
+                            let func = self.obarray.symbol_function_id(sym_id);
+                            let head = FormHead::classify(sym_id, func);
+                            self.form_head_cache.push(sym_id, epoch, head);
+                            head
+                        }
+                    })
+                }
+                _ => None,
+            };
+
+            // Keep only evaluator-internal literal forms on the
+            // pre-resolution fast path.  GNU decides public special-form
+            // dispatch from the function cell's UNEVALLED subr, so
+            // user-visible special forms flow through the resolved subr
+            // surface below.  With overrides active there is no cached head,
+            // so the two literal heads are tested directly.
+            if let Some(sym_id) = sym_id
+                && head.map_or_else(
+                    || sym_id == lambda_symbol() || sym_id == byte_code_literal_symbol(),
+                    |head| head.literal_head,
+                )
+                && let Some(result) = self.try_special_form_value_id(sym_id, original_args)
+            {
+                break 'dispatch result;
+            }
+
+            let prefetched_cell = head.and_then(|head| head.func);
+            if let Some(head_sym) = sym_id
+                && let Some(head) = head
+                && let Some(func) = head.func
+            {
+                match head.dispatch {
+                    EvalDispatch::Special(kind) => {
+                        // GNU eval.c:2624: `list_length (args_left)` runs for
+                        // every SUBRP, UNEVALLED ones included, before the
+                        // dispatch.  The frame stays UNEVALLED
+                        // (eval.c:2618-2619).
+                        if list_length(&original_args).is_none() {
+                            break 'dispatch Err(self.listp_error(original_args));
+                        }
+                        break 'dispatch self.run_special_form(kind.0, head_sym, original_args);
+                    }
+                    EvalDispatch::Call(CallTarget::Primitive(call)) => {
+                        // GNU eval.c:2606-2614: the arity check against the
+                        // raw argument count, signalling with the surface
+                        // symbol, before any argument is evaluated.
+                        let numargs = match list_length(&original_args) {
+                            Some(n) => n,
+                            None => break 'dispatch Err(self.listp_error(original_args)),
+                        };
+                        if numargs < call.min_args as usize
+                            || call.max_args.is_some_and(|m| numargs > m as usize)
+                        {
+                            break 'dispatch Err(signal(
+                                LispCondition::WrongNumberOfArguments,
+                                vec![original_fun, Value::fixnum(numargs as i64)],
+                            ));
+                        }
+                        // The builtin histogram counted each interpreted call
+                        // of a `&rest` builtin when the slow path resolved it.
+                        #[cfg(feature = "vm-profile")]
+                        if let Some(id) = func.as_subr_id() {
+                            crate::emacs_core::bytecode::vm::vm_profile::bump_subr(id);
+                        }
+                        let (first_arg, nargs) =
+                            match self.eval_call_args_onto_stack(func, original_args) {
+                                Ok(positions) => positions,
+                                Err(flow) => break 'dispatch Err(flow),
+                            };
+                        self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
+                        break 'dispatch self.dispatch_subr_fn_from_bc_stack(
+                            call.function,
+                            first_arg,
+                            nargs,
+                        );
+                    }
+                    EvalDispatch::Call(CallTarget::Bytecode) => {
+                        // Byte-code keeps its order: the dump stub is
+                        // materialized before any argument is evaluated, and
+                        // at dispatch rather than at classification.
+                        let Some(bc_data) = func.get_bytecode_data() else {
+                            break 'dispatch self.eval_cons_slow(
+                                original_fun,
+                                original_args,
+                                outer_bt_count,
+                                symbol_mode,
+                                sym_id,
+                                prefetched_cell,
+                            );
+                        };
+                        if list_length(&original_args).is_none() {
+                            break 'dispatch Err(self.listp_error(original_args));
+                        }
+                        let (first_arg, nargs) =
+                            match self.eval_call_args_onto_stack(func, original_args) {
+                                Ok(positions) => positions,
+                                Err(flow) => break 'dispatch Err(flow),
+                            };
+                        self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
+                        break 'dispatch self
+                            .execute_bytecode_call_from_stack(bc_data, first_arg, nargs, func);
+                    }
+                    EvalDispatch::Call(CallTarget::InterpretedClosure) => {
+                        if list_length(&original_args).is_none() {
+                            break 'dispatch Err(self.listp_error(original_args));
+                        }
+                        let (first_arg, nargs) =
+                            match self.eval_call_args_onto_stack(func, original_args) {
+                                Ok(positions) => positions,
+                                Err(flow) => break 'dispatch Err(flow),
+                            };
+                        self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
+                        // What the full resolution reaches for a `Lambda`
+                        // cell: `funcall_general_untraced`'s Lambda arm is
+                        // `apply_lambda`, with no frame of its own and no
+                        // debug-on-call.
+                        break 'dispatch self.apply_closure_from_bc_stack(func, first_arg, nargs);
+                    }
+                    _ => {}
+                }
+            }
+
+            self.eval_cons_slow(
+                original_fun,
+                original_args,
+                outer_bt_count,
+                symbol_mode,
+                sym_id,
+                prefetched_cell,
+            )
         };
         let result = self.dispatch_signal_result_if_needed(dispatch_result);
         self.retire_cons_frame(outer_bt_count, stack_base, result)
@@ -252,11 +506,7 @@ impl Context {
                 {
                     let start = span.start();
                     let end = start.saturating_add(span.len());
-                    self.eval_call_roots.truncate(frame.call_base);
-                    if end <= self.bc_buf.len() {
-                        let (bc_buf, roots) = (&self.bc_buf, &mut self.eval_call_roots);
-                        roots.extend_from_slice(&bc_buf[start..end]);
-                    }
+                    self.publish_bc_span_call_roots(frame.call_base, start, end);
                 }
                 // SAFETY: the top entry is a `Backtrace` without
                 // debug-on-exit whose arguments own no
@@ -309,152 +559,28 @@ impl Context {
         Ok((first_arg, self.bc_buf.len() - first_arg))
     }
 
-    pub(super) fn eval_sub_cons_dispatch(
+    /// The full resolution of a head the cached classification declined to
+    /// decide.  Verbatim the old dispatcher tail: overrides, symbol/cons
+    /// indirection, autoloads, aliased special forms, macros, the direct subr
+    /// entry, callable validation and the generic call.  Out of line: this is
+    /// the cold arm, and the hot dispatcher should not carry its body in its
+    /// instruction footprint.
+    #[inline(never)]
+    pub(super) fn eval_cons_slow(
         &mut self,
         original_fun: Value,
         original_args: Value,
         outer_bt_count: usize,
+        symbol_mode: crate::tagged::SymbolMode,
+        sym_id: Option<SymId>,
+        prefetched_cell: Option<Value>,
     ) -> EvalResult {
-        let symbol_mode = self.symbol_mode();
-        // Resolve function (GNU eval.c:2600-2605)
-        let sym_id = original_fun.as_symbol_id(symbol_mode);
-
-        // Everything this head decides -- whether it is an evaluator-internal
-        // literal form, what its function cell holds, and whether that cell is
-        // a subr -- depends only on the symbol and the function epoch.  A form
-        // is evaluated 32.5 times on average here (measured on magit-status;
-        // 61.4 on org-journal-open), so re-deriving it per evaluation is
-        // almost entirely repeat work.  One probe answers all three.
-        //
-        // The cache is bypassed entirely while compiler function overrides are
-        // active, exactly as the direct resolution below was.
-        let overrides_active = self.compiler_function_overrides_active();
-        let head: Option<FormHead> = match sym_id {
-            Some(sym_id) if !overrides_active => {
-                let epoch = self.obarray.function_epoch();
-                Some(match self.form_head_cache.find(sym_id, epoch) {
-                    Some(head) => head,
-                    None => {
-                        let func = self.obarray.symbol_function_id(sym_id);
-                        let head = FormHead::classify(sym_id, func);
-                        self.form_head_cache.push(sym_id, epoch, head);
-                        head
-                    }
-                })
-            }
-            _ => None,
-        };
-
-        // Keep only evaluator-internal literal forms on the pre-resolution
-        // fast path. GNU decides public special-form dispatch from the
-        // function cell's UNEVALLED subr, so user-visible special forms
-        // should flow through the resolved subr surface below.
-        //
-        // With overrides active there is no cached head, so the two literal
-        // heads are still tested directly.
-        if let Some(sym_id) = sym_id
-            && head.map_or_else(
-                || sym_id == lambda_symbol() || sym_id == byte_code_literal_symbol(),
-                |head| head.literal_head,
-            )
-            && let Some(result) = self.try_special_form_value_id(sym_id, original_args)
-        {
-            return result;
-        }
-
-        // GNU `eval_sub` (`src/eval.c:2600-2680`): the symbol's function cell
-        // is read once; a SUBRP that is not UNEVALLED evaluates its arguments
-        // into `argvals` and calls by `maxargs`, a COMPILEDP goes to
-        // `apply_lambda`.  Neither path re-examines aliases, autoloads,
-        // macros, overrides or callability -- the cell already IS a fixed-
-        // arity builtin or a byte-code object -- so those probes stay on the
-        // full resolution below, which every other cell shape still takes.
-        let prefetched_cell = head.and_then(|head| head.func);
-        // The cached class decides the common cells.  FUNC and the class's
-        // payload are copied out before any argument is evaluated: a nested
-        // `eval_sub` can refill this slot, and GNU reads `fun` first too.
-        if let Some(sym_id) = sym_id
-            && let Some(head) = head
-            && let Some(func) = head.func
-        {
-            match head.class {
-                HeadClass::SpecialForm(handler) => {
-                    // GNU eval.c:2624: `list_length (args_left)` runs for
-                    // every SUBRP, UNEVALLED ones included, before the
-                    // dispatch.  The frame stays UNEVALLED (eval.c:2618-2619).
-                    if list_length(&original_args).is_none() {
-                        return Err(self.listp_error(original_args));
-                    }
-                    return self.run_special_form(handler, sym_id, original_args);
-                }
-                HeadClass::Subr {
-                    function,
-                    min_args,
-                    max_args,
-                } => {
-                    // GNU eval.c:2606-2614: the arity check against the raw
-                    // argument count, signalling with the surface symbol,
-                    // before any argument is evaluated.
-                    let numargs = match list_length(&original_args) {
-                        Some(n) => n,
-                        None => return Err(self.listp_error(original_args)),
-                    };
-                    if numargs < min_args as usize || max_args.is_some_and(|m| numargs > m as usize)
-                    {
-                        return Err(signal(
-                            LispCondition::WrongNumberOfArguments,
-                            vec![original_fun, Value::fixnum(numargs as i64)],
-                        ));
-                    }
-                    // The builtin histogram counted each interpreted call
-                    // of a `&rest` builtin when the slow path resolved it.
-                    #[cfg(feature = "vm-profile")]
-                    if let Some(id) = func.as_subr_id() {
-                        crate::emacs_core::bytecode::vm::vm_profile::bump_subr(id);
-                    }
-                    let (first_arg, nargs) = self.eval_call_args_onto_stack(func, original_args)?;
-                    self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
-                    return self.dispatch_subr_fn_from_bc_stack(function, first_arg, nargs);
-                }
-                HeadClass::ByteCode | HeadClass::Lambda => {
-                    // Byte-code keeps its order: the dump stub is
-                    // materialized before any argument is evaluated.
-                    let bc_data = match head.class {
-                        HeadClass::ByteCode => func.get_bytecode_data(),
-                        _ => None,
-                    };
-                    if bc_data.is_some() || matches!(head.class, HeadClass::Lambda) {
-                        if list_length(&original_args).is_none() {
-                            return Err(self.listp_error(original_args));
-                        }
-                        let (first_arg, nargs) =
-                            self.eval_call_args_onto_stack(func, original_args)?;
-                        self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
-                        return match bc_data {
-                            Some(bc_data) => self
-                                .execute_bytecode_call_from_stack(bc_data, first_arg, nargs, func),
-                            // What the full resolution reaches for a
-                            // `Lambda` cell: `funcall_general_untraced`'s
-                            // Lambda arm is `apply_lambda`, with no frame of
-                            // its own and no debug-on-call.
-                            None => self.apply_closure_from_bc_stack(func, first_arg, nargs),
-                        };
-                    }
-                }
-                HeadClass::Slow => {}
-            }
-        }
-
         // Resolve function value
         let func = if let Some(sym_id) = sym_id {
             if let Some(override_func) = self
                 .compiler_function_overrides_active()
                 .then(|| {
-                    compiler_function_override_in_obarray(
-                        self.variables(),
-                        sym_id,
-                        self.symbol_mode(),
-                    )
+                    compiler_function_override_in_obarray(self.variables(), sym_id, symbol_mode)
                 })
                 .flatten()
             {
@@ -470,7 +596,7 @@ impl Context {
                             f = resolved;
                         }
                         loop {
-                            if !super::super::autoload::is_autoload_value(&f, self.symbol_mode()) {
+                            if !super::super::autoload::is_autoload_value(&f, symbol_mode) {
                                 break f;
                             }
 
@@ -509,7 +635,7 @@ impl Context {
             // values are quoted through to the normal callable validation
             // below.
             if original_fun.is_cons()
-                && cons_head_symbol_id(&original_fun, self.symbol_mode()) == Some(lambda_symbol())
+                && cons_head_symbol_id(&original_fun, symbol_mode) == Some(lambda_symbol())
             {
                 self.instantiate_callable_cons_form(original_fun)?
             } else {
@@ -563,8 +689,9 @@ impl Context {
             let arg_values = value_list_to_values(&original_args);
             let bt_count = self.specpdl.len();
             self.push_backtrace_frame(original_fun, &arg_values);
-            let expanded =
-                self.with_macro_expansion_scope(|eval| eval.apply_lambda(func, arg_values));
+            let expanded = self.with_macro_expansion_scope(|eval| {
+                eval.apply_lambda(CallableRoot::Specpdl, func, arg_values)
+            });
             let expanded = self.unbind_to_with_result(bt_count, expanded);
             let expanded = expanded?;
             let expanded_root_count = self.specpdl.len();
@@ -572,7 +699,7 @@ impl Context {
             let result = self.eval_sub(expanded);
             return self.unbind_to_with_result(expanded_root_count, result);
         }
-        if cons_head_symbol_id(&func, self.symbol_mode()) == Some(macro_symbol()) {
+        if cons_head_symbol_id(&func, symbol_mode) == Some(macro_symbol()) {
             // Cons-cell macro: (macro . fn) — GNU eval.c:2730
             // Same up-front `apply1`/`list_length` validation as the
             // `func.is_macro()` branch above (GNU eval.c:2766).

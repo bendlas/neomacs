@@ -33,6 +33,7 @@ use neovm_core::buffer::{Buffer, BufferId, CharPos0, EmacsByteRange};
 use neovm_core::emacs_core::Context;
 use neovm_core::emacs_core::display_spec::{DisplayPropertySpecs, display_spec_when_parts};
 use neovm_core::emacs_core::display_when::{DisplayWhenSite, DisplayWhenSiteKey};
+use neovm_core::emacs_core::intern::WellKnown;
 use neovm_core::emacs_core::value::{Value, get_string_text_properties_table_for_value};
 use rustc_hash::FxHashMap;
 
@@ -674,10 +675,16 @@ pub(crate) fn evaluate_window_display_when_forms_at_end(
     target: crate::display_property::DisplayPropertyTarget,
     end_boundary: DisplayWhenEndBoundary,
 ) -> DisplayWhenConditions {
-    let default_prefixes: Vec<Value> = ["line-prefix", "wrap-prefix"]
-        .iter()
-        .filter_map(|name| evaluator.buffer_default_value(name))
-        .collect();
+    // GNU's `Vline_prefix` / `Vwrap_prefix` DEFVARs, read through the same
+    // buffer-defaults precedence as the generic helper but without resolving
+    // the two fixed spellings by name on every layout pass.
+    let default_prefixes: Vec<Value> = [
+        &crate::fixed_symbols::LINE_PREFIX,
+        &crate::fixed_symbols::WRAP_PREFIX,
+    ]
+    .into_iter()
+    .filter_map(|symbol| evaluator.buffer_default_value_fixed(symbol))
+    .collect();
     let run_sites = match evaluator.buffer_manager().get(buf_id) {
         Some(buffer) => collect_when_form_run_sites(
             buffer,
@@ -739,6 +746,28 @@ fn collect_when_form_sites(
     .collect()
 }
 
+/// The three fixed property spellings the display-when scan reads. The
+/// spelling and the identity come from the same `WellKnown` variant, so the
+/// scan is a static-id read instead of a per-row `intern`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhenScanProperty {
+    Display,
+    LinePrefix,
+    WrapPrefix,
+}
+
+impl WhenScanProperty {
+    const ALL: [Self; 3] = [Self::Display, Self::LinePrefix, Self::WrapPrefix];
+
+    const fn well_known(self) -> WellKnown {
+        match self {
+            Self::Display => WellKnown::Display,
+            Self::LinePrefix => WellKnown::LinePrefix,
+            Self::WrapPrefix => WellKnown::WrapPrefix,
+        }
+    }
+}
+
 fn collect_when_form_run_sites(
     buffer: &Buffer,
     window_id: Option<u64>,
@@ -752,8 +781,8 @@ fn collect_when_form_run_sites(
     let to = to.min(buffer.layout_point_max_char_pos()).max(from);
     let gnu_pos = |pos: CharPos0| pos.get() as i64 + 1;
 
-    for name in ["display", "line-prefix", "wrap-prefix"] {
-        let name_value = Value::symbol(name);
+    for property in WhenScanProperty::ALL {
+        let name_value = Value::symbol(property.well_known());
         // This proof covers only raw buffer properties. Overlays, prefix
         // variables and properties inside strings are independent sources
         // and must still be scanned below.
@@ -768,7 +797,7 @@ fn collect_when_form_run_sites(
             let next = buffer.next_watched_property_change_at_char_pos(pos, to, &[name_value]);
             let run_end = if next <= pos { to } else { next };
             if let Some(value) = buffer.layout_text_prop_at_emacs_byte_pos(bytepos, name_value) {
-                if name == "display" {
+                if property == WhenScanProperty::Display {
                     collect_when_forms(
                         value,
                         buffer_object,
@@ -844,7 +873,9 @@ fn collect_when_form_run_sites(
         // evaluated here.
         if start < end && start < to && end > from {
             let at = start.max(from);
-            if let Some(value) = overlays.overlay_get_named(overlay, Value::symbol("display")) {
+            if let Some(value) =
+                overlays.overlay_get_named(overlay, Value::symbol(&crate::fixed_symbols::DISPLAY))
+            {
                 collect_when_forms(
                     value,
                     buffer_object,
@@ -854,8 +885,8 @@ fn collect_when_form_run_sites(
                     &mut sites,
                 );
             }
-            for name in ["line-prefix", "wrap-prefix"] {
-                if let Some(value) = overlays.overlay_get_named(overlay, Value::symbol(name)) {
+            for symbol in [WellKnown::LinePrefix, WellKnown::WrapPrefix] {
+                if let Some(value) = overlays.overlay_get_named(overlay, Value::symbol(symbol)) {
                     collect_prefix_string_when_forms(value, gnu_pos(at), &mut sites);
                 }
             }
@@ -879,8 +910,8 @@ fn collect_when_form_run_sites(
 
     // The buffer-local and the default `line-prefix`/`wrap-prefix` values
     // (GNU reads `Vline_prefix`/`Vwrap_prefix`, whichever binding applies).
-    for name in ["line-prefix", "wrap-prefix"] {
-        if let Some(value) = buffer.buffer_local_value(name) {
+    for symbol in [WellKnown::LinePrefix, WellKnown::WrapPrefix] {
+        if let Some(value) = buffer.buffer_local_value_id(symbol.id()) {
             collect_prefix_string_when_forms(value, gnu_pos(from), &mut sites);
         }
     }
@@ -936,7 +967,7 @@ fn collect_prefix_string_when_forms(
     let Some(props) = get_string_text_properties_table_for_value(string) else {
         return;
     };
-    let display = Value::symbol("display");
+    let display = Value::symbol(&crate::fixed_symbols::DISPLAY);
     let length = lisp_string.schars();
     let mut run: Option<(Value, usize)> = None;
     for index in 0..=length {

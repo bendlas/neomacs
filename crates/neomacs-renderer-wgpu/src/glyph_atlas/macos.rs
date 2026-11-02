@@ -1,0 +1,326 @@
+//! Native outline masks, replaying the exact font bytes already pinned by layout.
+//!
+//! Core Graphics antialiasing defines stroke weight for macOS text; Swash's
+//! outline coverage is not a substitute for that drawing policy.
+//!
+//! GNU macfont draws on screen with Core Graphics font smoothing enabled by
+//! the window context and with the usual dark-on-light contrast. Font
+//! smoothing's gamma is contrast-dependent: extracting coverage from white
+//! glyphs on black inflated it by about 20% at 1x, which made Neomacs heavier
+//! than GNU. Masks are therefore rasterized as dark glyphs on white and
+//! inverted.
+//! Keep the native objects on the atlas owner and upload ordinary grayscale
+//! masks, so WGPU composition and layout advances remain shared.
+
+use super::{RasterContent, RasterGlyphImage};
+use cosmic_text::{CacheKey, CacheKeyFlags, Font};
+use objc2_core_foundation::{CFArray, CFData, CFRetained, CGPoint};
+use objc2_core_graphics::{
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
+};
+use objc2_core_text::{
+    CTFont, CTFontDescriptor, CTFontManagerCreateFontDescriptorsFromData, CTFontOrientation,
+};
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::Hasher;
+use std::ptr::{self, NonNull};
+use swash::TableProvider;
+
+#[derive(Default)]
+pub(super) struct NativeRasterizer {
+    // Independently pinned collection faces can map the same file at different
+    // addresses. Intern by content, comparing bytes within hash buckets so a
+    // collision can never substitute another font. `clear()` drops the backing
+    // together with the fonts, which retain their own reference meanwhile.
+    backing: FxHashMap<u64, Vec<CFRetained<CFData>>>,
+    // fontdb IDs are generation-local, so `clear()` drops these caches when
+    // the font system is replaced. Sizes are physical font sizes (the backing
+    // scale is already multiplied in), so a DPI change adds entries instead
+    // of invalidating existing ones. Failures are cached alongside fonts.
+    sources: FxHashMap<fontdb::ID, Option<CFRetained<CTFont>>>,
+    fonts: FxHashMap<(fontdb::ID, u32), CFRetained<CTFont>>,
+}
+
+impl NativeRasterizer {
+    pub(super) fn clear(&mut self) {
+        self.fonts.clear();
+        self.sources.clear();
+        self.backing.clear();
+    }
+
+    pub(super) fn rasterize(
+        &mut self,
+        source: &Font,
+        postscript_name: &str,
+        key: CacheKey,
+    ) -> Option<RasterGlyphImage> {
+        self.rasterize_with_polarity(source, postscript_name, key, MaskPolarity::DarkOnLight)
+    }
+
+    /// Rasterize with an explicit mask polarity. Production uses the
+    /// dark-on-light polarity of ordinary macOS text; tests render the
+    /// light-on-dark control to keep the contrast choice honest.
+    fn rasterize_with_polarity(
+        &mut self,
+        source: &Font,
+        postscript_name: &str,
+        key: CacheKey,
+        polarity: MaskPolarity,
+    ) -> Option<RasterGlyphImage> {
+        let face = source.as_swash();
+        // Keep variable instances, synthetic styles and embedded strikes on
+        // their existing paths until the native adapter can replay their full
+        // contract. Color artwork has already been handled by glyph_image.
+        if face.variations().next().is_some()
+            || key.flags.contains(CacheKeyFlags::FAKE_ITALIC)
+            || key.flags.contains(CacheKeyFlags::PIXEL_FONT)
+            || [*b"sbix", *b"CBDT", *b"EBDT", *b"COLR", *b"SVG "]
+                .iter()
+                .any(|tag| face.table_by_tag(u32::from_be_bytes(*tag)).is_some())
+        {
+            return None;
+        }
+        let size = f32::from_bits(key.font_size_bits);
+        if !size.is_finite() || size <= 0.0 {
+            return None;
+        }
+        // Hash/compare only when a face is first opened, never per glyph or
+        // size. Separate mappings of identical bytes share the native copy.
+        let backing = &mut self.backing;
+        let base = self
+            .sources
+            .entry(key.font_id)
+            .or_insert_with(|| {
+                let data = intern_backing(backing, source.data());
+                open_exact_font(&data, postscript_name, 1.0)
+            })
+            .as_ref()?;
+        let font = self
+            .fonts
+            .entry((key.font_id, key.font_size_bits))
+            .or_insert_with(|| {
+                // SAFETY: null preserves the base matrix; no attributes are
+                // overridden, so the copied font retains the same exact source.
+                unsafe { base.copy_with_attributes(size.into(), ptr::null(), None) }
+            });
+        rasterize(font, key, polarity)
+    }
+}
+
+/// Contrast direction used when extracting a smoothing-aware coverage mask.
+///
+/// Core Graphics font smoothing applies a contrast-dependent gamma, so the
+/// same glyph produces different coverage on black and on white. The atlas
+/// stores one polarity-independent mask, so it must use the polarity of the
+/// text it replaces: dark glyphs on the default light background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaskPolarity {
+    /// Dark glyphs on a light background, the default macOS text contrast.
+    DarkOnLight,
+    /// Light glyphs on a dark background, kept as the test control.
+    #[cfg_attr(not(test), allow(dead_code))]
+    LightOnDark,
+}
+
+fn backing_hash(bytes: &[u8]) -> u64 {
+    let mut hash = FxHasher::default();
+    hash.write(bytes);
+    hash.finish()
+}
+
+fn intern_backing(
+    backing: &mut FxHashMap<u64, Vec<CFRetained<CFData>>>,
+    bytes: &[u8],
+) -> CFRetained<CFData> {
+    let candidates = backing.entry(backing_hash(bytes)).or_default();
+    for data in candidates.iter() {
+        // SAFETY: these are immutable CFData copies created below; no mutable
+        // alias is exposed or passed to CoreText.
+        if unsafe { data.as_bytes_unchecked() } == bytes {
+            return data.clone();
+        }
+    }
+    let data = CFData::from_bytes(bytes);
+    candidates.push(data.clone());
+    data
+}
+
+fn open_exact_font(data: &CFData, postscript_name: &str, size: f32) -> Option<CFRetained<CTFont>> {
+    // SAFETY: CoreText returns an array of CTFontDescriptor objects, retained
+    // here and by each typed get. Descriptors refer to these bytes, not to a
+    // system family lookup (which could select another installed font).
+    let descriptors = unsafe {
+        CFRetained::cast_unchecked::<CFArray<CTFontDescriptor>>(
+            CTFontManagerCreateFontDescriptorsFromData(data),
+        )
+    };
+    for index in 0..descriptors.len() {
+        let descriptor = descriptors.get(index)?;
+        // SAFETY: null requests the identity transform; the descriptor is live.
+        let font = unsafe { CTFont::with_font_descriptor(&descriptor, size.into(), ptr::null()) };
+        // Select the exact collection member. Never substitute a best-match
+        // family when the selected face is missing from these bytes.
+        if unsafe { font.post_script_name() }.to_string() == postscript_name {
+            return Some(font);
+        }
+    }
+    None
+}
+
+fn rasterize(font: &CTFont, key: CacheKey, polarity: MaskPolarity) -> Option<RasterGlyphImage> {
+    let mut glyph = key.glyph_id;
+    // SAFETY: one live glyph, no per-glyph output array, count is one.
+    let bounds = unsafe {
+        font.bounding_rects_for_glyphs(
+            CTFontOrientation::Horizontal,
+            NonNull::from(&mut glyph),
+            ptr::null_mut(),
+            1,
+        )
+    };
+    let x_offset = f64::from(key.x_bin.as_float());
+    // Match the Swash placement path this replaces: a positive atlas y bin
+    // shifts ink upwards, and Core Graphics y also increases upwards.
+    let y_offset = f64::from(key.y_bin.as_float());
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return Some(RasterGlyphImage {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+            content: RasterContent::Mask,
+        });
+    }
+    // Leave room for native smoothing beyond the mathematical outline bounds.
+    let left = (bounds.origin.x + x_offset).floor() - 2.0;
+    let bottom = (bounds.origin.y + y_offset).floor() - 2.0;
+    let right = (bounds.origin.x + bounds.size.width + x_offset).ceil() + 2.0;
+    let top = (bounds.origin.y + bounds.size.height + y_offset).ceil() + 2.0;
+    let width = right - left;
+    let height = top - bottom;
+    if ![left, bottom, right, top, width, height]
+        .iter()
+        .all(|v| v.is_finite())
+        || width <= 0.0
+        || height <= 0.0
+        || width > 8192.0
+        || height > 8192.0
+        || left < i32::MIN as f64
+        || left > i32::MAX as f64
+        || top < i32::MIN as f64
+        || top > i32::MAX as f64
+    {
+        return None;
+    }
+    let width = width as usize;
+    let height = height as usize;
+    // A corrupt or oversized font metric must not turn one glyph into a
+    // multi-hundred-megabyte allocation: 4 Mi pixels is 16 MiB of RGBA.
+    let pixel_count = width.checked_mul(height)?;
+    if pixel_count > 4 * 1024 * 1024 {
+        return None;
+    }
+    // A filled background is required for Core Graphics font smoothing. The
+    // background matches the polarity being measured; see `MaskPolarity`.
+    let light_background = polarity == MaskPolarity::DarkOnLight;
+    let mut pixels = vec![if light_background { 255u8 } else { 0u8 }; pixel_count.checked_mul(4)?];
+    let colorspace = CGColorSpace::new_device_rgb()?;
+    // An opaque RGB bitmap is required for Core Graphics to apply any
+    // smoothing at all; alpha-only contexts silently disable it.
+    // SAFETY: pixels owns width*height*4 writable bytes and outlives the context.
+    let context = unsafe {
+        CGBitmapContextCreate(
+            pixels.as_mut_ptr().cast(),
+            width,
+            height,
+            8,
+            width * 4,
+            Some(&colorspace),
+            CGImageByteOrderInfo::Order32Big.0 | CGImageAlphaInfo::NoneSkipLast.0,
+        )
+    }?;
+    CGContext::set_should_antialias(Some(&context), true);
+    // GNU draws on screen without touching these flags, so the window context
+    // keeps its default smoothing, which is what this adapter must reproduce.
+    CGContext::set_allows_font_smoothing(Some(&context), true);
+    CGContext::set_should_smooth_fonts(Some(&context), true);
+    CGContext::set_allows_font_subpixel_positioning(Some(&context), true);
+    CGContext::set_should_subpixel_position_fonts(Some(&context), true);
+    CGContext::set_should_subpixel_quantize_fonts(Some(&context), false);
+    if light_background {
+        CGContext::set_rgb_fill_color(Some(&context), 0.0, 0.0, 0.0, 1.0);
+    } else {
+        CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
+    }
+    // Match GNU macfont's ordinary-outline drawing operation. The font size
+    // already includes backing scale; do not scale the context a second time.
+    let graphics_font = unsafe { font.graphics_font(ptr::null_mut()) };
+    CGContext::set_font(Some(&context), Some(&graphics_font));
+    CGContext::set_font_size(Some(&context), f32::from_bits(key.font_size_bits).into());
+    let position = CGPoint {
+        x: x_offset - left,
+        y: y_offset - bottom,
+    };
+    // SAFETY: both pointers address one live element for this synchronous call.
+    unsafe { CGContext::show_glyphs_at_positions(Some(&context), &glyph, &position, 1) };
+    drop(context);
+    // Bitmap rows are top-down. Collapse any OS-dependent channel differences
+    // to grayscale instead of assuming a physical LCD component order.
+    let data: Vec<u8> = pixels
+        .chunks_exact(4)
+        .map(|p| {
+            let luminance = ((u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2]) + 1) / 3) as u8;
+            if light_background {
+                255 - luminance
+            } else {
+                luminance
+            }
+        })
+        .collect();
+    // Published bitmap bounds are also used as ink bounds by clipping and
+    // overlap diagnostics. Remove the transparent smoothing guard band while
+    // retaining every nonzero antialiased pixel.
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for (index, &coverage) in data.iter().enumerate() {
+        if coverage != 0 {
+            let x = index % width;
+            let y = index / width;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if min_x == width {
+        return Some(RasterGlyphImage {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+            content: RasterContent::Mask,
+        });
+    }
+    let ink_width = max_x - min_x + 1;
+    let ink_height = max_y - min_y + 1;
+    let mut ink = Vec::with_capacity(ink_width * ink_height);
+    for y in min_y..=max_y {
+        ink.extend_from_slice(&data[y * width + min_x..y * width + max_x + 1]);
+    }
+    Some(RasterGlyphImage {
+        left: left as i32 + min_x as i32,
+        top: top as i32 - min_y as i32,
+        width: ink_width as u32,
+        height: ink_height as u32,
+        data: ink,
+        content: RasterContent::Mask,
+    })
+}
+
+#[cfg(test)]
+#[path = "tests/macos_test.rs"]
+mod tests;

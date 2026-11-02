@@ -11,25 +11,60 @@
 #![allow(dead_code)]
 
 mod admission;
+#[cfg(test)]
+mod admission_probe;
 mod authority_word;
 mod collection;
 mod cons_allocation;
 mod cons_catalog;
+mod construction;
+mod execution;
+pub(super) mod facade;
+pub use execution::ParallelExecutionAdmission;
+pub(crate) use execution::{
+    CellRead, CellReadError, ExecutionActivation, HofError, HofScratch, HofSingleton,
+    ImmediateResult, ImmediateResultError,
+};
+#[cfg(test)]
+pub(crate) use execution::{
+    CohortPhase, CohortSize, ExecutionFixtureReceipt, ExecutionTestDeadline, ExecutionTestHomes,
+    ExecutionTestRetry, ExecutionTestSeed, HofTestInputs, PublicationFacts, PublicationInputs,
+    execution_test_retry, with_test_prepared_cell_execution, with_test_prepared_execution,
+    with_test_prepared_hof_cohort, with_test_prepared_hof_execution,
+    with_test_prepared_publication_cohort,
+};
+mod wrappers;
+#[cfg(test)]
+use crate::emacs_core::eval::world::{
+    WorldProofEra as ProofEra, WorldProofEraFinishFailure as ProofEraFinishFailure,
+};
+pub(crate) use wrappers::EraFinishFailure;
+pub use wrappers::ParallelHeapEra;
+#[cfg(test)]
+pub(crate) use wrappers::{
+    ProofEra as GenericProofEra, ProofEraFinishFailure as GenericProofEraFinishFailure,
+};
+mod keeper;
+pub(crate) use keeper::{EraKeeper, FrozenFunctionRoots, FrozenLegacyRoots};
 mod gate;
 mod image;
 mod native_extent;
+#[cfg(test)]
+mod nmjit_n1;
 mod root_slot;
 mod run_slice;
 mod table_allocation;
 mod table_authority;
 mod weak_policy;
-pub use collection::{CollectionError, CollectionReport};
+pub use collection::{CollectionError, CollectionReport, MinorCollectionError};
 use gate::RegistryGuard;
 pub use root_slot::OwnerRootSlot;
 pub use run_slice::{RunSlice, SliceRoot};
 mod rendezvous;
 mod summaries;
 mod symbol_authority;
+#[cfg(all(test, not(feature = "gc-memory-telemetry")))]
+mod symbol_diagnostics;
 #[cfg(test)]
 pub(crate) mod symbol_functions;
 #[cfg(test)]
@@ -39,8 +74,9 @@ mod symbol_intern;
 #[cfg(test)]
 pub use symbol_authority::FunctionOpKind;
 pub use symbol_authority::{
-    FunctionActivation, FunctionCallCache, FunctionError, FunctionStep, GlobalError,
-    InitialInternError, KeeperSymbols, PlainSymbolBacking, SymbolHandle, SymbolMut, SymbolRef,
+    FunctionActivation, FunctionCallCache, FunctionError, FunctionSelection, FunctionStep,
+    GlobalError, InitialInternError, KeeperSymbols, PlainSymbolBacking, SymbolHandle, SymbolMut,
+    SymbolRef,
 };
 pub(crate) use symbol_authority::{SymbolReadToken, SymbolWriteToken};
 mod token;
@@ -74,7 +110,8 @@ use rustc_hash::FxHashMap;
 
 use super::young_registry::{YoungRegistrationId, YoungRegistryError};
 use super::{HeapIdentity, QuiescentCollector};
-use crate::emacs_core::eval::world::{Baton, FrozenLegacyRoots};
+#[cfg(test)]
+use crate::emacs_core::eval::world::Baton;
 use image::{OwnerGcState, PublishedGcImage};
 use weak_policy::WeakSweepPermit;
 
@@ -293,74 +330,87 @@ impl Registry {
 /// Keeper-confined RAII admission, with both heap and World retained.
 /// There is deliberately no Deref, heap accessor, or constructor from IDs.
 #[must_use = "finish explicitly; abandonment retains the World and poisons the era"]
-pub struct ParallelHeapEra<'heap> {
+struct EraCore<'heap, K: EraKeeper> {
     collector: RefCell<Option<QuiescentCollector<'heap>>>,
     suspended_cons: RefCell<Option<super::facade_mark::SuspendedConsCollector<'heap>>>,
     legacy_roots: Option<FrozenLegacyRoots>,
     #[cfg(test)]
+    symbol_table_admission_charge: super::symbol_table::publication::RetainedTableBytes,
+    #[cfg(test)]
     weak_sweep: Option<WeakSweepPermit>,
-    keeper: Option<Baton>,
+    keeper: Option<K>,
     registry: Option<Arc<Registry>>,
     _thread: PhantomData<Rc<()>>,
 }
 
-pub(crate) struct EraAdmissionFailure<'heap> {
+pub(crate) struct EraAdmissionFailure<'heap, K: EraKeeper> {
     pub(crate) reason: RegistrationError,
     pub(crate) collector: QuiescentCollector<'heap>,
-    pub(crate) keeper: Baton,
+    pub(crate) keeper: K,
 }
 
-impl std::fmt::Debug for EraAdmissionFailure<'_> {
+impl<K: EraKeeper> std::fmt::Debug for EraAdmissionFailure<'_, K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("EraAdmissionFailure")
             .field(&self.reason)
             .finish()
     }
 }
-impl std::fmt::Debug for ParallelHeapEra<'_> {
+impl<K: EraKeeper> std::fmt::Debug for EraCore<'_, K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParallelHeapEra")
+        f.debug_struct("EraCore")
             .field("heap", &self.registry.as_ref().map(|r| r.heap))
             .finish_non_exhaustive()
     }
 }
 
-/// Busy/error recovery returns the entire admission; it never restores serial
-/// authority merely because one owner is delayed.
-pub(crate) struct EraFinishFailure<'heap> {
-    pub(crate) reason: RegistrationError,
-    pub(crate) era: ParallelHeapEra<'heap>,
-}
-impl std::fmt::Debug for EraFinishFailure<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("EraFinishFailure")
-            .field(&self.reason)
-            .finish()
-    }
+/// A refused finish returns its private semantic core to the nominal wrapper.
+struct CoreFinishFailure<'heap, K: EraKeeper> {
+    reason: RegistrationError,
+    core: EraCore<'heap, K>,
 }
 
-impl<'heap> ParallelHeapEra<'heap> {
+#[cfg(test)]
+enum InitialTablePreparation {
+    Actual,
+    RefuseOnce,
+}
+
+impl<'heap, K: EraKeeper> EraCore<'heap, K> {
     #[cold]
     #[inline(never)]
-    pub(crate) fn admit(
-        mut collector: QuiescentCollector<'heap>,
-        keeper: Baton,
-    ) -> Result<Self, EraAdmissionFailure<'heap>> {
+    fn admit<A: construction::CoreAdmission<'heap, K>>(
+        admission: A,
+        prepare: impl FnOnce(
+            &K,
+        ) -> Result<
+            (super::FacadeEpochRetention, symbol_authority::SymbolBacking),
+            RegistrationError,
+        >,
+    ) -> Result<(Self, A::Evidence), EraAdmissionFailure<'heap, K>> {
+        let (checked, witness) = admission.into_checked();
+        Self::admit_checked(
+            checked,
+            witness,
+            prepare,
+            #[cfg(test)]
+            InitialTablePreparation::Actual,
+        )
+    }
+
+    fn admit_checked<W: construction::ConstructionEvidence>(
+        checked: construction::CheckedCollector<'heap, K>,
+        witness: W,
+        prepare: impl FnOnce(
+            &K,
+        ) -> Result<
+            (super::FacadeEpochRetention, symbol_authority::SymbolBacking),
+            RegistrationError,
+        >,
+        #[cfg(test)] preparation: InitialTablePreparation,
+    ) -> Result<(Self, W), EraAdmissionFailure<'heap, K>> {
+        let (mut collector, keeper) = checked.into_parts();
         let heap = collector.heap_identity();
-        let reason = if heap != keeper.parallel_heap_identity() {
-            Some(RegistrationError::WrongHeap)
-        } else if !keeper.held_here() {
-            Some(RegistrationError::WrongThread)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            return Err(EraAdmissionFailure {
-                reason,
-                collector,
-                keeper,
-            });
-        }
         let generation = match issue_generation(&NEXT_REGISTRATION_GENERATION) {
             Ok(generation) => generation,
             Err(reason) => {
@@ -371,17 +421,63 @@ impl<'heap> ParallelHeapEra<'heap> {
                 });
             }
         };
-        let root_epoch = match keeper.parallel_epoch_retention() {
-            Ok(epoch) => epoch,
-            Err(_) => {
+        let (root_epoch, backing) = match prepare(&keeper) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
                 return Err(EraAdmissionFailure {
-                    reason: RegistrationError::Exhausted,
+                    reason,
                     collector,
                     keeper,
                 });
             }
         };
-        let image = match PublishedGcImage::from_legacy(collector.registration_heap_mut()) {
+        // All fallible pointer-table preparation precedes detaching the legacy
+        // image, so refusal returns both original construction inputs intact.
+        #[cfg(test)]
+        match preparation {
+            InitialTablePreparation::Actual => {}
+            InitialTablePreparation::RefuseOnce => {
+                // SAFETY: exclusive checked collector and held keeper retain
+                // this freshly created backing before any table or participant.
+                unsafe {
+                    super::symbol_table::SymbolTableBacking::arm_initial_table_refusal_for_test(
+                        &backing,
+                    );
+                }
+            }
+        }
+        // SAFETY: exclusive checked collector and retained keeper, with no
+        // participant yet published and all ordinary execution excluded.
+        let tables = match unsafe {
+            super::symbol_table::SymbolTableBacking::prepare_initial_symbol_table(&backing)
+        }
+        .and_then(|initial| {
+            super::symbol_table::publication::PublishedSymbolTables::new(
+                initial,
+                super::symbol_table::publication::TableLimits::default(),
+            )
+            .map_err(super::symbol_table::publication_error)
+        }) {
+            Ok(tables) => tables,
+            Err(reason) => {
+                return Err(EraAdmissionFailure {
+                    reason,
+                    collector,
+                    keeper,
+                });
+            }
+        };
+        let table_bytes = match tables.retained_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Err(EraAdmissionFailure {
+                    reason: super::symbol_table::publication_error(error),
+                    collector,
+                    keeper,
+                });
+            }
+        };
+        let mut image = match PublishedGcImage::from_legacy(collector.registration_heap_mut()) {
             Ok(image) => image,
             Err(error) => {
                 return Err(EraAdmissionFailure {
@@ -391,6 +487,7 @@ impl<'heap> ParallelHeapEra<'heap> {
                 });
             }
         };
+        image.charge_symbol_tables(table_bytes);
         let young = image.young_id();
         let key = MutatorKey {
             heap,
@@ -420,44 +517,48 @@ impl<'heap> ParallelHeapEra<'heap> {
         });
         let mut young_index = FxHashMap::default();
         young_index.insert(young, 0);
-        let symbols =
-            symbol_authority::SymbolSidecar::new(keeper.parallel_symbol_backing(), generation);
-        Ok(Self {
-            collector: RefCell::new(Some(collector)),
-            suspended_cons: RefCell::new(None),
-            legacy_roots: None,
-            #[cfg(test)]
-            weak_sweep: None,
-            keeper: Some(keeper),
-            registry: Some(Arc::new(Registry {
-                heap,
-                world: heap,
-                gate: GateLine {
-                    state: Mutex::new(RegistryState {
-                        entries: vec![entry],
-                        young_index,
-                        next_registration: 2,
-                        generation_limit: u64::MAX,
-                        catalog_transition: false,
-                        rendezvous: rendezvous::control::State::new(),
-                    }),
-                    gate_owner: AtomicU64::new(0),
-                },
-                park: ParkLine {
-                    parked: AtomicUsize::new(0),
-                    poisoned: AtomicBool::new(false),
-                    wake: std::sync::Condvar::new(),
-                },
-                phase: PhaseLine::new(),
-                request_epoch: AtomicU64::new(0),
-                completed_epoch: AtomicU64::new(0),
-                keeper_thread: std::thread::current().id(),
-                root_epoch,
-                cons_catalog: super::cons_storage::ConsCatalog::new(heap),
-                symbols,
-            })),
-            _thread: PhantomData,
-        })
+        let symbols = symbol_authority::SymbolSidecar::new(backing, generation, tables);
+        Ok((
+            Self {
+                collector: RefCell::new(Some(collector)),
+                suspended_cons: RefCell::new(None),
+                legacy_roots: None,
+                #[cfg(test)]
+                symbol_table_admission_charge: table_bytes,
+                #[cfg(test)]
+                weak_sweep: None,
+                keeper: Some(keeper),
+                registry: Some(Arc::new(Registry {
+                    heap,
+                    world: heap,
+                    gate: GateLine {
+                        state: Mutex::new(RegistryState {
+                            entries: vec![entry],
+                            young_index,
+                            next_registration: 2,
+                            generation_limit: u64::MAX,
+                            catalog_transition: false,
+                            rendezvous: rendezvous::control::State::new(),
+                        }),
+                        gate_owner: AtomicU64::new(0),
+                    },
+                    park: ParkLine {
+                        parked: AtomicUsize::new(0),
+                        poisoned: AtomicBool::new(false),
+                        wake: std::sync::Condvar::new(),
+                    },
+                    phase: PhaseLine::new(),
+                    request_epoch: AtomicU64::new(0),
+                    completed_epoch: AtomicU64::new(0),
+                    keeper_thread: std::thread::current().id(),
+                    root_epoch,
+                    cons_catalog: super::cons_storage::ConsCatalog::new(heap),
+                    symbols,
+                })),
+                _thread: PhantomData,
+            },
+            witness,
+        ))
     }
 
     fn registry(&self) -> &Registry {
@@ -470,8 +571,9 @@ impl<'heap> ParallelHeapEra<'heap> {
 
     #[cold]
     #[inline(never)]
-    pub fn register(
+    fn register<W: construction::ConstructionEvidence>(
         &self,
+        _witness: &W,
         owner: u64,
         root_capacity: usize,
     ) -> Result<MutatorPermit<'_>, RegistrationError> {
@@ -553,9 +655,9 @@ impl<'heap> ParallelHeapEra<'heap> {
     /// roots before this terminal transfer can restore serial ownership.
     pub(crate) fn finish(
         mut self,
-    ) -> Result<(QuiescentCollector<'heap>, Baton), EraFinishFailure<'heap>> {
+    ) -> Result<(QuiescentCollector<'heap>, K), CoreFinishFailure<'heap, K>> {
         if let Err(reason) = self.prepare_finish() {
-            return Err(EraFinishFailure { reason, era: self });
+            return Err(CoreFinishFailure { reason, core: self });
         }
         let collector = self.collector.get_mut().take().expect("live era");
         let keeper = self.keeper.take().expect("live era");
@@ -789,7 +891,7 @@ impl<'heap> ParallelHeapEra<'heap> {
     }
 }
 
-impl Drop for ParallelHeapEra<'_> {
+impl<K: EraKeeper> Drop for EraCore<'_, K> {
     fn drop(&mut self) {
         let Some(registry) = self.registry.take() else {
             return;
@@ -805,7 +907,8 @@ impl Drop for ParallelHeapEra<'_> {
     }
 }
 
-static_assertions::assert_not_impl_any!(ParallelHeapEra<'static>: Send, Sync, Clone, Copy);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(ParallelHeapEra<'static, Baton>: Send, Sync, Clone, Copy);
 static_assertions::assert_impl_all!(MutatorEntry: Send, Sync);
 static_assertions::assert_impl_all!(MutatorKey: Send, Sync, Copy);
 
@@ -843,3 +946,6 @@ mod a8_probes;
 mod native_extent_tests;
 #[cfg(test)]
 mod restricted_lisp;
+
+// Shared dormant production-entry contention vocabulary.
+pub(crate) mod retry;

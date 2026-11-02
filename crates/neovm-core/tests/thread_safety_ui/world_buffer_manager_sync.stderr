@@ -79,6 +79,8 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `Rc<neomacs_display_protocol::tty_palette::TtyPalette>: Send`
            which is required by `BufferManager: Sync`
+           `Rc<xdisp::mode_line_output::OutputState>: Send`
+           which is required by `BufferManager: Sync`
            `NonNull<eval::owner_bindings::OwnerSlab>: Send`
            which is required by `BufferManager: Sync`
            `Cell<CanonicalArm>: Sync`
@@ -98,6 +100,8 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            `*mut StringObj: Send`
            which is required by `BufferManager: Sync`
            `*const u8: Send`
+           which is required by `BufferManager: Sync`
+           `Rc<Cell<Vec<TaggedValue>>>: Send`
            which is required by `BufferManager: Sync`
            `Rc<Cell<*const ()>>: Send`
            which is required by `BufferManager: Sync`
@@ -173,6 +177,8 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            which is required by `BufferManager: Sync`
            `RefCell<Vec<Option<dynamic_module::GlobalRefEntry>>>: Sync`
            which is required by `BufferManager: Sync`
+           `Rc<Cell<Vec<TaggedValue>>>: Sync`
+           which is required by `BufferManager: Sync`
            `Rc<Cell<*const ()>>: Sync`
            which is required by `BufferManager: Sync`
            `Cell<u64>: Sync`
@@ -212,6 +218,10 @@ error[E0599]: the associated function or constant `share` exists for struct `Thr
            `*const LispSymbol: Sync`
            which is required by `BufferManager: Sync`
            `*const Atomic<u32>: Sync`
+           which is required by `BufferManager: Sync`
+           `NonNull<MarkerObj>: Send`
+           which is required by `BufferManager: Sync`
+           `Rc<window::word_wrap::CachedWordWrapPolicy>: Send`
            which is required by `BufferManager: Sync`
            `NonNull<()>: Send`
            which is required by `BufferManager: Sync`

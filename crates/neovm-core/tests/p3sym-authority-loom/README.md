@@ -1,5 +1,81 @@
 # Proof 3 symbol authority models — C1
 
+## C6 coherent request snapshot extension
+
+`combined/request_snapshot.rs` adds two unscripted first/next-request polls
+and one forced old-order witness. Request writers hold the registry gate
+while publishing phase and Release word. Observers acquire the same gate
+before their Acquire load. A refused try-lock is a legal Busy observation.
+Sampling before the gate can mix the old word with a new phase and falsely
+refuse publication; the negative witness is `C6 request poll mixed epochs
+across the registry gate`. The scripted negative joins both actors before
+its assertion and supplies no evidence of unscripted scheduling coverage.
+Total:81cases,27negative witnesses (13exhaustive,68bounded at each bound).
+
+## C6 preparation extension
+
+`tests/combined.rs` contains 16 specification cases (nine positive, seven
+negative), extending the original 15-case preparation from stacked C5 tip
+`7d1f1a21eb`. Six stopped epochs transfer one immutable
+function/name graph between owner homes, real-role global/projection cells,
+a function cell, a selected old activation and the exact-name registry index.
+Later full census permits old-definition reclamation. A separate unscripted
+ACK case explores root-image publication and release-before-ACK; stale epochs
+and a held lease cannot authorize tracing. Existing authority/support code is
+reused, with no engine dependency or helper fork. A refused acquisition is
+handled explicitly; the scripted phase actions have no competing lease.
+
+The full crate now defines **78 cases** and **26 intended witnesses**. Run all
+cases at preemption bounds 2 and 3 using the existing entered/completed receipt
+accounting. These are expected counts before C6 validation, not a qualification
+result. Retained C1–C5 receipt revisions remain unchanged.
+
+New exact witness headings:
+
+- `C6 second stop omitted live global reseeding`
+- `C6 stop omitted canonical projection backing`
+- `C6 stop omitted the live function-cell root`
+- `C6 replacement lost the active old definition`
+- `C6 stop omitted the exact registry name root`
+- `C6 ACK preceded publication of its owner root image`
+- `C6 keeper traced while a symbol lease was held`
+
+Generation bits and sweep masks are finite specifications. They do **not**
+implement a collector, all-owner young-log capture, remsets or real minor GC.
+Omission controls inspect copied root censuses, then complete every handoff
+and join before emitting the named witness; they do not deliberately sweep a
+native heap while omitting required roots. Native combined executor, actual
+GEN0/GEN1 collections and eventual reclamation, GNU twins, keeper sealing,
+Miri/TSan, assertion-enabled families, scaling diagnostics, census and board
+remain separate C6 obligations. The running JIT/spine-lifetime gap remains a
+later N-mutator JIT obligation because production JIT does not run in this era.
+
+
+### C6 model type correction
+
+The retained preparation originally had 77 cases and 25 witnesses. The added
+function-cell omission control raises those static expectations to 78 and 26;
+existing qualification receipts remain pinned to their original sources and
+are not evidence for this addition. The new control removes only the audit
+census's function-cell root, completes all real censuses and joins the actor,
+then reports `C6 stop omitted the live function-cell root`.
+
+C6's model now distinguishes `Backing`, `Attempt::{Committed,Busy}`,
+`CollectionKind::{Major,Minor}`, `Owner`, `StopSequence`, transfer/replacement
+phases, ACK order and word-gate policy. Root object sets and atomic root words
+cannot be substituted for stop sequences or owner indices. Array indexing and
+atomic encoding convert these private domains only at their storage boundaries.
+Phase and policy matches are exhaustive. No new model synchronization or engine
+TLS is added; the shared authority/helper implementation remains unchanged.
+
+These types prevent domain confusion. Matching ACK epochs, the globally zero
+authority word, safe scripted handoffs and root reachability remain modeled
+runtime invariants; native lifetime evidence is a separate obligation. Scripted uncontended attempts
+must commit; concurrent refusal branches remain legal without an acquisition
+unwrap or fairness assumption. The generation model still does not implement
+a real minor collector. Native combined sessions and keeper sealing need their
+own later implementation and receipts.
+
 ## C4 preparation extension
 
 `tests/functions.rs` adds ten cases (seven positive, three negative) on the
@@ -140,7 +216,7 @@ taskset -c 0-3,14-31 nix develop -c bash -c '
 ' > tmp/peer-p3sym/c1/loom-bound2.log 2>&1
 ```
 
-Repeat with `P3SYM_PREEMPTIONS=3`. The eight `support::exhaustive` cases ignore
+Repeat with `P3SYM_PREEMPTIONS=3`. The 13 `support::exhaustive` cases ignore
 that bound; all remaining cases explicitly use the selected bound (default
 2, qualification rejects <2). The helper overrides ambient
 LOOM_MAX_PREEMPTIONS, records the effective bound, sets max_branches=4096,

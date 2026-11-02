@@ -25,7 +25,7 @@ fn call_marker_position(args: Vec<Value>) -> EvalResult {
 fn call_marker_buffer(args: Vec<Value>) -> EvalResult {
     MARKER_TEST_CTX.with(|slot| {
         let mut ctx = Box::new(super::super::eval::Context::new());
-        let result = builtin_marker_buffer(&mut ctx, args);
+        let result = builtin_marker_buffer(&mut ctx, &args);
         *slot.borrow_mut() = Some(ctx);
         result
     })
@@ -43,7 +43,7 @@ fn call_set_marker_insertion_type(args: Vec<Value>) -> EvalResult {
 fn call_copy_marker(args: Vec<Value>) -> EvalResult {
     MARKER_TEST_CTX.with(|slot| {
         let mut ctx = Box::new(super::super::eval::Context::new());
-        let result = builtin_copy_marker(&mut ctx, args);
+        let result = builtin_copy_marker(&mut ctx, &args);
         *slot.borrow_mut() = Some(ctx);
         result
     })
@@ -106,7 +106,7 @@ fn builtin_marker_buffer_returns_live_buffer() {
     let mut eval = super::super::eval::Context::new();
     let buffer_id = eval.buffers.current_buffer_id().expect("current buffer");
     let marker = make_marker_value(Some(buffer_id), Some(LispCharPos1::new(1)), false);
-    let buf = builtin_marker_buffer(&mut eval, vec![marker]).unwrap();
+    let buf = builtin_marker_buffer(&mut eval, &vec![marker]).unwrap();
     assert_eq!(buf, Value::make_buffer(buffer_id));
 }
 
@@ -126,7 +126,7 @@ fn builtin_copy_marker_from_marker() {
     let mut eval = super::super::eval::Context::new();
     let buffer_id = eval.buffers.current_buffer_id().expect("current buffer");
     let m = make_registered_buffer_marker(&mut eval.buffers, buffer_id, LispCharPos1::new(5), true);
-    let copy = builtin_copy_marker(&mut eval, vec![m]).unwrap();
+    let copy = builtin_copy_marker(&mut eval, &vec![m]).unwrap();
     assert!(is_marker(&copy));
     assert!(marker_position_value(&copy).is_fixnum());
 }
@@ -155,11 +155,11 @@ fn builtin_copy_marker_from_integer_clips_like_set_marker() {
         .expect("current buffer")
         .insert("abc");
 
-    let before_min = builtin_copy_marker(&mut eval, vec![Value::fixnum(-10)])
+    let before_min = builtin_copy_marker(&mut eval, &vec![Value::fixnum(-10)])
         .expect("copy marker before point-min");
     assert_eq!(marker_position_value(&before_min), Value::fixnum(1));
 
-    let after_max = builtin_copy_marker(&mut eval, vec![Value::fixnum(99)])
+    let after_max = builtin_copy_marker(&mut eval, &vec![Value::fixnum(99)])
         .expect("copy marker after point-max");
     assert_eq!(marker_position_value(&after_max), Value::fixnum(4));
 }
@@ -173,7 +173,7 @@ fn builtin_copy_marker_from_integer_clips_like_set_marker() {
 #[test]
 fn builtin_make_marker_returns_empty() {
     crate::test_utils::init_test_tracing();
-    let m = builtin_make_marker(vec![]).unwrap();
+    let m = builtin_make_marker(&vec![]).unwrap();
     assert!(is_marker(&m));
     assert!(marker_position_value(&m).is_nil());
     assert!(marker_buffer_value(&m).is_nil());
@@ -215,7 +215,7 @@ fn numeric_comparisons_use_live_marker_positions() {
         )
         .expect("evaluation succeeds");
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&Ok(result)),
+        crate::emacs_core::format_eval_result(&Ok(result)),
         "OK (12 nil t)"
     );
 }
@@ -298,7 +298,7 @@ fn copy_marker_from_integer_tracks_insertions_before_it() {
         )
         .expect("evaluation succeeds");
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&Ok(result)),
+        crate::emacs_core::format_eval_result(&Ok(result)),
         r#"OK (5 "aXbc")"#
     );
 }
@@ -318,10 +318,7 @@ fn set_marker_uses_live_source_marker_position_after_insertions() {
              (marker-position dst))"#,
         )
         .expect("evaluation succeeds");
-    assert_eq!(
-        crate::emacs_core::error::format_eval_result(&Ok(result)),
-        "OK 5"
-    );
+    assert_eq!(crate::emacs_core::format_eval_result(&Ok(result)), "OK 5");
 }
 
 /// `set-marker` into the buffer the marker is ALREADY in must not touch the
@@ -367,13 +364,13 @@ fn set_marker_within_the_same_buffer_leaves_the_marker_chain_alone() {
             })
             .collect();
 
-        let before = ctx.buffers.get(buffer_id).unwrap().marker_chain_ids();
+        let before = ctx.buffers.get(buffer_id).unwrap().marker_chain_ptrs();
         assert_eq!(before.len(), 3, "three markers are on the chain");
 
         builtin_set_marker_in_buffers(&mut ctx.buffers, &[markers[1], Value::fixnum(8)])
             .expect("set-marker");
 
-        let after = ctx.buffers.get(buffer_id).unwrap().marker_chain_ids();
+        let after = ctx.buffers.get(buffer_id).unwrap().marker_chain_ptrs();
         assert_eq!(
             before, after,
             "set-marker inside the same buffer re-chained the marker"

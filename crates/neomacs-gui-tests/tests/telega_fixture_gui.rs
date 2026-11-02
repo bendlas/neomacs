@@ -221,7 +221,10 @@ fn telega_frontend_ingests_a_delayed_avatar_update_file() {
             line.record == "request" && line.type_name.as_deref() == Some("downloadFile")
         })
     });
-    let before = fixture.read_checkpoint().expect("checkpoint");
+    let before = fixture.wait_for_checkpoint(
+        "waiting for the undelivered avatar's initials placeholder",
+        |checkpoint| checkpoint["avatar-spec-initials"].as_bool() == Some(true),
+    );
     assert_eq!(
         before["avatar-spec-initials"].as_bool(),
         Some(true),
@@ -504,7 +507,13 @@ fn neomacs_binary() -> PathBuf {
 }
 
 fn mock_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_neomacs-telega-fixture-mock"))
+    // nextest extracts the archive's binaries into its own target directory and
+    // publishes the real path as NEXTEST_BIN_EXE_<name>; the compile-time
+    // CARGO_BIN_EXE path points into the archive builder's workspace and does
+    // not exist on the test runner. Prefer the nextest variable when present.
+    std::env::var_os("NEXTEST_BIN_EXE_neomacs-telega-fixture-mock")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_neomacs-telega-fixture-mock")))
 }
 
 fn process_group_alive(pgid: i32) -> bool {
@@ -798,6 +807,18 @@ impl Fixture {
     fn read_checkpoint(&self) -> Option<Value> {
         let bytes = fs::read(&self.checkpoint_path).ok()?;
         serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Wait for the fixture's checkpoint to report a state, then return the
+    /// checkpoint that matched.  The checkpoint is published by the editor's
+    /// Lisp timer, so it can trail an externally observed event (for example
+    /// the mock server logging a download request) by a few frames on a
+    /// loaded machine.
+    fn wait_for_checkpoint(&self, what: &str, predicate: impl Fn(&Value) -> bool) -> Value {
+        self.wait_for(what, Duration::from_secs(30), || {
+            let checkpoint = self.read_checkpoint()?;
+            predicate(&checkpoint).then_some(checkpoint)
+        })
     }
 
     /// Ready checkpoint: Telega finished fetching chats, the real root buffer

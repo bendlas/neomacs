@@ -43,6 +43,9 @@ mod desktop_font_startup;
 #[path = "desktop_font_updates.rs"]
 mod desktop_font_updates;
 
+#[path = "desktop_font_pins.rs"]
+mod desktop_font_pins;
+
 #[path = "display_line_numbers.rs"]
 mod display_line_numbers;
 
@@ -55,8 +58,14 @@ mod dual_width_fixed_pitch;
 #[path = "eob_overlay_motion.rs"]
 mod eob_overlay_motion;
 
+#[path = "eval_buffer_shorthands_gui_oracle.rs"]
+mod eval_buffer_shorthands_gui_oracle;
+
 #[path = "extended_keysyms.rs"]
 mod extended_keysyms;
+
+#[path = "face_background_mode_gui_oracle.rs"]
+mod face_background_mode_gui_oracle;
 
 #[path = "fill_column_stipple.rs"]
 mod fill_column_stipple;
@@ -94,8 +103,17 @@ mod recenter_box_drawing;
 #[path = "interaction_geometry.rs"]
 mod interaction_geometry;
 
+#[path = "issue_417_startup.rs"]
+mod issue_417_startup;
+
 #[path = "issue_582_fullscreen.rs"]
 mod issue_582_fullscreen;
+
+#[path = "issue_621_mouse_drag_selection_gui_oracle.rs"]
+mod issue_621_mouse_drag_selection_gui_oracle;
+
+#[path = "kill_minibuffer_window_gui_oracle.rs"]
+mod kill_minibuffer_window_gui_oracle;
 
 #[path = "ligature_compose.rs"]
 mod ligature_compose;
@@ -108,6 +126,9 @@ mod minibuffer_line_gui;
 
 #[path = "minibuffer_selected_window.rs"]
 mod minibuffer_selected_window;
+
+#[path = "mouse_position_in_root_frame_gui_oracle.rs"]
+mod mouse_position_in_root_frame_gui_oracle;
 
 #[path = "native_frame_focus.rs"]
 mod native_frame_focus;
@@ -186,3 +207,14 @@ mod x11_presentation;
 
 #[path = "xpm_named_colors.rs"]
 mod xpm_named_colors;
+
+#[cfg(target_os = "linux")]
+#[path = "wayland_readiness.rs"]
+mod wayland_readiness;
+
+#[cfg(target_os = "linux")]
+#[path = "wayland_shm_pool_growth.rs"]
+mod wayland_shm_pool_growth;
+
+#[path = "category_word_wrap.rs"]
+mod category_word_wrap;

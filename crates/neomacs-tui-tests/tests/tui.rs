@@ -89,10 +89,22 @@ mod issue_445_ibuffer_filter_groups;
 mod issue_446_align_to_hscroll;
 #[path = "issue_470.rs"]
 mod issue_470;
+#[path = "issue_621_mouse_drag_selection.rs"]
+mod issue_621_mouse_drag_selection;
+#[path = "issue_654_centered_cursor.rs"]
+mod issue_654_centered_cursor;
+#[path = "issue_656_kill_minibuffer.rs"]
+mod issue_656_kill_minibuffer;
+#[path = "issue_658_eval_buffer_shorthands.rs"]
+mod issue_658_eval_buffer_shorthands;
+#[path = "issue_660_mouse_position_in_root_frame.rs"]
+mod issue_660_mouse_position_in_root_frame;
 #[path = "mark_region_fill.rs"]
 mod mark_region_fill;
 #[path = "menu_bar.rs"]
 mod menu_bar;
+#[path = "minibuffer_barrier.rs"]
+mod minibuffer_barrier;
 #[path = "minibuffer_line.rs"]
 mod minibuffer_line;
 #[path = "minor_mode_order_repro.rs"]
@@ -154,6 +166,8 @@ mod source_navigation;
 mod spacemacs_boot;
 #[path = "startup_terminal_initialization.rs"]
 mod startup_terminal_initialization;
+#[path = "strict_cluster_invisible.rs"]
+mod strict_cluster_invisible;
 #[path = "strict_grid.rs"]
 mod strict_grid;
 #[path = "tty_color_index.rs"]
@@ -184,3 +198,4 @@ mod minibuffer_selected_window;
 mod treesit_debug_mode_line;
 
 mod encoded_file;
+mod mode_line_element_attribution_oracle;

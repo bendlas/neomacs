@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+mod command_projection;
+pub use command_projection::RenderCommandSender;
+
 mod frame_mailbox;
 mod frame_opacity;
 pub use frame_mailbox::{FrameReceiver, FrameSender, QueuedPresentation, SupersededPresentation};
@@ -318,6 +321,22 @@ pub enum WindowVisibility {
     Invisible,
 }
 
+impl WindowVisibility {
+    pub(crate) const fn is_visible_or_iconified(self) -> bool {
+        matches!(self, Self::Visible | Self::Iconified)
+    }
+}
+
+impl From<neovm_core::window::FrameVisibility> for WindowVisibility {
+    fn from(visibility: neovm_core::window::FrameVisibility) -> Self {
+        match visibility {
+            neovm_core::window::FrameVisibility::Visible => Self::Visible,
+            neovm_core::window::FrameVisibility::Iconified => Self::Iconified,
+            neovm_core::window::FrameVisibility::Invisible => Self::Invisible,
+        }
+    }
+}
+
 /// Lifecycle commands for the render thread.
 #[derive(Debug)]
 pub enum LifecycleCommand {
@@ -401,6 +420,7 @@ pub enum WindowCommand {
         /// GNU's `x-no-window-manager`: create the window override-redirect so a
         /// window manager never adopts Emacs's own frames as clients.
         override_redirect: bool,
+        visibility: WindowVisibility,
     },
     /// Associate the already-created primary OS window with its real Emacs frame ID.
     AdoptPrimaryFrame { frame: FrameRef },
@@ -667,8 +687,6 @@ pub enum UiCommand {
 // constructors and destructuring code.
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigCommand {
-    /// Enable or disable font ligatures
-    SetLigaturesEnabled { enabled: bool },
     /// Replace the complete, already validated visual configuration snapshot.
     SetVisualConfig(VisualConfig),
     /// Replace the compiled NS modifier policy (issue #442).
@@ -764,7 +782,7 @@ pub enum RenderCommand {
 // silently dropping command input.  Keep Neomacs' render-to-evaluator input
 // queue at the same scale and use backpressure for durable user input below.
 const INPUT_CHANNEL_CAPACITY: usize = 4096;
-const COMMAND_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const COMMAND_CHANNEL_CAPACITY: usize = 64;
 
 /// Effective full-frame shader availability published by the render thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1040,7 +1058,7 @@ pub struct ThreadComms {
     pub frame_rx: FrameReceiver,
 
     /// Commands: Emacs → Render
-    pub cmd_tx: Sender<RenderCommand>,
+    pub cmd_tx: RenderCommandSender,
     pub cmd_rx: Receiver<RenderCommand>,
 
     /// Input events: Render → Emacs
@@ -1051,13 +1069,14 @@ pub struct ThreadComms {
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
     pub frame_opacity: Arc<Mutex<FrameOpacityState>>,
     pub native_window_ids: SharedNativeWindowIds,
+    image_decoder: Option<neomacs_renderer_wgpu::ImageDecoder>,
 }
 
 impl ThreadComms {
     /// Create new thread communication channels
     pub fn new() -> Self {
         let (frame_tx, frame_rx) = frame_mailbox::channel();
-        let (cmd_tx, cmd_rx) = bounded(COMMAND_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = RenderCommandSender::default_channel();
         let (input_tx, input_rx) = bounded(INPUT_CHANNEL_CAPACITY);
         let capabilities = Arc::new(SharedRenderCapabilities::default());
         Self {
@@ -1071,7 +1090,15 @@ impl ThreadComms {
             tooltip_context: Arc::default(),
             frame_opacity: Arc::default(),
             native_window_ids: Arc::default(),
+            image_decoder: None,
         }
+    }
+
+    /// Transfer the GUI's CPU image decoder to the native thread.
+    /// Metadata clients can submit work before GPU resources exist.
+    pub fn with_image_decoder(mut self, decoder: neomacs_renderer_wgpu::ImageDecoder) -> Self {
+        self.image_decoder = Some(decoder);
+        self
     }
 
     /// Split into Emacs-side and Render-side handles
@@ -1088,6 +1115,7 @@ impl ThreadComms {
 
         let render = RenderComms {
             input_stream: Default::default(),
+            image_decoder: self.image_decoder,
             tooltip_context: self.tooltip_context,
             frame_opacity: self.frame_opacity,
             frame_rx: self.frame_rx,
@@ -1110,7 +1138,7 @@ impl Default for ThreadComms {
 /// Emacs thread communication handle
 pub struct EmacsComms {
     pub frame_tx: FrameSender,
-    pub cmd_tx: Sender<RenderCommand>,
+    pub cmd_tx: RenderCommandSender,
     pub input_rx: Receiver<InputEvent>,
     pub capabilities: Arc<SharedRenderCapabilities>,
     pub tooltip_context: Arc<neomacs_display_protocol::tooltip::TooltipContext>,
@@ -1120,6 +1148,7 @@ pub struct EmacsComms {
 
 /// Render thread communication handle
 pub struct RenderComms {
+    pub(crate) image_decoder: Option<neomacs_renderer_wgpu::ImageDecoder>,
     input_stream: neomacs_display_protocol::input_progress::InputStream,
     pub frame_rx: FrameReceiver,
     pub cmd_rx: Receiver<RenderCommand>,

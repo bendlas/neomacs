@@ -553,3 +553,237 @@ fn verify_catches_nothing_on_a_loop_heavy_body() {
     assert!(eval.tier_i.stats().count(TierIEvent::Run) >= 2);
     let _ = Value::NIL;
 }
+
+/// GNU `Fprogn` reads the rest of the body list before evaluating each
+/// form; both tiers must keep the saved tail when a form mutates the list.
+#[test]
+fn progn_keeps_the_saved_body_tail_when_a_form_mutates_the_list() {
+    let src = r#"
+(progn
+  (setq ti-pcdr-l (list 'progn '(setcdr (cdr ti-pcdr-l) nil) '(setq ti-pcdr-x 1)))
+  (progn (eval ti-pcdr-l) ti-pcdr-x))
+"#;
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        "OK 1",
+        "the tree walker lost the saved body tail after the list was mutated"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        assert_eq!(
+            run(mode, src).0,
+            off,
+            "{mode:?} lost the saved body tail after the list was mutated"
+        );
+    }
+}
+
+/// A `let` value that only a weak table references must become collectable
+/// when the binding's scope ends, in the tree walker and in both Tier-I
+/// modes. GNU answers 0 for the interpreted and byte-compiled forms (Flet's
+/// SAFE_ALLOCA and exec_byte_code restore the stack range); a retained
+/// sequence temp root used to keep the lexical value alive past the binding.
+#[test]
+fn weak_references_drop_when_a_let_scope_ends_in_every_tier() {
+    let src = r#"
+(defvar ti-wr-cell nil)
+(defun ti-wr-make (tbl) (let ((o (list 1 2))) (puthash o t tbl) o))
+(defun ti-wr (tbl)
+  (setq ti-wr-cell (ti-wr-make tbl))
+  (setq ti-wr-cell nil)
+  (garbage-collect)
+  (hash-table-count tbl))
+(ti-wr (make-hash-table :weakness 'key))
+"#;
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        "OK 0",
+        "the tree walker kept the weak entry alive after the let scope"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        let results = run(mode, src).0;
+        assert_eq!(
+            results, off,
+            "{mode:?} kept the weak entry alive after the let scope"
+        );
+    }
+}
+
+/// GNU `Flet` keeps its evaluated initializers in the `SAFE_ALLOCA`'d
+/// `temps[]` array for the whole body (eval.c:1151-1186), independently of
+/// the binding: `(setq obj nil)` drops the binding's reference but not the
+/// temp, so a weak-key table must still see the value. GNU answers (1 1);
+/// 15953b7821 rooted only dynamic values and answered (1 0).
+#[test]
+fn let_initializers_stay_rooted_through_the_body_in_every_tier() {
+    let src = r#"
+(let ((ht (make-hash-table :weakness 'key)))
+  (let ((obj (list 1 2)))
+    (puthash obj t ht)
+    (let ((before (hash-table-count ht)))
+      (setq obj nil)
+      (garbage-collect)
+      (list before (hash-table-count ht)))))
+"#;
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        "OK (1 1)",
+        "the tree walker dropped a let initializer inside the let body"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        assert_eq!(
+            run(mode, src).0,
+            off,
+            "{mode:?} dropped a let initializer inside the let body"
+        );
+    }
+}
+
+/// Neo's retention rule keeps a returned form's temps visible to the rest of
+/// its enclosing body sequence: the inner let's initializer is still
+/// reachable by the `garbage-collect` in the outer body.  The rule is
+/// deterministic and conservative, and the enclosing sequence ends it (an
+/// explicit evaluation ends its run earlier; see the boundary test).  GNU
+/// 31.1 answers 1 for this form on the reference builds; the rule is ours,
+/// not an emulation of GNU stack-slot residue.
+#[test]
+fn let_initializer_temps_survive_the_enclosing_body_in_every_tier() {
+    let src = r#"
+(let ((ht (make-hash-table :weakness 'value)))
+  (let ((obj (list 1 2)))
+    (puthash 'key obj ht))
+  (garbage-collect)
+  (hash-table-count ht))
+"#;
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        "OK 1",
+        "the tree walker dropped the inner let's temps before the enclosing body sequence ended"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        assert_eq!(
+            run(mode, src).0,
+            off,
+            "{mode:?} dropped the inner let's temps before the enclosing body sequence ended"
+        );
+    }
+}
+
+/// An explicit `eval` is an evaluation boundary like GNU `Feval`'s C frame:
+/// the temps and evaluated-argument residue created while it runs must die
+/// when it returns, even though the enclosing body sequence is still
+/// running. GNU answers 0; the un-scoped `eval_call_roots` run kept the
+/// puthash key alive and answered 1.
+#[test]
+fn eval_boundary_releases_its_temporary_roots_in_every_tier() {
+    let src = r#"
+(progn
+  (setq ti-eb-ht (make-hash-table :weakness 'key))
+  (eval '(let ((obj (list 1 2))) (puthash obj t ti-eb-ht)))
+  (garbage-collect)
+  (hash-table-count ti-eb-ht))
+"#;
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        "OK 0",
+        "the tree walker leaked an eval's temporary roots into the enclosing body"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        assert_eq!(
+            run(mode, src).0,
+            off,
+            "{mode:?} leaked an eval's temporary roots into the enclosing body"
+        );
+    }
+}
+
+/// GNU `Fprogn` (eval.c:433-446) reads the rest of the body before evaluating
+/// the form, keeps that continuation visible across a collection, and ends
+/// the loop at an improper tail without signaling.  The ten controls cover
+/// both lexical modes; the tree walker and Tier-I must agree with GNU.
+#[test]
+fn progn_saved_continuation_and_improper_tail_in_every_tier() {
+    let src = r#"
+(progn
+  (defun ti-progn-owner-case (kind lexical)
+    (let* ((f (list 'progn nil '(quote old-next)))
+           (args (cdr f)))
+      (setcar args
+              (cond
+               ((eq kind 'mutate-final-tail-to-atom-no-gc)
+                (list 'progn (list 'setcdr (list 'quote (cddr f)) 7) '(quote step)))
+               (t
+                (list 'progn
+                      (if (memq kind '(detach-tail-no-gc detach-tail-gc))
+                          (list 'setcdr (list 'quote args) nil)
+                        '(quote keep-tail))
+                      (if (memq kind '(keep-tail-gc detach-tail-gc))
+                          '(garbage-collect)
+                        '(quote no-gc))
+                      '(quote step)))))
+      (list kind lexical
+            (condition-case e (list 'value (eval f lexical))
+              (error (list 'signal e))))))
+  (let (results)
+    (dolist (lexical '(nil t))
+      (dolist (kind '(keep-tail-no-gc detach-tail-no-gc keep-tail-gc detach-tail-gc
+                      mutate-final-tail-to-atom-no-gc))
+        (push (ti-progn-owner-case kind lexical) results)))
+    (nreverse results)))
+"#;
+    let expected = "OK ((keep-tail-no-gc nil (value old-next)) (detach-tail-no-gc nil (value old-next)) (keep-tail-gc nil (value old-next)) (detach-tail-gc nil (value old-next)) (mutate-final-tail-to-atom-no-gc nil (value old-next)) (keep-tail-no-gc t (value old-next)) (detach-tail-no-gc t (value old-next)) (keep-tail-gc t (value old-next)) (detach-tail-gc t (value old-next)) (mutate-final-tail-to-atom-no-gc t (value old-next)))";
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        expected,
+        "the tree walker dropped the saved continuation or rejected an improper tail"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        assert_eq!(
+            run(mode, src).0,
+            off,
+            "{mode:?} differs on the saved continuation or the improper tail"
+        );
+    }
+}
+
+/// GNU `funcall_lambda` evaluates a body with `Fprogn` (eval.c:3448-3455), so
+/// a lambda body has the same saved-continuation semantics: a body form that
+/// detaches its own tail and collects must still reach the detached sibling,
+/// and a final atom tail must not be rejected.
+#[test]
+fn lambda_body_saved_continuation_in_every_tier() {
+    let src = r#"
+(list
+ (let* ((body (list nil '(quote old-next)))
+        (cell body)
+        (fn (eval (cons 'lambda (cons nil body)) nil)))
+   (setcar body
+           (list 'progn (list 'setcdr (list 'quote cell) nil)
+                 '(garbage-collect) '(quote step)))
+   (condition-case e (list 'value (funcall fn)) (error (list 'signal e))))
+ (let* ((body (list nil '(quote old-next)))
+        (cell (cdr body))
+        (fn (eval (cons 'lambda (cons nil body)) nil)))
+   (setcar body
+           (list 'progn (list 'setcdr (list 'quote cell) 7) '(quote step)))
+   (condition-case e (list 'value (funcall fn)) (error (list 'signal e)))))
+"#;
+    let off = run(TierIMode::Off, src).0;
+    assert_eq!(
+        last(&off),
+        "OK ((value old-next) (value old-next))",
+        "the tree walker re-read the mutated spine instead of the saved continuation"
+    );
+    for mode in [TierIMode::Verify, TierIMode::On] {
+        assert_eq!(
+            run(mode, src).0,
+            off,
+            "{mode:?} differs on a lambda body's saved continuation"
+        );
+    }
+}

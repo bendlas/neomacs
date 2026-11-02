@@ -115,12 +115,16 @@ pub(crate) mod frame_layout;
 mod gc_memory_allocator;
 mod image_catalog;
 mod input_bridge;
+use input_bridge::publication::{InputPublisher, InputRoute, PrimaryInputPublisher};
+use neomacs_display_runtime::tty_input::Publication;
 mod secondary_tty;
 mod startup_font;
 mod startup_frame;
 mod startup_resources;
 mod termcap_input;
 pub(crate) mod terminal_capabilities;
+#[cfg(target_os = "linux")]
+mod text_huge_pages;
 pub(crate) mod tty_frontend;
 pub(crate) mod tty_init;
 pub(crate) mod tty_output;
@@ -137,7 +141,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use neomacs_display_protocol::{SelectionOwner, VideoId, VisualConfig, WebViewId};
-use neomacs_display_runtime::display_scale::observe_event_loop_display;
 #[cfg(not(feature = "neo-term"))]
 use neomacs_display_runtime::render_thread::run_render_loop_current_thread;
 #[cfg(feature = "neo-term")]
@@ -157,7 +160,7 @@ use neomacs_display_runtime::thread_comm::{
     AssetCommand, ClipboardCommand, ClipboardSelection, ConfigCommand, EmacsComms, FrameRef,
     FrameShaderAvailability, FrameShaderExecution, FrameShaderRequestId,
     InputEvent as DisplayInputEvent, LifecycleCommand, RenderCommand, SharedRenderCapabilities,
-    SurfaceSource, ThreadComms, UiCommand, WindowCommand, WindowFullscreenMode, WindowVisibility,
+    SurfaceSource, ThreadComms, UiCommand, WindowCommand, WindowFullscreenMode,
 };
 #[cfg(feature = "neo-term")]
 use neomacs_display_runtime::{
@@ -182,7 +185,6 @@ use neomacs_webview::{
 
 use neovm_core::buffer::{BufferId, EmacsBytePos, EmacsByteRange, LispCharPos1};
 use neovm_core::emacs_core::Value;
-use neovm_core::emacs_core::builtins::set_neomacs_monitor_info;
 use neovm_core::emacs_core::display::gui_window_system_symbol;
 use neovm_core::emacs_core::display_host::{
     AvailableFontFamilyName, FontCoverage, FontCoverageRequest, FontCoverageTarget,
@@ -1040,10 +1042,18 @@ fn startup_dimensions(
             // GUI frame is therefore 80x35 of *counted* text; match that observable.
             let cols = 80u32;
             let text_rows = 35u32;
-            // Side chrome the layout reserves outside the text columns: a default
-            // vertical scroll bar (one char wide) plus the two 8px fringes.
+            // Side chrome the layout reserves outside the text columns: the
+            // default vertical scroll bar plus the two 8px fringes.  GNU's
+            // gui_figure_window_size adds FRAME_SCROLL_BAR_AREA_WIDTH, the
+            // toolkit default (16 px, src/xfns.c:2393-2438), not a character
+            // cell; sharing the layout's constant keeps the requested window
+            // and the text area the layout reserves in agreement.  Reserving
+            // one cell here made the first frame come up one column short
+            // whenever the font's cell was not 16 pixels (13 px DejaVu Sans
+            // Mono: 1069 requested, 79 columns realized).
             const DEFAULT_FRINGE_PX: f32 = 8.0;
-            let side_chrome = frame_metrics.char_width + 2.0 * DEFAULT_FRINGE_PX;
+            let side_chrome = neovm_core::window::GUI_SCROLL_BAR_DEFAULT_WIDTH_PX as f32
+                + 2.0 * DEFAULT_FRINGE_PX;
             // Top chrome reserved above the text lines for a default GUI frame: a
             // one-line menu bar (char_height) plus the icon-height tool bar. Both
             // default on under -Q; if a user disables either this slightly
@@ -1080,6 +1090,26 @@ enum FrontendHandle {
     Batch,
 }
 
+/// Startup retains the auxiliary-terminal owner until late input activation.
+/// The primary publisher has already moved into its selected native owner.
+enum TtyInputConnection {
+    Noninteractive,
+    Interactive {
+        secondary_factory: secondary_tty::SecondaryTtyFactory,
+    },
+}
+
+impl std::fmt::Debug for TtyInputConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Noninteractive => f.write_str("TtyInputConnection::Noninteractive"),
+            Self::Interactive { .. } => f
+                .debug_struct("TtyInputConnection::Interactive")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 impl FrontendHandle {
     fn join(self) {
         match self {
@@ -1113,10 +1143,6 @@ struct EvaluatorExit {
 impl EvaluatorExit {
     const OK: Self = Self {
         exit_code: 0,
-        restart: false,
-    };
-    const STARTUP_FAILED: Self = Self {
-        exit_code: 1,
         restart: false,
     };
 }
@@ -1245,11 +1271,11 @@ struct PrimaryWindowDisplayHost {
     resources: neomacs_display_runtime::gui_resources::GuiResources,
     system_fonts: neovm_core::emacs_core::display_host::SystemFonts,
     tooltip_client: neomacs_display_protocol::tooltip::TooltipClient,
-    cmd_tx: crossbeam_channel::Sender<RenderCommand>,
+    cmd_tx: neomacs_display_runtime::thread_comm::RenderCommandSender,
     render_waker: Option<GuiEventLoopWaker>,
     font_sizing: FontSizing,
-    primary_window_adopted: bool,
-    primary_frame_id: Option<neovm_core::window::FrameId>,
+    primary_frame: PrimaryFrame,
+    gui_startup: Option<GuiStartupParameters>,
     /// X11 window ids published by the render thread, keyed by Emacs frame id.
     native_window_ids: neomacs_display_runtime::thread_comm::SharedNativeWindowIds,
     /// Whether the native backend is X11 (only then are window ids published).
@@ -1274,6 +1300,36 @@ struct PrimaryWindowDisplayHost {
     requested_frame_shader: Mutex<Option<RequestedFrameShader>>,
     #[cfg(feature = "neo-term")]
     terminal_state: TerminalHostState,
+}
+
+/// The native primary can be assigned once, and a retired assignment cannot
+/// accidentally become an opening frame again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryFrame {
+    Awaiting,
+    Adopted(FrameId),
+    Retired,
+}
+
+impl PrimaryFrame {
+    fn is_awaiting(self) -> bool {
+        matches!(self, Self::Awaiting)
+    }
+
+    fn id(self) -> Option<FrameId> {
+        match self {
+            Self::Adopted(frame) => Some(frame),
+            Self::Awaiting | Self::Retired => None,
+        }
+    }
+}
+
+struct GuiStartupParameters {
+    display: BootstrapDisplayConfig,
+    preferred_font: Option<String>,
+    publisher: startup_frame::InitialWindowPublisher,
+    primary_frame: Arc<Mutex<Option<FrameId>>>,
+    pending_request: Option<GuiFrameHostRequest>,
 }
 
 #[derive(Clone)]
@@ -1457,27 +1513,19 @@ fn read_primary_window_size(shared: &SharedPrimaryWindowSize) -> PrimaryWindowSi
 }
 
 fn prime_initial_monitor_snapshot(shared: &SharedMonitorInfo) {
-    let (lock, cvar) = &**shared;
+    let (lock, ready) = &**shared;
     let monitors = match lock.lock() {
-        Ok(guard) => {
-            if guard.is_empty() {
-                match cvar.wait_timeout(guard, Duration::from_secs(2)) {
-                    Ok((guard, _)) => guard.clone(),
-                    Err(poisoned) => {
-                        let (guard, _) = poisoned.into_inner();
-                        guard.clone()
-                    }
-                }
-            } else {
-                guard.clone()
-            }
-        }
+        Ok(guard) => match ready.wait_timeout_while(guard, Duration::from_secs(2), |monitors| {
+            monitors.is_empty()
+        }) {
+            Ok((guard, _)) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().0.clone(),
+        },
         Err(poisoned) => poisoned.into_inner().clone(),
     };
-
-    if !monitors.is_empty() {
-        set_neomacs_monitor_info(input_bridge::convert_monitor_infos(&monitors));
-    }
+    neovm_core::emacs_core::builtins::set_neomacs_monitor_info(
+        input_bridge::convert_monitor_infos(&monitors),
+    );
 }
 
 fn record_primary_window_resize(shared: &SharedPrimaryWindowSize, event: &DisplayInputEvent) {
@@ -1517,8 +1565,22 @@ impl PrimaryWindowDisplayHost {
         service
     }
 
+    fn pending_primary_request_mut(
+        &mut self,
+        frame_id: FrameId,
+    ) -> Option<&mut GuiFrameHostRequest> {
+        if self.primary_frame.id() != Some(frame_id) {
+            return None;
+        }
+        let startup = self.gui_startup.as_mut()?;
+        if !startup.publisher.is_waiting() {
+            return None;
+        }
+        startup.pending_request.as_mut()
+    }
+
     fn frame_ref_for_gui_frame(&self, frame_id: FrameId) -> FrameRef {
-        if !self.primary_window_adopted || self.primary_frame_id == Some(frame_id) {
+        if self.primary_frame.is_awaiting() || self.primary_frame.id() == Some(frame_id) {
             FrameRef::Primary
         } else {
             FrameRef::Frame(frame_id.0)
@@ -1594,6 +1656,115 @@ fn render_fullscreen_mode(fullscreen: FrameFullscreen) -> WindowFullscreenMode {
 }
 
 impl DisplayHost for PrimaryWindowDisplayHost {
+    fn fail_pending_gui_startup(&mut self, error: String) -> bool {
+        let Some(startup) = self.gui_startup.as_ref() else {
+            return false;
+        };
+        if !startup.publisher.is_waiting() {
+            return false;
+        }
+        startup.publisher.fail(error);
+        true
+    }
+
+    fn prepare_initial_gui_frame(
+        &mut self,
+    ) -> Result<Option<neovm_core::emacs_core::display_host::InitialGuiFrameDefaults>, String> {
+        let Some(startup) = self
+            .gui_startup
+            .as_ref()
+            .filter(|_| self.primary_frame.is_awaiting())
+        else {
+            return Ok(None);
+        };
+        let Some(font) =
+            startup_font::StartupFont::select(&startup.display, startup.preferred_font.as_deref())
+        else {
+            let error = startup_frame::StartupFrameError::NoUsableFont.to_string();
+            return Err(error);
+        };
+        let (width, height) = startup_dimensions(FrontendKind::Gui, font.metrics(), false);
+        let selected = font.into_selected();
+        let height_tenths = startup
+            .display
+            .font_sizing()
+            .face_height_tenths_for_layout_pixels(selected.metrics.pixel_size.max(1));
+        let BootstrapDisplayKind::Gui { identity, .. } = &startup.display.kind else {
+            return Err("initial GUI frame requires a graphical connection".into());
+        };
+        Ok(Some(
+            neovm_core::emacs_core::display_host::InitialGuiFrameDefaults {
+                display: identity.clone(),
+                font: ResolvedFrameFont {
+                    font: core_opened_font_from_selection(selected, font_otf_capability_for_file),
+                    height_tenths,
+                },
+                size: GuiFrameHostSize { width, height },
+            },
+        ))
+    }
+
+    fn finish_gui_frame_creation(&mut self, request: GuiFrameHostRequest) -> Result<(), String> {
+        let Some(startup) = self.gui_startup.as_ref() else {
+            return Ok(());
+        };
+        if self.primary_frame.id() != Some(request.frame_id) || !startup.publisher.is_waiting() {
+            return Ok(());
+        }
+        // A font setter can request geometry before a native allocation
+        // exists. Retain its target while the logical frame awaits configure.
+        let size = startup.pending_request.as_ref().map_or(
+            PrimaryWindowSize {
+                width: request.width,
+                height: request.height,
+            },
+            |pending| PrimaryWindowSize {
+                width: pending.width,
+                height: pending.height,
+            },
+        );
+        *self
+            .primary_window_size
+            .lock()
+            .map_err(|error| error.to_string())? = size;
+        // Publish only the surviving logical frame's final native intent.
+        // An abandoned raw constructor has not queued commands for a window
+        // that a later constructor might otherwise inherit.
+        for command in [
+            WindowCommand::SetWindowTitle {
+                title: request.title.as_utf8_str().unwrap_or("Neomacs").to_owned(),
+            },
+            WindowCommand::SetFrameGeometryHints {
+                frame: FrameRef::Primary,
+                geometry_hints: request.geometry_hints,
+            },
+            WindowCommand::AdoptPrimaryFrame {
+                frame: FrameRef::Frame(request.frame_id.0),
+            },
+            WindowCommand::SetWindowFullscreen {
+                frame: FrameRef::Primary,
+                mode: render_fullscreen_mode(
+                    request.fullscreen.unwrap_or(FrameFullscreen::Windowed),
+                ),
+            },
+        ] {
+            self.send_render_command(
+                RenderCommand::Window(command),
+                "failed to finalize initial GUI frame",
+            )?;
+        }
+        startup.publisher.complete(
+            neomacs_display_runtime::render_thread::InitialWindowPreparation {
+                size: neomacs_display_runtime::render_thread::InitialWindowSize {
+                    width: size.width,
+                    height: size.height,
+                },
+                visibility: request.visibility.into(),
+                decorated: request.decorated,
+            },
+        )
+    }
+
     #[cfg(target_os = "macos")]
     fn ns_resource(&self, name: &str) -> Option<String> {
         self.resources.ns_resource(name)
@@ -1635,46 +1806,54 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         tracing::debug!(
             "PrimaryWindowDisplayHost::realize_gui_frame fid=0x{:x} adopted={} size={}x{} title={}",
             request.frame_id.0,
-            self.primary_window_adopted,
+            !self.primary_frame.is_awaiting(),
             request.width,
             request.height,
             title_string
         );
-        if !self.primary_window_adopted {
-            let fullscreen_frame = FrameRef::Primary;
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::SetWindowTitle {
-                    title: title_string.clone(),
-                }),
-                "failed to update primary window title",
-            )?;
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
-                    frame: FrameRef::Primary,
-                    geometry_hints: request.geometry_hints,
-                }),
-                "failed to update primary window geometry hints",
-            )?;
-            self.send_render_command(
-                RenderCommand::Window(WindowCommand::AdoptPrimaryFrame {
-                    frame: FrameRef::Frame(request.frame_id.0),
-                }),
-                "failed to adopt primary GUI frame",
-            )?;
-            // The opening GUI frame adopts the already-existing primary host
-            // window. Do not push stale Lisp bootstrap dimensions back into
-            // that window during adoption; host resize events remain the
-            // source of truth until the window is fully realized.
-            self.primary_window_adopted = true;
-            self.primary_frame_id = Some(request.frame_id);
-            if let Some(fullscreen) = request.fullscreen {
+        if self.primary_frame.is_awaiting() {
+            self.primary_frame = PrimaryFrame::Adopted(request.frame_id);
+            let preparing = if let Some(startup) = &mut self.gui_startup
+                && startup.publisher.is_waiting()
+            {
+                *startup
+                    .primary_frame
+                    .lock()
+                    .map_err(|error| error.to_string())? = Some(request.frame_id);
+                startup.pending_request = Some(request.clone());
+                true
+            } else {
+                false
+            };
+            if !preparing {
                 self.send_render_command(
-                    RenderCommand::Window(WindowCommand::SetWindowFullscreen {
-                        frame: fullscreen_frame,
-                        mode: render_fullscreen_mode(fullscreen),
+                    RenderCommand::Window(WindowCommand::SetWindowTitle {
+                        title: title_string.clone(),
                     }),
-                    "failed to set primary GUI frame fullscreen mode",
+                    "failed to update primary window title",
                 )?;
+                self.send_render_command(
+                    RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
+                        frame: FrameRef::Primary,
+                        geometry_hints: request.geometry_hints,
+                    }),
+                    "failed to update primary window geometry hints",
+                )?;
+                self.send_render_command(
+                    RenderCommand::Window(WindowCommand::AdoptPrimaryFrame {
+                        frame: FrameRef::Frame(request.frame_id.0),
+                    }),
+                    "failed to adopt primary GUI frame",
+                )?;
+                if let Some(fullscreen) = request.fullscreen {
+                    self.send_render_command(
+                        RenderCommand::Window(WindowCommand::SetWindowFullscreen {
+                            frame: FrameRef::Primary,
+                            mode: render_fullscreen_mode(fullscreen),
+                        }),
+                        "failed to set primary GUI frame fullscreen mode",
+                    )?;
+                }
             }
         } else {
             let fullscreen_frame = FrameRef::Frame(request.frame_id.0);
@@ -1686,6 +1865,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
                     title: title_string,
                     geometry_hints: request.geometry_hints,
                     override_redirect: request.override_redirect,
+                    visibility: request.visibility.into(),
                 }),
                 "failed to create additional GUI window",
             )?;
@@ -1789,7 +1969,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
     }
 
     fn opening_gui_frame_pending(&self) -> bool {
-        !self.primary_window_adopted
+        self.primary_frame.is_awaiting()
     }
 
     fn native_x11_window_ids(&self, frame_id: neovm_core::window::FrameId) -> Option<(u64, u64)> {
@@ -1797,7 +1977,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         // The primary window is recorded under id 0 until the render thread
         // processes AdoptPrimaryFrame; fall back to it only for that frame.
         let entry = ids.get(&frame_id.0).or_else(|| {
-            (self.primary_frame_id == Some(frame_id))
+            (self.primary_frame.id() == Some(frame_id))
                 .then(|| ids.get(&0))
                 .flatten()
         })?;
@@ -1837,16 +2017,29 @@ impl DisplayHost for PrimaryWindowDisplayHost {
     }
 
     fn destroy_gui_frame(&mut self, frame_id: neovm_core::window::FrameId) -> Result<(), String> {
-        let frame = if self.primary_frame_id == Some(frame_id) {
-            self.primary_frame_id = None;
-            FrameRef::Primary
-        } else {
-            FrameRef::Frame(frame_id.0)
-        };
         self.last_window_titles
             .lock()
             .map_err(|err| format!("failed to forget GUI frame title: {err}"))?
             .remove(&frame_id);
+        let frame = if self.primary_frame.id() == Some(frame_id) {
+            if let Some(startup) = self.gui_startup.as_mut()
+                && startup.publisher.is_waiting()
+            {
+                // No native window has been published. A later constructor
+                // can claim the same one-shot preparation capability.
+                *startup
+                    .primary_frame
+                    .lock()
+                    .map_err(|error| error.to_string())? = None;
+                startup.pending_request = None;
+                self.primary_frame = PrimaryFrame::Awaiting;
+                return Ok(());
+            }
+            self.primary_frame = PrimaryFrame::Retired;
+            FrameRef::Primary
+        } else {
+            FrameRef::Frame(frame_id.0)
+        };
         self.send_render_command(
             RenderCommand::Window(WindowCommand::DestroyWindow { frame }),
             "failed to destroy GUI frame window",
@@ -1854,7 +2047,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
     }
 
     fn show_popup_menu(&mut self, menu: PopupMenuRequest) -> Result<(), String> {
-        let frame = if self.primary_frame_id == Some(menu.frame_id) {
+        let frame = if self.primary_frame.id() == Some(menu.frame_id) {
             FrameRef::Primary
         } else {
             FrameRef::Frame(menu.frame_id.0)
@@ -1888,7 +2081,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         self.send_render_command(
             RenderCommand::Ui(UiCommand::PresentTooltip {
                 ticket,
-                frame: if self.primary_frame_id == Some(frame) {
+                frame: if self.primary_frame.id() == Some(frame) {
                     FrameRef::Primary
                 } else {
                     FrameRef::Frame(frame.0)
@@ -1925,7 +2118,17 @@ impl DisplayHost for PrimaryWindowDisplayHost {
     }
 
     fn resize_gui_frame(&mut self, request: GuiFrameHostRequest) -> Result<(), String> {
-        let frame = if self.primary_frame_id == Some(request.frame_id) {
+        if let Some(pending) = self.pending_primary_request_mut(request.frame_id) {
+            // Resize requests carry geometry; a staged fullscreen change
+            // remains part of this constructor until Lisp finalizes it.
+            let fullscreen = request.fullscreen.or(pending.fullscreen);
+            *pending = GuiFrameHostRequest {
+                fullscreen,
+                ..request
+            };
+            return Ok(());
+        }
+        let frame = if self.primary_frame.id() == Some(request.frame_id) {
             FrameRef::Primary
         } else {
             FrameRef::Frame(request.frame_id.0)
@@ -1954,6 +2157,10 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         frame_id: neovm_core::window::FrameId,
         geometry_hints: neovm_core::window::GuiFrameGeometryHints,
     ) -> Result<(), String> {
+        if let Some(request) = self.pending_primary_request_mut(frame_id) {
+            request.geometry_hints = geometry_hints;
+            return Ok(());
+        }
         let frame = self.frame_ref_for_gui_frame(frame_id);
         self.send_render_command(
             RenderCommand::Window(WindowCommand::SetFrameGeometryHints {
@@ -1970,6 +2177,10 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         frame_id: neovm_core::window::FrameId,
         fullscreen: FrameFullscreen,
     ) -> Result<(), String> {
+        if let Some(request) = self.pending_primary_request_mut(frame_id) {
+            request.fullscreen = Some(fullscreen);
+            return Ok(());
+        }
         let frame = self.frame_ref_for_gui_frame(frame_id);
         self.send_render_command(
             RenderCommand::Window(WindowCommand::SetWindowFullscreen {
@@ -1986,12 +2197,18 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         frame_id: neovm_core::window::FrameId,
         visibility: FrameVisibility,
     ) -> Result<(), String> {
+        if let Some(request) = self.pending_primary_request_mut(frame_id) {
+            request.visibility = visibility;
+            if !visibility.is_visible() {
+                return Ok(());
+            }
+            // The faces wrapper exposes its frame after delayed parameters;
+            // raw constructors can explicitly complete preparation here too.
+            let request = request.clone();
+            self.finish_gui_frame_creation(request)?;
+        }
         let frame = self.frame_ref_for_gui_frame(frame_id);
-        let visibility = match visibility {
-            FrameVisibility::Visible => WindowVisibility::Visible,
-            FrameVisibility::Iconified => WindowVisibility::Iconified,
-            FrameVisibility::Invisible => WindowVisibility::Invisible,
-        };
+        let visibility = visibility.into();
         self.send_render_command(
             RenderCommand::Window(WindowCommand::SetWindowVisibility { frame, visibility }),
             "failed to update GUI frame visibility",
@@ -2053,9 +2270,13 @@ impl DisplayHost for PrimaryWindowDisplayHost {
 
     fn set_gui_frame_undecorated(
         &mut self,
-        _frame_id: neovm_core::window::FrameId,
+        frame_id: neovm_core::window::FrameId,
         undecorated: bool,
     ) -> Result<(), String> {
+        if let Some(request) = self.pending_primary_request_mut(frame_id) {
+            request.decorated = !undecorated;
+            return Ok(());
+        }
         self.send_render_command(
             RenderCommand::Window(WindowCommand::SetWindowDecorations {
                 decorated: !undecorated,
@@ -2082,8 +2303,12 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         cached_titles.insert(frame_id, title.clone());
         drop(cached_titles);
 
+        if let Some(request) = self.pending_primary_request_mut(frame_id) {
+            request.title = title;
+            return Ok(());
+        }
         let title_string = title.as_utf8_str().unwrap_or("Neomacs").to_owned();
-        let frame = if self.primary_frame_id == Some(frame_id) {
+        let frame = if self.primary_frame.id() == Some(frame_id) {
             FrameRef::Primary
         } else {
             FrameRef::Frame(frame_id.0)
@@ -2099,7 +2324,7 @@ impl DisplayHost for PrimaryWindowDisplayHost {
     }
 
     fn current_primary_window_size(&self) -> Option<GuiFrameHostSize> {
-        if self.primary_window_adopted {
+        if !self.primary_frame.is_awaiting() {
             return None;
         }
         let state = read_primary_window_size(&self.primary_window_size);
@@ -2113,6 +2338,23 @@ impl DisplayHost for PrimaryWindowDisplayHost {
         self.send_render_command(
             RenderCommand::Config(ConfigCommand::SetVisualConfig(config)),
             "failed to set visual configuration",
+        )
+    }
+
+    fn set_scroll_indicators(&mut self, enabled: bool) -> Result<(), String> {
+        self.send_render_command(
+            RenderCommand::Config(ConfigCommand::SetScrollIndicators { enabled }),
+            "failed to set scroll indicators",
+        )
+    }
+
+    fn set_extra_spacing(&mut self, line_spacing: f32, letter_spacing: f32) -> Result<(), String> {
+        self.send_render_command(
+            RenderCommand::Config(ConfigCommand::SetExtraSpacing {
+                line_spacing,
+                letter_spacing,
+            }),
+            "failed to set extra spacing",
         )
     }
 
@@ -3132,6 +3374,7 @@ fn frame_host_title(eval: &mut Context, frame_id: FrameId) -> LispString {
     }
 }
 
+#[cfg(test)]
 fn adopt_existing_primary_gui_frame(eval: &mut Context) -> Result<(), String> {
     if eval
         .display_host
@@ -3140,10 +3383,18 @@ fn adopt_existing_primary_gui_frame(eval: &mut Context) -> Result<(), String> {
     {
         return Ok(());
     }
-    let Some((frame_id, width, height)) = eval
-        .frame_manager()
-        .selected_frame()
-        .map(|frame| (frame.id, frame.width, frame.height))
+    let Some((frame_id, width, height, visibility, decorated)) =
+        eval.frame_manager().selected_frame().map(|frame| {
+            (
+                frame.id,
+                frame.width,
+                frame.height,
+                frame.visibility,
+                frame
+                    .known_parameter(FrameParam::Undecorated)
+                    .is_none_or(|value| value.is_nil()),
+            )
+        })
     else {
         return Ok(());
     };
@@ -3177,6 +3428,8 @@ fn adopt_existing_primary_gui_frame(eval: &mut Context) -> Result<(), String> {
         height,
         title,
         geometry_hints,
+        visibility,
+        decorated,
         fullscreen,
         override_redirect: false,
     })
@@ -3231,12 +3484,10 @@ fn initialize_reused_gui_startup_frame(eval: &mut Context, frame_id: FrameId) {
         frame.set_known_parameter(FrameParam::ToolBarLines, Value::fixnum(1));
     }
 
-    // GNU startup calls `window-system-initialization`, then
-    // `frame-initialize`; the opening GUI frame is created through
-    // `faces.el:x-create-frame-with-faces`.  Neomacs creates the host
-    // GUI frame before Lisp startup and reuses it as `frame-initial-frame`,
-    // so run the frame-local Lisp side effects that GNU's creation path
-    // applies after `x-create-frame` returns.
+    // Callers bootstrapping an existing GUI frame, including isolated test
+    // fixtures, bypass faces.el:x-create-frame-with-faces. Apply its frame-local
+    // Lisp initialization here. The GUI worker instead starts with a terminal
+    // and lets Lisp create its opening graphical frame normally.
     run_reused_gui_startup_frame_lisp(
         eval,
         frame_id,
@@ -3597,8 +3848,10 @@ fn run_gui_main_thread(
     font_observer: neomacs_display_runtime::font_defaults::FontDefaultsObserver,
 ) {
     let render_waker = GuiEventLoopWaker::new(event_loop.create_proxy());
+    let image_decoder = neomacs_display_runtime::render_thread::ImageDecoder::new();
+    let image_decode_client = image_decoder.client();
 
-    let comms = ThreadComms::new();
+    let comms = ThreadComms::new().with_image_decoder(image_decoder);
     let (emacs_comms, render_comms) = comms.split();
     let (startup_reply, startup_ready) =
         neomacs_display_runtime::render_thread::InitialWindowReply::channel(
@@ -3617,6 +3870,7 @@ fn run_gui_main_thread(
         bootstrap_display,
         font_observer,
         emacs_comms,
+        image_decode_client,
         Arc::clone(&gui_image_metadata),
         Arc::clone(&shared_monitors),
         #[cfg(feature = "neo-term")]
@@ -3734,6 +3988,7 @@ fn spawn_gui_evaluator_worker(
     bootstrap_display: BootstrapDisplayConfig,
     font_observer: neomacs_display_runtime::font_defaults::FontDefaultsObserver,
     emacs_comms: EmacsComms,
+    image_decode_client: neomacs_display_runtime::render_thread::ImageDecodeClient,
     gui_image_metadata: SharedImageRenderState,
     shared_monitors: SharedMonitorInfo,
     #[cfg(feature = "neo-term")] shared_terminals: SharedTerminals,
@@ -3758,6 +4013,7 @@ fn spawn_gui_evaluator_worker(
                     bootstrap_display,
                     font_observer,
                     emacs_comms,
+                    image_decode_client,
                     gui_image_metadata,
                     shared_monitors,
                     #[cfg(feature = "neo-term")]
@@ -3878,6 +4134,7 @@ fn run_gui_evaluator_worker(
     bootstrap_display: BootstrapDisplayConfig,
     mut font_observer: neomacs_display_runtime::font_defaults::FontDefaultsObserver,
     emacs_comms: EmacsComms,
+    image_decode_client: neomacs_display_runtime::render_thread::ImageDecodeClient,
     gui_image_metadata: SharedImageRenderState,
     shared_monitors: SharedMonitorInfo,
     #[cfg(feature = "neo-term")] shared_terminals: SharedTerminals,
@@ -3885,6 +4142,10 @@ fn run_gui_evaluator_worker(
 ) -> EvaluatorExit {
     let mut evaluator = create_startup_evaluator_for_mode(mode, &startup);
     evaluator.setup_thread_locals();
+    // The native event loop publishes connection metadata before it creates
+    // any window. Install it synchronously so init.el can query the display
+    // even before the command loop starts draining native input events.
+    prime_initial_monitor_snapshot(&shared_monitors);
     reset_terminal_host();
     reset_terminal_runtime();
     // GNU's `x_term_init'/`pgtk_term_init' create an output_x_window/output_pgtk
@@ -3897,7 +4158,7 @@ fn run_gui_evaluator_worker(
     let BootstrapDisplayKind::Gui { identity, .. } = &bootstrap_display.kind else {
         unreachable!("GUI evaluator requires graphical bootstrap configuration");
     };
-    configure_terminal_runtime(TerminalRuntimeConfig::window_system(identity.clone()));
+    evaluator.initialize_graphical_terminal(identity.clone());
     let font_display = identity.clone();
     evaluator.set_variable("dump-mode", Value::NIL);
     // GNU's window-system terminal inits do not measure a line speed, they
@@ -3908,39 +4169,27 @@ fn run_gui_evaluator_worker(
     tracing::info!("GUI evaluator context initialized");
 
     let (resources, preferred_font) = startup.gui.prepare(&invocation_name());
-    let prepared = match startup_frame::PreparedGuiFrame::prepare(
-        bootstrap_display.clone(),
-        preferred_font.as_deref(),
-    ) {
-        Ok(frame) => frame,
-        Err(error) => {
-            startup_reply.failed(error.to_string());
-            return EvaluatorExit::STARTUP_FAILED;
-        }
-    };
-    let size = prepared.size();
-    let primary_window_size: SharedPrimaryWindowSize = Arc::new(Mutex::new(size));
-    let Some(_native_startup) =
-        startup_reply.ready(neomacs_display_runtime::render_thread::InitialWindowSize {
-            width: size.width,
-            height: size.height,
-        })
-    else {
-        return EvaluatorExit::STARTUP_FAILED;
-    };
-    let _bootstrap = prepared.install(&mut evaluator);
-    let frame_id = evaluator
-        .frame_manager()
-        .selected_frame()
-        .expect("No selected frame after bootstrap")
-        .id;
+    let native_startup = startup_frame::InitialWindowOwner::new(startup_reply);
+    let primary_frame = Arc::new(Mutex::new(None));
+    let primary_window_size: SharedPrimaryWindowSize = Arc::new(Mutex::new(PrimaryWindowSize {
+        width: 0,
+        height: 0,
+    }));
+    let frame_id = bootstrap_gui_startup_terminal(&mut evaluator);
+    seed_gnu_default_gui_chrome_modes(&mut evaluator);
     configure_gnu_startup_state(&mut evaluator, frame_id, &startup);
     maybe_install_startup_phase_trace(&mut evaluator);
 
     // Created before the display host: the image catalog resolves geometry
     // off-thread and must be able to ask for the redisplay that publishes it.
-    let (input_tx, input_rx) = crossbeam_channel::unbounded();
-    let image_redisplay_waker = RedisplayWaker::new(input_tx.clone(), evaluator.wait_notifier());
+    let input = neovm_core::host_input::HostInputPublisher::install(&mut evaluator);
+    let mut input_publisher = InputPublisher::new(
+        input.clone(),
+        InputRoute::gui(Arc::clone(&primary_frame)),
+        Arc::clone(&primary_window_size),
+        evaluator.quit_requested.clone(),
+    );
+    let image_redisplay_waker = RedisplayWaker::new(input.clone());
     evaluator.set_display_host(Box::new(PrimaryWindowDisplayHost {
         resources,
         system_fonts: bootstrap_display.font_defaults.system_fonts(),
@@ -3950,8 +4199,14 @@ fn run_gui_evaluator_worker(
         cmd_tx: emacs_comms.cmd_tx.clone(),
         render_waker: Some(render_waker.clone()),
         font_sizing: bootstrap_display.font_sizing(),
-        primary_window_adopted: false,
-        primary_frame_id: None,
+        primary_frame: PrimaryFrame::Awaiting,
+        gui_startup: Some(GuiStartupParameters {
+            display: bootstrap_display.clone(),
+            preferred_font,
+            publisher: native_startup.publisher(),
+            primary_frame: Arc::clone(&primary_frame),
+            pending_request: None,
+        }),
         native_window_ids: Arc::clone(&emacs_comms.native_window_ids),
         x11_backend: identity.backend()
             == neomacs_display_protocol::GraphicalBackend::X11,
@@ -3964,6 +4219,7 @@ fn run_gui_evaluator_worker(
             Some(render_waker.clone()),
             Arc::clone(&gui_image_metadata),
             Some(image_redisplay_waker),
+            image_decode_client,
         )),
         #[cfg(feature = "video")]
         resolved_videos: Mutex::new(ResolvedVideoRegistry::default()),
@@ -3975,23 +4231,11 @@ fn run_gui_evaluator_worker(
         #[cfg(feature = "neo-term")]
         terminal_state: TerminalHostState::new(shared_terminals),
     }));
-    adopt_existing_primary_gui_frame(&mut evaluator)
-        .expect("bootstrap GUI frame adoption should succeed");
-
-    prime_initial_monitor_snapshot(&shared_monitors);
-
     let secondary_ttys = secondary_tty::SecondaryTtyRegistry::default();
     let display_input_rx = emacs_comms.input_rx;
     let mut font_changes = font_observer.take_changes();
-    let primary_window_size_for_input = Arc::clone(&primary_window_size);
-    let quit_requested = evaluator.quit_requested.clone();
-    // Cross-platform wakeup: wake the evaluator's wait loop AFTER queueing input
-    // so it drains the channel immediately. Correct ordering (post-send) and
-    // works on every OS, unlike the Unix-only wakeup pipe.
-    let input_notifier = evaluator.wait_notifier();
-    let secondary_input_tx = input_tx.clone();
-    let secondary_input_notifier = input_notifier.clone();
-    let secondary_quit_requested = quit_requested.clone();
+    let secondary_input_tx = input;
+    let secondary_quit_requested = evaluator.quit_requested.clone();
     std::thread::Builder::new()
         .name("input-bridge".to_string())
         .spawn(move || {
@@ -4006,84 +4250,39 @@ fn run_gui_evaluator_worker(
                             font_changes = crossbeam_channel::never();
                             continue;
                         };
-                        if input_tx.send(neovm_core::keyboard::InputEvent::SystemFontsChanged {
-                            fonts,
-                            display: font_display.clone(),
-                        }).is_err() {
-                            break;
-                        }
-                        if let Some(notifier) = &input_notifier
-                            && let Err(error) = notifier.notify()
-                        {
-                            tracing::error!(%error, "font preferences failed to wake evaluator");
+                        match input_publisher.publish_core(
+                            neovm_core::keyboard::InputEvent::SystemFontsChanged {
+                                fonts,
+                                display: font_display.clone(),
+                            },
+                        ) {
+                            Publication::Delivered => {}
+                            Publication::ReceiverClosed => break,
                         }
                         continue;
                     }
                 };
-                let should_log = input_bridge::should_log_display_event(&event);
-                if should_log {
-                    tracing::debug!("input-bridge: received display event {:?}", event);
-                }
-                record_primary_window_resize(&primary_window_size_for_input, &event);
-                let mut queued_input = false;
-                let mut evaluator_disconnected = false;
-                for mut kb_event in input_bridge::convert_display_event(&event) {
-                    // Before renderer adoption, zero identifies the original
-                    // native window. Lisp may already have selected a child;
-                    // resolve that transport alias before queuing the resize.
-                    if let neovm_core::keyboard::InputEvent::Resize { emacs_frame_id, .. } =
-                        &mut kb_event
-                        && *emacs_frame_id == 0
-                    {
-                        *emacs_frame_id = frame_id.0;
-                    }
-                    if should_log {
-                        tracing::debug!(
-                            "input-bridge: converted display event {:?} to keyboard event {:?}",
-                            event,
-                            kb_event
-                        );
-                    }
-                    if kb_event.requests_default_quit() {
-                        quit_requested.request();
-                    }
-                    if input_tx.send(kb_event).is_err() {
-                        evaluator_disconnected = true;
-                        break;
-                    }
-                    queued_input = true;
-                }
-                if evaluator_disconnected {
-                    break;
-                }
-                if queued_input
-                    && let Some(notifier) = &input_notifier
-                    && let Err(error) = notifier.notify()
-                {
-                    tracing::error!(%error, "input bridge failed to wake evaluator");
+                match input_publisher.publish_display(&event) {
+                    Publication::Delivered => {}
+                    Publication::ReceiverClosed => break,
                 }
             }
         })
         .expect("Failed to spawn input bridge thread");
 
-    evaluator.init_input_system(input_rx);
+    evaluator.init_input_system();
     evaluator.set_tty_frame_host_factory(Box::new(secondary_tty::SecondaryTtyFactory::new(
         secondary_ttys.clone(),
         secondary_input_tx,
-        secondary_input_notifier,
         secondary_quit_requested,
     )));
     install_diagnostics_eval_hooks(&mut evaluator);
 
-    frame_layout::REDISPLAY_RUNTIME.with(|runtime| {
-        runtime.enable_cosmic_metrics();
-        runtime.set_font_sizing(bootstrap_display.font_sizing());
-    });
+    frame_layout::configure_gui_runtime(bootstrap_display.font_sizing());
     let preview_tx = emacs_comms.cmd_tx.clone();
     let preview_waker = render_waker.clone();
     evaluator.scroll_preview_fn = Some(Box::new(move |eval, frame, window, inputs| {
-        let intent = frame_layout::REDISPLAY_RUNTIME
-            .with(|runtime| runtime.resolved_scroll_preview(eval, frame, window, inputs));
+        let intent = frame_layout::resolved_scroll_preview(eval, frame, window, inputs);
         if let Some(intent) = intent
             && preview_tx
                 .try_send(neomacs_display_runtime::thread_comm::RenderCommand::Window(
@@ -4095,7 +4294,6 @@ fn run_gui_evaluator_worker(
         }
     }));
     let frame_tx = emacs_comms.frame_tx;
-    let initial_frame_tx = frame_tx.clone();
     let redisplay_waker = render_waker.clone();
     let secondary_ttys_for_redisplay = secondary_ttys.clone();
     evaluator.redisplay_fn = Some(Box::new(move |eval: &mut Context| {
@@ -4106,7 +4304,8 @@ fn run_gui_evaluator_worker(
     frame_layout::install_frame_snapshot_fn(&mut evaluator);
     frame_layout::install_window_layout_query_fn(&mut evaluator);
     frame_layout::install_font_shape_driver(&mut evaluator);
-    publish_gui_frame(&mut evaluator, &initial_frame_tx, Some(&render_waker));
+    // Lisp's frame-initialize will create the first GUI frame. Publishing the
+    // startup terminal as a GUI scene would expose the same premature frame.
 
     if let Some(buf) = evaluator.buffer_manager_mut().current_buffer_mut() {
         let mut ul = buf.get_undo_list();
@@ -4456,6 +4655,15 @@ pub fn run(mode: RuntimeMode) {
         std::process::exit(1);
     });
 
+    // Collapse after daemon::prepare so the post-fork serving process benefits;
+    // the pre-fork parent would waste it. --help/--version already exited, so
+    // they never spawn this thread. Running before tracing initialization adds
+    // no subscriber-ordering constraint. The background thread keeps collapse
+    // off the startup critical path (measured 1.4–3.1 ms warm, 43–105 ms cold
+    // once per binary per boot; tmp/t12/DESIGN.md).
+    #[cfg(target_os = "linux")]
+    text_huge_pages::start_background_collapse();
+
     // GNU parses `--no-site-lisp` (and `-Q` / `-x`) into a C global that
     // `init_lread` reads while it builds `load-path` (src/emacs.c:2126,
     // src/lread.c:5514).  neovm-core never sees argv, so hand it the
@@ -4536,12 +4744,12 @@ pub fn run(mode: RuntimeMode) {
         Interactivity::from_noninteractive(startup.noninteractive || startup.daemon.is_some());
     let mut gui_font_observer = None;
     let bootstrap_display = if let Some(event_loop) = gui_event_loop.as_ref() {
-        let observation = observe_event_loop_display(event_loop);
+        let observation = event_loop.display_observation();
         let system_name: String = hostname::get()
             .map(|name| name.to_string_lossy().replace([' ', '\t'], "-"))
             .unwrap_or_else(|_| "localhost".into());
-        let identity = display_identity_resolver
-            .resolve(event_loop, &system_name)
+        let identity = event_loop
+            .display_identity(display_identity_resolver, &system_name)
             .unwrap_or_else(|error| {
                 eprintln!("neomacs: failed to resolve graphical display identity: {error:?}");
                 std::process::exit(1);
@@ -4656,174 +4864,146 @@ pub fn run(mode: RuntimeMode) {
     let tty_popup_force_full_redraw = Arc::new(AtomicBool::new(false));
     let secondary_ttys = secondary_tty::SecondaryTtyRegistry::default();
     if tty_init::should_enable_live_tty_io(&startup) {
-        set_terminal_host(Box::new(tty_frontend::TtyTerminalHost {
-            cmd_tx: emacs_comms.cmd_tx.clone(),
-        }));
+        set_terminal_host(Box::new(tty_frontend::TtyTerminalHost::new(
+            emacs_comms.cmd_tx.clone(),
+        )));
         evaluator.set_display_host(Box::new(tty_frontend::TtyPopupDisplayHost::new(
             tty_popup_force_full_redraw.clone(),
         )));
     }
 
-    // 5. Spawn the frontend loop matching the requested startup mode.
-    let frontend = if startup.noninteractive || startup.daemon.is_some() {
-        // Batch mode: no terminal I/O, matching GNU which skips
-        // init_display() for --batch (emacs.c:1835).
+    // Prepare the unbounded native publication owner before the reader can
+    // acquire input. The Context retains it until activation at the original step.
+    let (frontend, input_connection) = if startup.noninteractive {
         tracing::info!("TTY batch mode — skipping terminal init");
-        FrontendHandle::Batch
+        (FrontendHandle::Batch, TtyInputConnection::Noninteractive)
     } else {
-        // Single-thread TTY path: terminal init here, rendering via TtyRif
-        // on the evaluator thread, input reader on a background thread.
-        // GNU init_tty parity: a terminal that cannot position the cursor
-        // cannot run a full-screen editor — refuse while stdout is still
-        // cooked, before any raw-mode or alternate-screen byte.
-        if let Err(diagnostic) = tty_init::tty_check_terminal_powerful_enough() {
-            eprintln!("{diagnostic}");
-            std::process::exit(1);
-        }
-        if let Err(diagnostic) = tty_init::tty_init_terminal() {
-            eprintln!("{diagnostic}");
-            std::process::exit(1);
-        }
-        let input_reader = match tty_frontend::TtyInputReader::spawn(render_comms) {
-            Ok(reader) => reader,
-            Err(error) => {
-                tty_init::tty_shutdown_terminal();
-                tracing::error!(%error, "Failed to start TTY input reader");
-                std::process::exit(1);
-            }
-        };
-        tracing::info!("TTY frontend spawned (TtyRif single-thread redisplay)");
-        FrontendHandle::TtyRifInput(input_reader)
-    };
-
-    // 6. Create input bridge: convert display runtime events → keyboard events.
-    //
-    // GNU Emacs does NOT initialize terminal I/O in --batch mode.
-    // The evaluator runs without any input receiver, so
-    // `input_rx.is_none()` correctly signals batch mode throughout
-    // the keyboard/command-loop code. This prevents blocking on
-    // `rx.recv()` in read_char_with_timeout and avoids spawning
-    // unnecessary threads.
-    if !startup.noninteractive {
-        // This is an interactively displayed session, so its frames show the
-        // menu / tab / tool bars, which occupy rows of the window text area.
-        // Mark each frame and recompute its window geometry so windows (and
-        // their tab / header lines) render below the chrome.  Batch sessions
-        // skip this block, leaving `displays_chrome` false so their
-        // `window-edges` stay GNU-batch-compatible (root at line 0).
-        for frame in evaluator
-            .frame_manager_mut()
-            .frames_mut()
-            .filter(|_| startup.daemon.is_none())
-        {
-            frame.displays_chrome = true;
-            frame.sync_window_area_bounds();
-        }
-
-        let (input_tx, input_rx) = crossbeam_channel::unbounded();
-        let display_input_rx = emacs_comms.input_rx;
-        let primary_window_size_for_input = Arc::clone(&primary_window_size);
-        // Shared quit-request flag. When the bridge sees `C-g` it flips
-        // this so the evaluator's `maybe_quit` can observe it without
-        // waiting for `read_char` to drain the channel. Mirrors GNU's
-        // synchronous keystroke path (`keyboard.c:3812` sets Vquit_flag
-        // immediately); Rust can't longjmp into the evaluator, so we
-        // poll an atomic instead.
-        let quit_requested = evaluator.quit_requested.clone();
-        // Cross-platform wakeup (post-send): see the matching comment on the
-        // other input-bridge path.
-        let input_notifier = evaluator.wait_notifier();
-        let secondary_input_tx = input_tx.clone();
-        let secondary_input_notifier = input_notifier.clone();
-        let secondary_quit_requested = quit_requested.clone();
-        let tty_input_capacity = match &frontend {
-            FrontendHandle::TtyRifInput(reader) => reader.capacity_notifier(),
-            FrontendHandle::Batch => None,
-        };
-        if startup.daemon.is_none() {
-            std::thread::Builder::new()
-            .name("input-bridge".to_string())
-            .spawn(move || {
-                while let Ok(event) = display_input_rx.recv() {
-                    // Return transport capacity independently of evaluator progress.
-                    // The reader arms this wake only after a full bounded send;
-                    // ordinary input therefore requires no extra wakeup syscall.
-                    if let Some(notifier) = &tty_input_capacity
-                        && let Err(error) = notifier.notify_capacity()
-                    {
-                        tracing::error!(%error, "TTY bridge failed to signal input capacity");
-                    }
-                    let should_log = input_bridge::should_log_display_event(&event);
-                    if should_log {
-                        tracing::debug!("input-bridge: received display event {:?}", event);
-                    }
-                    record_primary_window_resize(&primary_window_size_for_input, &event);
-                    let mut queued_input = false;
-                    let mut evaluator_disconnected = false;
-                    for kb_event in input_bridge::convert_display_event(&event) {
-                        if should_log {
-                            tracing::debug!(
-                                "input-bridge: converted display event {:?} to keyboard event {:?}",
-                                event,
-                                kb_event
-                            );
-                        }
-                        if kb_event.requests_default_quit() {
-                            quit_requested.request();
-                        }
-                        if input_tx.send(kb_event).is_err() {
-                            evaluator_disconnected = true;
-                            break;
-                        }
-                        queued_input = true;
-                    }
-                    if evaluator_disconnected {
-                        break; // Context dropped
-                    }
-                    if queued_input
-                        && let Some(notifier) = &input_notifier
-                        && let Err(error) = notifier.notify()
-                    {
-                        tracing::error!(%error, "input bridge failed to wake evaluator");
-                    }
-                }
-            })
-            .expect("Failed to spawn input bridge thread");
-        }
-
-        // 7. Connect evaluator to input system
-        evaluator.init_input_system(input_rx);
-        evaluator.set_tty_frame_host_factory(Box::new(secondary_tty::SecondaryTtyFactory::new(
-            secondary_ttys.clone(),
-            secondary_input_tx,
-            secondary_input_notifier,
-            secondary_quit_requested,
-        )));
-        install_diagnostics_eval_hooks(&mut evaluator);
-    } else if neovm_core::face::realization::enabled() {
-        // GNU allows an explicit make-terminal-frame even in --batch
-        // (frame.c:1754-1823). Install the deferred auxiliary-device factory
-        // without initializing a primary terminal or a keyboard receiver.
-        let (auxiliary_input_tx, _auxiliary_input_rx) = crossbeam_channel::unbounded();
-        let mut factory = secondary_tty::SecondaryTtyFactory::new(
-            secondary_ttys.clone(),
-            auxiliary_input_tx,
-            evaluator.wait_notifier(),
+        let input = neovm_core::host_input::HostInputPublisher::install(&mut evaluator);
+        let input_publisher = PrimaryInputPublisher::new(
+            input.clone(),
+            Arc::clone(&primary_window_size),
             evaluator.quit_requested.clone(),
         );
-        // A noninteractive daemon still installs redisplay immediately below.
-        // Plain --batch waits until make-terminal-frame opens a device
-        // (frame.c:1811) so elb-style batch never builds the display runtime.
-        if startup.daemon.is_none() {
-            let render_registry = secondary_ttys.clone();
-            factory.defer_redisplay_until_open(Box::new(move |eval| {
-                frame_layout::install_headless_tty_redisplay(
-                    eval,
-                    Some(Box::new(move |eval| render_registry.render_selected(eval))),
-                );
-            }));
+        let secondary_factory = secondary_tty::SecondaryTtyFactory::new(
+            secondary_ttys.clone(),
+            input,
+            evaluator.quit_requested.clone(),
+        );
+        let frontend = if startup.daemon.is_some() {
+            // Daemon input belongs only to deferred auxiliary terminals.
+            drop(input_publisher);
+            drop(emacs_comms.input_rx);
+            tracing::info!("TTY daemon mode — skipping terminal init");
+            FrontendHandle::Batch
+        } else {
+            if let Err(diagnostic) = tty_init::tty_check_terminal_powerful_enough() {
+                eprintln!("{diagnostic}");
+                std::process::exit(1);
+            }
+            if let Err(diagnostic) = tty_init::tty_init_terminal() {
+                eprintln!("{diagnostic}");
+                std::process::exit(1);
+            }
+            #[cfg(unix)]
+            let reader_result = {
+                // No bridge owns this unused bounded receiver. RenderComms
+                // still owns the original command and native resource lives.
+                drop(emacs_comms.input_rx);
+                tty_frontend::TtyInputReader::spawn_primary(render_comms, input_publisher)
+            };
+            #[cfg(not(unix))]
+            let reader_result = {
+                let reader = tty_frontend::TtyInputReader::spawn(render_comms);
+                if let Ok(reader) = &reader {
+                    let capacity = reader.capacity_notifier();
+                    let display_input_rx = emacs_comms.input_rx;
+                    let mut input_publisher = input_publisher.into_legacy();
+                    std::thread::Builder::new()
+                        .name("input-bridge".to_string())
+                        .spawn(move || {
+                            while let Ok(event) = display_input_rx.recv() {
+                                if let Some(notifier) = &capacity
+                                    && let Err(error) = notifier.notify_capacity()
+                                {
+                                    tracing::error!(%error, "TTY bridge failed to signal input capacity");
+                                }
+                                match input_publisher.publish_display(&event) {
+                                    Publication::Delivered => {}
+                                    Publication::ReceiverClosed => break,
+                                }
+                            }
+                        })
+                        .expect("Failed to spawn input bridge thread");
+                }
+                reader
+            };
+            let input_reader = match reader_result {
+                Ok(reader) => reader,
+                Err(error) => {
+                    tty_init::tty_shutdown_terminal();
+                    tracing::error!(%error, "Failed to start TTY input reader");
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!("TTY frontend spawned (TtyRif single-thread redisplay)");
+            FrontendHandle::TtyRifInput(input_reader)
+        };
+        (
+            frontend,
+            TtyInputConnection::Interactive { secondary_factory },
+        )
+    };
+
+    // GNU --batch installs no primary keyboard receiver. Interactive daemon
+    // sessions retain secondary input without creating primary TTY I/O.
+    match input_connection {
+        TtyInputConnection::Interactive { secondary_factory } => {
+            // This is an interactively displayed session, so its frames show the
+            // menu / tab / tool bars, which occupy rows of the window text area.
+            // Mark each frame and recompute its window geometry so windows (and
+            // their tab / header lines) render below the chrome.  Batch sessions
+            // skip this block, leaving `displays_chrome` false so their
+            // `window-edges` stay GNU-batch-compatible (root at line 0).
+            for frame in evaluator
+                .frame_manager_mut()
+                .frames_mut()
+                .filter(|_| startup.daemon.is_none())
+            {
+                frame.displays_chrome = true;
+                frame.sync_window_area_bounds();
+            }
+
+            // Connect the evaluator at the original post-frontend step.
+            evaluator.init_input_system();
+            evaluator.set_tty_frame_host_factory(Box::new(secondary_factory));
+            install_diagnostics_eval_hooks(&mut evaluator);
         }
-        evaluator.set_tty_frame_host_factory(Box::new(factory));
+        TtyInputConnection::Noninteractive => {
+            if neovm_core::face::realization::enabled() {
+                // GNU allows an explicit make-terminal-frame even in --batch
+                // (frame.c:1754-1823). Install the deferred auxiliary-device factory
+                // without initializing a primary terminal or a keyboard receiver.
+                let auxiliary_input_tx = neovm_core::host_input::HostInputPublisher::closed();
+                let mut factory = secondary_tty::SecondaryTtyFactory::new(
+                    secondary_ttys.clone(),
+                    auxiliary_input_tx,
+                    evaluator.quit_requested.clone(),
+                );
+                // A noninteractive daemon still installs redisplay immediately below.
+                // Plain --batch waits until make-terminal-frame opens a device
+                // (frame.c:1811) so elb-style batch never builds the display runtime.
+                if startup.daemon.is_none() {
+                    let render_registry = secondary_ttys.clone();
+                    factory.defer_redisplay_until_open(Box::new(move |eval| {
+                        frame_layout::install_headless_tty_redisplay(
+                            eval,
+                            Some(Box::new(move |eval| render_registry.render_selected(eval))),
+                        );
+                    }));
+                }
+                evaluator.set_tty_frame_host_factory(Box::new(factory));
+            }
+        }
     }
 
     // 8. Set up redisplay callback (layout engine + TTY RIF render).
@@ -4947,7 +5127,43 @@ fn run_temacs_dump_mode(dump_mode: LoadupDumpMode, startup: &StartupOptions) {
 }
 
 #[allow(dead_code)]
+fn register_workspace_carrier_tls() {
+    use neovm_core::emacs_core::eval::{CarrierTlsReset, register_carrier_tls_reset};
+    #[cfg(debug_assertions)]
+    {
+        register_carrier_tls_reset(CarrierTlsReset::with_fingerprint(
+            "neomacs-layout-engine",
+            neomacs_layout_engine::reset_carrier_tls,
+            neomacs_layout_engine::carrier_tls_fingerprint,
+        ));
+        register_carrier_tls_reset(CarrierTlsReset::with_fingerprint(
+            "neomacs-terminfo",
+            neomacs_terminfo::reset_carrier_tls,
+            neomacs_terminfo::carrier_tls_fingerprint,
+        ));
+        // `frame_layout::REDISPLAY_RUNTIME` is CarrierIntrinsic: it holds
+        // layout caches and the font metrics service, never a Lisp `Value`.
+        // Rebuilding the font service per park is a system-font scan
+        // (measured ~52M instructions per Lisp thread on many_threads), so it
+        // is deliberately not reset.
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        register_carrier_tls_reset(CarrierTlsReset::new(
+            "neomacs-layout-engine",
+            neomacs_layout_engine::reset_carrier_tls,
+        ));
+        register_carrier_tls_reset(CarrierTlsReset::new(
+            "neomacs-terminfo",
+            neomacs_terminfo::reset_carrier_tls,
+        ));
+        // `frame_layout::REDISPLAY_RUNTIME` is CarrierIntrinsic (layout caches
+        // and font metrics, never a Lisp `Value`); see the debug block above.
+    }
+}
+
 fn main() {
+    register_workspace_carrier_tls();
     neomacs_display_runtime::macos_bundle_runtime::configure_before_threads();
     #[cfg(feature = "gc-memory-telemetry")]
     neovm_core::tagged::gc::memory_telemetry::set_allocator_sampler(gc_memory_allocator::sample);
@@ -5498,6 +5714,46 @@ fn invocation_directory_from_argv0() -> PathBuf {
     directory.unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// GNU starts even a graphical session with only its initial terminal frame.
+/// Keep its terminal owner distinct from the graphical connection used later
+/// by x-create-frame; no native window or graphical Lisp frame is needed here.
+fn bootstrap_gui_startup_terminal(eval: &mut Context) -> FrameId {
+    const INITIAL_TERMINAL: u64 = 1;
+    ensure_terminal_runtime_owner(
+        INITIAL_TERMINAL,
+        "initial_terminal",
+        TerminalRuntimeConfig::inactive(),
+    );
+    let frame_id = if let Some(frame) = eval.frame_manager().selected_frame() {
+        frame.id
+    } else {
+        let buffer = eval.buffer_manager_mut().create_buffer("*scratch*");
+        eval.frame_manager_mut()
+            .create_frame_on_terminal("F1", INITIAL_TERMINAL, 80, 25, buffer)
+    };
+    eval.frame_manager_mut()
+        .get_mut(frame_id)
+        .expect("initial frame")
+        .terminal_id = INITIAL_TERMINAL;
+    bootstrap_buffers_with_font(
+        eval,
+        80,
+        25,
+        bootstrap_tty_display_config(Interactivity::Batch),
+        startup_font::BootstrapFont::Tty,
+    );
+    let frame = eval
+        .frame_manager_mut()
+        .get_mut(frame_id)
+        .expect("initial terminal frame");
+    frame.initial = true;
+    frame.displays_chrome = false;
+    frame.set_known_parameter(FrameParam::ForegroundColor, Value::string("unspecified-fg"));
+    frame.set_known_parameter(FrameParam::BackgroundColor, Value::string("unspecified-bg"));
+    eval.sync_keyboard_terminal_owner();
+    frame_id
+}
+
 fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &StartupOptions) {
     // Doom and similar configs deliberately raise `gc-cons-threshold` during
     // startup. Keep the measured arena-fragmentation ceiling active through
@@ -5546,6 +5802,19 @@ fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &
             Value::NIL
         },
     );
+    // GNU `main' reads the locale from the environment and snapshots
+    // `using_utf8 ()` into `text_quoting_flag` before any Lisp runs
+    // (src/emacs.c:1653-1656); Lisp reads that bool as
+    // `internal--text-quoting-flag` (src/doc.c:735-736).  A pdump carries the
+    // value that built it, but GNU's C bool cannot be dumped, so every process
+    // must restate it from its own locale -- and it must happen before
+    // `normal-top-level`, where `startup--setup-quote-display` and
+    // `(setq internal--text-quoting-flag t)` run interactively
+    // (lisp/startup.el:1619-1620).
+    eval.set_variable(
+        "internal--text-quoting-flag",
+        Value::bool_val(neovm_core::emacs_core::coding::process_locale_uses_utf8()),
+    );
     if startup.noninteractive {
         // GNU emacs.c raises this after initialization for batch jobs so
         // short-lived noninteractive commands spend less time in GC.
@@ -5577,19 +5846,33 @@ fn configure_gnu_startup_state(eval: &mut Context, frame_id: FrameId, startup: &
     BuildDetails::from_omit_flag(startup.no_build_details).apply(eval);
     let (terminal_frame, frame_initial_frame, default_minibuffer_frame) = match startup.frontend {
         FrontendKind::Gui => {
-            let terminal_frame_id = ensure_gnu_startup_terminal_frame(eval, frame_id);
-            let window_system = Value::symbol(gui_window_system_symbol());
-            eval.set_variable("window-system", window_system);
-            eval.set_variable("initial-window-system", window_system);
-            eval.set_variable(
-                "frame-initial-frame-alist",
-                opening_frame_initial_alist(eval, window_system),
-            );
-            (
-                Value::make_frame(terminal_frame_id.0),
-                Value::make_frame(frame_id.0),
-                Value::make_frame(frame_id.0),
-            )
+            let already_graphical = eval
+                .frame_manager()
+                .get(frame_id)
+                .is_some_and(|frame| frame.effective_window_system().is_some());
+            if !already_graphical {
+                eval.set_variable("window-system", Value::NIL);
+                eval.set_variable(
+                    "initial-window-system",
+                    Value::symbol(gui_window_system_symbol()),
+                );
+                eval.set_variable("frame-initial-frame-alist", Value::NIL);
+                (Value::make_frame(frame_id.0), Value::NIL, Value::NIL)
+            } else {
+                let terminal_frame_id = ensure_gnu_startup_terminal_frame(eval, frame_id);
+                let window_system = Value::symbol(gui_window_system_symbol());
+                eval.set_variable("window-system", window_system);
+                eval.set_variable("initial-window-system", window_system);
+                eval.set_variable(
+                    "frame-initial-frame-alist",
+                    opening_frame_initial_alist(eval, window_system),
+                );
+                (
+                    Value::make_frame(terminal_frame_id.0),
+                    Value::make_frame(frame_id.0),
+                    Value::make_frame(frame_id.0),
+                )
+            }
         }
         FrontendKind::Tty => {
             eval.set_variable("window-system", Value::NIL);
@@ -5815,9 +6098,9 @@ fn run_gnu_startup_inner(eval: &mut Context) {
     let top_level = eval.variable_value_by_name("top-level");
     tracing::info!("top-level variable before startup: {:?}", top_level);
 
-    let (_tx, rx) = crossbeam_channel::unbounded();
+    let _input = neovm_core::host_input::HostInputPublisher::install(eval);
 
-    eval.init_input_system(rx);
+    eval.init_input_system();
 
     let result = eval.recursive_edit();
 

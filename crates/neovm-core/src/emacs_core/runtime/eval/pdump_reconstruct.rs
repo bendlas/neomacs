@@ -38,6 +38,33 @@ impl Context {
         bookmarks: BookmarkManager,
         watchers: VariableWatcherList,
     ) -> Self {
+        // A restored image can contain byte-code values before any Context
+        // constructor ran; install the structural semantics before the first
+        // one can be compared or hashed.
+        crate::emacs_core::bytecode::semantics::install();
+        // The function-cell observer is process state, not image state, and a
+        // restored image can hold byte-code functions before any Context
+        // constructor ran. Install it exactly where the semantics hook is
+        // installed; skipping this silently loses redefinition pinning and
+        // inline eviction in every image-restored process.
+        #[cfg(feature = "jit")]
+        crate::emacs_core::jit::install_function_cell_observer();
+        // The text-property storage in the value layer roots its intermediate
+        // conses through the evaluator's scratch-root stack; hand it the
+        // stack operations here, at the same one-time hooks.
+        crate::emacs_core::value::scratch_bridge::install_scratch_root_hooks(
+            crate::emacs_core::value::scratch_bridge::ScratchRootHooks {
+                save: super::save_scratch_gc_roots,
+                push: super::push_scratch_gc_root,
+                restore: super::restore_scratch_gc_roots,
+            },
+        );
+        // The evaluator's observed-run log of function-epoch moves is plain
+        // process state too; install it unconditionally so non-JIT builds
+        // keep the verify-run mismatch report.
+        crate::emacs_core::symbol::install_function_epoch_move_sink(
+            crate::emacs_core::eval::note_function_epoch_move,
+        );
         let dumped_function_surface = obarray.clone();
         let mut obarray = obarray;
         let core_eval_symbols = install_core_eval_symbols(&mut obarray, false);
@@ -181,6 +208,7 @@ impl Context {
             minibuffer_selected_window: world.global.minibuffer_selected_window,
             active_minibuffer_window: world.global.active_minibuffer_window,
             shutdown_request: None,
+            loadup_dump_mode: None,
             shutdown_in_progress: false,
             daemon: world.global.daemon,
             _reserved_input_mode_interrupt: true,
@@ -191,7 +219,7 @@ impl Context {
             threads: world.global.threads,
             kmacro: world.global.kmacro,
             command_loop: world.global.command_loop,
-            input_rx: None,
+            input_rx: crate::host_input::HostInputReceiver::default(),
             eval_task_rx: None,
             quit_requested: QuitRequest::new(),
             redisplay_fn: None,
@@ -292,6 +320,7 @@ impl Context {
                 super::super::dynamic_module::current_dynamic_module_registry_handle(),
             in_flight_registry: super::super::error::current_in_flight_registry_handle(),
             cached_standard_case_table: None,
+            frame_and_buffer_state: None,
         };
         ev.setup_thread_locals();
 

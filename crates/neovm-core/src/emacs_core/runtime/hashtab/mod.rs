@@ -9,15 +9,32 @@
 
 use super::error::{EvalResult, Flow, signal};
 use super::intern::{SymId, resolve_sym};
-use super::print::print_value;
 use super::value::*;
-use crate::buffer::{CharLen, CharPos0, CharRange};
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_max_args, expect_min_args};
+use crate::emacs_core::value::positions::{CharLen, CharPos0, CharRange};
 use crate::tagged::SymbolMode;
 use crate::tagged::gc::with_tagged_heap;
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+
+/// Entry operands for one synchronous, GC-inhibited user-test activation.
+/// The owning mutator pins this on its stack and its Context selects it;
+/// independent mutators never share it. Normalized scalar settings preserve
+/// the entry countdown without holding Lisp values across callbacks.
+#[derive(Clone, Copy)]
+pub(crate) struct HashTestGcInhibitAccounting {
+    pub(crate) bytes_at_start: usize,
+    pub(crate) charged_bytes_at_start: usize,
+    pub(crate) collector_threshold_at_start: usize,
+    /// Resolved only when GC-maybe first needs the saved entry operands.
+    pub(crate) threshold_at_start: Option<std::num::NonZeroUsize>,
+    pub(crate) entry_threshold_bytes: usize,
+    pub(crate) entry_percentage_scaled: Option<std::num::NonZeroU64>,
+    pub(crate) threshold_overridden: bool,
+    pub(crate) memory_full: bool,
+    pub(crate) startup_ceiling: bool,
+}
 
 // Callback knobs, read once per process:
 // | Knob | Values | Default | Effect |
@@ -35,86 +52,17 @@ pub(crate) fn hash_test_parity_enabled() -> bool {
 }
 
 mod user_test_guard;
-pub(crate) use user_test_guard::{
-    gc_threshold_integer_fallback, inhibited_user_test_since_gc, with_user_test_guard,
-};
-
-/// Immutable process configuration holds no Lisp state. Concurrent mutators
-/// may read it; each maphash activation owns its callback and roots.
-#[cfg(feature = "jit")]
-static MAPHASH_BYTECODE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    !std::env::var("NEOVM_MAPHASH_BYTECODE").is_ok_and(|value| value == "off")
-});
-
-/// A callback selected for one synchronous maphash activation. GNU resolves
-/// symbol callbacks anew for every slot; only a direct bytecode identity can
-/// use the specialized entry. This value and its roots belong to one mutator,
-/// and no Lisp state is cached across activations or shared with other threads.
-pub(crate) enum MaphashCallee {
-    Generic(Value),
-    #[cfg(feature = "jit")]
-    ByteCode(Value),
-    #[cfg(feature = "jit")]
-    UnobservedByteCode(Value),
-}
-
-impl MaphashCallee {
-    pub(crate) fn resolve(function: Value) -> Self {
-        #[cfg(feature = "jit")]
-        if *MAPHASH_BYTECODE && function.is_bytecode() {
-            return if crate::tagged::collection_reads::reads_need_observation() {
-                Self::ByteCode(function)
-            } else {
-                Self::UnobservedByteCode(function)
-            };
-        }
-        Self::Generic(function)
-    }
-
-    #[inline]
-    fn call(&self, eval: &mut super::eval::Context, key: Value, value: Value) -> EvalResult {
-        match *self {
-            Self::Generic(function) => eval.apply2(function, key, value),
-            #[cfg(feature = "jit")]
-            Self::ByteCode(function) => eval.apply2_bytecode(function, key, value),
-            #[cfg(feature = "jit")]
-            Self::UnobservedByteCode(function) => {
-                eval.apply2_bytecode_unobserved(function, key, value)
-            }
-        }
-    }
-}
+pub(crate) use user_test_guard::{gc_threshold_integer_fallback, inhibited_user_test_since_gc};
 
 const SXHASH_MAX_DEPTH: usize = 3;
-const SXHASH_MAX_LEN: usize = 7;
+pub(crate) const SXHASH_MAX_LEN: usize = 7;
 const SXHASH_FIXNUM_SHIFT: u32 = 2;
 const SXHASH_FIXNUM_BITS: u32 = 62;
 const SXHASH_INTMASK: u64 = (1_u64 << SXHASH_FIXNUM_BITS) - 1;
-const SXHASH_FALLBACK_NONNEG_MASK: u64 = (1_u64 << (SXHASH_FIXNUM_BITS - 1)) - 1;
+pub(crate) const SXHASH_FALLBACK_NONNEG_MASK: u64 = (1_u64 << (SXHASH_FIXNUM_BITS - 1)) - 1;
 const LISP_TYPE_INT0: u64 = 2;
 const LISP_TYPE_INT1: u64 = 6;
 const KNUTH_ALPHA: u32 = 2_654_435_769;
-
-// ---------------------------------------------------------------------------
-// Argument helpers
-// ---------------------------------------------------------------------------
-
-fn validate_optional_obarray_arg(args: &[Value]) -> Result<(), Flow> {
-    if let Some(obarray) = args.get(1)
-        && !obarray.is_nil()
-    {
-        crate::emacs_core::builtins::symbols::check_obarray_value(*obarray)?;
-    }
-    Ok(())
-}
-
-fn is_global_obarray_proxy_in_state(
-    vars: crate::emacs_core::eval::VariableView<'_>,
-    value: &Value,
-) -> bool {
-    vars.value_by_name("obarray")
-        .is_some_and(|proxy| proxy == *value)
-}
 
 /// Convert a `HashKey` back into a `Value`.
 pub(crate) fn hash_key_to_value(key: &HashKey) -> Value {
@@ -157,7 +105,7 @@ pub(crate) fn hash_key_to_visible_value(table: &LispHashTable, key: &HashKey) ->
         .unwrap_or_else(|| hash_key_to_value(key))
 }
 
-fn sxhash_combine(x: u64, y: u64) -> u64 {
+pub(crate) fn sxhash_combine(x: u64, y: u64) -> u64 {
     x.rotate_left(4).wrapping_add(y)
 }
 
@@ -249,7 +197,11 @@ fn fallback_sxhash_emacs_uint(value: &Value, test: HashTableTest, symbol_mode: S
     hasher.finish() & SXHASH_FALLBACK_NONNEG_MASK
 }
 
-fn emacs_sxhash_obj_with_fallback(value: &Value, depth: usize, symbol_mode: SymbolMode) -> u64 {
+pub(crate) fn emacs_sxhash_obj_with_fallback(
+    value: &Value,
+    depth: usize,
+    symbol_mode: SymbolMode,
+) -> u64 {
     emacs_sxhash_obj(value, depth, symbol_mode)
         .unwrap_or_else(|| fallback_sxhash_emacs_uint(value, HashTableTest::Equal, symbol_mode))
 }
@@ -306,13 +258,13 @@ fn emacs_sxhash_structural_pseudovector(
 
 fn emacs_sxhash_marker(value: &Value) -> Option<u64> {
     let marker = value.as_marker_data()?;
-    let bytepos = if marker.buffer.is_some() {
-        marker.bytepos as u64
+    let bytepos = if marker.buffer.is_attached() {
+        marker.bytepos.get() as u64
     } else {
         0
     };
     Some(sxhash_combine(
-        marker.buffer.map(|buffer| buffer.0).unwrap_or(0),
+        marker.buffer_id().map(|buffer| buffer.0).unwrap_or(0),
         bytepos,
     ))
 }
@@ -326,54 +278,6 @@ fn emacs_sxhash_overlay(value: &Value, depth: usize, symbol_mode: SymbolMode) ->
         hash,
         emacs_sxhash_obj_with_fallback(&overlay.plist, depth, symbol_mode),
     );
-    Some(hash)
-}
-
-/// GNU `sxhash_obj` (src/fns.c:5525-5536) sends a `PVEC_CLOSURE` through
-/// `sxhash_vector` like any pseudovector `internal_equal` walks, so two
-/// `equal` byte-code objects hash alike and share an `equal` hash-table
-/// bucket.  The elements are [`ByteCodeFunction::structural_parts`] -- the
-/// same sequence `equal` compares, so everything `equal` distinguishes,
-/// including a captured environment beside the constants, moves the hash --
-/// folded like `sxhash_vector`: seeded with the slot count, at most
-/// `SXHASH_MAX_LEN` elements.
-fn emacs_sxhash_bytecode(value: &Value, depth: usize, symbol_mode: SymbolMode) -> Option<u64> {
-    use crate::emacs_core::bytecode::ByteCodeStructuralPart as Part;
-    let bc = value.get_bytecode_data()?;
-    let mut parts = bc.structural_parts();
-    let Part::ObservableSlotCount(slot_count) = parts.next()? else {
-        unreachable!("byte-code structure starts with its observable shape")
-    };
-    let mut hash = slot_count as u64;
-    for part in parts.take(SXHASH_MAX_LEN) {
-        let part_hash = match part {
-            Part::ObservableSlotCount(_) => {
-                unreachable!("byte-code structure contains one leading shape")
-            }
-            Part::Value(value) => emacs_sxhash_obj_with_fallback(&value, depth + 1, symbol_mode),
-            Part::Bytes(bytes) => emacs_hash_char_array(bytes),
-            Part::Ops(ops) => {
-                let mut hasher = DefaultHasher::new();
-                ops.hash(&mut hasher);
-                hasher.finish() & SXHASH_FALLBACK_NONNEG_MASK
-            }
-            Part::Values(values) => {
-                let mut vector_hash = values.len() as u64;
-                for value in values.iter().take(SXHASH_MAX_LEN) {
-                    vector_hash = sxhash_combine(
-                        vector_hash,
-                        emacs_sxhash_obj_with_fallback(value, depth + 2, symbol_mode),
-                    );
-                }
-                vector_hash
-            }
-            // GNU `sxhash_string` hashes the bytes; equal strings have equal
-            // bytes whatever their representation.
-            Part::Text(text) => emacs_hash_char_array(text.as_bytes()),
-            Part::Absent => 42,
-        };
-        hash = sxhash_combine(hash, part_hash);
-    }
     Some(hash)
 }
 
@@ -399,7 +303,7 @@ fn emacs_sxhash_obj(value: &Value, depth: usize, symbol_mode: SymbolMode) -> Opt
             emacs_sxhash_structural_pseudovector(value, depth, symbol_mode)
         }
         ValueKind::Veclike(VecLikeType::ByteCode) => {
-            emacs_sxhash_bytecode(value, depth, symbol_mode)
+            (crate::emacs_core::value::bytecode_semantics().sxhash)(value, depth, symbol_mode)
         }
         ValueKind::Veclike(VecLikeType::Bignum) => sxhash_bignum(value),
         ValueKind::Veclike(VecLikeType::BoolVector) => sxhash_bool_vector(value),
@@ -580,9 +484,9 @@ fn hash_value_for_equal(
         ValueKind::Veclike(VecLikeType::Marker) => {
             18_u8.hash(hasher);
             if let Some(marker) = value.as_marker_data() {
-                marker.buffer.map(|buffer| buffer.0).hash(hasher);
-                if marker.buffer.is_some() {
-                    marker.bytepos.hash(hasher);
+                marker.buffer_id().map(|buffer| buffer.0).hash(hasher);
+                if marker.buffer.is_attached() {
+                    marker.bytepos.get().hash(hasher);
                 } else {
                     0_usize.hash(hasher);
                 }
@@ -694,7 +598,13 @@ fn internal_hash_table_diagnostic_hash(key: &HashKey, test: HashTableTest) -> u3
     }
 }
 
-fn internal_hash_table_nonempty_buckets(table: &LispHashTable) -> Vec<Vec<(Value, i64)>> {
+fn internal_hash_table_nonempty_buckets<K>(
+    table: &LispHashTable,
+    sort_key: K,
+) -> Vec<Vec<(Value, i64)>>
+where
+    K: Fn(&Value) -> String,
+{
     if table.data.is_empty() {
         return Vec::new();
     }
@@ -708,7 +618,7 @@ fn internal_hash_table_nonempty_buckets(table: &LispHashTable) -> Vec<Vec<(Value
         buckets[index].push((entry.key, hash as i64));
     }
     for bucket in &mut buckets {
-        bucket.sort_by_key(|(key, hash)| (print_value(key), *hash));
+        bucket.sort_by_key(|(key, hash)| (sort_key(key), *hash));
     }
     buckets
         .into_iter()
@@ -956,12 +866,18 @@ pub(crate) fn builtin_internal_hash_table_index_size(args: Vec<Value>) -> EvalRe
 }
 
 /// `(internal--hash-table-buckets TABLE)` -- return non-empty bucket alists.
-pub(crate) fn builtin_internal_hash_table_buckets(args: Vec<Value>) -> EvalResult {
+///
+/// `sort_key` orders a bucket by a caller-provided stable key: the Lisp
+/// builtin passes the printer, so this value-layer module never names it.
+pub(crate) fn builtin_internal_hash_table_buckets<K>(args: Vec<Value>, sort_key: K) -> EvalResult
+where
+    K: Fn(&Value) -> String,
+{
     expect_args("internal--hash-table-buckets", &args, 1)?;
     match args[0].kind() {
         ValueKind::Veclike(VecLikeType::HashTable) => {
             let table = args[0].as_hash_table().unwrap().clone();
-            let buckets = internal_hash_table_nonempty_buckets(&table);
+            let buckets = internal_hash_table_nonempty_buckets(&table, sort_key);
             if buckets.is_empty() {
                 return Ok(Value::NIL);
             }
@@ -991,7 +907,9 @@ pub(crate) fn builtin_internal_hash_table_histogram(args: Vec<Value>) -> EvalRes
     match args[0].kind() {
         ValueKind::Veclike(VecLikeType::HashTable) => {
             let table = args[0].as_hash_table().unwrap().clone();
-            let buckets = internal_hash_table_nonempty_buckets(&table);
+            // Only bucket SIZES are rendered; the within-bucket order never
+            // reaches the result, so the value layer needs no printer here.
+            let buckets = internal_hash_table_nonempty_buckets(&table, |_key| String::new());
             if buckets.is_empty() {
                 return Ok(Value::NIL);
             }
@@ -1017,83 +935,6 @@ pub(crate) fn builtin_internal_hash_table_histogram(args: Vec<Value>) -> EvalRes
 // Eval-dependent builtins
 // ---------------------------------------------------------------------------
 
-/// (maphash FUNCTION TABLE) — call FUNCTION with each (KEY VALUE) pair.
-pub(crate) fn builtin_maphash(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    expect_args("maphash", &args, 2)?;
-    if !args[1].is_hash_table() {
-        return Err(signal(
-            LispCondition::WrongTypeArgument,
-            vec![Value::symbol("hash-table-p"), args[1]],
-        ));
-    }
-
-    let roots = eval.save_specpdl_roots();
-    for arg in &args {
-        eval.push_specpdl_root(*arg);
-    }
-    let func = args[0];
-    let table = args[1];
-    let callee = MaphashCallee::resolve(func);
-    // Native proof stays within this mutator's activation and owns no roots.
-    let native = if super::eval::native_callback_cache_enabled() {
-        let epoch = eval.obarray().function_epoch();
-        eval.resolve_mapped_subr_callee(func).and_then(|(subr, _)| {
-            super::eval::CheckedNativeCallback::resolve(subr, 2).map(|proof| (subr, epoch, proof))
-        })
-    } else {
-        None
-    };
-    let result = (|| -> EvalResult {
-        let mut slot = 0_usize;
-        loop {
-            let Some((key, val)) = maphash_entry_at_slot(table, slot) else {
-                if slot >= maphash_slot_len(table) {
-                    break;
-                }
-                slot += 1;
-                continue;
-            };
-            eval.push_specpdl_root(key);
-            eval.push_specpdl_root(val);
-            match native {
-                Some((subr, epoch, proof)) => {
-                    eval.apply2_checked_subr(func, subr, epoch, proof, key, val)?;
-                }
-                None => {
-                    callee.call(eval, key, val)?;
-                }
-            }
-            slot += 1;
-        }
-        Ok(Value::NIL)
-    })();
-    eval.restore_specpdl_roots(roots);
-    result
-}
-
-/// (mapatoms FUNCTION &optional OBARRAY) — call FUNCTION with each interned symbol.
-pub(crate) fn builtin_mapatoms(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    let roots = eval.save_specpdl_roots();
-    for arg in &args {
-        eval.push_specpdl_root(*arg);
-    }
-    let (func, symbols) = collect_mapatoms_symbols(eval, args)?;
-    eval.push_specpdl_root(func);
-    // The snapshot contains only immediate `SymId` values. Symbols live in
-    // the process-global append-only registry, so they cannot be reclaimed by
-    // a callback-triggered GC and do not belong in the managed-object root
-    // stack. Rooting every symbol made one Doom startup permanently retain a
-    // multi-megabyte root-vector capacity after `mapatoms` returned.
-    let result = (|| -> EvalResult {
-        for sym in symbols {
-            eval.apply1(func, sym)?;
-        }
-        Ok(Value::NIL)
-    })();
-    eval.restore_specpdl_roots(roots);
-    result
-}
-
 pub(crate) fn validate_maphash_args(args: &[Value]) -> Result<(Value, Value), Flow> {
     expect_args("maphash", args, 2)?;
     if !args[1].is_hash_table() {
@@ -1118,183 +959,6 @@ pub(crate) fn maphash_entry_at_slot(table: Value, slot: usize) -> Option<(Value,
     Some((entry.key, entry.value))
 }
 
-fn current_lisp_obarray_value(eval: &super::eval::Context) -> Value {
-    eval.variable_value_by_name("obarray").unwrap_or_else(|| {
-        eval.variable_value_by_name("neovm--obarray-object")
-            .unwrap_or(Value::NIL)
-    })
-}
-
-fn effective_mapatoms_obarray_arg(eval: &super::eval::Context, args: &[Value]) -> Value {
-    args.get(1)
-        .copied()
-        .filter(|value| !value.is_nil())
-        .unwrap_or_else(|| current_lisp_obarray_value(eval))
-}
-
-pub(crate) fn collect_mapatoms_symbols(
-    eval: &super::eval::Context,
-    args: Vec<Value>,
-) -> Result<(Value, Vec<Value>), Flow> {
-    expect_min_args("mapatoms", &args, 1)?;
-    expect_max_args("mapatoms", &args, 2)?;
-    let func = args[0];
-    let effective_obarray = effective_mapatoms_obarray_arg(eval, &args);
-
-    if !crate::emacs_core::builtins::symbols::is_global_obarray_proxy(eval, &effective_obarray) {
-        let custom_obarray =
-            crate::emacs_core::builtins::symbols::check_obarray_value(effective_obarray)?;
-        let all_slots = crate::emacs_core::builtins::symbols::obarray_buckets(custom_obarray)
-            .unwrap_or_default();
-        let mut symbols = Vec::new();
-        for slot in &all_slots {
-            let mut current = *slot;
-            loop {
-                match current.kind() {
-                    ValueKind::Nil => break,
-                    ValueKind::Cons => {
-                        let car = current.cons_car();
-                        let cdr = current.cons_cdr();
-                        symbols.push(car);
-                        current = cdr;
-                    }
-                    _ => break,
-                }
-            }
-        }
-        return Ok((func, symbols));
-    }
-
-    let symbols = crate::emacs_core::builtins::symbols::global_obarray_symbols_in_bucket_order(
-        eval.obarray(),
-        effective_obarray,
-    );
-    Ok((func, symbols))
-}
-
-/// (unintern NAME OBARRAY) — remove symbol from obarray.
-pub(crate) fn builtin_unintern(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
-    let symbol_mode = eval.symbol_mode();
-    // GNU `Sunintern` is `2, 2`: OBARRAY is mandatory (may be nil).
-    expect_min_args("unintern", &args, 2)?;
-    expect_max_args("unintern", &args, 2)?;
-    validate_optional_obarray_arg(&args)?;
-
-    // GNU tests SYMBOLP, which includes nil and t. Keep exact-symbol
-    // deletion distinct from name lookup; a namesake in another obarray
-    // must never be removed by a symbol argument.
-    enum UninternTarget<'a> {
-        Symbol(SymId),
-        Name(&'a crate::heap_types::LispString),
-    }
-
-    let target = if let Some(symbol) = args[0].as_symbol_id(eval.symbol_mode()) {
-        UninternTarget::Symbol(symbol)
-    } else if let Some(name) = args[0].as_lisp_string() {
-        UninternTarget::Name(name)
-    } else {
-        return Err(signal(
-            LispCondition::WrongTypeArgument,
-            vec![Value::symbol("stringp"), args[0]],
-        ));
-    };
-
-    let target_name = match &target {
-        UninternTarget::Symbol(id) => crate::emacs_core::intern::resolve_sym_lisp_string(*id),
-        UninternTarget::Name(name) => *name,
-    };
-
-    // Custom obarray path
-    if let Some(custom_obarray) = args
-        .get(1)
-        .filter(|v| !v.is_nil() && !is_global_obarray_proxy_in_state(eval.variables(), v))
-    {
-        let custom_obarray =
-            crate::emacs_core::builtins::symbols::check_obarray_value(*custom_obarray)?;
-        let vec_len =
-            crate::emacs_core::builtins::symbols::obarray_len(custom_obarray).unwrap_or(0);
-        if vec_len == 0 {
-            return Ok(Value::NIL);
-        }
-        let bucket_idx =
-            crate::emacs_core::builtins::symbols::obarray_hash_lisp_string(target_name, vec_len);
-        let bucket =
-            crate::emacs_core::builtins::symbols::obarray_bucket(custom_obarray, bucket_idx)
-                .unwrap_or(Value::NIL);
-
-        // GNU oblookup compares a name's character count and bytes and never
-        // its multibyte flag (lread.c:4945). The canonical name atom of an
-        // ASCII-only spelling is stored unibyte while the query can be
-        // multibyte, so LispString equality (which compares the flag) misses a
-        // symbol that `intern-soft` -- and GNU -- resolve. Compare the way
-        // lookup does.
-        let name_query = match &target {
-            UninternTarget::Name(name) => {
-                Some(crate::emacs_core::intern::SymbolNameQuery::from(*name))
-            }
-            UninternTarget::Symbol(_) => None,
-        };
-
-        // Walk the bucket chain and rebuild without the matching symbol
-        let mut items = Vec::new();
-        let mut found = false;
-        let mut current = bucket;
-        loop {
-            match current.kind() {
-                ValueKind::Nil => break,
-                ValueKind::Cons => {
-                    let car = current.cons_car();
-                    let cdr = current.cons_cdr();
-                    if !found {
-                        let should_remove = match &target {
-                            UninternTarget::Symbol(target_id) => {
-                                car.as_symbol_id(symbol_mode) == Some(*target_id)
-                            }
-                            UninternTarget::Name(_) => name_query.is_some_and(|query| {
-                                car.as_symbol_id(symbol_mode)
-                                    .map(
-                                        crate::emacs_core::intern::resolve_lisp_visible_symbol_name,
-                                    )
-                                    .is_some_and(|sym_name| query.matches(sym_name.text()))
-                            }),
-                        };
-                        if should_remove {
-                            found = true;
-                            current = cdr;
-                            continue;
-                        }
-                    }
-                    items.push(car);
-                    current = cdr;
-                }
-                _ => break,
-            }
-        }
-
-        if found {
-            // Rebuild the bucket chain
-            let new_bucket = items
-                .into_iter()
-                .rev()
-                .fold(Value::NIL, |acc, sym| Value::cons(sym, acc));
-            let _ = crate::emacs_core::builtins::symbols::set_obarray_bucket(
-                custom_obarray,
-                bucket_idx,
-                new_bucket,
-            );
-            crate::emacs_core::builtins::symbols::note_obarray_symbol_removed(custom_obarray);
-            return Ok(Value::T);
-        }
-        return Ok(Value::NIL);
-    }
-
-    // Global obarray path
-    let removed = match target {
-        UninternTarget::Symbol(id) => eval.obarray.unintern_id(id),
-        UninternTarget::Name(name) => eval.obarray.unintern_lisp_string(name),
-    };
-    Ok(if removed { Value::T } else { Value::NIL })
-}
 #[cfg(test)]
 #[path = "tests/bignum_sxhash_test.rs"]
 mod bignum_sxhash_tests;

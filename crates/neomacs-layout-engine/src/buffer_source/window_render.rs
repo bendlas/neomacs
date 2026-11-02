@@ -132,6 +132,9 @@ where
     buffer_name: &'a str,
     reserve_right_border_col: bool,
     position_publication: WindowPositionPublication,
+    /// Evaluate and measure chrome on this attempt. Set for a Position query's
+    /// first pass; its measured-metric retry clears it.
+    remeasure_chrome: bool,
     resolved_window_start: ResolvedWindowStart,
     forward_viewport_measurement: Option<ForwardViewportMeasurement>,
 }
@@ -164,6 +167,7 @@ where
             buffer_name,
             reserve_right_border_col,
             position_publication: WindowPositionPublication::Redisplay,
+            remeasure_chrome: false,
             resolved_window_start,
             forward_viewport_measurement: None,
         }
@@ -174,6 +178,11 @@ where
         publication: WindowPositionPublication,
     ) -> Self {
         self.position_publication = publication;
+        self
+    }
+
+    pub(crate) fn with_remeasure_chrome(mut self, remeasure: bool) -> Self {
+        self.remeasure_chrome = remeasure;
         self
     }
 
@@ -249,6 +258,7 @@ where
                     buffer_name: self.buffer_name,
                     reserve_right_border_col: self.reserve_right_border_col,
                     position_publication: self.position_publication,
+                    remeasure_chrome: self.remeasure_chrome,
                     resolved_window_start: self.resolved_window_start,
                     forward_viewport_measurement: self.forward_viewport_measurement.clone(),
                 };
@@ -307,6 +317,7 @@ where
             buffer_name: self.buffer_name,
             reserve_right_border_col: self.reserve_right_border_col,
             position_publication: self.position_publication,
+            remeasure_chrome: self.remeasure_chrome,
             resolved_window_start: self.resolved_window_start,
             forward_viewport_measurement: self.forward_viewport_measurement.clone(),
         };
@@ -411,6 +422,7 @@ where
             buffer_name,
             reserve_right_border_col,
             position_publication,
+            remeasure_chrome,
             resolved_window_start,
             forward_viewport_measurement,
         } = self;
@@ -587,7 +599,7 @@ where
             bytes_read
         );
 
-        if geometry.text_height <= 0.0 || geometry.text_width <= 0.0 {
+        if geometry.text_width <= 0.0 {
             return BufferSourceRenderAttemptOutcome::Skipped;
         }
 
@@ -597,14 +609,16 @@ where
         // window_start to point — which then PERSISTS and corrupts the real (tall)
         // window. Pairs with the forward-scroll guard in
         // `BufferWindowSourceRequest::should_forward_scroll_without_layout`.
-        let remaining_visibility_retries =
-            if scroll.is_some() || (geometry.max_rows <= 1 && !params.is_minibuffer()) {
-                // Phase 2 consumes the authoritative post-scroll window_start; never
-                // re-derive scrolling via a visibility retry.
-                0
-            } else {
-                remaining_visibility_retries
-            };
+        let remaining_visibility_retries = if scroll.as_ref().is_some_and(|replay| !replay.edit)
+            || (geometry.max_rows <= 1 && !params.is_minibuffer())
+        {
+            // A genuine scroll consumes an authoritative window_start.
+            // An edit can still discover that point needs a new viewport;
+            // preserve its retry budget for the measured-row decision.
+            0
+        } else {
+            remaining_visibility_retries
+        };
 
         let reserve_right_special_col =
             !frame_params.window_system && params.right_fringe_width == 0.0;
@@ -628,7 +642,23 @@ where
             geometry.max_rows,
             &walk_setup,
         )
-        .with_position_publication(position_publication);
+        .with_position_publication(position_publication)
+        .with_remeasure_chrome(remeasure_chrome);
+
+        if geometry.text_height <= 0.0 {
+            return output_setup.measure_chrome_for_empty_body(
+                state,
+                chrome_plan.render_request(
+                    params,
+                    *layout_box,
+                    geometry.mode_line_display_row,
+                    reserve_right_border_col,
+                    window_metrics,
+                    buffer_name,
+                ),
+                params,
+            );
+        }
 
         output_setup.render_body_attempt(
             &mut walk_setup,

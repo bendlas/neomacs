@@ -264,12 +264,13 @@ fn org_cycle_hide_drawers_show_all_recovery_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_deep_heading_font_lock_after_level_edits_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"*\" 0 1 (face org-level-1)) \"L1\" 1 org-level-1 org-level-1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) \"L2\" 2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) \"L3\" 3 org-level-3 org-level-3) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) \"L4\" 5 org-level-5 org-level-5) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) \"L5\" 5 org-level-5 org-level-5)) \"* L1\\n** L2\\n*** L3\\n***** L4\\n***** L5\\nBody\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (require 'org)
@@ -291,12 +292,12 @@ fn org_deep_heading_font_lock_after_level_edits_combo() {
         (while (re-search-forward "^\\(\\*+\\) \\(L[0-9]\\)" nil t)
           (push (list (match-string 1)
                       (substring-no-properties (match-string 2))
-                      (org-outline-level)
+                      (save-match-data (org-outline-level))
                       (get-text-property (match-beginning 1) 'face)
                       (get-text-property (match-beginning 2) 'face))
                 out))
         (list (nreverse out)
-              (buffer-substring-no-properties (point-min) (point-max))))))"#,
+              (buffer-substring-no-properties (point-min) (point-max)))))))"#,
         expect,
     );
 }
@@ -342,12 +343,13 @@ fn org_global_cycle_deep_sibling_visibility_integrity_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_reveal_hidden_deep_heading_context_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A body\" nil) (\"B\" t) (\"B body\" nil) (\"C\" t) (\"C body\" nil) (\"D\" t) (\"D body\" nil) (\"E\" t) (\"E body\" nil)) \"* A\\nA body\\n** B\\nB body\\n*** C\\nC body\\n**** D\\nD body\\n* E\\nE body\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (require 'org)
@@ -372,17 +374,73 @@ fn org_reveal_hidden_deep_heading_context_combo() {
                   (list needle (not (null (org-invisible-p pos))))))
               '("A body" "B" "B body" "C" "C body" "D" "D body" "E" "E body"))))
         (list visibility
-              (buffer-substring-no-properties (point-min) (point-max))))))"#,
+              (buffer-substring-no-properties (point-min) (point-max)))))))"#,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
+#[test]
+fn org_fold_region_boundaries_after_hidden_edit_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (((\"B body\" nil nil 74 1) (\"C\" nil nil 74 1) (\"D body\" nil nil 74 1) (\"E body\" nil nil 74 1) (\"F body\" nil nil 74 1)) ((\"B body\" t \"\\nB body\\n*** C\\nC body\\n**** D\\nD body\" 50 16) (\"D body\" nil nil 55 50) (\"Inserted\" t \"\\nE body** Inserted\\nInserted body\\n**** Inserted child\\nChild body\\n\" 119 55) (\"Child body\" t \"\\nE body** Inserted\\nInserted body\\n**** Inserted child\\nChild body\\n\" 119 55) (\"E body\" t \"\\nE body** Inserted\\nInserted body\\n**** Inserted child\\nChild body\\n\" 119 55) (\"F body\" nil nil 131 130)) ((\"B body\" nil nil 131 1) (\"D body\" nil nil 131 1) (\"Inserted\" nil nil 131 1) (\"Child body\" nil nil 131 1)) \"* A\\nA body\\n** B\\nB body\\n*** C\\nC body\\n**** D\\nD body\\n** E\\nE body** Inserted\\nInserted body\\n**** Inserted child\\nChild body\\n\\n* F\\nF body\\n\")""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r#"(progn
+  (require 'org)
+  (require 'org-cycle)
+  (require 'org-fold)
+  (with-temp-buffer
+    (org-mode)
+    (insert "* A\nA body\n** B\nB body\n*** C\nC body\n**** D\nD body\n")
+    (insert "** E\nE body\n* F\nF body\n")
+    (let ((probe
+           (lambda (needle)
+             (save-excursion
+               (goto-char (point-min))
+               (search-forward needle)
+               (let ((region (org-fold-get-region-at-point '(headline drawer))))
+                 (list needle
+                       (not (null (org-fold-folded-p (point) 'headline)))
+                       (and region
+                            (buffer-substring-no-properties
+                             (car region) (min (cdr region) (point-max))))
+                       (org-fold-next-visibility-change (point) nil t)
+                       (org-fold-previous-visibility-change (point) nil t))))))
+          before after)
+      (goto-char (point-min))
+      (search-forward "B")
+      (beginning-of-line)
+      (org-cycle)
+      (setq before (mapcar probe '("B body" "C" "D body" "E body" "F body")))
+      (org-fold-show-subtree)
+      (org-end-of-subtree)
+      (insert "** Inserted\nInserted body\n*** Inserted child\nChild body\n")
+      (goto-char (point-min))
+      (search-forward "Inserted child")
+      (beginning-of-line)
+      (org-demote-subtree)
+      (org-fold-hide-sublevels 2)
+      (setq after (mapcar probe
+                          '("B body" "D body" "Inserted" "Child body"
+                            "E body" "F body")))
+      (org-fold-show-all)
+      (list before
+            after
+            (mapcar probe '("B body" "D body" "Inserted" "Child body"))
+            (buffer-substring-no-properties (point-min) (point-max))))))"#,
+        expect,
+    );
+}
+
 #[test]
 fn org_mixed_cycle_deep_siblings_no_line_merge_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable states)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((local-b ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (local-b ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (local-b ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (local-b ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (hide-a1a ((\"A body\" nil) (\"A1\" nil) (\"A1a\" t) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (show-a1a ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (global ((\"A body\" t) (\"A1\" t) (\"A1a\" t) (\"A1a-i body\" t) (\"B body\" t) (\"B1\" t) (\"B1a\" t) (\"B1a-i body\" t) (\"C body\" nil) (\"Tail\" t) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (global ((\"A body\" nil) (\"A1\" t) (\"A1a\" t) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" t) (\"B1a\" t) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" t) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (global ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (global ((\"A body\" t) (\"A1\" t) (\"A1a\" t) (\"A1a-i body\" t) (\"B body\" t) (\"B1\" t) (\"B1a\" t) (\"B1a-i body\" t) (\"C body\" nil) (\"Tail\" t) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (global ((\"A body\" nil) (\"A1\" t) (\"A1a\" t) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" t) (\"B1a\" t) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" t) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\")) (all ((\"A body\" nil) (\"A1\" nil) (\"A1a\" nil) (\"A1a-i body\" nil) (\"B body\" nil) (\"B1\" nil) (\"B1a\" nil) (\"B1a-i body\" nil) (\"C body\" nil) (\"Tail\" nil) (\"Tail body\" nil)) (\"* Root\" \"** A\" \"A body\" \"*** A1\" \"A1 body\" \"**** A1a\" \"A1a body\" \"***** A1a-i\" \"A1a-i body\" \"** B\" \"B body\" \"*** B1\" \"B1 body\" \"**** B1a\" \"B1a body\" \"***** B1a-i\" \"B1a-i body\" \"** C\" \"C body\" \"* Tail\" \"Tail body\"))) 11 \"* Root\\n** A\\nA body\\n*** A1\\nA1 body\\n**** A1a\\nA1a body\\n***** A1a-i\\nA1a-i body\\n** B\\nB body\\n*** B1\\nB1 body\\n**** B1a\\nB1a body\\n***** B1a-i\\nB1a-i body\\n** C\\nC body\\n* Tail\\nTail body\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (require 'org)
@@ -411,7 +469,7 @@ fn org_mixed_cycle_deep_siblings_no_line_merge_combo() {
                       "C body" "Tail" "Tail body"))
                    (split-string
                     (buffer-substring-no-properties (point-min) (point-max))
-                    "\n" t)))))
+                    "\n" t))))
           states)
       (goto-char (point-min))
       (search-forward "B")
@@ -434,66 +492,13 @@ fn org_mixed_cycle_deep_siblings_no_line_merge_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_fold_region_boundaries_after_hidden_edit_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""ERR (void-variable before)""#]];
-    crate::common::assert_oracle_parity_expect(
-        r#"(progn
-  (require 'org)
-  (require 'org-cycle)
-  (require 'org-fold)
-  (with-temp-buffer
-    (org-mode)
-    (insert "* A\nA body\n** B\nB body\n*** C\nC body\n**** D\nD body\n")
-    (insert "** E\nE body\n* F\nF body\n")
-    (let ((probe
-           (lambda (needle)
-             (save-excursion
-               (goto-char (point-min))
-               (search-forward needle)
-               (let ((region (org-fold-get-region-at-point '(headline drawer))))
-                 (list needle
-                       (not (null (org-fold-folded-p (point) 'headline)))
-                       (and region
-                            (buffer-substring-no-properties
-                             (car region) (min (cdr region) (point-max))))
-                       (org-fold-next-visibility-change (point) nil t)
-                       (org-fold-previous-visibility-change (point) nil t)))))))
-          before after)
-      (goto-char (point-min))
-      (search-forward "B")
-      (beginning-of-line)
-      (org-cycle)
-      (setq before (mapcar probe '("B body" "C" "D body" "E body" "F body")))
-      (org-fold-show-subtree)
-      (org-end-of-subtree)
-      (insert "** Inserted\nInserted body\n*** Inserted child\nChild body\n")
-      (goto-char (point-min))
-      (search-forward "Inserted child")
-      (beginning-of-line)
-      (org-demote-subtree)
-      (org-fold-hide-sublevels 2)
-      (setq after (mapcar probe
-                          '("B body" "D body" "Inserted" "Child body"
-                            "E body" "F body")))
-      (org-fold-show-all)
-      (list before
-            after
-            (mapcar probe '("B body" "D body" "Inserted" "Child body"))
-            (buffer-substring-no-properties (point-min) (point-max))))))"#,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_repeated_fold_hidden_boundary_complex_edit_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((alpha-cycle ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 t) (\"quoted alpha\" 9 t) (\"Alpha child\" 11 t) (\"Alpha L4\" 13 t) (\"Alpha L5\" 15 t) (\"Beta body\" 18 nil) (\"Beta child\" 22 nil) (\"Gamma body\" 25 nil) (\"Tail body\" 27 nil)) 9 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil))) (alpha-cycle ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 nil) (\"quoted alpha\" 9 nil) (\"Alpha child\" 11 t) (\"Alpha L4\" 13 t) (\"Alpha L5\" 15 t) (\"Beta body\" 18 nil) (\"Beta child\" 22 nil) (\"Gamma body\" 25 nil) (\"Tail body\" 27 nil)) 9 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil))) (alpha-cycle ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 nil) (\"quoted alpha\" 9 nil) (\"Alpha child\" 11 nil) (\"Alpha L4\" 13 nil) (\"Alpha L5\" 15 nil) (\"Beta body\" 18 nil) (\"Beta child\" 22 nil) (\"Gamma body\" 25 nil) (\"Tail body\" 27 nil)) 9 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil))) (after-hidden-insert ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 nil) (\"quoted alpha\" 9 nil) (\"Alpha child\" 11 nil) (\"Alpha L4\" 13 nil) (\"Alpha L5\" 15 nil) (\"Beta body\" 20 nil) (\"Beta child\" 24 nil) (\"Gamma body\" 27 nil) (\"Tail body\" 29 nil)) 9 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil))) (beta-cycle ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 nil) (\"quoted alpha\" 9 nil) (\"Alpha child\" 11 nil) (\"Alpha L4\" 13 nil) (\"Alpha L5\" 15 nil) (\"Beta body\" 20 t) (\"Beta child\" 24 t) (\"Gamma body\" 27 nil) (\"Tail body\" 29 nil)) 9 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil))) (beta-cycle ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 nil) (\"quoted alpha\" 9 nil) (\"Alpha child\" 11 nil) (\"Alpha L4\" 13 nil) (\"Alpha L5\" 15 nil) (\"Beta body\" 20 nil) (\"Beta child\" 24 t) (\"Gamma body\" 27 nil) (\"Tail body\" 29 nil)) 9 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil))) (after-show-all ((\"Root paragraph\" 5 nil) (\"Alpha body\" 7 nil) (\"quoted alpha\" 9 nil) (\"Alpha child\" 11 nil) (\"Alpha L4\" 13 nil) (\"Alpha L5\" 15 nil) (\"Beta body\" 20 nil) (\"Beta child\" 24 nil) (\"Gamma body\" 30 nil) (\"Tail body\" 32 nil)) 10 ((\"Alpha L4\" org-level-4 org-level-4 nil) (\"Alpha L5\" org-level-5 org-level-5 nil)))) nil ((\"** TODO Alpha\" 6 \"** TODO Alpha\") (\"***** TODO Alpha L5\" 15 \"***** TODO Alpha L5\") (\"Inserted under hidden L5\" 16 \"Inserted under hidden L5\") (\"** WAIT Beta\" 19 \"** WAIT Beta\") (\"*** TODO Beta inserted\" 26 \"*** TODO Beta inserted\") (\"** TODO Gamma\" 29 \"** TODO Gamma\") (\"* Tail\" 31 \"* Tail\")) \"* Root\\n:PROPERTIES:\\n:Owner: Ada\\n:END:\\nRoot paragraph.\\n** TODO Alpha\\nAlpha body\\n#+begin_quote\\nquoted alpha\\n#+end_quote\\n*** TODO Alpha child\\n- [ ] child task\\n**** TODO Alpha L4\\nL4 body\\n***** TODO Alpha L5\\nInserted under hidden L5\\n\\nL5 body\\n** WAIT Beta\\nBeta body\\n:LOGBOOK:\\nCLOCK: [2026-05-27 Wed 09:00]--[2026-05-27 Wed 09:15] =>  0:15\\n:END:\\n*** TODO Beta child\\nBeta child body\\n*** TODO Beta inserted\\nInserted beta body\\n\\n** TODO Gamma\\nGamma body\\n* Tail\\nTail body\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -610,17 +615,18 @@ fn org_repeated_fold_hidden_boundary_complex_edit_combo() {
                    "Inserted under hidden L5" "** WAIT Beta"
                    "*** TODO Beta inserted" "** TODO Gamma" "* Tail"))
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_font_lock_deep_headings_after_cycle_and_edits_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) #(\"[#A]\" 0 4 (font-lock-fontified t face (org-priority org-headline-todo org-level-1))) \"L1 \" nil 1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1) nil) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) nil \"L2 \" nil 2 org-level-2 org-level-2 org-level-2 nil) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) nil \"L3\" nil 3 org-level-3 org-level-3 org-level-3 nil) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) nil \"L4                                                          \" nil 5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5) nil) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"DONE\" 0 4 (face (org-done org-level-6))) nil \"L5\" nil 6 org-level-6 (org-done org-level-6) (org-headline-done org-level-6) nil) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"TODO\" 0 4 (face (org-todo org-level-7))) nil \"L6\" nil 7 org-level-7 (org-todo org-level-7) (org-headline-todo org-level-7) nil) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"TODO\" 0 4 (face (org-todo org-level-7))) nil \"L7\" nil 7 org-level-7 (org-todo org-level-7) (org-headline-todo org-level-7) nil) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"TODO\" 0 4 (face (org-todo org-level-8))) nil \"L8\" nil 8 org-level-8 (org-todo org-level-8) (org-headline-todo org-level-8) nil)) \"* TODO [#A] L1 :work:\\n** NEXT L2 :tag:\\n*** WAIT L3\\n***** TODO L4                                                          :deep:\\n****** DONE L5\\n******* TODO L6\\n******* TODO L7\\n******** TODO L8\\nbody with /italic/ and =code=\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r#"(progn
   (require 'org)
@@ -660,7 +666,7 @@ fn org_font_lock_deep_headings_after_cycle_and_edits_combo() {
                       (match-string 3)
                       (substring-no-properties (match-string 4))
                       (match-string 5)
-                      (org-outline-level)
+                      (save-match-data (org-outline-level))
                       (get-text-property (match-beginning 1) 'face)
                       (and (match-beginning 2)
                            (get-text-property (match-beginning 2) 'face))
@@ -669,17 +675,18 @@ fn org_font_lock_deep_headings_after_cycle_and_edits_combo() {
                                          'font-lock-fontified))
                 out))
         (list (nreverse out)
-              (buffer-substring-no-properties (point-min) (point-max))))))"#,
+              (buffer-substring-no-properties (point-min) (point-max)))))))"#,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_cycle_startup_visibility_archived_drawers_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((\"Active\" nil) (\":VISIBILITY:\" nil) (\"active body\" nil) (\"Child\" nil) (\"child body\" nil) (\"Grand\" nil) (\"body grand\" nil) (\"Archived\" nil) (\"archived body\" nil) (\"Hidden child\" nil) (\"hidden body\" nil) (\"Blocks\" nil) (\"quoted body\" nil)) ((\"Active\" nil) (\":VISIBILITY:\" nil) (\"active body\" nil) (\"Child\" nil) (\"child body\" 2) (\"Grand\" 2) (\"body grand\" nil) (\"Archived\" nil) (\"archived body\" nil) (\"Hidden child\" nil) (\"hidden body\" nil) (\"Blocks\" nil) (\"quoted body\" nil)) ((\"Active\" 2) (\":VISIBILITY:\" 2) (\"active body\" nil) (\"Child\" 2) (\"child body\" nil) (\"Grand\" 2) (\"body grand\" nil) (\"Archived\" nil) (\"archived body\" 2) (\"Hidden child\" 2) (\"hidden body\" nil) (\"Blocks\" 2) (\"quoted body\" 2)) ((\"Active\" nil) (\":VISIBILITY:\" nil) (\"active body\" nil) (\"Child\" nil) (\"child body\" nil) (\"Grand\" nil) (\"body grand\" nil) (\"Archived\" nil) (\"archived body\" nil) (\"Hidden child\" nil) (\"hidden body\" nil) (\"Blocks\" nil) (\"quoted body\" nil)) \"#+STARTUP: content\\n* Active\\n:PROPERTIES:\\n:VISIBILITY: children\\n:END:\\nactive body\\n** Child\\nchild body\\n*** Grand\\nbody grand\\n* Archived :ARCHIVE:\\narchived body\\n** Hidden child\\nhidden body\\n* Blocks\\n#+begin_quote\\nquoted body\\n#+end_quote\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -728,17 +735,18 @@ fn org_cycle_startup_visibility_archived_drawers_combo() {
                     after-global
                     (funcall snapshot)
                    (buffer-substring-no-properties
-                    (point-min) (point-max)))))))))"##,
+                    (point-min) (point-max))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v60() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"IoT\" 1 nil 1 org-level-1 \"Nina\" \"devices\" nil) (\"Sensor\" 6 nil 2 org-level-2 \"Nina\" \"devices\" nil) (\"Gateway\" 16 nil 2 org-level-2 \"Nina\" \"devices\" \"medium\")) ((\"IoT\" 1 nil 1 org-level-1 \"Nina\" \"devices\" nil) (\"Sensor\" 6 2 2 org-level-2 \"Nina\" \"devices\" nil) (\"Gateway\" 16 2 2 org-level-2 \"Nina\" \"devices\" \"medium\")) ((\"IoT\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Sensor\" 13 2 2 org-level-2 nil \"???\" nil) (\"Gateway\" 23 2 2 org-level-2 nil \"???\" \"medium\")) ((\"IoT\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Sensor\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Gateway\" 23 nil 2 org-level-2 nil \"???\" \"medium\")) ((\"IoT\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Sensor\" 13 2 2 org-level-2 nil \"???\" nil) (\"Gateway\" 23 2 2 org-level-2 nil \"???\" \"medium\")) \"* TODO IoT :iot:\\n** WAIT Actuator :actuator:ml:\\n:PROPERTIES:\\n:Effort: 4h\\n:Accuracy: critical\\n:END:\\nActuator body.\\n\\n:PROPERTIES:\\n:Owner: Nina\\n:CATEGORY: devices\\n:END:\\n** DONE Sensor :sensor:core:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 01:00]--[2026-05-28 Wed 05:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 5h\\n:Accuracy: high\\n:END:\\nSensor body.\\n\\n** TODO Gateway :gateway:edge:\\n:PROPERTIES:\\n:Effort: 3h\\n:Accuracy: medium\\n:END:\\nGateway body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -774,7 +782,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v60() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("IoT" "Sensor" "Gateway")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "IoT")
@@ -788,17 +796,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v60() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v59() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Cloud\" 1 nil 1 org-level-1 \"Mike\" \"infra\" nil) (\"Compute\" 6 nil 2 org-level-2 \"Mike\" \"infra\" nil) (\"Storage\" 16 nil 2 org-level-2 \"Mike\" \"infra\" \"99.9\")) ((\"Cloud\" 1 nil 1 org-level-1 \"Mike\" \"infra\" nil) (\"Compute\" 6 2 2 org-level-2 \"Mike\" \"infra\" nil) (\"Storage\" 16 2 2 org-level-2 \"Mike\" \"infra\" \"99.9\")) ((\"Cloud\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Compute\" 13 2 2 org-level-2 nil \"???\" nil) (\"Storage\" 23 2 2 org-level-2 nil \"???\" \"99.9\")) ((\"Cloud\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Compute\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Storage\" 23 nil 2 org-level-2 nil \"???\" \"99.9\")) ((\"Cloud\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Compute\" 13 2 2 org-level-2 nil \"???\" nil) (\"Storage\" 23 2 2 org-level-2 nil \"???\" \"99.9\")) \"* TODO Cloud :cloud:\\n** WAIT Network :network:security:\\n:PROPERTIES:\\n:Effort: 6h\\n:SLA: 99.95\\n:END:\\nNetwork body.\\n\\n:PROPERTIES:\\n:Owner: Mike\\n:CATEGORY: infra\\n:END:\\n** DONE Compute :compute:core:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 02:00]--[2026-05-28 Wed 06:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 5h\\n:SLA: 99.99\\n:END:\\nCompute body.\\n\\n** TODO Storage :storage:edge:\\n:PROPERTIES:\\n:Effort: 3h\\n:SLA: 99.9\\n:END:\\nStorage body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -834,7 +843,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v59() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Cloud" "Compute" "Storage")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Cloud")
@@ -848,17 +857,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v59() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v58() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Search\" 1 nil 1 org-level-1 \"Larry\" \"engine\" nil) (\"Index\" 6 nil 2 org-level-2 \"Larry\" \"engine\" nil) (\"Crawl\" 16 nil 2 org-level-2 \"Larry\" \"engine\" \"high\")) ((\"Search\" 1 nil 1 org-level-1 \"Larry\" \"engine\" nil) (\"Index\" 6 2 2 org-level-2 \"Larry\" \"engine\" nil) (\"Crawl\" 16 2 2 org-level-2 \"Larry\" \"engine\" \"high\")) ((\"Search\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Index\" 13 2 2 org-level-2 nil \"???\" nil) (\"Crawl\" 23 2 2 org-level-2 nil \"???\" \"high\")) ((\"Search\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Index\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Crawl\" 23 nil 2 org-level-2 nil \"???\" \"high\")) ((\"Search\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Index\" 13 2 2 org-level-2 nil \"???\" nil) (\"Crawl\" 23 2 2 org-level-2 nil \"???\" \"high\")) \"* TODO Search :search:\\n** WAIT Rank :ranker:ml:\\n:PROPERTIES:\\n:Effort: 8h\\n:Relevance: high\\n:END:\\nRank body.\\n\\n:PROPERTIES:\\n:Owner: Larry\\n:CATEGORY: engine\\n:END:\\n** DONE Index :indexer:core:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 03:00]--[2026-05-28 Wed 07:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 6h\\n:Relevance: critical\\n:END:\\nIndex body.\\n\\n** TODO Crawl :spider:edge:\\n:PROPERTIES:\\n:Effort: 4h\\n:Relevance: high\\n:END:\\nCrawl body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -894,7 +904,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v58() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Search" "Index" "Crawl")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Search")
@@ -908,17 +918,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v58() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v57() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Data\" 1 nil 1 org-level-1 \"Kate\" \"analytics\" nil) (\"ETL\" 6 nil 2 org-level-2 \"Kate\" \"analytics\" nil) (\"Dashboard\" 16 nil 2 org-level-2 \"Kate\" \"analytics\" \"medium\")) ((\"Data\" 1 nil 1 org-level-1 \"Kate\" \"analytics\" nil) (\"ETL\" 6 2 2 org-level-2 \"Kate\" \"analytics\" nil) (\"Dashboard\" 16 2 2 org-level-2 \"Kate\" \"analytics\" \"medium\")) ((\"Data\" 1 nil 1 org-level-1 nil \"???\" nil) (\"ETL\" 13 2 2 org-level-2 nil \"???\" nil) (\"Dashboard\" 23 2 2 org-level-2 nil \"???\" \"medium\")) ((\"Data\" 1 nil 1 org-level-1 nil \"???\" nil) (\"ETL\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Dashboard\" 23 nil 2 org-level-2 nil \"???\" \"medium\")) ((\"Data\" 1 nil 1 org-level-1 nil \"???\" nil) (\"ETL\" 13 2 2 org-level-2 nil \"???\" nil) (\"Dashboard\" 23 2 2 org-level-2 nil \"???\" \"medium\")) \"* TODO Data :data:\\n** WAIT ML :ml:research:\\n:PROPERTIES:\\n:Effort: 10h\\n:Latency: high\\n:END:\\nML body.\\n\\n:PROPERTIES:\\n:Owner: Kate\\n:CATEGORY: analytics\\n:END:\\n** DONE ETL :pipeline:core:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 04:00]--[2026-05-28 Wed 08:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 5h\\n:Latency: low\\n:END:\\nETL body.\\n\\n** TODO Dashboard :viz:edge:\\n:PROPERTIES:\\n:Effort: 3h\\n:Latency: medium\\n:END:\\nDashboard body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -954,7 +965,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v57() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Data" "ETL" "Dashboard")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Data")
@@ -968,17 +979,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v57() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v56() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Backend\" 1 nil 1 org-level-1 \"Jack\" \"server\" nil) (\"Auth\" 6 nil 2 org-level-2 \"Jack\" \"server\" nil) (\"API\" 16 nil 2 org-level-2 \"Jack\" \"server\" \"high\")) ((\"Backend\" 1 nil 1 org-level-1 \"Jack\" \"server\" nil) (\"Auth\" 6 2 2 org-level-2 \"Jack\" \"server\" nil) (\"API\" 16 2 2 org-level-2 \"Jack\" \"server\" \"high\")) ((\"Backend\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Auth\" 13 2 2 org-level-2 nil \"???\" nil) (\"API\" 23 2 2 org-level-2 nil \"???\" \"high\")) ((\"Backend\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Auth\" 13 nil 2 org-level-2 nil \"???\" nil) (\"API\" 23 nil 2 org-level-2 nil \"???\" \"high\")) ((\"Backend\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Auth\" 13 2 2 org-level-2 nil \"???\" nil) (\"API\" 23 2 2 org-level-2 nil \"???\" \"high\")) \"* TODO Backend :backend:\\n** WAIT DB :database:persistence:\\n:PROPERTIES:\\n:Effort: 8h\\n:Severity: high\\n:END:\\nDB body.\\n\\n:PROPERTIES:\\n:Owner: Jack\\n:CATEGORY: server\\n:END:\\n** DONE Auth :security:core:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 05:00]--[2026-05-28 Wed 09:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 6h\\n:Severity: critical\\n:END:\\nAuth body.\\n\\n** TODO API :rest:edge:\\n:PROPERTIES:\\n:Effort: 4h\\n:Severity: high\\n:END:\\nAPI body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1014,7 +1026,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v56() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Backend" "Auth" "API")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Backend")
@@ -1028,17 +1040,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v56() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v55() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"System\" 1 nil 1 org-level-1 \"Irene\" \"core\" nil) (\"Component-A\" 6 nil 2 org-level-2 \"Irene\" \"core\" nil) (\"Component-B\" 16 nil 2 org-level-2 \"Irene\" \"core\" \"medium\")) ((\"System\" 1 nil 1 org-level-1 \"Irene\" \"core\" nil) (\"Component-A\" 6 2 2 org-level-2 \"Irene\" \"core\" nil) (\"Component-B\" 16 2 2 org-level-2 \"Irene\" \"core\" \"medium\")) ((\"System\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Component-A\" 13 2 2 org-level-2 nil \"???\" nil) (\"Component-B\" 23 2 2 org-level-2 nil \"???\" \"medium\")) ((\"System\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Component-A\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Component-B\" 23 nil 2 org-level-2 nil \"???\" \"medium\")) ((\"System\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Component-A\" 13 2 2 org-level-2 nil \"???\" nil) (\"Component-B\" 23 2 2 org-level-2 nil \"???\" \"medium\")) \"* TODO System :system:\\n** WAIT Component-C :infra:security:\\n:PROPERTIES:\\n:Effort: 3h\\n:Criticality: critical\\n:END:\\nComponent C body.\\n\\n:PROPERTIES:\\n:Owner: Irene\\n:CATEGORY: core\\n:END:\\n** DONE Component-A :infra:net:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 06:00]--[2026-05-28 Wed 10:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 5h\\n:Criticality: high\\n:END:\\nComponent A body.\\n\\n** TODO Component-B :infra:storage:\\n:PROPERTIES:\\n:Effort: 7h\\n:Criticality: medium\\n:END:\\nComponent B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1074,7 +1087,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v55() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("System" "Component-A" "Component-B")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "System")
@@ -1088,17 +1101,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v55() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v54() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Platform\" 1 nil 1 org-level-1 \"Hank\" \"infra\" nil) (\"Service-A\" 6 nil 2 org-level-2 \"Hank\" \"infra\" nil) (\"Service-B\" 16 nil 2 org-level-2 \"Hank\" \"infra\" \"99.5\")) ((\"Platform\" 1 nil 1 org-level-1 \"Hank\" \"infra\" nil) (\"Service-A\" 6 2 2 org-level-2 \"Hank\" \"infra\" nil) (\"Service-B\" 16 2 2 org-level-2 \"Hank\" \"infra\" \"99.5\")) ((\"Platform\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Service-A\" 13 2 2 org-level-2 nil \"???\" nil) (\"Service-B\" 23 2 2 org-level-2 nil \"???\" \"99.5\")) ((\"Platform\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Service-A\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Service-B\" 23 nil 2 org-level-2 nil \"???\" \"99.5\")) ((\"Platform\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Service-A\" 13 2 2 org-level-2 nil \"???\" nil) (\"Service-B\" 23 2 2 org-level-2 nil \"???\" \"99.5\")) \"* TODO Platform :platform:\\n** WAIT Service-C :microservice:auth:\\n:PROPERTIES:\\n:Effort: 3h\\n:SLA: 99.99\\n:END:\\nService C body.\\n\\n:PROPERTIES:\\n:Owner: Hank\\n:CATEGORY: infra\\n:END:\\n** DONE Service-A :microservice:core:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 07:00]--[2026-05-28 Wed 11:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 6h\\n:SLA: 99.9\\n:END:\\nService A body.\\n\\n** TODO Service-B :microservice:edge:\\n:PROPERTIES:\\n:Effort: 4h\\n:SLA: 99.5\\n:END:\\nService B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1134,7 +1148,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v54() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Platform" "Service-A" "Service-B")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Platform")
@@ -1148,17 +1162,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v54() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_tag_prop_clock_font_v53() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Product\" 1 nil 1 org-level-1 \"Gina\" \"eng\" nil) (\"API\" 6 nil 2 org-level-2 \"Gina\" \"eng\" nil) (\"UI\" 16 nil 2 org-level-2 \"Gina\" \"eng\" \"P1\")) ((\"Product\" 1 nil 1 org-level-1 \"Gina\" \"eng\" nil) (\"API\" 6 2 2 org-level-2 \"Gina\" \"eng\" nil) (\"UI\" 16 2 2 org-level-2 \"Gina\" \"eng\" \"P1\")) ((\"Product\" 1 nil 1 org-level-1 nil \"???\" nil) (\"API\" 13 2 2 org-level-2 nil \"???\" nil) (\"UI\" 23 2 2 org-level-2 nil \"???\" \"P1\")) ((\"Product\" 1 nil 1 org-level-1 nil \"???\" nil) (\"API\" 13 nil 2 org-level-2 nil \"???\" nil) (\"UI\" 23 nil 2 org-level-2 nil \"???\" \"P1\")) ((\"Product\" 1 nil 1 org-level-1 nil \"???\" nil) (\"API\" 13 2 2 org-level-2 nil \"???\" nil) (\"UI\" 23 2 2 org-level-2 nil \"???\" \"P1\")) \"* TODO Product :product:\\n** WAIT Docs :docs:writing:\\n:PROPERTIES:\\n:Effort: 3h\\n:Tier: P2\\n:END:\\nDocs body.\\n\\n:PROPERTIES:\\n:Owner: Gina\\n:CATEGORY: eng\\n:END:\\n** DONE API :backend:api:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 08:00]--[2026-05-28 Wed 12:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 5h\\n:Tier: P0\\n:END:\\nAPI body.\\n\\n** TODO UI :frontend:ui:\\n:PROPERTIES:\\n:Effort: 8h\\n:Tier: P1\\n:END:\\nUI body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1194,7 +1209,7 @@ fn org_fold_hide_all_edit_cycle_tag_prop_clock_font_v53() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Product" "API" "UI")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Product")
@@ -1208,17 +1223,18 @@ fn org_fold_hide_all_edit_cycle_tag_prop_clock_font_v53() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v52() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Board\" 1 nil 1 org-level-1 \"Frank\" \"kanban\" nil) (\"Card-A\" 6 nil 2 org-level-2 \"Frank\" \"kanban\" nil) (\"Card-B\" 16 nil 2 org-level-2 \"Frank\" \"kanban\" \"medium\")) ((\"Board\" 1 nil 1 org-level-1 \"Frank\" \"kanban\" nil) (\"Card-A\" 6 2 2 org-level-2 \"Frank\" \"kanban\" nil) (\"Card-B\" 16 2 2 org-level-2 \"Frank\" \"kanban\" \"medium\")) ((\"Board\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Card-A\" 13 2 2 org-level-2 nil \"???\" nil) (\"Card-B\" 23 2 2 org-level-2 nil \"???\" \"medium\")) ((\"Board\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Card-A\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Card-B\" 23 nil 2 org-level-2 nil \"???\" \"medium\")) ((\"Board\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Card-A\" 13 2 2 org-level-2 nil \"???\" nil) (\"Card-B\" 23 2 2 org-level-2 nil \"???\" \"medium\")) \"* TODO Board :board:\\n** WAIT Card-C :devops:deploy:\\n:PROPERTIES:\\n:Effort: 2h\\n:Weight: light\\n:END:\\nCard C body.\\n\\n:PROPERTIES:\\n:Owner: Frank\\n:CATEGORY: kanban\\n:END:\\n** DONE Card-A :backend:cache:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 10:00]--[2026-05-28 Wed 13:00] =>  3:00\\n:END:\\n:PROPERTIES:\\n:Effort: 4h\\n:Weight: heavy\\n:END:\\nCard A body.\\n\\n** TODO Card-B :frontend:ui:\\n:PROPERTIES:\\n:Effort: 6h\\n:Weight: medium\\n:END:\\nCard B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1254,7 +1270,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v52() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Board" "Card-A" "Card-B")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Board")
@@ -1268,17 +1284,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v52() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v51() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Release\" 1 nil 1 org-level-1 \"Eve\" \"ship\" nil) (\"Feature-X\" 6 nil 2 org-level-2 \"Eve\" \"ship\" nil) (\"Feature-Y\" 16 nil 2 org-level-2 \"Eve\" \"ship\" nil)) ((\"Release\" 1 nil 1 org-level-1 \"Eve\" \"ship\" nil) (\"Feature-X\" 6 2 2 org-level-2 \"Eve\" \"ship\" nil) (\"Feature-Y\" 16 2 2 org-level-2 \"Eve\" \"ship\" nil)) ((\"Release\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Feature-X\" 13 2 2 org-level-2 nil \"???\" nil) (\"Feature-Y\" 23 2 2 org-level-2 nil \"???\" nil)) ((\"Release\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Feature-X\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Feature-Y\" 23 nil 2 org-level-2 nil \"???\" nil)) ((\"Release\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Feature-X\" 13 2 2 org-level-2 nil \"???\" nil) (\"Feature-Y\" 23 2 2 org-level-2 nil \"???\" nil)) \"* TODO Release :release:\\n** WAIT Feature-Z :devops:infra:\\n:PROPERTIES:\\n:Effort: 3h\\n:Priority: medium\\n:END:\\nFeature Z body.\\n\\n:PROPERTIES:\\n:Owner: Eve\\n:CATEGORY: ship\\n:END:\\n** DONE Feature-X :backend:api:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 08:00]--[2026-05-28 Wed 12:00] =>  4:00\\n:END:\\n:PROPERTIES:\\n:Effort: 5h\\n:Priority: critical\\n:END:\\nFeature X body.\\n\\n** TODO Feature-Y :frontend:ux:\\n:PROPERTIES:\\n:Effort: 8h\\n:Priority: high\\n:END:\\nFeature Y body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1314,7 +1331,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v51() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Release" "Feature-X" "Feature-Y")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Release")
@@ -1328,17 +1345,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v51() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v50() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Campaign\" 1 nil 1 org-level-1 \"Dave\" \"marketing\" nil) (\"Email-Blast\" 6 nil 2 org-level-2 \"Dave\" \"marketing\" nil) (\"Social-Media\" 16 nil 2 org-level-2 \"Dave\" \"marketing\" \"medium\")) ((\"Campaign\" 1 nil 1 org-level-1 \"Dave\" \"marketing\" nil) (\"Email-Blast\" 6 2 2 org-level-2 \"Dave\" \"marketing\" nil) (\"Social-Media\" 16 2 2 org-level-2 \"Dave\" \"marketing\" \"medium\")) ((\"Campaign\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Email-Blast\" 13 2 2 org-level-2 nil \"???\" nil) (\"Social-Media\" 23 2 2 org-level-2 nil \"???\" \"medium\")) ((\"Campaign\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Email-Blast\" 13 nil 2 org-level-2 nil \"???\" nil) (\"Social-Media\" 23 nil 2 org-level-2 nil \"???\" \"medium\")) ((\"Campaign\" 1 nil 1 org-level-1 nil \"???\" nil) (\"Email-Blast\" 13 2 2 org-level-2 nil \"???\" nil) (\"Social-Media\" 23 2 2 org-level-2 nil \"???\" \"medium\")) \"* TODO Campaign :campaign:\\n** WAIT SEO-Optimization :seo:tech:\\n:PROPERTIES:\\n:Effort: 8h\\n:ROI: low\\n:END:\\nSEO body.\\n\\n:PROPERTIES:\\n:Owner: Dave\\n:CATEGORY: marketing\\n:END:\\n** DONE Email-Blast :email:perf:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 08:00]--[2026-05-28 Wed 10:30] =>  2:30\\n:END:\\n:PROPERTIES:\\n:Effort: 3h\\n:ROI: high\\n:END:\\nEmail blast body.\\n\\n** TODO Social-Media :social:\\n:PROPERTIES:\\n:Effort: 5h\\n:ROI: medium\\n:END:\\nSocial media body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1375,7 +1393,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v50() {
                              (list needle 'not-found nil nil nil nil nil nil))))
                      '("Campaign" "Email-Blast" "Social-Media")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Campaign")
@@ -1389,17 +1407,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v50() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v49() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Iteration\" 1 nil 1 org-level-1 \"Carol\" \"sprint\") (\"Item-A\" 6 nil 2 org-level-2 \"Carol\" \"sprint\") (\"Item-B\" 16 nil 2 org-level-2 \"Carol\" \"sprint\")) ((\"Iteration\" 1 nil 1 org-level-1 \"Carol\" \"sprint\") (\"Item-A\" 6 2 2 org-level-2 \"Carol\" \"sprint\") (\"Item-B\" 16 2 2 org-level-2 \"Carol\" \"sprint\")) ((\"Iteration\" 1 nil 1 org-level-1 nil \"???\") (\"Item-A\" 13 2 2 org-level-2 nil \"???\") (\"Item-B\" 23 2 2 org-level-2 nil \"???\")) ((\"Iteration\" 1 nil 1 org-level-1 nil \"???\") (\"Item-A\" 13 nil 2 org-level-2 nil \"???\") (\"Item-B\" 23 nil 2 org-level-2 nil \"???\")) ((\"Iteration\" 1 nil 1 org-level-1 nil \"???\") (\"Item-A\" 13 2 2 org-level-2 nil \"???\") (\"Item-B\" 23 2 2 org-level-2 nil \"???\")) \"* TODO Iteration :iter:\\n** WAIT Item-C :devops:\\n:PROPERTIES:\\n:Effort: 1h\\n:Complexity: low\\n:END:\\nItem C body.\\n\\n:PROPERTIES:\\n:Owner: Carol\\n:CATEGORY: sprint\\n:END:\\n** DONE Item-A :fe:perf:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 10:00]--[2026-05-28 Wed 12:00] =>  2:00\\n:END:\\n:PROPERTIES:\\n:Effort: 2h\\n:Complexity: high\\n:END:\\nItem A body.\\n\\n** TODO Item-B :be:\\n:PROPERTIES:\\n:Effort: 4h\\n:Complexity: medium\\n:END:\\nItem B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1434,7 +1453,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v49() {
                              (list needle 'not-found nil nil nil nil nil))))
                      '("Iteration" "Item-A" "Item-B")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Iteration")
@@ -1448,17 +1467,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_font_v49() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_tag_prop_v48() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Phase-1\" 1 nil 1 \"Bob\" \"phase1\" nil) (\"Task-A\" 6 nil 2 \"Bob\" \"phase1\" nil)) ((\"Phase-1\" 1 nil 1 \"Bob\" \"phase1\" nil) (\"Task-A\" 6 2 2 \"Bob\" \"phase1\" nil)) ((\"Phase-1\" 1 nil 1 nil \"???\" nil) (\"Task-A\" 13 2 2 nil \"???\" nil)) ((\"Phase-1\" 1 nil 1 nil \"???\" nil) (\"Task-A\" 13 nil 2 nil \"???\" nil)) ((\"Phase-1\" 1 nil 1 nil \"???\" nil) (\"Task-A\" 13 2 2 nil \"???\" nil)) \"* TODO Phase-1 :phase:\\n** WAIT Task-B :frontend:ux:\\n:PROPERTIES:\\n:Effort: 5h\\n:Priority: medium\\n:END:\\nTask B body.\\n\\n:PROPERTIES:\\n:Owner: Bob\\n:CATEGORY: phase1\\n:END:\\n** DONE Task-A :backend:perf:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 11:30] =>  2:30\\n:END:\\n:PROPERTIES:\\n:Effort: 3h\\n:Priority: high\\n:END:\\nTask A body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1487,7 +1507,7 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_v48() {
                            (list needle 'not-found nil nil nil nil nil))))
                    '("Phase-1" "Task-A")))))
       (let ((initial (funcall snap 'initial)))
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           (goto-char (point-min))
           (search-forward "Phase-1")
@@ -1500,17 +1520,18 @@ fn org_fold_hide_edit_show_cycle_clock_tag_prop_v48() {
               (let ((after-cycle (funcall snap 'cycle)))
                 (list initial after-hide after-edit after-show after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_font_face_v47() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Sprint\" 1 nil 1 org-level-1 \"Alice\") (\"Story-A\" 5 nil 2 org-level-2 \"Alice\") (\"Story-B\" 15 nil 2 org-level-2 \"Alice\")) ((\"Sprint\" 1 nil 1 org-level-1 \"Alice\") (\"Story-A\" 5 2 2 org-level-2 \"Alice\") (\"Story-B\" 15 2 2 org-level-2 \"Alice\")) ((\"Sprint\" 1 nil 1 org-level-1 nil) (\"Story-A\" 12 2 2 org-level-2 nil) (\"Story-B\" 22 2 2 org-level-2 nil)) ((\"Sprint\" 1 nil 1 org-level-1 nil) (\"Story-A\" 12 nil 2 org-level-2 nil) (\"Story-B\" 22 nil 2 org-level-2 nil)) ((\"Sprint\" 1 nil 1 org-level-1 nil) (\"Story-A\" 12 2 2 org-level-2 nil) (\"Story-B\" 22 2 2 org-level-2 nil)) \"* TODO Sprint :sprint:\\n** WAIT Story-C :devops:\\n:PROPERTIES:\\n:Effort: 2h\\n:Points: 3\\n:END:\\nStory C body.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:END:\\n** DONE Story-A :fe:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 11:00] =>  2:00\\n:END:\\n:PROPERTIES:\\n:Effort: 3h\\n:Points: 5\\n:END:\\nStory A body.\\n\\n** TODO Story-B :be:\\n:PROPERTIES:\\n:Effort: 5h\\n:Points: 8\\n:END:\\nStory B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1545,7 +1566,7 @@ fn org_fold_hide_all_edit_cycle_font_face_v47() {
                              (list needle 'not-found nil nil nil nil))))
                      '("Sprint" "Story-A" "Story-B")))))
         (let ((initial (funcall snap 'initial)))
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide (funcall snap 'hide)))
             (goto-char (point-min))
             (search-forward "Sprint")
@@ -1559,17 +1580,18 @@ fn org_fold_hide_all_edit_cycle_font_face_v47() {
                 (let ((after-cycle (funcall snap 'cycle)))
                   (list initial after-hide after-edit after-show after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_multi_tag_prop_clock_v46() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Release-1.0\" 1 nil 1 \"Bob\" \"release\" nil) (\"Feature-A\" 6 nil 2 \"Bob\" \"release\" nil) (\"Feature-B\" 16 nil 2 \"Bob\" \"release\" \"medium\")) ((\"Release-1.0\" 1 nil 1 \"Bob\" \"release\" nil) (\"Feature-A\" 6 2 2 \"Bob\" \"release\" nil) (\"Feature-B\" 16 2 2 \"Bob\" \"release\" \"medium\")) ((\"Release-1.0\" 1 nil 1 nil \"???\" nil) (\"Feature-A\" 13 2 2 nil \"???\" nil) (\"Feature-B\" 23 2 2 nil \"???\" \"medium\")) ((\"Release-1.0\" 1 nil 1 nil \"???\" nil) (\"Feature-A\" 13 nil 2 nil \"???\" nil) (\"Feature-B\" 23 nil 2 nil \"???\" \"medium\")) ((\"Release-1.0\" 1 nil 1 nil \"???\" nil) (\"Feature-A\" 13 2 2 nil \"???\" nil) (\"Feature-B\" 23 2 2 nil \"???\" \"medium\")) \"* TODO Release-1.0 :release:\\n** WAIT Feature-C :devops:security:\\n:PROPERTIES:\\n:Effort: 3h\\n:Complexity: low\\n:END:\\nFeature C body.\\n\\n:PROPERTIES:\\n:Owner: Bob\\n:CATEGORY: release\\n:END:\\n** DONE Feature-A :backend:perf:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 12:00] =>  3:00\\n:END:\\n:PROPERTIES:\\n:Effort: 4h\\n:Complexity: high\\n:END:\\nFeature A body.\\n\\n** TODO Feature-B :frontend:\\n:PROPERTIES:\\n:Effort: 6h\\n:Complexity: medium\\n:END:\\nFeature B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1601,7 +1623,7 @@ fn org_fold_hide_all_edit_cycle_multi_tag_prop_clock_v46() {
                            (list needle 'not-found nil nil nil nil nil))))
                    '("Release-1.0" "Feature-A" "Feature-B")))))
       (let ((initial (funcall snap 'initial)))
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           (goto-char (point-min))
           (search-forward "Release-1.0")
@@ -1614,17 +1636,18 @@ fn org_fold_hide_all_edit_cycle_multi_tag_prop_clock_v46() {
               (let ((after-cycle (funcall snap 'cycle)))
                 (list initial after-hide after-edit after-show after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_tag_prop_clock_v45() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Epic-1\" 1 nil 1 \"Alice\" \"dev\" nil) (\"Story-A\" 6 nil 2 \"Alice\" \"dev\" nil) (\"Story-B\" 16 nil 2 \"Alice\" \"dev\" \"8\")) ((\"Epic-1\" 1 nil 1 \"Alice\" \"dev\" nil) (\"Story-A\" 6 2 2 \"Alice\" \"dev\" nil) (\"Story-B\" 16 2 2 \"Alice\" \"dev\" \"8\")) ((\"Epic-1\" 1 nil 1 nil \"???\" nil) (\"Story-A\" 13 2 2 nil \"???\" nil) (\"Story-B\" 23 2 2 nil \"???\" \"8\")) ((\"Epic-1\" 1 nil 1 nil \"???\" nil) (\"Story-A\" 13 nil 2 nil \"???\" nil) (\"Story-B\" 23 nil 2 nil \"???\" \"8\")) ((\"Epic-1\" 1 nil 1 nil \"???\" nil) (\"Story-A\" 13 2 2 nil \"???\" nil) (\"Story-B\" 23 2 2 nil \"???\" \"8\")) \"* TODO Epic-1 :epic:\\n** WAIT Story-C :devops:\\n:PROPERTIES:\\n:Effort: 2h\\n:Points: 3\\n:END:\\nStory C body.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:CATEGORY: dev\\n:END:\\n** DONE Story-A :frontend:urgent:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 11:30] =>  2:30\\n:END:\\n:PROPERTIES:\\n:Effort: 3h\\n:Points: 5\\n:END:\\nStory A body.\\n\\n** TODO Story-B :backend:\\n:PROPERTIES:\\n:Effort: 5h\\n:Points: 8\\n:END:\\nStory B body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1656,7 +1679,7 @@ fn org_fold_hide_all_edit_cycle_tag_prop_clock_v45() {
                            (list needle 'not-found nil nil nil nil nil))))
                    '("Epic-1" "Story-A" "Story-B")))))
       (let ((initial (funcall snap 'initial)))
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           (goto-char (point-min))
           (search-forward "Epic-1")
@@ -1669,17 +1692,18 @@ fn org_fold_hide_all_edit_cycle_tag_prop_clock_v45() {
               (let ((after-cycle (funcall snap 'cycle)))
                 (list initial after-hide after-edit after-show after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_tag_clock_v44() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Sprint-1\" 1 nil 1 \"Alice\" nil) (\"Story-A\" 5 nil 2 \"Alice\" nil) (\"Story-B\" 15 nil 2 \"Alice\" \"8\") (\"Story-C\" 22 nil 2 \"Alice\" \"3\")) ((\"Sprint-1\" 1 nil 1 \"Alice\" nil) (\"Story-A\" 5 2 2 \"Alice\" nil) (\"Story-B\" 15 2 2 \"Alice\" \"8\") (\"Story-C\" 22 2 2 \"Alice\" \"3\")) ((\"Sprint-1\" 1 nil 1 nil nil) (\"Story-A\" 12 2 2 nil nil) (\"Story-B\" 22 2 2 nil \"8\") (\"Story-C\" 29 2 2 nil \"3\")) ((\"Sprint-1\" 1 nil 1 nil nil) (\"Story-A\" 12 nil 2 nil nil) (\"Story-B\" 22 nil 2 nil \"8\") (\"Story-C\" 29 nil 2 nil \"3\")) ((\"Sprint-1\" 1 nil 1 nil nil) (\"Story-A\" 12 2 2 nil nil) (\"Story-B\" 22 2 2 nil \"8\") (\"Story-C\" 29 2 2 nil \"3\")) \"* TODO Sprint-1 :sprint:\\n** DONE Story-D :frontend:\\n:PROPERTIES:\\n:Effort: 1h\\n:Story-points: 2\\n:END:\\nStory D body.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:END:\\n** DONE Story-A :frontend:\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 11:00] =>  2:00\\n:END:\\n:PROPERTIES:\\n:Effort: 3h\\n:Story-points: 5\\n:END:\\nStory A body.\\n\\n** TODO Story-B :backend:\\n:PROPERTIES:\\n:Effort: 5h\\n:Story-points: 8\\n:END:\\nStory B body.\\n\\n** WAIT Story-C :devops:\\n:PROPERTIES:\\n:Effort: 2h\\n:Story-points: 3\\n:END:\\nStory C body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1714,7 +1738,7 @@ fn org_fold_hide_all_edit_cycle_tag_clock_v44() {
                    '("Sprint-1" "Story-A" "Story-B" "Story-C")))))
       (let ((initial (funcall snap 'initial)))
         ;; Hide all
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           ;; Edit: insert Story-D under hidden Sprint
           (goto-char (point-min))
@@ -1734,17 +1758,18 @@ fn org_fold_hide_all_edit_cycle_tag_clock_v44() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_prop_inherit_clock_v43() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Project\" 1 nil 1 \"Alice\" \"work\") (\"Module A\" 6 nil 2 \"Alice\" \"work\") (\"Component X\" 13 nil 3 \"Alice\" \"work\") (\"Module B\" 19 nil 2 \"Alice\" \"work\") (\"Component Z\" 23 nil 3 \"Alice\" \"work\")) ((\"Project\" 1 nil 1 \"Alice\" \"work\") (\"Module A\" 6 2 2 \"Alice\" \"work\") (\"Component X\" 13 2 3 \"Alice\" \"work\") (\"Module B\" 19 2 2 \"Alice\" \"work\") (\"Component Z\" 23 2 3 \"Alice\" \"work\")) ((\"Project\" 1 nil 1 nil \"???\") (\"Module A\" 13 2 2 nil \"???\") (\"Component X\" 20 2 3 nil \"???\") (\"Module B\" 26 2 2 nil \"???\") (\"Component Z\" 30 2 3 nil \"???\")) ((\"Project\" 1 nil 1 nil \"???\") (\"Module A\" 13 nil 2 nil \"???\") (\"Component X\" 20 nil 3 nil \"???\") (\"Module B\" 26 nil 2 nil \"???\") (\"Component Z\" 30 nil 3 nil \"???\")) ((\"Project\" 1 nil 1 nil \"???\") (\"Module A\" 13 2 2 nil \"???\") (\"Component X\" 20 2 3 nil \"???\") (\"Module B\" 26 2 2 nil \"???\") (\"Component Z\" 30 2 3 nil \"???\")) \"* TODO Project :project:\\n** WAIT Module C\\n:PROPERTIES:\\n:Effort: 1h\\n:END:\\n*** Component W\\nBody W.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:CATEGORY: work\\n:END:\\n** DONE Module A\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:30] =>  1:30\\n:END:\\n:PROPERTIES:\\n:Effort: 2h\\n:END:\\n*** Component X\\nBody X.\\n\\n*** Component Y\\nBody Y.\\n\\n** TODO Module B\\n:PROPERTIES:\\n:Effort: 3h\\n:END:\\n*** Component Z\\nBody Z.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1777,7 +1802,7 @@ fn org_fold_hide_all_edit_cycle_prop_inherit_clock_v43() {
                    '("Project" "Module A" "Component X" "Module B" "Component Z")))))
       (let ((initial (funcall snap 'initial)))
         ;; Hide all
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           ;; Edit: insert Module C under hidden Project
           (goto-char (point-min))
@@ -1797,17 +1822,18 @@ fn org_fold_hide_all_edit_cycle_prop_inherit_clock_v43() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_edit_show_cycle_clock_prop_v42() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Project\" 1 nil 1 \"Alice\") (\"Task A\" 5 nil 2 \"Alice\") (\"Task B\" 14 nil 2 \"Alice\")) ((\"Project\" 1 2 1 \"Alice\") (\"Task A\" 5 2 2 \"Alice\") (\"Task B\" 14 2 2 \"Alice\")) ((\"Project\" 1 nil 1 nil) (\"Task A\" 11 2 2 nil) (\"Task B\" 20 2 2 nil)) ((\"Project\" 1 nil 1 nil) (\"Task A\" 11 nil 2 nil) (\"Task B\" 20 nil 2 nil)) ((\"Project\" 1 2 1 nil) (\"Task A\" 11 2 2 nil) (\"Task B\" 20 2 2 nil)) \"* TODO Project\\n** WAIT Task C\\n:PROPERTIES:\\n:Effort: 3h\\n:END:\\nBody C.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:END:\\n** DONE Task A\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:00] =>  1:00\\n:END:\\n:PROPERTIES:\\n:Effort: 2h\\n:END:\\nBody A.\\n\\n** TODO Task B\\nBody B.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1837,7 +1863,7 @@ fn org_fold_hide_edit_show_cycle_clock_prop_v42() {
                    '("Project" "Task A" "Task B")))))
       (let ((initial (funcall snap 'initial)))
         ;; Hide all
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           ;; Edit: insert Task C under hidden Project
           (goto-char (point-min))
@@ -1857,17 +1883,18 @@ fn org_fold_hide_edit_show_cycle_clock_prop_v42() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_subtree_scheduled_deadline_cycle_v41() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 48 57)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Alpha\" 1 nil 1) (\"Beta\" 5 nil 2) (\"Gamma\" 8 nil 3)) ((\"Alpha\" 1 2 1) (\"Beta\" 5 2 2) (\"Gamma\" 8 2 3)) ((\"Alpha\" 1 nil 1) (\"Beta\" 8 2 2) (\"Gamma\" 11 2 3)) ((\"Alpha\" 1 nil 1) (\"Beta\" 8 nil 2) (\"Gamma\" 11 nil 3)) ((\"Alpha\" 1 2 1) (\"Beta\" 8 2 2) (\"Gamma\" 11 2 3)) \"* TODO Alpha\\n** WAIT Delta\\nBody delta.\\n\\nSCHEDULED: <2026-05-28 Wed>\\nBody alpha.\\n\\n** DONE Beta\\nBody beta.\\n\\n*** TODO Gamma\\nBody gamma.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1916,17 +1943,18 @@ fn org_fold_hide_subtree_scheduled_deadline_cycle_v41() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_subtree_edit_cycle_prop_clock_v40() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 54 57)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Project\" 1 nil 1 \"Alice\") (\"Task A\" 5 nil 2 \"Alice\") (\"Task B\" 14 nil 2 \"Alice\")) ((\"Project\" 1 nil 1 \"Alice\") (\"Task A\" 5 2 2 \"Alice\") (\"Task B\" 14 nil 2 \"Alice\")) ((\"Project\" 1 nil 1 nil) (\"Task A\" 11 2 2 nil) (\"Task B\" 20 nil 2 nil)) ((\"Project\" 1 nil 1 nil) (\"Task A\" 11 nil 2 nil) (\"Task B\" 20 nil 2 nil)) ((\"Project\" 1 2 1 nil) (\"Task A\" 11 2 2 nil) (\"Task B\" 20 2 2 nil)) \"* TODO Project\\n** WAIT Task C\\n:PROPERTIES:\\n:Effort: 3h\\n:END:\\nBody C.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:END:\\n** DONE Task A\\n:LOGBOOK:\\nCLOCK: [2026-05-28 Wed 09:00]--[2026-05-28 Wed 10:00] =>  1:00\\n:END:\\n:PROPERTIES:\\n:Effort: 2h\\n:END:\\nBody A.\\n\\n** TODO Task B\\n:PROPERTIES:\\n:Effort: 1h\\n:END:\\nBody B.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1981,17 +2009,18 @@ fn org_fold_hide_subtree_edit_cycle_prop_clock_v40() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_prop_inherit_edit_cycle_v39() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Project\" 1 nil 1 \"Alice\" \"work\") (\"Module A\" 6 nil 2 \"Alice\" \"work\") (\"Component X\" 10 nil 3 \"Alice\" \"work\") (\"Module B\" 16 nil 2 \"Alice\" \"work\") (\"Component Z\" 20 nil 3 \"Alice\" \"work\")) ((\"Project\" 1 nil 1 \"Alice\" \"work\") (\"Module A\" 6 2 2 \"Alice\" \"work\") (\"Component X\" 10 2 3 \"Alice\" \"work\") (\"Module B\" 16 2 2 \"Alice\" \"work\") (\"Component Z\" 20 2 3 \"Alice\" \"work\")) ((\"Project\" 1 nil 1 nil \"???\") (\"Module A\" 13 2 2 nil \"???\") (\"Component X\" 17 2 3 nil \"???\") (\"Module B\" 23 2 2 nil \"???\") (\"Component Z\" 27 2 3 nil \"???\")) ((\"Project\" 1 nil 1 nil \"???\") (\"Module A\" 13 nil 2 nil \"???\") (\"Component X\" 17 nil 3 nil \"???\") (\"Module B\" 23 nil 2 nil \"???\") (\"Component Z\" 27 nil 3 nil \"???\")) ((\"Project\" 1 nil 1 nil \"???\") (\"Module A\" 13 2 2 nil \"???\") (\"Component X\" 17 2 3 nil \"???\") (\"Module B\" 23 2 2 nil \"???\") (\"Component Z\" 27 2 3 nil \"???\")) \"* Project :project:\\n** Module C\\n:PROPERTIES:\\n:Effort: 1h\\n:END:\\n*** Component W\\nBody W.\\n\\n:PROPERTIES:\\n:Owner: Alice\\n:CATEGORY: work\\n:END:\\n** Module A\\n:PROPERTIES:\\n:Effort: 2h\\n:END:\\n*** Component X\\nBody X.\\n\\n*** Component Y\\nBody Y.\\n\\n** Module B\\n:PROPERTIES:\\n:Effort: 3h\\n:END:\\n*** Component Z\\nBody Z.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -2023,7 +2052,7 @@ fn org_fold_hide_all_prop_inherit_edit_cycle_v39() {
                    '("Project" "Module A" "Component X" "Module B" "Component Z")))))
       (let ((initial (funcall snap 'initial)))
         ;; Hide all
-        (org-fold-hide-all)
+        (org-fold-hide-sublevels 1)
         (let ((after-hide (funcall snap 'hide)))
           ;; Edit: insert under hidden Project
           (goto-char (point-min))
@@ -2043,17 +2072,18 @@ fn org_fold_hide_all_prop_inherit_edit_cycle_v39() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_subtree_prop_drawer_edit_cycle_show_v38() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 50 57)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Alpha\" 1 nil 1) (\"Beta\" 8 nil 2) (\"Gamma\" 14 nil 3)) ((\"Alpha\" 1 2 1) (\"Beta\" 8 2 2) (\"Gamma\" 14 2 3)) ((\"Alpha\" 1 nil 1) (\"Beta\" 14 2 2) (\"Gamma\" 20 2 3)) ((\"Alpha\" 1 nil 1) (\"Beta\" 14 nil 2) (\"Gamma\" 20 nil 3)) ((\"Alpha\" 1 2 1) (\"Beta\" 14 2 2) (\"Gamma\" 20 2 3)) \"* TODO Alpha\\n** WAIT Delta\\n:PROPERTIES:\\n:Effort: 45m\\n:END:\\nBody delta.\\n\\n:PROPERTIES:\\n:Effort: 2h\\n:CUSTOM_ID: alpha\\n:END:\\nBody alpha.\\n\\n** DONE Beta\\n:PROPERTIES:\\n:Effort: 1h\\n:END:\\nBody beta.\\n\\n*** TODO Gamma\\n:PROPERTIES:\\n:Effort: 30m\\n:END:\\nBody gamma.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -2104,17 +2134,18 @@ fn org_fold_hide_subtree_prop_drawer_edit_cycle_show_v38() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_all_edit_cycle_font_face_v37() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-fold-hide-all)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Project\" 1 nil 1 org-level-1) (\"Module A\" 2 nil 2 org-level-2) (\"Component X\" 3 nil 3 org-level-3) (\"Sub 1\" 4 nil 4 org-level-4) (\"Sub 2\" 6 nil 4 org-level-4) (\"Component Y\" 8 nil 3 org-level-3) (\"Module B\" 10 nil 2 org-level-2) (\"Component Z\" 11 nil 3 org-level-3)) ((\"Project\" 1 2 1 org-level-1) (\"Module A\" 2 2 2 org-level-2) (\"Component X\" 3 2 3 org-level-3) (\"Sub 1\" 4 2 4 org-level-4) (\"Sub 2\" 6 2 4 org-level-4) (\"Component Y\" 8 2 3 org-level-3) (\"Module B\" 10 2 2 org-level-2) (\"Component Z\" 11 2 3 org-level-3)) ((\"Project\" 1 nil 1 org-level-1) (\"Module A\" 5 2 2 org-level-2) (\"Component X\" 6 2 3 org-level-3) (\"Sub 1\" 7 2 4 org-level-4) (\"Sub 2\" 9 2 4 org-level-4) (\"Component Y\" 11 2 3 org-level-3) (\"Module B\" 13 2 2 org-level-2) (\"Component Z\" 14 2 3 org-level-3)) ((\"Project\" 1 nil 1 org-level-1) (\"Module A\" 5 nil 2 org-level-2) (\"Component X\" 6 nil 3 org-level-3) (\"Sub 1\" 7 nil 4 org-level-4) (\"Sub 2\" 9 nil 4 org-level-4) (\"Component Y\" 11 nil 3 org-level-3) (\"Module B\" 13 nil 2 org-level-2) (\"Component Z\" 14 nil 3 org-level-3)) ((\"Project\" 1 2 1 org-level-1) (\"Module A\" 5 2 2 org-level-2) (\"Component X\" 6 2 3 org-level-3) (\"Sub 1\" 7 2 4 org-level-4) (\"Sub 2\" 9 2 4 org-level-4) (\"Component Y\" 11 2 3 org-level-3) (\"Module B\" 13 2 2 org-level-2) (\"Component Z\" 14 2 3 org-level-3)) \"* TODO Project\\n** DONE New Module\\nNew body.\\n\\n** DONE Module A\\n*** TODO Component X\\n**** DONE Sub 1\\nBody 1.\\n**** TODO Sub 2\\nBody 2.\\n*** WAIT Component Y\\nBody Y.\\n** TODO Module B\\n*** DONE Component Z\\nBody Z.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -2148,7 +2179,7 @@ fn org_fold_hide_all_edit_cycle_font_face_v37() {
                        "Sub 2" "Component Y" "Module B" "Component Z")))))
         (let ((initial (funcall snap 'initial)))
           ;; Hide all
-          (org-fold-hide-all)
+          (org-fold-hide-sublevels 1)
           (let ((after-hide-all (funcall snap 'hide-all)))
             ;; Edit under hidden Project
             (goto-char (point-min))
@@ -2169,17 +2200,18 @@ fn org_fold_hide_all_edit_cycle_font_face_v37() {
                         after-show
                         after-cycle
                         (buffer-substring-no-properties
-                         (point-min) (point-max))))))))))))))"##,
+                         (point-min) (point-max))))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_cycle_subtree_edit_show_all_v36() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 45 57)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Alpha\" 1 nil 1) (\"Beta\" 4 nil 2) (\"Gamma\" 7 nil 3) (\"Delta\" 10 nil 2)) ((\"Alpha\" 1 2 1) (\"Beta\" 4 2 2) (\"Gamma\" 7 2 3) (\"Delta\" 10 2 2)) ((\"Alpha\" 1 nil 1) (\"Beta\" 7 2 2) (\"Gamma\" 10 2 3) (\"Delta\" 13 2 2)) ((\"Alpha\" 1 nil 1) (\"Beta\" 7 nil 2) (\"Gamma\" 10 nil 3) (\"Delta\" 13 nil 2)) ((\"Alpha\" 1 2 1) (\"Beta\" 7 2 2) (\"Gamma\" 10 2 3) (\"Delta\" 13 2 2)) \"* Alpha\\n** Epsilon\\nBody epsilon.\\n\\nBody alpha.\\n\\n** Beta\\nBody beta.\\n\\n*** Gamma\\nBody gamma.\\n\\n** Delta\\nBody delta.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -2225,7 +2257,7 @@ fn org_fold_cycle_subtree_edit_show_all_v36() {
                       after-show
                       after-cycle
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
@@ -3798,12 +3830,13 @@ fn org_fold_subtree_edit_global_show_font_face_v10_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_todo_toggle_cycle_show_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 55 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2 org-level-2) (\"Beta\" 3 nil 3 org-level-3 org-level-3) (\"SIBLING\" 4 nil 2 org-level-2 org-level-2)) nil \"* TODO Root\\n** TODO Alpha\\n*** DONE Beta\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -3859,17 +3892,18 @@ fn org_fold_font_face_after_todo_toggle_cycle_show_v2_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_edit_cycle_show_font_face_v9_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 4 nil 4 org-level-4) (\"Inserted\" 5 nil 4 org-level-4) (\"SIBLING\" 8 nil 2 org-level-2)) nil \"* DONE Root\\n** TODO Alpha\\n*** DONE Beta\\n**** TODO Gamma\\n**** TODO Inserted under Gamma\\nInserted body.\\n\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -3922,17 +3956,18 @@ fn org_fold_subtree_edit_cycle_show_font_face_v9_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_subtree_edit_cycle_show_font_face_v8_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 4 nil 4 org-level-4) (\"SIBLING\" 5 nil 2 org-level-2) (\"Inserted\" 6 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Beta\\n**** WAIT Gamma\\n** NEXT Sibling\\n** DONE Inserted after Sibling\\nInserted body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -3985,17 +4020,18 @@ fn org_fold_hide_subtree_edit_cycle_show_font_face_v8_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_sublevels_reveal_context_font_level_v4_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (search-failed \"Delta body\")""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 4 nil 4 org-level-4) (\"Delta\" 5 2 5 org-level-5) (\"Epsilon\" 6 2 6 org-level-6) (\"SIBLING\" 7 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Beta\\n**** WAIT Gamma\\n***** DONE Delta\\n****** TODO Epsilon\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4020,7 +4056,7 @@ fn org_fold_hide_sublevels_reveal_context_font_level_v4_combo() {
       (org-fold-hide-sublevels 1)
       ;; Reveal Delta with isearch context
       (goto-char (point-min))
-      (search-forward "Delta body")
+      (search-forward "Delta")
       (org-fold-show-context 'isearch)
       ;; Check
       (let ((probe (lambda (needle)
@@ -4045,17 +4081,18 @@ fn org_fold_hide_sublevels_reveal_context_font_level_v4_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_subtree_edit_show_font_face_level_v7_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 49 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 7 nil 4 org-level-4) (\"Inserted\" 4 nil 4 org-level-4) (\"SIBLING\" 8 nil 2 org-level-2)) nil \"* DONE Root\\n** TODO Alpha\\n*** DONE Beta\\n**** TODO Inserted under Beta\\nInserted body.\\n\\n**** TODO Gamma\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4105,17 +4142,18 @@ fn org_fold_hide_subtree_edit_show_font_face_level_v7_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_hide_edit_show_font_level_visibility_v6_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 48 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 6 nil 3 org-level-3) (\"Gamma\" 7 nil 4 org-level-4) (\"Inserted\" 3 nil 3 org-level-3) (\"SIBLING\" 8 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Inserted under Alpha\\nInserted body.\\n\\n*** TODO Beta\\n**** WAIT Gamma\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4164,17 +4202,18 @@ fn org_fold_subtree_hide_edit_show_font_level_visibility_v6_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_narrow_edit_widen_cycle_font_face_level_v4_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 3 nil 2 org-level-2) (\"Beta\" 5 nil 3 org-level-3) (\"Gamma\" 7 nil 4 org-level-4) (\"Inserted\" 8 nil 4 nil) (\"SIBLING\" 11 nil 2 org-level-2)) nil \"* Root\\nRoot body.\\n** Alpha\\nAlpha body.\\n*** Beta\\nBeta body.\\n**** Gamma\\nGamma body.*** Inserted in narrow\\nInserted body.\\n\\n** Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4227,17 +4266,18 @@ fn org_fold_narrow_edit_widen_cycle_font_face_level_v4_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_sublevels_reveal_font_face_level_v3_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (search-failed \"Gamma body\")""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 4 2 4 org-level-4) (\"Delta\" 5 2 5 org-level-5) (\"SIBLING\" 6 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Beta\\n**** WAIT Gamma\\n***** DONE Delta\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4261,7 +4301,7 @@ fn org_fold_hide_sublevels_reveal_font_face_level_v3_combo() {
       (org-fold-hide-sublevels 1)
       ;; Reveal Gamma with isearch context
       (goto-char (point-min))
-      (search-forward "Gamma body")
+      (search-forward "Gamma")
       (org-fold-show-context 'isearch)
       ;; Check
       (let ((probe (lambda (needle)
@@ -4286,17 +4326,18 @@ fn org_fold_hide_sublevels_reveal_font_face_level_v3_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_edit_show_global_font_level_v5_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 6 nil 3 org-level-3) (\"Gamma\" 7 nil 4 org-level-4) (\"Inserted\" 3 nil 3 org-level-3) (\"SIBLING\" 8 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Inserted under Alpha\\nInserted body.\\n\\n*** TODO Beta\\n**** WAIT Gamma\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4349,17 +4390,18 @@ fn org_fold_subtree_edit_show_global_font_level_v5_combo() {
           (list headings
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_export_html_after_cycle_font_state_deep_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (3 1 6 3 1 t t \"<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">1.</span> <span class=\\\"todo TODO\\\">TODO</span> Root&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"root\\\">root</span></span></h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<p>\\nRoot body with <b>bold</b>.\\n</p>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.1.</span> <span class=\\\"done DONE\\\">DONE</span> Alpha</h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-1\\\">\\n<p>\\nAlpha body.\\n</p>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-4\\\">\\n<h4 id=\\\"orgHASH\\\"><span class=\\\"section-number-4\\\">1.1.1.</span> <span class=\\\"todo TODO\\\">TODO</span> Beta</h4>\\n<div class=\\\"outline-text-4\\\" id=\\\"text-1-1-1\\\">\\n<p>\\nBeta body.\\n</p>\\n</div>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-3\\\">\\n<h3 id=\\\"orgHASH\\\"><span class=\\\"section-number-3\\\">1.2.</span> NEXT Gamma</h3>\\n<div class=\\\"outline-text-3\\\" id=\\\"text-1-2\\\">\\n<p>\\nGamma body.\\n</p>\\n</div>\\n</div>\\n</div>\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4409,7 +4451,7 @@ fn org_fold_export_html_after_cycle_font_state_deep_combo() {
                  (replace-regexp-in-string
                   "sec:org[[:alnum:]-]+" "sec:org-id"
                   (replace-regexp-in-string
-                   "org[[:alnum:]-]\\{8,\\}" "orgHASH" html))))))))"##,
+                   "org[0-9a-f]\\{7\\}" "orgHASH" html)))))))))"##,
         expect,
     );
 }
@@ -4530,12 +4572,13 @@ fn org_fold_font_face_after_narrow_subtree_cycle_edit_v2_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_demote_subtree_show_all_v3_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 49 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A\" 0 1 org-level-1) (\"B\" 0 3 org-level-3) (\"C\" 0 4 org-level-4) (\"D\" 0 1 org-level-1) (\"E\" 0 1 org-level-1)) nil \"* A\\n*** B\\n**** C\\n* D\\n* E\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4585,7 +4628,7 @@ fn org_fold_font_face_after_demote_subtree_show_all_v3_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -4663,7 +4706,6 @@ fn org_fold_font_face_after_multiple_hidden_edits_global_show_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_promote_cycle_show_all_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -4725,17 +4767,18 @@ fn org_fold_font_face_after_promote_cycle_show_all_v2_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_demote_promote_cycle_global_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 53 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A\" 0 1 nil org-level-1) (\"B\" 0 1 nil nil) (\"C\" 0 3 nil org-level-3) (\"D\" 0 1 nil nil)) nil \"* A\\nbody A\\n** B\\nbody B\\n*** C\\nbody C\\n** D\\nbody D\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4789,17 +4832,18 @@ fn org_fold_font_face_after_demote_promote_cycle_global_v2_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_cut_paste_cycle_global_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A\" 1 nil 1 org-level-1) (\"B\" 2 nil 1 nil) (\"C\" 3 nil 2 org-level-2) (\"D\" 2 nil 1 nil)) nil \"* A\\nbody A\\n** C\\nbody C\\n** B\\nbody B\\n* D\\nbody D\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4852,17 +4896,18 @@ fn org_fold_font_face_after_cut_paste_cycle_global_v2_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_cut_paste_promote_demote_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 56 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A\" 0 1 org-level-1) (\"B\" 0 3 org-level-3) (\"C\" 0 1 org-level-1) (\"D\" 0 1 org-level-1) (\"E\" 0 2 org-level-2)) nil \"* A\\n*** B\\n* C\\n* D\\n** E\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -4919,12 +4964,11 @@ fn org_fold_font_face_after_cut_paste_promote_demote_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_after_multiple_todo_toggle_show_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -4992,7 +5036,7 @@ fn org_fold_font_face_after_multiple_todo_toggle_show_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -5070,12 +5114,13 @@ fn org_fold_font_face_after_todo_toggle_cycle_show_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_level_after_cut_paste_subtree_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A\" 1 nil 1 org-level-1) (\"B\" 2 nil 1 nil) (\"C\" 3 nil 2 org-level-2) (\"D\" 2 nil 1 nil) (\"E\" 9 nil 2 org-level-2)) nil \"* A\\nbody A\\n** C\\nbody C\\n** B\\nbody B\\n* D\\nbody D\\n** E\\nbody E\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5128,17 +5173,18 @@ fn org_fold_font_face_level_after_cut_paste_subtree_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_hide_edit_global_show_font_deep_v4_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 52 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 4 nil 4 org-level-4) (\"SIBLING\" 5 nil 2 org-level-2) (\"Inserted S\" 6 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Beta\\n**** WAIT Gamma\\n** NEXT Sibling\\n** DONE Inserted S\\nInserted S body.\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5191,17 +5237,18 @@ fn org_fold_subtree_hide_edit_global_show_font_deep_v4_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_sublevels_show_context_font_level_visibility_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 2 1 org-level-1) (\"Alpha\" 2 2 2 org-level-2) (\"Beta\" 4 2 3 org-level-3) (\"Gamma\" 6 2 4 org-level-4) (\"Delta\" 8 2 5 org-level-5) (\"Sibling\" 10 2 2 org-level-2)) ((\"Root\" 2 1) (\"Alpha\" nil 2) (\"Beta\" nil 3) (\"Gamma\" nil 4) (\"Delta\" nil 5) (\"Sibling\" 2 2)) nil \"* Root\\n** Alpha\\nAlpha body.\\n*** Beta\\nBeta body.\\n**** Gamma\\nGamma body.\\n***** Delta\\nDelta body.\\n** Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5268,7 +5315,7 @@ fn org_fold_sublevels_show_context_font_level_visibility_v2_combo() {
                   after-show
                   (nreverse merged)
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
@@ -5349,12 +5396,13 @@ fn org_fold_multiple_subtree_hide_cycle_show_font_level_v5_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_level_visibility_after_multiple_cycles_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 64 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" nil 1 org-level-1) (\"Alpha\" nil 2 org-level-2) (\"Beta\" nil 3 org-level-3) (\"Gamma\" nil 4 org-level-4) (\"SIBLING\" nil 2 org-level-2)) nil t \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5419,17 +5467,18 @@ fn org_fold_font_level_visibility_after_multiple_cycles_v2_combo() {
               (nreverse merged)
               level-ok
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_overview_local_global_show_font_face_deep_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-cycle-contents)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" nil 1 org-level-1) (\"Root body\" nil 1 nil) (\"Alpha\" nil 2 org-level-2) (\"Alpha body\" nil 2 nil) (\"Beta\" nil 3 org-level-3) (\"Beta body\" nil 3 nil) (\"Gamma\" nil 4 org-level-4) (\"Gamma body\" nil 4 nil) (\"Sibling\" nil 2 org-level-2) (\"Sibling body\" nil 2 nil)) nil \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5460,7 +5509,7 @@ fn org_fold_overview_local_global_show_font_face_deep_combo() {
       (org-cycle)
       (org-cycle)
       ;; Global contents
-      (org-cycle-contents)
+      (org-cycle-content)
       ;; Local cycle on Beta
       (goto-char (point-min))
       (search-forward "Beta")
@@ -5493,17 +5542,18 @@ fn org_fold_overview_local_global_show_font_face_deep_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_hide_edit_show_all_font_face_level_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 57 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1 org-level-1) (\"Alpha\" 3 nil 2 org-level-2 org-level-2) (\"Beta\" 5 nil 3 org-level-3 org-level-3) (\"Gamma\" 10 nil 4 org-level-4 org-level-4) (\"Inserted under Beta\" 6 nil 4 org-level-4 org-level-4) (\"Sibling\" 12 nil 2 org-level-2 org-level-2)) nil \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\n**** TODO Inserted under Beta\\nInserted body.\\n\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5561,7 +5611,7 @@ fn org_fold_subtree_hide_edit_show_all_font_face_level_v2_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -5645,12 +5695,13 @@ fn org_fold_hide_sublevels_reveal_cycle_font_level_deep_v3_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_repeated_global_cycle_show_all_font_level_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 54 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"L1\" nil 1 org-level-1) (\"L2\" nil 2 org-level-2) (\"L3\" nil 3 org-level-3) (\"L4\" nil 4 org-level-4) (\"L5\" nil 5 org-level-5) (\"L2b\" nil 2 org-level-2)) nil t \"* TODO L1\\n** DONE L2\\n*** TODO L3\\n**** WAIT L4\\n***** DONE L5\\n** NEXT L2b\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5705,7 +5756,7 @@ fn org_fold_repeated_global_cycle_show_all_font_level_v2_combo() {
               (nreverse merged)
               level-ok
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -5769,12 +5820,13 @@ fn org_fold_narrow_subtree_show_all_widen_font_deep_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_cycle_global_local_mixed_font_level_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function org-cycle-contents)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" nil 1 org-level-1) (\"Root body\" nil 1 nil) (\"Alpha\" nil 2 org-level-2) (\"Alpha body\" nil 2 nil) (\"Beta\" nil 3 org-level-3) (\"Beta body\" nil 3 nil) (\"Gamma\" nil 4 org-level-4) (\"Gamma body\" nil 4 nil) (\"Sibling\" nil 2 org-level-2) (\"Sibling body\" nil 2 nil)) nil \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5805,7 +5857,7 @@ fn org_fold_cycle_global_local_mixed_font_level_integrity_combo() {
       (org-cycle)
       (org-cycle)
       ;; Global contents
-      (org-cycle-contents)
+      (org-cycle-content)
       ;; Local cycle on Beta
       (goto-char (point-min))
       (search-forward "Beta")
@@ -5839,17 +5891,18 @@ fn org_fold_cycle_global_local_mixed_font_level_integrity_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_hide_show_all_font_face_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 54 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2 org-level-2) (\"Beta\" 6 nil 3 org-level-3 org-level-3) (\"Gamma\" 7 nil 4 org-level-4 org-level-4) (\"Delta\" 8 nil 5 org-level-5 org-level-5) (\"Inserted under Alpha\" 3 nil 3 org-level-3 org-level-3) (\"Sibling\" 9 nil 2 org-level-2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Inserted under Alpha\\nInserted body.\\n\\n*** TODO Beta\\n**** WAIT Gamma\\n***** DONE Delta\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5904,17 +5957,18 @@ fn org_fold_subtree_hide_show_all_font_face_integrity_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_level_visibility_after_demote_promote_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 49 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"L1\" 0 1 org-level-1) (\"L2\" 0 2 org-level-2) (\"L3\" 0 4 org-level-4) (\"L4\" 0 4 org-level-4) (\"L5\" 0 5 org-level-5)) nil \"* L1\\n** L2\\n**** L3\\n**** L4\\n***** L5\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -5964,7 +6018,7 @@ fn org_fold_font_level_visibility_after_demote_promote_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -6110,12 +6164,13 @@ fn org_fold_show_all_after_multiple_hidden_edits_font_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_hide_edit_reveal_font_level_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 56 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 4 nil 3 org-level-3) (\"Gamma\" 9 nil 4 org-level-4) (\"Inserted under Beta\" 5 nil 4 nil) (\"Sibling\" 11 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\n**** TODO Inserted under Beta\\nInserted body.\\n\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6172,17 +6227,18 @@ fn org_fold_subtree_hide_edit_reveal_font_level_v2_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_indirect_buffer_decouple_font_level_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 48 67)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (ok ((\"Root\" 2 1) (\"Alpha\" nil 2) (\"Beta\" nil 3) (\"Gamma\" nil 4) (\"Sibling\" nil 2)))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6231,17 +6287,18 @@ fn org_fold_indirect_buffer_decouple_font_level_v2_combo() {
                           '("Root" "Alpha" "Beta" "Gamma" "Sibling"))))
                     (kill-buffer clone)
                     (list 'ok clone-state)))
-              (error (list 'divergence (car err) (cdr err))))))))))"##,
+              (error (list 'divergence (car err) (cdr err)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_deep_level_cycle_hidden_edit_show_all_font_v3_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 81 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"L1\" 1 nil 1 org-level-1) (\"L2\" 2 nil 2 org-level-2) (\"L3\" 3 nil 3 org-level-3) (\"L4\" 4 nil 4 org-level-4) (\"L5\" 5 nil 5 org-level-5) (\"L6\" 9 nil 6 org-level-6) (\"L7\" 10 nil 7 org-level-7) (\"L8\" 14 nil 8 org-level-8) (\"L9\" 15 nil 9 org-level-1) (\"Inserted under L5\" 6 nil 5 org-level-5) (\"Inserted under L7\" 11 nil 7 org-level-7)) nil t \"* TODO L1\\n** DONE L2\\n*** TODO L3\\n**** WAIT L4\\n***** DONE L5\\n***** TODO Inserted under L5\\nInserted L5 body.\\n\\n****** TODO L6\\n******* WAIT L7\\n******* TODO Inserted under L7\\nInserted L7 body.\\n\\n******** DONE L8\\n********* TODO L9\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6323,17 +6380,18 @@ fn org_fold_deep_level_cycle_hidden_edit_show_all_font_v3_combo() {
               (nreverse merged)
               level-ok
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_narrow_widen_cycle_font_level_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Alpha\" nil 2 org-level-2) (\"Alpha body\" nil 2 nil) (\"Beta\" 2 3 org-level-3) (\"Beta body\" 2 3 nil) (\"Gamma\" 2 4 org-level-4) (\"Gamma body\" 2 4 nil) (\"Root\" not-found nil nil nil) (\"Sibling\" not-found nil nil nil)) ((\"Alpha\" nil 2) (\"Beta\" nil 3) (\"Gamma\" nil 4) (\"Inserted\" nil 3) (\"Root\" not-found nil nil) (\"Sibling\" not-found nil nil)) \"** Alpha\\nAlpha body.\\n*** Beta\\nBeta body.\\n**** Gamma\\nGamma body.\\n*** Inserted in narrow\\nInserted body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6390,7 +6448,7 @@ fn org_fold_narrow_widen_cycle_font_level_integrity_combo() {
           (list narrowed-state
                 narrowed-show
                 (buffer-substring-no-properties
-                 (point-min) (point-max))))))))"##,
+                 (point-min) (point-max)))))))))"##,
         expect,
     );
 }
@@ -6480,12 +6538,13 @@ fn org_fold_overview_content_all_local_cycle_font_deep_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_cut_paste_subtree_reexpand_font_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 60 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"A\" 1 nil 1 org-level-1) (\"body A\" 2 nil 1 nil) (\"B\" 2 nil 1 nil) (\"body B\" 4 nil 2 nil) (\"C\" 5 nil 2 org-level-2) (\"body C\" 6 nil 2 nil) (\"E\" 7 nil 1 org-level-1) (\"body E\" 8 nil 1 nil)) nil \"* A\\nbody A\\n** B\\nbody B\\n** C\\nbody C\\n* E\\nbody E\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6546,17 +6605,18 @@ fn org_fold_cut_paste_subtree_reexpand_font_integrity_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_startup_visibility_property_cycle_font_deep_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 66 51)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" nil 1 org-level-1) (\"Root body\" nil 1 nil) (\"Alpha\" nil 2 org-level-2) (\"Alpha body\" nil 2 nil) (\"Beta\" nil 3 org-level-3) (\"Beta body\" nil 3 nil) (\"Gamma\" nil 4 org-level-4) (\"Gamma body\" nil 4 nil) (\"Sibling\" nil 2 org-level-2) (\"Sibling body\" nil 2 nil)) ((\"Root\" 2 1) (\"Alpha\" 2 2) (\"Beta\" 2 3) (\"Gamma\" 2 4) (\"Sibling\" 2 2)) nil \"* TODO Root\\n:PROPERTIES:\\n:VISIBILITY: children\\n:END:\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6623,17 +6683,18 @@ fn org_fold_startup_visibility_property_cycle_font_deep_combo() {
                   after-global
                   (nreverse merged)
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_hide_sublevels_show_context_cycle_font_deep_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (search-failed \"Delta body\")""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 3 nil 3 org-level-3) (\"Gamma\" 4 nil 4 org-level-4) (\"Delta\" 5 2 5 org-level-5) (\"Epsilon\" 6 nil 6 org-level-6) (\"Sibling\" 7 nil 2 org-level-2)) nil \"* TODO Root\\n** DONE Alpha\\n*** TODO Beta\\n**** WAIT Gamma\\n***** DONE Delta\\n****** TODO Epsilon\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6658,7 +6719,7 @@ fn org_fold_hide_sublevels_show_context_cycle_font_deep_v2_combo() {
       (org-fold-hide-sublevels 1)
       ;; Reveal Delta with isearch
       (goto-char (point-min))
-      (search-forward "Delta body")
+      (search-forward "Delta")
       (org-fold-show-context 'isearch)
       ;; Now cycle Gamma
       (goto-char (point-min))
@@ -6690,7 +6751,7 @@ fn org_fold_hide_sublevels_show_context_cycle_font_deep_v2_combo() {
         (list state
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -6764,12 +6825,13 @@ fn org_fold_sublevels_reveal_context_font_state_deep_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_hide_edit_show_all_font_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 65 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 3 nil 2 org-level-2) (\"Beta\" 5 nil 3 org-level-3) (\"Gamma\" 10 nil 4 org-level-4) (\"Inserted under Beta\" 6 nil 4 org-level-4) (\"Sibling\" 12 nil 2 org-level-2) (\"Inserted after Sibling\" 13 nil 2 org-level-2)) nil \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\n**** TODO Inserted under Beta\\nInserted body.\\n\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\n** DONE Inserted after Sibling\\nInserted sibling body.\\n\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6835,17 +6897,18 @@ fn org_fold_subtree_hide_edit_show_all_font_integrity_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_multiple_hidden_edits_global_cycle_font_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 79 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1 org-level-1) (\"Alpha\" 2 nil 2 org-level-2) (\"Beta\" 7 nil 3 org-level-3) (\"Gamma\" 9 nil 4 org-level-4) (\"Delta\" 11 nil 5 org-level-5) (\"Inserted under Alpha\" 3 nil 3 org-level-3) (\"Sibling\" 13 nil 2 org-level-2) (\"Inserted after Sibling\" 14 nil 2 org-level-2)) nil t \"* TODO Root\\n** DONE Alpha\\n*** TODO Inserted under Alpha\\nInserted Alpha body.\\n\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n***** DONE Delta\\nDelta body.\\n** NEXT Sibling\\n** DONE Inserted after Sibling\\nInserted Sibling body.\\n\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6925,17 +6988,18 @@ fn org_fold_multiple_hidden_edits_global_cycle_font_combo() {
               (nreverse merged)
               level-ok
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_visibility_after_promote_demote_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 49 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"L1\" 0 1 org-level-1 org-level-1) (\"L2\" 0 3 org-level-3 org-level-3) (\"L3\" 0 4 org-level-4 org-level-4) (\"L4\" 0 4 org-level-4 org-level-4) (\"L5\" 0 5 org-level-5 org-level-5)) nil \"* L1\\n*** L2\\n**** L3\\n**** L4\\n***** L5\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -6985,17 +7049,18 @@ fn org_fold_font_face_visibility_after_promote_demote_combo() {
         (list headings
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_deep_heading_cycle_hidden_edit_font_regression_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 68 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"L1\" 1 nil 1 org-level-1) (\"L2\" 2 nil 2 org-level-2) (\"L3\" 3 nil 3 org-level-3) (\"L4\" 4 nil 4 org-level-4) (\"L5\" 5 nil 5 org-level-5) (\"L6\" 9 nil 6 org-level-6) (\"L7\" 10 nil 7 org-level-7) (\"L8\" 11 nil 8 org-level-8) (\"Inserted\" 6 nil 5 org-level-5)) nil t \"* TODO L1\\n** DONE L2\\n*** TODO L3\\n**** WAIT L4\\n***** DONE L5\\n***** TODO Inserted under L5\\nInserted body.\\n\\n****** TODO L6\\n******* WAIT L7\\n******** DONE L8\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7064,17 +7129,18 @@ fn org_fold_deep_heading_cycle_hidden_edit_font_regression_v2_combo() {
               (nreverse merged)
               level-ok
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_global_cycle_overview_content_all_font_deep_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 57 48)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((overview ((\"Root\" 2 1 org-level-1 org-level-1) (\"Root body\" 2 1 nil nil) (\"Alpha\" 2 2 org-level-2 org-level-2) (\"Alpha body\" 2 2 nil nil) (\"Beta\" 2 3 org-level-3 org-level-3) (\"Beta body\" 2 3 nil nil) (\"Gamma\" 2 4 org-level-4 org-level-4) (\"Gamma body\" 2 4 nil nil) (\"Sibling\" 2 2 org-level-2 org-level-2) (\"Sibling body\" 2 2 nil nil))) (contents ((\"Root\" 2 1 org-level-1 org-level-1) (\"Root body\" 2 1 nil nil) (\"Alpha\" 2 2 org-level-2 org-level-2) (\"Alpha body\" 2 2 nil nil) (\"Beta\" 2 3 org-level-3 org-level-3) (\"Beta body\" 2 3 nil nil) (\"Gamma\" 2 4 org-level-4 org-level-4) (\"Gamma body\" 2 4 nil nil) (\"Sibling\" 2 2 org-level-2 org-level-2) (\"Sibling body\" 2 2 nil nil))) (all ((\"Root\" nil 1 org-level-1 org-level-1) (\"Root body\" nil 1 nil nil) (\"Alpha\" nil 2 org-level-2 org-level-2) (\"Alpha body\" nil 2 nil nil) (\"Beta\" nil 3 org-level-3 org-level-3) (\"Beta body\" nil 3 nil nil) (\"Gamma\" nil 4 org-level-4 org-level-4) (\"Gamma body\" nil 4 nil nil) (\"Sibling\" nil 2 org-level-2 org-level-2) (\"Sibling body\" nil 2 nil nil))) (overview ((\"Root\" 2 1 org-level-1 org-level-1) (\"Root body\" 2 1 nil nil) (\"Alpha\" 2 2 org-level-2 org-level-2) (\"Alpha body\" 2 2 nil nil) (\"Beta\" 2 3 org-level-3 org-level-3) (\"Beta body\" 2 3 nil nil) (\"Gamma\" 2 4 org-level-4 org-level-4) (\"Gamma body\" 2 4 nil nil) (\"Sibling\" 2 2 org-level-2 org-level-2) (\"Sibling body\" 2 2 nil nil))) (contents ((\"Root\" 2 1 org-level-1 org-level-1) (\"Root body\" 2 1 nil nil) (\"Alpha\" 2 2 org-level-2 org-level-2) (\"Alpha body\" 2 2 nil nil) (\"Beta\" 2 3 org-level-3 org-level-3) (\"Beta body\" 2 3 nil nil) (\"Gamma\" 2 4 org-level-4 org-level-4) (\"Gamma body\" 2 4 nil nil) (\"Sibling\" 2 2 org-level-2 org-level-2) (\"Sibling body\" 2 2 nil nil))) (all ((\"Root\" nil 1 org-level-1 org-level-1) (\"Root body\" nil 1 nil nil) (\"Alpha\" nil 2 org-level-2 org-level-2) (\"Alpha body\" nil 2 nil nil) (\"Beta\" nil 3 org-level-3 org-level-3) (\"Beta body\" nil 3 nil nil) (\"Gamma\" nil 4 org-level-4 org-level-4) (\"Gamma body\" nil 4 nil nil) (\"Sibling\" nil 2 org-level-2 org-level-2) (\"Sibling body\" nil 2 nil nil)))) ((\"Root\" nil 1 org-level-1 org-level-1) (\"Root body\" nil 1 nil nil) (\"Alpha\" nil 2 org-level-2 org-level-2) (\"Alpha body\" nil 2 nil nil) (\"Beta\" nil 3 org-level-3 org-level-3) (\"Beta body\" nil 3 nil nil) (\"Gamma\" nil 4 org-level-4 org-level-4) (\"Gamma body\" nil 4 nil nil) (\"Sibling\" nil 2 org-level-2 org-level-2) (\"Sibling body\" nil 2 nil nil)) nil \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7132,17 +7198,18 @@ fn org_fold_global_cycle_overview_content_all_font_deep_combo() {
                 final-state
                 (nreverse merged)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_narrow_subtree_cycle_edit_widen_font_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 88 45)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 1 nil 1) (\"Alpha\" 3 nil 2) (\"Beta\" 5 nil 3) (\"Gamma\" 7 nil 4) (\"Inserted\" 9 nil 3) (\"Sibling\" 12 nil 2)) nil \"* Root\\nRoot body.\\n** Alpha\\nAlpha body.\\n*** Beta\\nBeta body.\\n**** Gamma\\nGamma body.\\n*** Inserted in narrow\\nInserted body.\\n\\n** Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7231,17 +7298,18 @@ fn org_fold_narrow_subtree_cycle_edit_widen_font_combo() {
         (list after-widen
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_font_face_level_visibility_deep_state_v2_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument integer-or-marker-p nil)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"TODO Project :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 13 (face (org-headline-todo org-level-1)) 13 18 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 18 19 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Alpha :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 2 org-level-2 (org-done org-level-2)) (#(\"TODO Beta\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 9 (face (org-headline-todo org-level-3))) 3 3 2 org-level-3 (org-todo org-level-3)) (#(\"WAIT Gamma\" 0 10 (face org-level-4)) 4 4 2 org-level-4 org-level-4) (#(\"DONE Delta\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 2 org-level-5 (org-done org-level-5)) (#(\"TODO Epsilon\" 0 4 (face (org-todo org-level-6)) 4 5 (face org-level-6) 5 12 (face (org-headline-todo org-level-6))) 6 6 2 org-level-6 (org-todo org-level-6))) ((#(\"TODO Project :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 13 (face (org-headline-todo org-level-1)) 13 18 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 18 19 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Alpha :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 2 org-level-2 (org-done org-level-2)) (#(\"TODO Beta\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 9 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Gamma\" 0 10 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Delta\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"TODO Epsilon\" 0 4 (face (org-todo org-level-6)) 4 5 (face org-level-6) 5 12 (face (org-headline-todo org-level-6))) 6 6 nil org-level-6 (org-todo org-level-6))) ((#(\"TODO Project :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 13 (face (org-headline-todo org-level-1)) 13 18 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 18 19 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Alpha :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 2 org-level-2 (org-done org-level-2)) (#(\"TODO Beta\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 9 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Gamma\" 0 10 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Delta\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 2 org-level-5 (org-done org-level-5)) (#(\"TODO Epsilon\" 0 4 (face (org-todo org-level-6)) 4 5 (face org-level-6) 5 12 (face (org-headline-todo org-level-6))) 6 6 2 org-level-6 (org-todo org-level-6))) ((#(\"TODO Project :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 13 (face (org-headline-todo org-level-1)) 13 18 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 18 19 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Alpha :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 nil org-level-2 (org-done org-level-2)) (#(\"TODO Beta\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 9 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Gamma\" 0 10 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Delta\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"TODO Epsilon\" 0 4 (face (org-todo org-level-6)) 4 5 (face org-level-6) 5 12 (face (org-headline-todo org-level-6))) 6 6 nil org-level-6 (org-todo org-level-6)) (#(\"Inserted under hidden Gamma\" 0 27 (face org-level-4)) 4 4 nil org-level-4 org-level-4)) nil \"* TODO Project :root:\\nProject body.\\n** DONE Alpha :work:\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n***** DONE Delta\\nDelta body.\\n****** TODO Epsilon\\n**** Inserted under hidden Gamma\\nInserted body.\\n\\nEpsilon body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7276,7 +7344,7 @@ fn org_fold_font_face_level_visibility_deep_state_v2_combo() {
                    (let ((beg (line-beginning-position)))
                      (push (list (match-string 2)
                                  (length (match-string 1))
-                                 (org-outline-level)
+                                 (save-match-data (org-outline-level))
                                  (invisible-p beg)
                                  (get-text-property beg 'face)
                                  (get-text-property (match-beginning 2) 'face))
@@ -7317,17 +7385,18 @@ fn org_fold_font_face_level_visibility_deep_state_v2_combo() {
                       after-show-all
                       (nreverse merged)
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_local_cycle_global_cycle_show_all_font_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 79 51)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" nil 1 org-level-1) (\"Root body\" nil 1 nil) (\"Alpha\" nil 2 org-level-2) (\"Alpha body\" nil 2 nil) (\"Beta\" nil 3 org-level-3) (\"Beta body\" nil 3 nil) (\"Gamma\" nil 4 org-level-4) (\"Gamma body\" nil 4 nil) (\"Sibling\" nil 2 org-level-2) (\"Sibling body\" nil 2 nil)) ((\"Root\" 2 1) (\"Alpha\" 2 2) (\"Beta\" 2 3) (\"Gamma\" 2 4) (\"Sibling\" 2 2)) ((\"Root\" nil 1 org-level-1) (\"Alpha\" nil 2 org-level-2) (\"Beta\" nil 3 org-level-3) (\"Gamma\" nil 4 org-level-4) (\"Sibling\" nil 2 org-level-2)) nil \"* TODO Root\\nRoot body.\\n** DONE Alpha\\nAlpha body.\\n*** TODO Beta\\nBeta body.\\n**** WAIT Gamma\\nGamma body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7407,7 +7476,7 @@ fn org_fold_local_cycle_global_cycle_show_all_font_combo() {
                   after-show
                   (nreverse merged)
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
@@ -7485,12 +7554,13 @@ fn org_fold_hide_show_subtree_font_face_level_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_repeated_global_cycle_font_level_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument integer-or-marker-p nil)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"TODO Root\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 9 (face (org-headline-todo org-level-1))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Alpha\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 10 (face (org-headline-done org-level-2))) 2 2 nil org-level-2 (org-done org-level-2)) (#(\"TODO Beta\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 9 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Gamma\" 0 10 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Delta\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"TODO Epsilon\" 0 4 (face (org-todo org-level-6)) 4 5 (face org-level-6) 5 12 (face (org-headline-todo org-level-6))) 6 6 nil org-level-6 (org-todo org-level-6)) (#(\"NEXT Sibling\" 0 12 (face org-level-2)) 2 2 nil org-level-2 org-level-2)) nil t \"* TODO Root\\n** DONE Alpha\\n*** TODO Beta\\n**** WAIT Gamma\\n***** DONE Delta\\n****** TODO Epsilon\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7522,7 +7592,7 @@ fn org_fold_repeated_global_cycle_font_level_integrity_combo() {
           (let ((beg (line-beginning-position)))
             (push (list (match-string 2)
                         (length (match-string 1))
-                        (org-outline-level)
+                        (save-match-data (org-outline-level))
                         (invisible-p beg)
                         (get-text-property beg 'face)
                         (get-text-property (match-beginning 2) 'face))
@@ -7544,17 +7614,18 @@ fn org_fold_repeated_global_cycle_font_level_integrity_combo() {
                 (nreverse merged)
                 level-consistent
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_cycle_cut_paste_subtree_expand_integrity_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 59 42)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"Alpha\" 0 5 (face org-level-1)) 1 1 nil org-level-1) (#(\"Beta\" 0 4 (face org-level-2)) 2 2 nil org-level-2) (#(\"Gamma\" 0 5 (face org-level-2)) 2 2 nil org-level-2) (#(\"Delta\" 0 5 (face org-level-1)) 1 1 nil org-level-1)) nil \"* Alpha\\nAlpha body.\\n** Beta\\nBeta body.\\n** Gamma\\nGamma body.\\n* Delta\\nDelta body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7614,7 +7685,7 @@ fn org_fold_cycle_cut_paste_subtree_expand_integrity_combo() {
       (list (nreverse headings)
             (nreverse merged)
             (buffer-substring-no-properties
-             (point-min) (point-max)))))))"##,
+             (point-min) (point-max))))))"##,
         expect,
     );
 }
@@ -7671,12 +7742,13 @@ fn org_font_lock_deep_heading_face_after_demote_promote_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_subtree_show_all_font_level_state_deep_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument integer-or-marker-p nil)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"TODO Root\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 9 (face (org-headline-todo org-level-1))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Child\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 10 (face (org-headline-done org-level-2))) 2 2 nil org-level-2 (org-done org-level-2)) (#(\"TODO Grand\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 10 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Fourth\" 0 11 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Fifth\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"NEXT Sibling\" 0 12 (face org-level-2)) 2 2 nil org-level-2 org-level-2)) nil \"* TODO Root\\n** DONE Child\\n*** TODO Grand\\n**** WAIT Fourth\\n***** DONE Fifth\\n** NEXT Sibling\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7708,7 +7780,7 @@ fn org_fold_subtree_show_all_font_level_state_deep_combo() {
           (let ((beg (line-beginning-position)))
             (push (list (match-string 2)
                         (length (match-string 1))
-                        (org-outline-level)
+                        (save-match-data (org-outline-level))
                         (invisible-p beg)
                         (get-text-property beg 'face)
                         (get-text-property (match-beginning 2) 'face))
@@ -7723,7 +7795,7 @@ fn org_fold_subtree_show_all_font_level_state_deep_combo() {
         (list (nreverse headings)
               (nreverse merged)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -7794,12 +7866,13 @@ fn org_fold_hide_sublevels_show_context_font_level_deep_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_cycle_hidden_edit_global_font_state_deep_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument integer-or-marker-p nil)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((#(\"TODO Root :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 10 (face (org-headline-todo org-level-1)) 10 15 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 15 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Child :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 nil org-level-2 (org-done org-level-2)) (#(\"TODO Grand\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 10 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Fourth\" 0 11 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Fifth\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"NEXT Sibling\" 0 12 (face org-level-2)) 2 2 nil org-level-2 org-level-2)) ((#(\"TODO Root :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 10 (face (org-headline-todo org-level-1)) 10 15 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 15 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Child :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 nil org-level-2 (org-done org-level-2)) (#(\"TODO Grand\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 10 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Fourth\" 0 11 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Fifth\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"NEXT Sibling\" 0 12 (face org-level-2)) 2 2 nil org-level-2 org-level-2)) ((#(\"TODO Root :root:\" 0 4 (face (org-todo org-level-1)) 4 5 (face org-level-1) 5 10 (face (org-headline-todo org-level-1)) 10 15 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1)) 15 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-todo org-tag org-level-1) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 1 1 nil org-level-1 (org-todo org-level-1)) (#(\"DONE Child :work:\" 0 4 (face (org-done org-level-2)) 4 5 (face org-level-2) 5 11 (face (org-headline-done org-level-2)) 11 16 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2)) 16 17 (keymap (keymap (follow-link . mouse-face) (mouse-3 . org-find-file-at-mouse) (mouse-2 . org-open-at-mouse)) mouse-face highlight face (org-headline-done org-tag org-level-2) rear-nonsticky (mouse-face highlight keymap invisible intangible help-echo org-linked-text htmlize-link))) 2 2 nil org-level-2 (org-done org-level-2)) (#(\"TODO Grand\" 0 4 (face (org-todo org-level-3)) 4 5 (face org-level-3) 5 10 (face (org-headline-todo org-level-3))) 3 3 nil org-level-3 (org-todo org-level-3)) (#(\"WAIT Fourth\" 0 11 (face org-level-4)) 4 4 nil org-level-4 org-level-4) (#(\"DONE Fifth\" 0 4 (face (org-done org-level-5)) 4 5 (face org-level-5) 5 10 (face (org-headline-done org-level-5))) 5 5 nil org-level-5 (org-done org-level-5)) (#(\"NEXT Sibling\" 0 12 (face org-level-2)) 2 2 nil org-level-2 org-level-2)) nil 176 \"* TODO Root :root:\\nRoot body.\\n** DONE Child :work:\\nChild body.\\n*** TODO Grand\\nGrand body.\\n**** WAIT Fourth\\nFourth body.\\n***** DONE Fifth\\n***** TODO Inserted under hidden Fifth\\nInserted body.\\n\\nFifth body.\\n** NEXT Sibling\\nSibling body.\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -7834,7 +7907,7 @@ fn org_fold_cycle_hidden_edit_global_font_state_deep_combo() {
                    (let ((beg (line-beginning-position)))
                      (push (list (match-string 2)
                                  (length (match-string 1))
-                                 (org-outline-level)
+                                 (save-match-data (org-outline-level))
                                  (invisible-p beg)
                                  (get-text-property beg 'face)
                                  (get-text-property (match-beginning 2) 'face))
@@ -7875,7 +7948,7 @@ fn org_fold_cycle_hidden_edit_global_font_state_deep_combo() {
                       (nreverse merged)
                       (search-forward "Inserted under hidden Fifth" nil t)
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
@@ -8040,12 +8113,73 @@ fn org_fold_font_face_level_visibility_deep_state_capture_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
+#[test]
+fn org_fold_core_mixed_regions_recovery_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (((\"clock line\" 2 nil (13 . 30) nil (3 . 96)) (\"(+ 1 2)\" 2 nil nil (53 . 71) (3 . 96)) (\"body B\" 2 nil nil nil (3 . 96)) (\"C\" 2 nil (13 . 30) nil (3 . 96)) (\"body C\" nil nil nil nil nil) (\"D\" 2 nil (13 . 30) nil (3 . 96)) (\"body D\" nil nil nil nil nil)) ((\"clock line\" nil nil nil nil nil) (\"(+ 1 2)\" nil nil nil nil nil) (\"body B\" nil nil nil nil nil) (\"C\" nil nil nil nil nil) (\"body C\" nil nil nil nil nil) (\"D\" nil nil nil nil nil) (\"body D\" nil nil nil nil nil)) \"* A\\n:LOGBOOK:\\nclock line\\n:END:\\n#+begin_src emacs-lisp\\n(+ 1 2)\\n#+end_src\\n** B\\nbody B\\n*** C\\nbody C\\n* D\\nbody D\\n\")""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-fold)
+  (with-temp-buffer
+    (org-mode)
+    (insert "* A\n")
+    (insert ":LOGBOOK:\nclock line\n:END:\n")
+    (insert "#+begin_src emacs-lisp\n(+ 1 2)\n#+end_src\n")
+    (insert "** B\nbody B\n*** C\nbody C\n")
+    (insert "* D\nbody D\n")
+    (let* ((offset-region
+           (lambda (region)
+             (and region
+                  (cons (- (car region) (point-min))
+                        (- (cdr region) (point-min))))))
+          (probe
+           (lambda (needle)
+             (save-excursion
+               (goto-char (point-min))
+               (search-forward needle)
+               (list needle
+                     (invisible-p (point))
+                     (get-text-property (point) 'invisible)
+                     (funcall offset-region
+                              (org-fold-get-region-at-point 'drawer (point)))
+                     (funcall offset-region
+                              (org-fold-get-region-at-point 'block (point)))
+                     (funcall offset-region
+                              (org-fold-get-region-at-point 'outline
+                                                            (point))))))))
+      (org-fold-hide-drawer-all)
+      (org-fold-hide-block-all)
+      (goto-char (point-min))
+      (search-forward "B")
+      (beginning-of-line)
+      (org-fold-hide-subtree)
+      (let ((hidden (mapcar probe
+                            '("clock line" "(+ 1 2)" "body B" "C"
+                              "body C" "D" "body D"))))
+        (org-fold-show-subtree)
+        (org-fold-show-all '(blocks drawers))
+        (let ((shown (mapcar probe
+                             '("clock line" "(+ 1 2)" "body B" "C"
+                               "body C" "D" "body D"))))
+          (list hidden
+                shown
+                (buffer-substring-no-properties
+                 (point-min) (point-max))))))))"##,
+        expect,
+    );
+}
+
 #[test]
 fn org_repeated_deep_cycle_edit_fontify_no_merge_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 11) (\"Level 7 child\" t 12) (\"Body L7\" t 13) (\"Level 8 child\" t 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" nil 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 11) (\"Level 7 child\" t 12) (\"Body L7\" t 13) (\"Level 8 child\" t 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" nil 7) (\"Level 5 child\" nil 8) (\"Body L5\" nil 9) (\"Level 6 child\" nil 10) (\"Body L6\" nil 11) (\"Level 7 child\" nil 12) (\"Body L7\" nil 13) (\"Level 8 child\" nil 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 11) (\"Level 7 child\" t 12) (\"Body L7\" t 13) (\"Level 8 child\" t 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" nil 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 11) (\"Level 7 child\" t 12) (\"Body L7\" t 13) (\"Level 8 child\" t 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" nil 7) (\"Level 5 child\" nil 8) (\"Body L5\" nil 9) (\"Level 6 child\" nil 10) (\"Body L6\" nil 11) (\"Level 7 child\" nil 12) (\"Body L7\" nil 13) (\"Level 8 child\" nil 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (local-l4 ((\"Level 4 target\" nil 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 11) (\"Level 7 child\" t 12) (\"Body L7\" t 13) (\"Level 8 child\" t 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (hide-l6 ((\"Level 4 target\" nil 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 11) (\"Level 7 child\" t 12) (\"Body L7\" t 13) (\"Level 8 child\" t 14) (\"Body L8\" nil 15) (\"Project B\" nil 16) (\"Body B4\" nil 21)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (hidden-edit ((\"Level 4 target\" nil 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" nil 10) (\"Body L6\" t 12) (\"Level 7 child\" t 13) (\"Body L7\" t 14) (\"Level 8 child\" t 15) (\"Body L8\" nil 16) (\"Project B\" nil 17) (\"Body B4\" nil 22)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Inserted while L6 subtree hidden\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (show-l6 ((\"Level 4 target\" nil 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" nil 10) (\"Body L6\" nil 12) (\"Level 7 child\" nil 13) (\"Body L7\" nil 14) (\"Level 8 child\" nil 15) (\"Body L8\" nil 16) (\"Project B\" nil 17) (\"Body B4\" nil 22)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Inserted while L6 subtree hidden\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (global ((\"Level 4 target\" t 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 12) (\"Level 7 child\" t 13) (\"Body L7\" t 14) (\"Level 8 child\" t 15) (\"Body L8\" t 16) (\"Project B\" t 17) (\"Body B4\" nil 22)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Inserted while L6 subtree hidden\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (global ((\"Level 4 target\" nil 6) (\"Body L4\" nil 7) (\"Level 5 child\" t 8) (\"Body L5\" nil 9) (\"Level 6 child\" t 10) (\"Body L6\" nil 12) (\"Level 7 child\" t 13) (\"Body L7\" nil 14) (\"Level 8 child\" t 15) (\"Body L8\" nil 16) (\"Project B\" t 17) (\"Body B4\" nil 22)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Inserted while L6 subtree hidden\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (global ((\"Level 4 target\" nil 6) (\"Body L4\" nil 7) (\"Level 5 child\" nil 8) (\"Body L5\" nil 9) (\"Level 6 child\" nil 10) (\"Body L6\" nil 12) (\"Level 7 child\" nil 13) (\"Body L7\" nil 14) (\"Level 8 child\" nil 15) (\"Body L8\" nil 16) (\"Project B\" nil 17) (\"Body B4\" nil 22)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Inserted while L6 subtree hidden\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\")) (global ((\"Level 4 target\" t 6) (\"Body L4\" t 7) (\"Level 5 child\" t 8) (\"Body L5\" t 9) (\"Level 6 child\" t 10) (\"Body L6\" t 12) (\"Level 7 child\" t 13) (\"Body L7\" t 14) (\"Level 8 child\" t 15) (\"Body L8\" t 16) (\"Project B\" t 17) (\"Body B4\" nil 22)) (\"* Root\" \"** Project A\" \"Body A\" \"*** Area A1\" \"Body A1\" \"**** TODO Level 4 target :deep:\" \"Body L4\" \"***** NEXT Level 5 child\" \"Body L5\" \"****** WAIT Level 6 child\" \"Inserted while L6 subtree hidden\" \"Body L6\" \"******* DONE Level 7 child\" \"Body L7\" \"******** TODO Level 8 child\" \"Body L8\" \"** Project B\" \"Body B\" \"*** Area B1\" \"Body B1\" \"**** TODO B Level 4 :other:\" \"Body B4\"))) ((#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Level 4 target \" nil 4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4) nil) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"NEXT\" 0 4 (face org-level-5)) \"Level 5 child\" nil 5 org-level-5 org-level-5 org-level-5 nil) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"WAIT\" 0 4 (face org-level-6)) \"Level 6 child\" nil 6 org-level-6 org-level-6 org-level-6 nil) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"DONE\" 0 4 (face (org-done org-level-7))) \"Level 7 child\" nil 7 org-level-7 (org-done org-level-7) (org-headline-done org-level-7) nil) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"TODO\" 0 4 (face (org-todo org-level-8))) \"Level 8 child\" nil 8 org-level-8 (org-todo org-level-8) (org-headline-todo org-level-8) nil) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"B Level 4 \" nil 4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4) nil)) 11 1 \"* Root\\n** Project A\\nBody A\\n*** Area A1\\nBody A1\\n**** TODO Level 4 target :deep:\\nBody L4\\n***** NEXT Level 5 child\\nBody L5\\n****** WAIT Level 6 child\\nInserted while L6 subtree hidden\\nBody L6\\n******* DONE Level 7 child\\nBody L7\\n******** TODO Level 8 child\\nBody L8\\n** Project B\\nBody B\\n*** Area B1\\nBody B1\\n**** TODO B Level 4 :other:\\nBody B4\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -8117,7 +8251,7 @@ fn org_repeated_deep_cycle_edit_fontify_no_merge_combo() {
                         (match-string 2)
                         (substring-no-properties (match-string 3))
                         (match-string 4)
-                        (org-outline-level)
+                        (save-match-data (org-outline-level))
                         (get-text-property (match-beginning 1) 'face)
                         (and (match-beginning 2)
                              (get-text-property (match-beginning 2) 'face))
@@ -8131,76 +8265,18 @@ fn org_repeated_deep_cycle_edit_fontify_no_merge_combo() {
                 (count-matches "^Inserted while L6 subtree hidden$"
                                (point-min) (point-max))
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_fold_core_mixed_regions_recovery_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-fold)
-  (with-temp-buffer
-    (org-mode)
-    (insert "* A\n")
-    (insert ":LOGBOOK:\nclock line\n:END:\n")
-    (insert "#+begin_src emacs-lisp\n(+ 1 2)\n#+end_src\n")
-    (insert "** B\nbody B\n*** C\nbody C\n")
-    (insert "* D\nbody D\n")
-    (let ((offset-region
-           (lambda (region)
-             (and region
-                  (cons (- (car region) (point-min))
-                        (- (cdr region) (point-min))))))
-          (probe
-           (lambda (needle)
-             (save-excursion
-               (goto-char (point-min))
-               (search-forward needle)
-               (list needle
-                     (invisible-p (point))
-                     (get-text-property (point) 'invisible)
-                     (funcall offset-region
-                              (org-fold-get-region-at-point 'drawer (point)))
-                     (funcall offset-region
-                              (org-fold-get-region-at-point 'block (point)))
-                     (funcall offset-region
-                              (org-fold-get-region-at-point 'outline
-                                                            (point))))))))
-      (org-fold-hide-drawer-all)
-      (org-fold-hide-block-all)
-      (goto-char (point-min))
-      (search-forward "B")
-      (beginning-of-line)
-      (org-fold-hide-subtree)
-      (let ((hidden (mapcar probe
-                            '("clock line" "(+ 1 2)" "body B" "C"
-                              "body C" "D" "body D"))))
-        (org-fold-show-subtree)
-        (org-fold-show-all '(blocks drawers))
-        (let ((shown (mapcar probe
-                             '("clock line" "(+ 1 2)" "body B" "C"
-                               "body C" "D" "body D"))))
-          (list hidden
-                shown
-                (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_reveal_context_after_hidden_search_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"Root\" 2) (\"root body\" 2) (\"Alpha\" 2) (\"alpha body\" 2) (\"Beta\" 2) (\"beta body\" 2) (\"Gamma\" 2) (\"needle body\" 2) (\"Sibling\" 2) (\"sibling body\" nil)) ((\"Root\" 2) (\"root body\" nil) (\"Alpha\" 2) (\"alpha body\" nil) (\"Beta\" 2) (\"beta body\" nil) (\"Gamma\" nil) (\"needle body\" nil) (\"Sibling\" 2) (\"sibling body\" nil)) ((\"Root\" nil) (\"root body\" nil) (\"Alpha\" nil) (\"alpha body\" nil) (\"Beta\" nil) (\"beta body\" nil) (\"Gamma\" nil) (\"needle body\" nil) (\"Sibling\" 2) (\"sibling body\" nil)) ((\"Root\" nil) (\"root body\" nil) (\"Alpha\" nil) (\"alpha body\" nil) (\"Beta\" nil) (\"beta body\" nil) (\"Gamma\" nil) (\"needle body\" nil) (\"Sibling\" nil) (\"sibling body\" nil)) \"* Root\\nroot body\\n** Alpha\\nalpha body\\n*** Beta\\nbeta body\\n**** Gamma\\nneedle body\\n** Sibling\\nsibling body\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -8242,7 +8318,7 @@ fn org_fold_reveal_context_after_hidden_search_combo() {
                   after-reveal
                   (funcall visible)
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
@@ -8325,12 +8401,13 @@ fn org_fontify_like_org_mode_deep_markup_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_indent_deep_cycle_prefix_properties_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"L1\" 1 \"\" #(\"* \" 0 2 (face org-indent)) org-level-1 nil) (\"body 1\" 1 #(\"  \" 0 2 (face org-indent)) #(\"  \" 0 2 (face org-indent)) nil nil) (\"L2\" 2 #(\"*\" 0 1 (face org-indent)) #(\"*** \" 0 1 (face org-indent) 1 4 (face org-indent)) org-hide nil) (\"body 2\" 2 #(\"    \" 0 4 (face org-indent)) #(\"    \" 0 4 (face org-indent)) nil nil) (\"L3\" 3 #(\"**\" 0 2 (face org-indent)) #(\"***** \" 0 2 (face org-indent) 2 6 (face org-indent)) org-hide nil) (\"body 3\" 3 #(\"      \" 0 6 (face org-indent)) #(\"      \" 0 6 (face org-indent)) nil nil) (\"L4\" 4 #(\"***\" 0 3 (face org-indent)) #(\"******* \" 0 3 (face org-indent) 3 8 (face org-indent)) org-hide nil) (\"body 4\" 4 #(\"        \" 0 8 (face org-indent)) #(\"        \" 0 8 (face org-indent)) nil nil) (\"L5\" 5 #(\"****\" 0 4 (face org-indent)) #(\"********* \" 0 4 (face org-indent) 4 10 (face org-indent)) org-hide nil) (\"body 5\" 5 #(\"          \" 0 10 (face org-indent)) #(\"          \" 0 10 (face org-indent)) nil nil) (\"L6\" 6 #(\"*****\" 0 5 (face org-indent)) #(\"*********** \" 0 5 (face org-indent) 5 12 (face org-indent)) org-hide nil) (\"body 6\" 6 #(\"            \" 0 12 (face org-indent)) #(\"            \" 0 12 (face org-indent)) nil nil)) \"* L1\\nbody 1\\n** L2\\nbody 2\\n*** L3\\nbody 3\\n**** L4\\nbody 4\\n***** L5\\nbody 5\\n****** L6\\nbody 6\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -8365,7 +8442,7 @@ fn org_indent_deep_cycle_prefix_properties_combo() {
         (list (mapcar probe
                       '("L1" "body 1" "L2" "body 2" "L3" "body 3"
                         "L4" "body 4" "L5" "body 5" "L6" "body 6"))
-              (buffer-substring-no-properties (point-min) (point-max))))))"##,
+              (buffer-substring-no-properties (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -8541,146 +8618,13 @@ fn org_deep_visibility_property_cycle_recovery_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_repeated_deep_fold_expand_edit_no_heading_merge_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""ERR (void-variable snapshot)""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-cycle)
-  (require 'org-fold)
-  (with-temp-buffer
-    (let ((org-cycle-global-at-bob t)
-          (org-cycle-level-faces t)
-          (org-fontify-whole-heading-line t)
-          (org-hide-leading-stars nil)
-          (org-cycle-separator-lines 0))
-      (org-mode)
-      (insert "* Alpha\nalpha body one\n")
-      (insert "** Alpha child\nalpha child body\n")
-      (insert "*** Alpha grand\nalpha grand body\n")
-      (insert "**** Alpha fourth\nalpha fourth body\n")
-      (insert "***** Alpha fifth\nalpha fifth body\n")
-      (insert "****** Alpha sixth\nalpha sixth body\n")
-      (insert "******* Alpha seventh\nalpha seventh body\n")
-      (insert "******** Alpha eighth\nalpha eighth body\n")
-      (insert "** Alpha sibling\nalpha sibling body\n")
-      (insert "* Beta\nbeta body\n")
-      (insert "** Beta child\nbeta child body\n")
-      (insert "*** Beta grand\nbeta grand body\n")
-      (insert "**** Beta fourth\nbeta fourth body\n")
-      (insert "***** Beta fifth\nbeta fifth body\n")
-      (insert "* Gamma\ngamma body\n")
-      (let ((headings
-             '("Alpha" "Alpha child" "Alpha grand" "Alpha fourth"
-               "Alpha fifth" "Alpha sixth" "Alpha seventh"
-               "Alpha eighth" "Alpha sibling" "Beta" "Beta child"
-               "Beta grand" "Beta fourth" "Beta fifth" "Gamma"))
-            (bodies
-             '("alpha body one" "alpha fourth body" "alpha eighth body"
-               "alpha sibling body" "beta fourth body" "gamma body"))
-            states)
-        (let ((snapshot
-               (lambda (label)
-                 (font-lock-ensure (point-min) (point-max))
-                 (list label
-                       org-cycle-global-status
-                       org-cycle-subtree-status
-                       (mapcar
-                        (lambda (needle)
-                          (save-excursion
-                            (goto-char (point-min))
-                            (search-forward needle)
-                            (beginning-of-line)
-                            (let ((pos (point)))
-                              (list needle
-                                    (line-number-at-pos pos)
-                                    (org-at-heading-p)
-                                    (and (org-at-heading-p)
-                                         (org-outline-level))
-                                    (invisible-p pos)
-                                    (org-fold-folded-p
-                                     (line-end-position) 'headline)
-                                    (get-text-property pos 'face)
-                                    (get-text-property
-                                     (match-beginning 0) 'face))))))
-                        headings)
-                       (mapcar
-                        (lambda (needle)
-                          (save-excursion
-                            (goto-char (point-min))
-                            (search-forward needle)
-                            (list needle
-                                  (line-number-at-pos)
-                                  (invisible-p (point))
-                                  (get-text-property (point) 'face))))
-                        bodies)
-                       (save-excursion
-                         (goto-char (point-min))
-                         (let (out)
-                           (while (re-search-forward "^\\(\\*+\\) \\(.*\\)$" nil t)
-                             (push (list (match-string 1)
-                                         (match-string 2)
-                                         (line-number-at-pos))
-                                   out))
-                           (nreverse out)))
-                       (count-matches "^\\*+ " (point-min) (point-max))
-                       (count-lines (point-min) (point-max))
-                       (buffer-substring-no-properties
-                        (point-min) (point-max)))))))
-          (push (funcall snapshot 'initial) states)
-          (goto-char (point-min))
-          (search-forward "Alpha fourth")
-          (beginning-of-line)
-          (dotimes (_ 5)
-            (org-cycle)
-            (push (funcall snapshot 'local-fourth) states))
-          (goto-char (point-min))
-          (search-forward "Alpha")
-          (beginning-of-line)
-          (org-fold-hide-subtree)
-          (push (funcall snapshot 'alpha-hidden) states)
-          (org-fold-show-subtree)
-          (push (funcall snapshot 'alpha-shown) states)
-          (goto-char (point-min))
-          (search-forward "Alpha eighth")
-          (beginning-of-line)
-          (org-fold-hide-subtree)
-          (push (funcall snapshot 'eighth-hidden) states)
-          (org-end-of-subtree t t)
-          (insert "******** Alpha eighth inserted sibling\ninserted body\n")
-          (push (funcall snapshot 'after-hidden-insert) states)
-          (org-fold-show-all)
-          (push (funcall snapshot 'after-show-all) states)
-          (goto-char (point-min))
-          (dotimes (_ 6)
-            (org-cycle-global)
-            (push (funcall snapshot 'global-cycle) states))
-          (goto-char (point-min))
-          (search-forward "Beta fifth")
-          (beginning-of-line)
-          (dotimes (_ 4)
-            (org-cycle)
-            (push (funcall snapshot 'local-beta-fifth) states))
-          (org-fold-show-all)
-          (push (funcall snapshot 'final-show-all) states)
-          (list (nreverse states)
-                (split-string
-                 (buffer-substring-no-properties (point-min) (point-max))
-                 "\n" t))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_fold_move_reveal_deep_font_faces_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((startup nil nil ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 nil org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 nil nil nil) (\"(message \\\"alpha\\\")\" 19 nil (org-block) (org-block)) (\"Beta\" 21 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 22 nil nil nil) (\"Beta child\" 23 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 24 nil nil nil) (\"Beta level four\" 25 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 26 nil nil nil) (\"Tail\" 27 nil org-level-1 org-level-1) (\"tail body\" 28 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 10 28 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (local-alpha-four nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 22 nil nil nil) (\"Beta child\" 23 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 24 nil nil nil) (\"Beta level four\" 25 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 26 nil nil nil) (\"Tail\" 27 nil org-level-1 org-level-1) (\"tail body\" 28 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 10 28 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (local-alpha-four nil children ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 22 nil nil nil) (\"Beta child\" 23 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 24 nil nil nil) (\"Beta level four\" 25 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 26 nil nil nil) (\"Tail\" 27 nil org-level-1 org-level-1) (\"tail body\" 28 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 10 28 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (local-alpha-four nil subtree ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 nil org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 nil nil nil) (\"(message \\\"alpha\\\")\" 19 nil (org-block) (org-block)) (\"Beta\" 21 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 22 nil nil nil) (\"Beta child\" 23 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 24 nil nil nil) (\"Beta level four\" 25 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 26 nil nil nil) (\"Tail\" 27 nil org-level-1 org-level-1) (\"tail body\" 28 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 10 28 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (local-alpha-four nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 22 nil nil nil) (\"Beta child\" 23 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 24 nil nil nil) (\"Beta level four\" 25 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 26 nil nil nil) (\"Tail\" 27 nil org-level-1 org-level-1) (\"tail body\" 28 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 10 28 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (hidden-insert nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 23 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 24 nil nil nil) (\"Beta child\" 25 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 26 nil nil nil) (\"Beta level four\" 27 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 28 nil nil nil) (\"Tail\" 29 nil org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (show-all-after-insert nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 nil org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 nil nil nil) (\"(message \\\"alpha\\\")\" 19 nil (org-block) (org-block)) (\"Beta\" 23 nil org-level-2 (org-headline-todo org-level-2)) (\"beta body\" 24 nil nil nil) (\"Beta child\" 25 nil org-level-3 (org-headline-todo org-level-3)) (\"beta child body\" 26 nil nil nil) (\"Beta level four\" 27 nil org-level-4 (org-headline-todo org-level-4)) (\"beta level four body\" 28 nil nil nil) (\"Tail\" 29 nil org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"TODO\" 0 4 (face (org-todo org-level-3))) \"Beta child\" nil 3 org-level-3 org-level-3 (org-todo org-level-3) (org-headline-todo org-level-3)) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Beta level four\" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"*** TODO Beta child\" \"beta child body\" \"**** TODO Beta level four\" \"beta level four body\" \"* Tail\" \"tail body\")) (after-move-beta-child nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 nil org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 nil nil nil) (\"(message \\\"alpha\\\")\" 19 nil (org-block) (org-block)) (\"Beta\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 nil nil nil) (\"Beta level four\" 23 nil org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 nil nil nil) (\"Tail\" 29 nil org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (after-level-roundtrip nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 nil org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 nil nil nil) (\"(message \\\"alpha\\\")\" 19 nil (org-block) (org-block)) (\"Beta\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 nil nil nil) (\"Beta level four\" 23 nil org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 nil nil nil) (\"Tail\" 29 nil org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (after-context-reveal nil folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 2 org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 2 org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 2 org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 nil nil nil) (\"Beta level four\" 23 nil org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 nil nil nil) (\"Tail\" 29 2 org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (global-cycle overview folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 2 org-special-keyword org-special-keyword) (\"project body\" 7 2 nil nil) (\"Alpha\" 8 2 org-level-2 org-level-2) (\"alpha body\" 9 2 nil nil) (\"Alpha child\" 10 2 org-level-3 org-level-3) (\"child body\" 11 2 nil nil) (\"Alpha level four\" 12 2 org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 2 nil nil) (\"Beta level four\" 23 2 org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 2 nil nil) (\"Tail\" 29 2 org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (global-cycle overview folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 2 org-special-keyword org-special-keyword) (\"project body\" 7 2 nil nil) (\"Alpha\" 8 2 org-level-2 org-level-2) (\"alpha body\" 9 2 nil nil) (\"Alpha child\" 10 2 org-level-3 org-level-3) (\"child body\" 11 2 nil nil) (\"Alpha level four\" 12 2 org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 2 nil nil) (\"Beta level four\" 23 2 org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 2 nil nil) (\"Tail\" 29 2 org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (global-cycle overview folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 2 org-special-keyword org-special-keyword) (\"project body\" 7 2 nil nil) (\"Alpha\" 8 2 org-level-2 org-level-2) (\"alpha body\" 9 2 nil nil) (\"Alpha child\" 10 2 org-level-3 org-level-3) (\"child body\" 11 2 nil nil) (\"Alpha level four\" 12 2 org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 2 nil nil) (\"Beta level four\" 23 2 org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 2 nil nil) (\"Tail\" 29 2 org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (global-cycle overview folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 2 org-special-keyword org-special-keyword) (\"project body\" 7 2 nil nil) (\"Alpha\" 8 2 org-level-2 org-level-2) (\"alpha body\" 9 2 nil nil) (\"Alpha child\" 10 2 org-level-3 org-level-3) (\"child body\" 11 2 nil nil) (\"Alpha level four\" 12 2 org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 2 nil nil) (\"Beta level four\" 23 2 org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 2 nil nil) (\"Tail\" 29 2 org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (global-cycle overview folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 2 org-special-keyword org-special-keyword) (\"project body\" 7 2 nil nil) (\"Alpha\" 8 2 org-level-2 org-level-2) (\"alpha body\" 9 2 nil nil) (\"Alpha child\" 10 2 org-level-3 org-level-3) (\"child body\" 11 2 nil nil) (\"Alpha level four\" 12 2 org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 2 nil nil) (\"Alpha level five\" 14 2 org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 2 nil nil) (\"Alpha level six\" 16 2 org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 2 nil nil) (\"(message \\\"alpha\\\")\" 19 2 (org-block) (org-block)) (\"Beta\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 2 org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 2 nil nil) (\"Beta level four\" 23 2 org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 2 nil nil) (\"Tail\" 29 2 org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\")) (final overview folded ((\"Project\" 2 nil org-level-1 (org-headline-todo org-level-1)) (\":Owner:\" 5 nil org-special-keyword org-special-keyword) (\"project body\" 7 nil nil nil) (\"Alpha\" 8 nil org-level-2 org-level-2) (\"alpha body\" 9 nil nil nil) (\"Alpha child\" 10 nil org-level-3 org-level-3) (\"child body\" 11 nil nil nil) (\"Alpha level four\" 12 nil org-level-4 (org-headline-todo org-level-4)) (\"level four body\" 13 nil nil nil) (\"Alpha level five\" 14 nil org-level-5 (org-headline-done org-level-5)) (\"level five body\" 15 nil nil nil) (\"Alpha level six\" 16 nil org-level-6 (org-headline-todo org-level-6)) (\"level six body\" 17 nil nil nil) (\"(message \\\"alpha\\\")\" 19 nil (org-block) (org-block)) (\"Beta\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta body\" 28 nil nil nil) (\"Beta child\" 21 nil org-level-5 (org-headline-todo org-level-5)) (\"beta child body\" 22 nil nil nil) (\"Beta level four\" 23 nil org-level-6 (org-headline-todo org-level-6)) (\"beta level four body\" 24 nil nil nil) (\"Tail\" 29 nil org-level-1 org-level-1) (\"tail body\" 30 nil nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"TODO\" 0 4 (face (org-todo org-level-1))) \"Project \" nil 1 org-level-1 org-level-1 (org-todo org-level-1) (org-headline-todo org-level-1)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"NEXT\" 0 4 (face org-level-2)) \"Alpha\" nil 2 org-level-2 org-level-2 org-level-2 org-level-2) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"WAIT\" 0 4 (face org-level-3)) \"Alpha child\" nil 3 org-level-3 org-level-3 org-level-3 org-level-3) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"TODO\" 0 4 (face (org-todo org-level-4))) \"Alpha level four \" nil 4 org-level-4 org-level-4 (org-todo org-level-4) (org-headline-todo org-level-4)) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"DONE\" 0 4 (face (org-done org-level-5))) \"Alpha level five\" nil 5 org-level-5 org-level-5 (org-done org-level-5) (org-headline-done org-level-5)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha level six\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"*****\" 0 1 (face org-level-5) 1 2 (face org-level-5) 2 4 (face org-level-5) 4 5 (face org-level-5)) #(\"TODO\" 0 4 (face (org-todo org-level-5))) \"Beta child\" nil 5 org-level-5 org-level-5 (org-todo org-level-5) (org-headline-todo org-level-5)) (#(\"******\" 0 1 (face org-level-6) 1 2 (face org-level-6) 2 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Beta level four\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"TODO\" 0 4 (face (org-todo org-level-6))) \"Alpha inserted after hidden\" nil 6 org-level-6 org-level-6 (org-todo org-level-6) (org-headline-todo org-level-6)) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"TODO\" 0 4 (face (org-todo org-level-2))) \"Beta\" nil 2 org-level-2 org-level-2 (org-todo org-level-2) (org-headline-todo org-level-2)) (#(\"*\" 0 1 (face org-level-1)) #(\"Tai\" 0 3 (face org-level-1)) \"l\" nil 1 org-level-1 org-level-1 org-level-1 org-level-1)) 11 30 (\"#+STARTUP: content\" \"* TODO Project :work:\" \":PROPERTIES:\" \":VISIBILITY: children\" \":Owner: Ada\" \":END:\" \"project body\" \"** NEXT Alpha\" \"alpha body\" \"*** WAIT Alpha child\" \"child body\" \"**** TODO Alpha level four :deep:\" \"level four body\" \"***** DONE Alpha level five\" \"level five body\" \"****** TODO Alpha level six\" \"level six body\" \"#+begin_src emacs-lisp\" \"(message \\\"alpha\\\")\" \"#+end_src\" \"***** TODO Beta child\" \"beta child body\" \"****** TODO Beta level four\" \"beta level four body\" \"****** TODO Alpha inserted after hidden\" \"inserted alpha body\" \"** TODO Beta\" \"beta body\" \"* Tail\" \"tail body\"))) nil \"#+STARTUP: content\\n* TODO Project :work:\\n:PROPERTIES:\\n:VISIBILITY: children\\n:Owner: Ada\\n:END:\\nproject body\\n** NEXT Alpha\\nalpha body\\n*** WAIT Alpha child\\nchild body\\n**** TODO Alpha level four :deep:\\nlevel four body\\n***** DONE Alpha level five\\nlevel five body\\n****** TODO Alpha level six\\nlevel six body\\n#+begin_src emacs-lisp\\n(message \\\"alpha\\\")\\n#+end_src\\n***** TODO Beta child\\nbeta child body\\n****** TODO Beta level four\\nbeta level four body\\n****** TODO Alpha inserted after hidden\\ninserted alpha body\\n** TODO Beta\\nbeta body\\n* Tail\\ntail body\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -8749,7 +8693,7 @@ fn org_fold_move_reveal_deep_font_faces_combo() {
                                          (substring-no-properties
                                           (match-string 3))
                                          (match-string 4)
-                                         (org-outline-level)
+                                         (save-match-data (org-outline-level))
                                          (get-text-property
                                           (line-beginning-position) 'face)
                                          (get-text-property
@@ -8823,7 +8767,142 @@ fn org_fold_move_reveal_deep_font_faces_combo() {
             (list (nreverse states)
                   (nreverse bad-lines)
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))"##,
+                   (point-min) (point-max)))))))))"##,
+        expect,
+    );
+}
+
+#[test]
+fn org_repeated_deep_fold_expand_edit_no_heading_merge_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (((initial nil nil ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-fourth nil folded ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 2 nil) (\"alpha eighth body\" 16 nil org-level-4) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-fourth nil children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil org-level-5) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-fourth nil subtree ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-fourth nil folded ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 2 nil) (\"alpha eighth body\" 16 nil org-level-4) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-fourth nil children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil org-level-5) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (alpha-hidden nil children ((\"Alpha\" 1 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Alpha child\" 3 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 2 org-fold-outline org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 2 org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 2 nil) (\"alpha fourth body\" 8 2 nil) (\"alpha eighth body\" 16 2 nil) (\"alpha sibling body\" 18 nil org-level-1) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (alpha-shown nil children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (eighth-hidden nil children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 17 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 19 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 21 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 23 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 25 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 27 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 29 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil org-level-8) (\"alpha sibling body\" 18 nil nil) (\"beta fourth body\" 26 nil nil) (\"gamma body\" 30 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 17) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 19) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 21) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 23) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 25) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 27) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 29)) 15 30 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (after-hidden-insert nil children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil org-level-8) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (after-show-all nil children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (global-cycle overview children ((\"Alpha\" 1 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Alpha child\" 3 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 2 org-fold-outline org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 2 org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Beta\" 21 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Beta child\" 23 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Beta grand\" 25 t 3 2 org-fold-outline org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 2 org-fold-outline org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil org-fold-outline org-level-1 org-level-1)) ((\"alpha body one\" 2 2 nil) (\"alpha fourth body\" 8 2 nil) (\"alpha eighth body\" 16 2 nil) (\"alpha sibling body\" 20 nil org-level-1) (\"beta fourth body\" 28 2 nil) (\"gamma body\" 32 nil org-level-1)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (global-cycle contents children ((\"Alpha\" 1 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil org-fold-outline org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil org-fold-outline org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil org-fold-outline org-level-2 org-level-2) (\"Beta\" 21 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil org-fold-outline org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil org-fold-outline org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil org-fold-outline org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil org-fold-outline org-level-1 org-level-1)) ((\"alpha body one\" 2 nil org-level-1) (\"alpha fourth body\" 8 nil org-level-4) (\"alpha eighth body\" 16 nil org-level-8) (\"alpha sibling body\" 20 nil org-level-2) (\"beta fourth body\" 28 nil org-level-4) (\"gamma body\" 32 nil org-level-1)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (global-cycle all children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (global-cycle overview children ((\"Alpha\" 1 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Alpha child\" 3 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 2 org-fold-outline org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 2 org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 2 org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 2 org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 2 org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Beta\" 21 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Beta child\" 23 t 2 2 org-fold-outline org-level-2 org-level-2) (\"Beta grand\" 25 t 3 2 org-fold-outline org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 2 org-fold-outline org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 2 org-fold-outline org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil org-fold-outline org-level-1 org-level-1)) ((\"alpha body one\" 2 2 nil) (\"alpha fourth body\" 8 2 nil) (\"alpha eighth body\" 16 2 nil) (\"alpha sibling body\" 20 nil org-level-1) (\"beta fourth body\" 28 2 nil) (\"gamma body\" 32 nil org-level-1)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (global-cycle contents children ((\"Alpha\" 1 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil org-fold-outline org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil org-fold-outline org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil org-fold-outline org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil org-fold-outline org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil org-fold-outline org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil org-fold-outline org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil org-fold-outline org-level-2 org-level-2) (\"Beta\" 21 t 1 nil org-fold-outline org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil org-fold-outline org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil org-fold-outline org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil org-fold-outline org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil org-fold-outline org-level-1 org-level-1)) ((\"alpha body one\" 2 nil org-level-1) (\"alpha fourth body\" 8 nil org-level-4) (\"alpha eighth body\" 16 nil org-level-8) (\"alpha sibling body\" 20 nil org-level-2) (\"beta fourth body\" 28 nil org-level-4) (\"gamma body\" 32 nil org-level-1)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (global-cycle all children ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-beta-fifth all subtree ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-beta-fifth all folded ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-beta-fifth all subtree ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (local-beta-fifth all folded ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil org-fold-outline org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\") (final-show-all all folded ((\"Alpha\" 1 t 1 nil nil org-level-1 org-level-1) (\"Alpha child\" 3 t 2 nil nil org-level-2 org-level-2) (\"Alpha grand\" 5 t 3 nil nil org-level-3 org-level-3) (\"Alpha fourth\" 7 t 4 nil nil org-level-4 org-level-4) (\"Alpha fifth\" 9 t 5 nil nil org-level-5 org-level-5) (\"Alpha sixth\" 11 t 6 nil nil org-level-6 org-level-6) (\"Alpha seventh\" 13 t 7 nil nil org-level-7 org-level-7) (\"Alpha eighth\" 15 t 8 nil nil org-level-8 org-level-8) (\"Alpha sibling\" 19 t 2 nil nil org-level-2 org-level-2) (\"Beta\" 21 t 1 nil nil org-level-1 org-level-1) (\"Beta child\" 23 t 2 nil nil org-level-2 org-level-2) (\"Beta grand\" 25 t 3 nil nil org-level-3 org-level-3) (\"Beta fourth\" 27 t 4 nil nil org-level-4 org-level-4) (\"Beta fifth\" 29 t 5 nil nil org-level-5 org-level-5) (\"Gamma\" 31 t 1 nil nil org-level-1 org-level-1)) ((\"alpha body one\" 2 nil nil) (\"alpha fourth body\" 8 nil nil) (\"alpha eighth body\" 16 nil nil) (\"alpha sibling body\" 20 nil nil) (\"beta fourth body\" 28 nil nil) (\"gamma body\" 32 nil nil)) ((#(\"*\" 0 1 (face org-level-1)) #(\"Alpha\" 0 5 (face org-level-1)) 1) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha child\" 0 11 (face org-level-2)) 3) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Alpha grand\" 0 11 (face org-level-3)) 5) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Alpha fourth\" 0 12 (face org-level-4)) 7) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Alpha fifth\" 0 11 (face org-level-5)) 9) (#(\"******\" 0 5 (face org-level-6) 5 6 (face org-level-6)) #(\"Alpha sixth\" 0 11 (face org-level-6)) 11) (#(\"*******\" 0 6 (face org-level-7) 6 7 (face org-level-7)) #(\"Alpha seventh\" 0 13 (face org-level-7)) 13) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth\" 0 12 (face org-level-8)) 15) (#(\"********\" 0 7 (face org-level-8) 7 8 (face org-level-8)) #(\"Alpha eighth inserted sibling\" 0 29 (face org-level-8)) 17) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Alpha sibling\" 0 13 (face org-level-2)) 19) (#(\"*\" 0 1 (face org-level-1)) #(\"Beta\" 0 4 (face org-level-1)) 21) (#(\"**\" 0 1 (face org-level-2) 1 2 (face org-level-2)) #(\"Beta child\" 0 10 (face org-level-2)) 23) (#(\"***\" 0 2 (face org-level-3) 2 3 (face org-level-3)) #(\"Beta grand\" 0 10 (face org-level-3)) 25) (#(\"****\" 0 3 (face org-level-4) 3 4 (face org-level-4)) #(\"Beta fourth\" 0 11 (face org-level-4)) 27) (#(\"*****\" 0 4 (face org-level-5) 4 5 (face org-level-5)) #(\"Beta fifth\" 0 10 (face org-level-5)) 29) (#(\"*\" 0 1 (face org-level-1)) #(\"Gamma\" 0 5 (face org-level-1)) 31)) 16 32 \"* Alpha\\nalpha body one\\n** Alpha child\\nalpha child body\\n*** Alpha grand\\nalpha grand body\\n**** Alpha fourth\\nalpha fourth body\\n***** Alpha fifth\\nalpha fifth body\\n****** Alpha sixth\\nalpha sixth body\\n******* Alpha seventh\\nalpha seventh body\\n******** Alpha eighth\\nalpha eighth body\\n******** Alpha eighth inserted sibling\\ninserted body\\n** Alpha sibling\\nalpha sibling body\\n* Beta\\nbeta body\\n** Beta child\\nbeta child body\\n*** Beta grand\\nbeta grand body\\n**** Beta fourth\\nbeta fourth body\\n***** Beta fifth\\nbeta fifth body\\n* Gamma\\ngamma body\\n\")) (\"* Alpha\" \"alpha body one\" \"** Alpha child\" \"alpha child body\" \"*** Alpha grand\" \"alpha grand body\" \"**** Alpha fourth\" \"alpha fourth body\" \"***** Alpha fifth\" \"alpha fifth body\" \"****** Alpha sixth\" \"alpha sixth body\" \"******* Alpha seventh\" \"alpha seventh body\" \"******** Alpha eighth\" \"alpha eighth body\" \"******** Alpha eighth inserted sibling\" \"inserted body\" \"** Alpha sibling\" \"alpha sibling body\" \"* Beta\" \"beta body\" \"** Beta child\" \"beta child body\" \"*** Beta grand\" \"beta grand body\" \"**** Beta fourth\" \"beta fourth body\" \"***** Beta fifth\" \"beta fifth body\" \"* Gamma\" \"gamma body\"))""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-cycle)
+  (require 'org-fold)
+  (with-temp-buffer
+    (let ((org-cycle-global-at-bob t)
+          (org-cycle-level-faces t)
+          (org-fontify-whole-heading-line t)
+          (org-hide-leading-stars nil)
+          (org-cycle-separator-lines 0))
+      (org-mode)
+      (insert "* Alpha\nalpha body one\n")
+      (insert "** Alpha child\nalpha child body\n")
+      (insert "*** Alpha grand\nalpha grand body\n")
+      (insert "**** Alpha fourth\nalpha fourth body\n")
+      (insert "***** Alpha fifth\nalpha fifth body\n")
+      (insert "****** Alpha sixth\nalpha sixth body\n")
+      (insert "******* Alpha seventh\nalpha seventh body\n")
+      (insert "******** Alpha eighth\nalpha eighth body\n")
+      (insert "** Alpha sibling\nalpha sibling body\n")
+      (insert "* Beta\nbeta body\n")
+      (insert "** Beta child\nbeta child body\n")
+      (insert "*** Beta grand\nbeta grand body\n")
+      (insert "**** Beta fourth\nbeta fourth body\n")
+      (insert "***** Beta fifth\nbeta fifth body\n")
+      (insert "* Gamma\ngamma body\n")
+      (let ((headings
+             '("Alpha" "Alpha child" "Alpha grand" "Alpha fourth"
+               "Alpha fifth" "Alpha sixth" "Alpha seventh"
+               "Alpha eighth" "Alpha sibling" "Beta" "Beta child"
+               "Beta grand" "Beta fourth" "Beta fifth" "Gamma"))
+            (bodies
+             '("alpha body one" "alpha fourth body" "alpha eighth body"
+               "alpha sibling body" "beta fourth body" "gamma body"))
+            states)
+        (let ((snapshot
+               (lambda (label)
+                 (font-lock-ensure (point-min) (point-max))
+                 (list label
+                       org-cycle-global-status
+                       org-cycle-subtree-status
+                       (mapcar
+                        (lambda (needle)
+                          (save-excursion
+                            (goto-char (point-min))
+                            (search-forward needle)
+                            (beginning-of-line)
+                            (let ((pos (point)))
+                              (list needle
+                                    (line-number-at-pos pos)
+                                    (org-at-heading-p)
+                                    (and (org-at-heading-p)
+                                         (org-outline-level))
+                                    (invisible-p pos)
+                                    (org-fold-folded-p
+                                     (line-end-position) 'headline)
+                                    (get-text-property pos 'face)
+                                    (get-text-property
+                                     (match-beginning 0) 'face)))))
+                        headings)
+                       (mapcar
+                        (lambda (needle)
+                          (save-excursion
+                            (goto-char (point-min))
+                            (search-forward needle)
+                            (list needle
+                                  (line-number-at-pos)
+                                  (invisible-p (point))
+                                  (get-text-property (point) 'face))))
+                        bodies)
+                       (save-excursion
+                         (goto-char (point-min))
+                         (let (out)
+                           (while (re-search-forward "^\\(\\*+\\) \\(.*\\)$" nil t)
+                             (push (list (match-string 1)
+                                         (match-string 2)
+                                         (line-number-at-pos))
+                                   out))
+                           (nreverse out)))
+                       (count-matches "^\\*+ " (point-min) (point-max))
+                       (count-lines (point-min) (point-max))
+                       (buffer-substring-no-properties
+                        (point-min) (point-max))))))
+          (push (funcall snapshot 'initial) states)
+          (goto-char (point-min))
+          (search-forward "Alpha fourth")
+          (beginning-of-line)
+          (dotimes (_ 5)
+            (org-cycle)
+            (push (funcall snapshot 'local-fourth) states))
+          (goto-char (point-min))
+          (search-forward "Alpha")
+          (beginning-of-line)
+          (org-fold-hide-subtree)
+          (push (funcall snapshot 'alpha-hidden) states)
+          (org-fold-show-subtree)
+          (push (funcall snapshot 'alpha-shown) states)
+          (goto-char (point-min))
+          (search-forward "Alpha eighth")
+          (beginning-of-line)
+          (org-fold-hide-subtree)
+          (push (funcall snapshot 'eighth-hidden) states)
+          (org-end-of-subtree t t)
+          (insert "******** Alpha eighth inserted sibling\ninserted body\n")
+          (push (funcall snapshot 'after-hidden-insert) states)
+          (org-fold-show-all)
+          (push (funcall snapshot 'after-show-all) states)
+          (goto-char (point-min))
+          (dotimes (_ 6)
+            (org-cycle-global)
+            (push (funcall snapshot 'global-cycle) states))
+          (goto-char (point-min))
+          (search-forward "Beta fifth")
+          (beginning-of-line)
+          (dotimes (_ 4)
+            (org-cycle)
+            (push (funcall snapshot 'local-beta-fifth) states))
+          (org-fold-show-all)
+          (push (funcall snapshot 'final-show-all) states)
+          (list (nreverse states)
+                (split-string
+                 (buffer-substring-no-properties (point-min) (point-max))
+                 "\n" t)))))))"##,
         expect,
     );
 }

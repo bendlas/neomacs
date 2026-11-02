@@ -52,7 +52,7 @@ fn custom_hash_test_names_preserve_raw_bytes_escaping_and_symbol_identity() {
                     character_codes(escaped),
                     character_codes(print_value_bytes_with_options(&table, noescape)),
                     character_codes(
-                        crate::emacs_core::error::print_value_bytes_in_state_with_options(
+                        crate::emacs_core::print::print_value_bytes_in_state_with_options(
                             &ctx, &table, noescape,
                         ),
                     ),
@@ -76,19 +76,8 @@ fn gnu_expectation() -> String {
             format!(";;; -*- lexical-binding: nil; -*-\n(prin1 {form})\n"),
         )
         .unwrap();
-        let emacs = std::env::var_os("EMACS").unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".local/bin/emacs")
-                .into_os_string()
-        });
         // Campaign nextest runs already enclose this child in a PID sandbox.
-        let mut command = if let Some(wrapper) = std::env::var_os("NEOMACS_PROBE_SANDBOX") {
-            let mut command = std::process::Command::new(wrapper);
-            command.arg(emacs);
-            command
-        } else {
-            std::process::Command::new(emacs)
-        };
+        let mut command = crate::test_utils::gnu_probe_command();
         let result = command
             .args(["-Q", "--batch", "-l"])
             .arg(&script)

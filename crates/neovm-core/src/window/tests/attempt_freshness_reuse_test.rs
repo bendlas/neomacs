@@ -21,26 +21,17 @@ fn same_buffer_attempt_captures_fontifier_identity_once() {
     eval.window_layout_attempt_freshness(frame, window, live)
         .unwrap();
     crate::emacs_core::intern::reset_intern_calls();
-    let namespace_before = crate::emacs_core::intern::symbol_registry_epoch_value();
     let captured = eval
         .window_layout_attempt_freshness(frame, window, live)
         .unwrap();
-    let namespace_after = crate::emacs_core::intern::symbol_registry_epoch_value();
     let names = crate::emacs_core::intern::intern_call_names();
     let reads = names
         .iter()
         .filter(|name| name.as_str() == "fontification-functions")
         .count();
-    if namespace_before == namespace_after {
-        assert_eq!(reads, 1, "stable namespace must retain the one-read budget");
-    } else {
-        // Another test can legitimately unintern a process-global name. Its
-        // publication may be outside this request's guarded interval.
-        assert!(
-            (1..=2).contains(&reads),
-            "unexpected capture count: {reads}"
-        );
-    }
+    // The capture projects the hook's effective value through its
+    // pre-resolved identity, so the budget is no by-name resolution at all.
+    assert_eq!(reads, 0, "capture resolved the hook by name");
     assert_eq!(captured.live_buffer, captured.source_buffer);
     assert_eq!(
         captured.live_buffer,
@@ -141,12 +132,15 @@ fn distinct_buffer_attempt_keeps_two_independent_projections() {
         .window_layout_attempt_freshness(frame, window, source)
         .unwrap();
     let names = crate::emacs_core::intern::intern_call_names();
+    // Each buffer's effective hook is projected by its pre-resolved identity;
+    // the two captures below still retain distinct values.
     assert_eq!(
         names
             .iter()
             .filter(|name| name.as_str() == "fontification-functions")
             .count(),
-        2
+        0,
+        "per-buffer captures resolved the hook by name"
     );
     assert_eq!(captured.live_buffer.id, live);
     assert_eq!(captured.source_buffer.id, source);
@@ -169,17 +163,17 @@ fn distinct_buffer_attempt_keeps_two_independent_projections() {
 }
 
 #[test]
-fn same_buffer_attempt_rechecks_after_fontifier_namespace_change() {
+fn same_buffer_attempt_keeps_gnu_static_across_fontifier_name_unintern() {
     // Removing this real canonical name must not disturb another test's
-    // process-global registry. Follow the existing ignored-child pattern.
+    // process-global registry. Follow the marker-spawned child pattern.
     let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .args([
             "--exact",
-            "window::display::attempt_freshness_reuse_tests::same_buffer_namespace_change_child",
-            "--ignored",
+            "window::display::attempt_freshness_reuse_tests::same_buffer_fontifier_name_unintern_child",
             "--test-threads",
             "1",
         ])
+        .env(NAMESPACE_CHANGE_CHILD_ENV, "1")
         .env_remove("RUST_LOG")
         .output()
         .expect("run isolated namespace scenario");
@@ -192,9 +186,15 @@ fn same_buffer_attempt_rechecks_after_fontifier_namespace_change() {
     );
 }
 
+/// Marker for the fresh process `same_buffer_attempt_rechecks_after_fontifier_namespace_change`
+/// spawns; without it the child body returns at once.
+const NAMESPACE_CHANGE_CHILD_ENV: &str = "NEOVM_TEST_NAMESPACE_CHANGE_CHILD";
+
 #[test]
-#[ignore = "real canonical-name removal runs only in the isolated parent test"]
-fn same_buffer_namespace_change_child() {
+fn same_buffer_fontifier_name_unintern_child() {
+    if std::env::var_os(NAMESPACE_CHANGE_CHILD_ENV).is_none() {
+        return;
+    }
     use crate::emacs_core::display_when::DisplayWhenSite;
     use crate::emacs_core::intern::{intern, intern_call_names, reset_intern_calls};
     use crate::emacs_core::xdisp::{RedisplayFontificationOutcome, ensure_fontified_for_redisplay};
@@ -260,36 +260,27 @@ fn same_buffer_namespace_change_child() {
             .iter()
             .filter(|name| name.as_str() == "fontification-functions")
             .count(),
-        2
+        0,
+        "both captures read the hook by its pre-resolved identity"
     );
+    // GNU holds `Qfontification_functions` as a static: unintern removes only
+    // the Lisp name mapping, so the second capture still reads the ORIGINAL
+    // symbol's cell. (The retired epoch cache re-resolved by name and would
+    // have seen the fresh unbound symbol here.)
     assert_eq!(before.live_buffer, original_inputs);
-    assert_eq!(before.source_buffer.fontification_functions.0, None);
+    assert_eq!(before.source_buffer, original_inputs);
     let fresh_key = intern("fontification-functions");
     assert_ne!(fresh_key, old_key);
     assert_eq!(eval.obarray().function_epoch(), function_epoch);
     assert_eq!(
-        ensure_fontified_for_redisplay(&mut eval, live, 0, 4).unwrap(),
-        RedisplayFontificationOutcome::Unchanged
+        eval.eval_str("(boundp (intern \"fontification-functions\"))")
+            .unwrap(),
+        Value::NIL,
+        "Lisp sees a fresh unbound symbol"
     );
-    assert_eq!(
-        eval.eval_str("ttykey-namespace-calls").unwrap(),
-        Value::fixnum(0),
-        "fresh canonical key initially has no hook"
-    );
-    assert!(
-        eval.eval_str("(get-text-property 1 'display)")
-            .unwrap()
-            .is_nil()
-    );
-    eval.evaluate_display_when_sites(live, None, &sites, |spec| spec.is_string())
-        .expect("install exactly the saved F under fresh T through normal WHEN");
-    assert!(
-        eval.eval_str(
-            "(eq (symbol-value (intern \"fontification-functions\")) ttykey-namespace-saved-hook)"
-        )
-        .unwrap()
-        .is_truthy()
-    );
+
+    // A Lisp name unintern does not change any input the C-side attempt
+    // reads, so the attempt stays valid; no recheck can be justified by it.
     let after = eval
         .window_layout_attempt_freshness(frame, window, live)
         .unwrap();
@@ -297,17 +288,21 @@ fn same_buffer_namespace_change_child() {
     assert_eq!(after.source_buffer, original_inputs);
     assert_eq!(after.function_epoch, function_epoch);
     assert_eq!(before.body_redisplay, after.body_redisplay);
-    assert!(!before.remains_valid_across(&after, WindowLayoutLispBoundary::BufferBody));
-    // Counterfactual only: the real old clone token would have matched every
-    // field, so a generic revision change cannot explain the refusal above.
+    assert!(
+        before.remains_valid_across(&after, WindowLayoutLispBoundary::BufferBody),
+        "a Lisp-name unintern is invisible to GNU's static fontification variable"
+    );
     let mut old_cloned_token = before.clone();
     old_cloned_token.source_buffer = old_cloned_token.live_buffer.clone();
     assert_eq!(old_cloned_token, after);
 
+    // Decisive C-side probe: the fresh Lisp symbol is unbound, yet redisplay
+    // still runs the ORIGINAL static variable's hook. A by-name re-resolution
+    // would have seen no hook and stayed Unchanged.
     assert_eq!(
         ensure_fontified_for_redisplay(&mut eval, live, 0, 4).unwrap(),
         RedisplayFontificationOutcome::Fontified,
-        "refused attempt must retry the formerly skipped real hook"
+        "GNU's static fontification variable keeps the original hook after name unintern"
     );
     assert_eq!(
         eval.eval_str("ttykey-namespace-calls").unwrap(),
@@ -321,6 +316,18 @@ fn same_buffer_namespace_change_child() {
         eval.eval_str("(get-text-property 1 'fontified)")
             .unwrap()
             .is_truthy()
+    );
+
+    // The Lisp name is still usable through the fresh symbol, and installing
+    // the saved hook there does not retroactively change what C read.
+    eval.evaluate_display_when_sites(live, None, &sites, |spec| spec.is_string())
+        .expect("install exactly the saved F under fresh T through normal WHEN");
+    assert!(
+        eval.eval_str(
+            "(eq (symbol-value (intern \"fontification-functions\")) ttykey-namespace-saved-hook)"
+        )
+        .unwrap()
+        .is_truthy()
     );
     assert!(
         eval.buffer_layout_inputs(live).unwrap().props_modified_tick

@@ -376,11 +376,10 @@ fn uf11_lineage() {
 // org-element-contents
 // ═══════════════════════════════════════════════════════════════════════
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn uf11_contents() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (section)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(with-temp-buffer
   (org-mode)
@@ -388,7 +387,7 @@ fn uf11_contents() {
   (let* ((tree (org-element-parse-buffer))
          (h (car (org-element-map tree 'headline (lambda (h) h))))
          (children (mapcar 'org-element-type (org-element-contents h))))
-    children)"##,
+    children))"##,
         expect,
     );
 }
@@ -397,11 +396,10 @@ fn uf11_contents() {
 // org-element-type-p
 // ═══════════════════════════════════════════════════════════════════════
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn uf11_type_p() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (t nil t nil t)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(with-temp-buffer
   (org-mode)
@@ -414,7 +412,7 @@ fn uf11_type_p() {
           (org-element-type-p h 'paragraph)
           (org-element-type-p p 'paragraph)
           (org-element-type-p p 'headline)
-          (org-element-type-p pl 'plain-list)))"##,
+          (org-element-type-p pl 'plain-list))))"##,
         expect,
     );
 }
@@ -471,22 +469,23 @@ fn uf11_first_match() {
 // org-element-map with info
 // ═══════════════════════════════════════════════════════════════════════
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn uf11_map_info() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (\"H2\" t)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(with-temp-buffer
   (org-mode)
   (insert "* H1\n* H2\n* H3")
   (let* ((tree (org-element-parse-buffer))
+         (info (list :ignore-list
+                     (list (org-element-map tree 'headline #'identity nil t))))
          (result (org-element-map tree 'headline
-                   (lambda (h info)
+                   (lambda (h)
                      (list (org-element-property :raw-value h)
-                           (plist-get info :first-match)))
-                   nil 'first-match)))
-    result)"##,
+                           (and (plist-get info :ignore-list) t)))
+                   info 'first-match)))
+    result))"##,
         expect,
     );
 }

@@ -964,8 +964,19 @@ fn test_file_attributes_symlink_size_is_link_string_length_like_gnu() {
 
     // TYPE (nth 0) for a symlink is the target string.
     assert_eq!(items[0].as_str_owned().as_deref(), Some("alpha.txt"));
-    // MODES (nth 8) lstats: leading 'l' for symlink.
-    assert_eq!(items[8].as_str_owned().as_deref(), Some("lrwxrwxrwx"));
+    // MODES (nth 8) comes from the same lstat, formatted with GNU's
+    // filemodestring (src/dired.c:file_attributes reads st_mode from its one
+    // AT_SYMLINK_NOFOLLOW stat).  The permission bits are the filesystem's:
+    // ext4 lstats symlinks as 0777 while APFS reports 0755, and GNU on each
+    // platform prints what lstat returned, so derive the expectation from the
+    // same lstat rather than pinning one filesystem's bits.
+    use std::os::unix::fs::PermissionsExt;
+    let link_meta = fs::symlink_metadata(&link).expect("lstat the symlink");
+    let expected_modes = format_mode_string(link_meta.permissions().mode(), &link_meta);
+    assert_eq!(
+        items[8].as_str_owned().as_deref(),
+        Some(expected_modes.as_str())
+    );
     // SIZE (nth 7) must be the link-string byte length (9), NOT the target's 12.
     assert_eq!(items[7].as_int(), Some(9));
 
@@ -1014,7 +1025,13 @@ fn test_file_attributes_lessp_bad_args_match_gnu_order() {
         FlowKind::Signal(sig) => {
             assert_eq!(sig.symbol_name(), "wrong-type-argument");
             assert_eq!(sig.data[0].as_bare_symbol_name(), Some("listp"));
-            assert_eq!(sig.data[1].as_str_owned().as_deref(), Some("beta"));
+            // The reference GNU's C compiler decides which `Fcar` ran first:
+            // GCC x86-64 names the second argument, Apple Clang the first.
+            let offending = match crate::emacs_core::platform_facts::C_ARGUMENT_EVALUATION {
+                crate::emacs_core::platform_facts::CArgumentEvaluation::RightToLeft => "beta",
+                crate::emacs_core::platform_facts::CArgumentEvaluation::LeftToRight => "alpha",
+            };
+            assert_eq!(sig.data[1].as_str_owned().as_deref(), Some(offending));
         }
         other => panic!("expected signal, got {other:?}"),
     }

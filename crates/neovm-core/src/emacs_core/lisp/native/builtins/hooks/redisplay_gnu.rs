@@ -5,7 +5,13 @@
 use super::*;
 use crate::buffer::BufferId;
 use crate::emacs_core::eval::redisplay_hooks::HookWindowDimensions;
+use crate::emacs_core::intern::WellKnown;
 use crate::window::{FrameId, WindowId};
+
+// Fixed GNU hook spellings run on every redisplay; see `hooks.rs`.
+static WINDOW_SCROLL_FUNCTIONS: WellKnown = WellKnown::WindowScrollFunctions;
+static WINDOW_STATE_CHANGE_HOOK: WellKnown = WellKnown::WindowStateChangeHook;
+static INHIBIT_REDISPLAY: WellKnown = WellKnown::InhibitRedisplay;
 
 /// Owns one exclusive Context borrow through a window-change pass and its unwind.
 /// Saved binding and record state remain local to that Context; independent mutators
@@ -91,9 +97,7 @@ fn finish_record(eval: &mut super::eval::Context, record: bool) {
     if record {
         record_frames(eval);
     }
-    eval.gnu_redisplay_hooks.old_selected_frame =
-        eval.frames.selected_frame().map(|frame| frame.id);
-    eval.gnu_redisplay_hooks.old_selected_window = eval.gnu_selected_window();
+    eval.record_redisplay_selection();
 }
 
 fn live(eval: &super::eval::Context, frame: FrameId, window: WindowId) -> bool {
@@ -305,13 +309,13 @@ pub(super) fn run_eager_scroll(eval: &mut super::eval::Context, window: WindowId
         )
     })?;
     let argument = Value::make_window(window.0);
-    let start = super::super::window_cmds::builtin_window_start(eval, vec![argument])?;
+    let start = super::super::window_cmds::builtin_window_start(eval, &[argument])?;
     let saved = eval.buffers.current_buffer_id();
     let mut scope = BufferContext { eval, saved };
     if let Some(buffer) = super::window_buffer_id_in_state(scope.eval, frame, window) {
         scope.eval.set_current_buffer_unrecorded(buffer)?;
     }
-    let symbol = hook_runtime::hook_symbol_by_name(scope.eval, "window-scroll-functions");
+    let symbol = hook_runtime::hook_symbol_by_id(scope.eval, WINDOW_SCROLL_FUNCTIONS.id());
     let value = hook_runtime::hook_value_by_id(scope.eval, symbol).unwrap_or(Value::NIL);
     named_hook_value(
         scope.eval,
@@ -332,11 +336,8 @@ pub(super) fn run(eval: &mut super::eval::Context) -> EvalResult {
         armed: true,
     };
     let result = (|| {
-        pass.eval.try_specbind_or_unwind_to(
-            count,
-            crate::emacs_core::intern::intern("inhibit-redisplay"),
-            Value::T,
-        )?;
+        pass.eval
+            .try_specbind_or_unwind_to(count, INHIBIT_REDISPLAY.id(), Value::T)?;
         run_inner(&mut pass)
     })();
     finish_record(pass.eval, pass.record);
@@ -547,7 +548,7 @@ fn run_inner(pass: &mut ChangePass<'_>) -> EvalResult {
         }
     }
     if run_state_hook {
-        let symbol = hook_runtime::hook_symbol_by_name(pass.eval, "window-state-change-hook");
+        let symbol = hook_runtime::hook_symbol_by_id(pass.eval, WINDOW_STATE_CHANGE_HOOK.id());
         safe_named_hook(pass.eval, symbol, &[])?;
     }
     Ok(Value::NIL)
@@ -568,13 +569,13 @@ pub(super) fn run_committed_scroll(
         )
     })?;
     let window_arg = Value::make_window(window.0);
-    let start = super::super::window_cmds::builtin_window_start(eval, vec![window_arg])?;
+    let start = super::super::window_cmds::builtin_window_start(eval, &[window_arg])?;
     let saved = eval.buffers.current_buffer_id();
     let mut scope = BufferContext { eval, saved };
     if let Some(buffer) = super::window_buffer_id_in_state(scope.eval, frame, window) {
         scope.eval.set_current_buffer_unrecorded(buffer)?;
     }
-    let symbol = hook_runtime::hook_symbol_by_name(scope.eval, "window-scroll-functions");
+    let symbol = hook_runtime::hook_symbol_by_id(scope.eval, WINDOW_SCROLL_FUNCTIONS.id());
     safe_named_hook(scope.eval, symbol, &[window_arg, start])
 }
 

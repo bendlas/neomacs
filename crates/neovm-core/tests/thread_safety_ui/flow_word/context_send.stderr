@@ -105,7 +105,7 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Send`
            `NonNull<i64>: Send`
            which is required by `neovm_core::Context: Send`
-           `*mut builtins::collections::HashTestGcInhibitAccounting: Send`
+           `*mut hashtab::HashTestGcInhibitAccounting: Send`
            which is required by `neovm_core::Context: Send`
            `NonNull<neovm_core::buffer::Buffer>: Send`
            which is required by `neovm_core::Context: Send`
@@ -219,6 +219,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Send`
            `*mut *mut MarkerObj: Send`
            which is required by `neovm_core::Context: Send`
+           `Rc<xdisp::mode_line_output::OutputState>: Send`
+           which is required by `neovm_core::Context: Send`
            `Cell<CanonicalArm>: Sync`
            which is required by `neovm_core::Context: Send`
            `NonNull<ByteCodeFunction>: Send`
@@ -239,7 +241,9 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Send`
            `*mut StringObj: Send`
            which is required by `neovm_core::Context: Send`
-           `*mut MarkerObj: Send`
+           `NonNull<MarkerObj>: Send`
+           which is required by `neovm_core::Context: Send`
+           `Rc<Cell<Vec<TaggedValue>>>: Send`
            which is required by `neovm_core::Context: Send`
            `Rc<Cell<*const ()>>: Send`
            which is required by `neovm_core::Context: Send`
@@ -275,6 +279,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Send`
            `*mut SymbolWithPosObj: Send`
            which is required by `neovm_core::Context: Send`
+           `*mut MarkerObj: Send`
+           which is required by `neovm_core::Context: Send`
            `*mut BignumObj: Send`
            which is required by `neovm_core::Context: Send`
            `NonNull<[Cell<usize>; 8192]>: Send`
@@ -282,6 +288,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            `NonNull<LispBufferLocalValue>: Send`
            which is required by `neovm_core::Context: Send`
            `NonNull<LispFwd>: Send`
+           which is required by `neovm_core::Context: Send`
+           `Rc<window::word_wrap::CachedWordWrapPolicy>: Send`
            which is required by `neovm_core::Context: Send`
            `*mut ConsCell: Sync`
            which is required by `neovm_core::Context: Send`
@@ -302,6 +310,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            `*const tree_sitter::ffi::TSTree: Send`
            which is required by `neovm_core::Context: Send`
            `Rc<Vec<AutomaticCompositionSpan>>: Send`
+           which is required by `neovm_core::Context: Send`
+           `Rc<Cell<Vec<TaggedValue>>>: Sync`
            which is required by `neovm_core::Context: Send`
            `Rc<Cell<*const ()>>: Sync`
            which is required by `neovm_core::Context: Send`

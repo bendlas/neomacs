@@ -102,12 +102,13 @@ fn org_goto_location_indirect_return_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_goto_outline_path_completion_command_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (1 (3 \"*** Target\\n\" ((nil :maxlevel . 4)) (10 nil nil nil)) 6 3 \"*** Target\\n\" (56 10 nil nil))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -115,7 +116,11 @@ fn org_goto_outline_path_completion_command_combo() {
   (with-temp-buffer
     (let ((org-goto-interface 'outline-path-completion)
           (org-goto-max-level 4)
-          (org-mark-ring nil))
+          (org-mark-ring
+           (let ((ring (mapcar (lambda (_) (make-marker))
+                               (number-sequence 1 org-mark-ring-length))))
+             (setcdr (last ring) ring)
+             ring)))
       (org-mode)
       (insert "* Project\n")
       (insert "** Area\n")
@@ -141,7 +146,8 @@ fn org_goto_outline_path_completion_command_combo() {
           (let ((after-path (list (line-number-at-pos)
                                   (thing-at-point 'line t)
                                   captured-targets
-                                  (mapcar #'marker-position org-mark-ring))))
+                                  (mapcar #'marker-position
+                                          (seq-take org-mark-ring org-mark-ring-length)))))
             (goto-char (point-min))
             (search-forward "Other")
             (cl-letf (((symbol-function 'org-goto-location)
@@ -154,7 +160,8 @@ fn org_goto_outline_path_completion_command_combo() {
                       before-alt
                       (line-number-at-pos)
                       (thing-at-point 'line t)
-                      (mapcar #'marker-position org-mark-ring))))))))"##,
+                      (mapcar #'marker-position
+                                          (seq-take org-mark-ring org-mark-ring-length)))))))))))"##,
         expect,
     );
 }
@@ -250,12 +257,13 @@ fn org_goto_exit_commands_and_tag_search_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_heading_navigation_level_position_tracking_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 58 32)""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((3 \"** B\") (3 \"** B\") (3 \"** B\") (1 \"* A\") (1 \"* A\") 1 (15 \"* H\") (15 \"* H\") (1 \"* A\") 1 16 nil (10 \"body E\") 1 43 nil (5 \"*** C\") (5 \"*** C\") 1 92 nil (13 \"*** G\") 1 ((\"*\" 1 1) (\"**\" 2 3) (\"***\" 3 5) (\"****\" 4 7) (\"***\" 3 9) (\"**\" 2 11) (\"***\" 3 13) (\"*\" 1 15) (\"**\" 2 17)))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -314,7 +322,7 @@ fn org_heading_navigation_level_position_tracking_combo() {
                        (org-outline-level)
                        (line-number-at-pos))
                  levels))
-         (nreverse levels)))))))"##,
+         (nreverse levels))))))"##,
         expect,
     );
 }

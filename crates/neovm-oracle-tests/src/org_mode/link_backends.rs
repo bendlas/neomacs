@@ -55,12 +55,13 @@ fn org_info_link_file_node_description_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_info_man_store_link_context_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"info:elisp.info#Symbols\" (:type \"info\" :file \"/usr/share/info/elisp.info\" :node \"Symbols\" :link \"info:elisp.info#Symbols\" :description \"elisp.info#Symbols\") (:type \"man\" :link \"man:printf\" :description \"Manpage for printf\") (:type \"man\" :link \"man:printf\" :description \"Manpage for printf\") \"printf\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'ol)
@@ -82,25 +83,25 @@ fn org_info_man_store_link_context_combo() {
                     info-plist
                     man-link
                     org-store-link-plist
-                     (org-man-get-page-name))))))))"##,
+                     (org-man-get-page-name)))))))))"##,
         expect,
     );
 }
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_link_abbrev_custom_follow_export_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable followed)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((\"https\" \"//github.com/eval-exec/neomacs\" \"https://github.com/eval-exec/neomacs\" \"Neomacs\") (\"https\" \"//www.rfc-editor.org/rfc/rfc9110.txt\" \"https://www.rfc-editor.org/rfc/rfc9110.txt\" \"HTTP\") (\"https\" \"//doi.org/10.1000/example\" \"https://doi.org/10.1000/example\" \"Paper\") (\"ticket\" \"ABC-123\" \"ticket:ABC-123\" \"Bug\")) \"https://github.com/user/repo\" \"https://www.rfc-editor.org/rfc/rfc9110.txt\" ((\"ABC-123\" nil)) 29 98)""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ol)
   (let* ((followed nil)
          (org-link-parameters
-          (cons '("ticket" :follow (lambda (path arg)
-                                     (push (list path arg) followed)))
+          (cons (list "ticket" :follow (lambda (path arg)
+                                         (push (list path arg) followed)))
                 org-link-parameters)))
     (with-temp-buffer
       (org-mode)
@@ -140,7 +141,7 @@ fn org_link_abbrev_custom_follow_export_deep_state_combo() {
               expanded-rfc
               followed
               has-github
-              has-rfc))))))"##,
+              has-rfc)))))"##,
         expect,
     );
 }

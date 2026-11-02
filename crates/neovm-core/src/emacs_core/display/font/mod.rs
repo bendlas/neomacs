@@ -20,7 +20,7 @@ use crate::emacs_core::error::LispCondition;
 pub(crate) use crate::emacs_core::error::{
     expect_args, expect_args_range, expect_max_args, expect_min_args,
 };
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use strum::EnumString;
@@ -194,13 +194,113 @@ impl FontSpacing {
     }
 }
 
-static ALTERNATIVE_FONT_FAMILY_ALIST: OnceLock<RwLock<AlternativeFontFamilyAlist>> =
+/// GNU family-name lookup: trim the request and fold ASCII only. Both the
+/// shared native view and the legacy budgeted reader use this single rule.
+struct FontFamilyLookup<'a>(&'a str);
+impl<'a> FontFamilyLookup<'a> {
+    fn new(family: &'a str) -> Self {
+        Self(family.trim())
+    }
+    fn as_str(&self) -> &'a str {
+        self.0
+    }
+    fn matches(&self, name: &[u8]) -> bool {
+        name.eq_ignore_ascii_case(self.0.as_bytes())
+    }
+}
+
+#[derive(Default)]
+struct AlternativeFontFamilyState {
+    source: AlternativeFontFamilyAlist,
+    native: Vec<(FontNameSpelling, FrozenFontFamilies)>,
+}
+
+impl AlternativeFontFamilyState {
+    /// The informational and detached views are constructed together, before
+    /// publishing the owner's new revision under its write lock.
+    fn from_source(source: AlternativeFontFamilyAlist) -> Self {
+        let native = source
+            .iter()
+            .map(|(name, names)| {
+                let spelling = crate::emacs_core::intern::resolve_sym_lisp_string(*name);
+                let names = FrozenFontFamilies(
+                    names
+                        .iter()
+                        .map(|name| {
+                            Arc::from(crate::emacs_core::fontset::native_font_name(*name).as_ref())
+                        })
+                        .collect(),
+                );
+                (FontNameSpelling::from(spelling), names)
+            })
+            .collect();
+        Self { source, native }
+    }
+
+    /// GNU family alternatives preserve configured order, including the
+    /// requested family at the front when the setter provided it there.
+    fn capture(&self, family: &str) -> FrozenFontFamilies {
+        let lookup = FontFamilyLookup::new(family);
+        if lookup.as_str().is_empty() {
+            return std::iter::empty().collect();
+        }
+        self.native
+            .iter()
+            .find_map(|(name, names)| lookup.matches(name.as_bytes()).then(|| names.clone()))
+            .unwrap_or_else(|| std::iter::once(lookup.as_str().to_owned()).collect())
+    }
+}
+
+/// Immutable native family order. Names are materialized once by their owner,
+/// before publication; detached readers never consult an evaluator interner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenFontFamilies(Arc<[Arc<str>]>);
+
+impl FrozenFontFamilies {
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(AsRef::as_ref)
+    }
+}
+impl FromIterator<String> for FrozenFontFamilies {
+    fn from_iter<T: IntoIterator<Item = String>>(names: T) -> Self {
+        Self(names.into_iter().map(Arc::from).collect())
+    }
+}
+static_assertions::assert_impl_all!(FrozenFontFamilies: Send, Sync, Clone, std::fmt::Debug);
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FontFamilyCaptureError {
+    #[error("the native family-policy owner is unavailable")]
+    Unavailable,
+}
+
+static ALTERNATIVE_FONT_FAMILY_ALIST: OnceLock<RwLock<AlternativeFontFamilyState>> =
     OnceLock::new();
 static ALTERNATIVE_FONT_REGISTRY_ALIST: OnceLock<RwLock<AlternativeFontRegistryAlist>> =
     OnceLock::new();
 
-pub(crate) fn alternative_font_family_alist() -> &'static RwLock<AlternativeFontFamilyAlist> {
-    ALTERNATIVE_FONT_FAMILY_ALIST.get_or_init(|| RwLock::new(Vec::new()))
+fn alternative_font_family_alist() -> &'static RwLock<AlternativeFontFamilyState> {
+    ALTERNATIVE_FONT_FAMILY_ALIST.get_or_init(|| RwLock::new(AlternativeFontFamilyState::default()))
+}
+
+pub(crate) fn replace_alternative_font_family_alist(source: AlternativeFontFamilyAlist) {
+    let next = AlternativeFontFamilyState::from_source(source);
+    if let Ok(mut state) = alternative_font_family_alist().write() {
+        *state = next;
+        // Publish the epoch while the family owner remains exclusively held.
+        // A detached read sees the old pair or the new pair, never new names
+        // under the old font-selection revision.
+        crate::emacs_core::fontset::invalidate_font_selection_policy();
+    }
+}
+
+pub fn capture_alternative_font_families(
+    family: &str,
+) -> Result<FrozenFontFamilies, FontFamilyCaptureError> {
+    let state = alternative_font_family_alist()
+        .read()
+        .map_err(|_| FontFamilyCaptureError::Unavailable)?;
+    Ok(state.capture(family))
 }
 
 pub(crate) fn alternative_font_registry_alist() -> &'static RwLock<AlternativeFontRegistryAlist> {
@@ -255,36 +355,13 @@ pub(crate) fn init_font_vars(obarray: &mut super::symbol::Obarray) {
 }
 
 pub fn alternative_font_families(family: &str) -> Vec<String> {
-    let lookup = family.trim();
-    if lookup.is_empty() {
+    let lookup = FontFamilyLookup::new(family);
+    if lookup.as_str().is_empty() {
         return Vec::new();
     }
-
-    let Ok(alist) = alternative_font_family_alist().read() else {
-        return vec![lookup.to_string()];
-    };
-
-    alist
-        .iter()
-        .find_map(|(name, families)| {
-            // Issue #131: compare/return font-family names over their real Emacs
-            // bytes (resolve_sym_lisp_string), so raw-unibyte families are not
-            // confused with the PUA-sentinel storage form.
-            crate::emacs_core::intern::resolve_sym_lisp_string(*name)
-                .as_bytes()
-                .eq_ignore_ascii_case(lookup.as_bytes())
-                .then(|| {
-                    families
-                        .iter()
-                        .map(|sym| {
-                            crate::emacs_core::emacs_char::to_utf8_lossy(
-                                crate::emacs_core::intern::resolve_sym_lisp_string(*sym).as_bytes(),
-                            )
-                        })
-                        .collect()
-                })
-        })
-        .unwrap_or_else(|| vec![lookup.to_string()])
+    capture_alternative_font_families(family)
+        .map(|names| names.iter().map(str::to_owned).collect())
+        .unwrap_or_else(|_| vec![lookup.as_str().to_owned()])
 }
 
 /// Capture a bounded family search order without cloning an unbounded alist.
@@ -297,19 +374,19 @@ pub fn bounded_alternative_font_families(
     if family.len() > max_bytes {
         return None;
     }
-    let lookup = family.trim();
-    if lookup.is_empty() {
+    let lookup = FontFamilyLookup::new(family);
+    if lookup.as_str().is_empty() {
         return Some(Vec::new());
     }
     let alist = alternative_font_family_alist().read().ok()?;
     let mut remaining = max_bytes;
-    for (index, (name, families)) in alist.iter().enumerate() {
+    for (index, (name, families)) in alist.source.iter().enumerate() {
         if index >= max_entries {
             return None;
         }
         let name = crate::emacs_core::intern::resolve_sym_lisp_string(*name);
         remaining = remaining.checked_sub(name.as_bytes().len())?;
-        if !name.as_bytes().eq_ignore_ascii_case(lookup.as_bytes()) {
+        if !lookup.matches(name.as_bytes()) {
             continue;
         }
         if families.len() > max_entries {
@@ -325,7 +402,7 @@ pub fn bounded_alternative_font_families(
         }
         return Some(result);
     }
-    Some(vec![lookup.to_owned()])
+    Some(vec![lookup.as_str().to_owned()])
 }
 
 pub fn alternative_font_registries(registry: &str) -> Vec<String> {
@@ -1068,8 +1145,8 @@ pub(crate) fn publish_face_attribute_to_frame_parameter(
     Ok(())
 }
 
-/// Seed the selected frame's authoritative `default` Lisp face specification
-/// from its `font-parameter` without mutating Lisp override state.
+/// Seed the frame's authoritative `default` Lisp face specification
+/// from its opened `font-parameter` without mutating Lisp override state.
 ///
 /// GNU keeps the defface for `default` empty and realizes the actual frame
 /// font through the face subsystem in C.  Redisplay later derives the runtime
@@ -1082,6 +1159,7 @@ pub fn seed_live_frame_default_face_from_font_parameter(
         .frames
         .get(frame_id)
         .and_then(|frame| frame.fixed_parameter(crate::window::FrameQueryParam::FontParameter))
+        .filter(is_font_object)
     else {
         return;
     };
@@ -1091,6 +1169,10 @@ pub fn seed_live_frame_default_face_from_font_parameter(
     else {
         return;
     };
+    // GNU set_lface_from_font retains the opened object in LFACE_FONT.
+    // faces.el clears font-parameter when there was no explicit user request;
+    // that request marker cannot own the realized face font.
+    set_lisp_face_vector_attr(vector, LFaceAttr::Font, font_value);
     for (attr_name, attr_value) in derived_face_attrs_from_font_value(&font_value) {
         set_lisp_face_vector_attr(vector, attr_name, attr_value);
     }
@@ -2113,7 +2195,7 @@ fn font_parse_name(elems: &mut Vec<Value>, name: &str) -> bool {
 
 /// Build a font-spec from a font NAME string (GNU `font_spec_from_name`):
 /// parse NAME, then record it under `:name`.  Returns `None` on parse failure.
-fn font_spec_from_name(name: &str) -> Option<Value> {
+pub(crate) fn font_spec_from_name(name: &str) -> Option<Value> {
     let mut elems = vec![Value::keyword(FONT_SPEC_TAG)];
     if !font_parse_name(&mut elems, name) {
         return None;
@@ -4077,8 +4159,48 @@ pub struct GstringShapeCacheKey {
     pub chars: Vec<i64>,
 }
 
+/// The shaped-gstring cache owns its values strongly, like GNU's staticpro'd
+/// gstring_hash_table (src/composite.c:2201-2202). Keys contain no Lisp edges.
+pub(crate) fn trace_gstring_shape_cache(
+    cache: &std::collections::HashMap<GstringShapeCacheKey, Value>,
+    visit: &mut dyn FnMut(Value),
+) {
+    for value in cache.values().copied() {
+        visit(value);
+    }
+}
+
 pub type FontShapeFn =
     Box<dyn FnMut(&mut super::eval::Context, Value, Value) -> GstringShapeOutcome>;
+
+/// Own the installed callback while shaping has exclusive access to Context.
+/// The optional resource is restored even when shaping returns nil or unwinds;
+/// GNU font.c:4634-4700 never consumes the font driver's shape method.
+#[must_use]
+struct FontShapeDriverScope<'context> {
+    context: &'context mut super::eval::Context,
+    driver: Option<FontShapeFn>,
+}
+
+impl FontShapeDriverScope<'_> {
+    fn run(context: &mut super::eval::Context, gstring: Value, direction: Value) -> EvalResult {
+        let driver = context.font_shape_fn.take();
+        let mut scope = FontShapeDriverScope { context, driver };
+        match scope.driver.as_mut() {
+            Some(driver) => shape_gstring_with_driver(scope.context, driver, gstring, direction),
+            // GNU: `font->driver->shape == NULL` → the value is nil.
+            None => Ok(Value::NIL),
+        }
+    }
+}
+
+impl Drop for FontShapeDriverScope<'_> {
+    fn drop(&mut self) {
+        self.context.font_shape_fn = self.driver.take();
+    }
+}
+
+static_assertions::assert_not_impl_any!(FontShapeDriverScope<'static>: Send, Sync);
 
 pub(crate) fn font_shape_gstring(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
     expect_args("font-shape-gstring", &args, 2)?;
@@ -4109,18 +4231,24 @@ pub(crate) fn font_shape_gstring(eval: &mut super::eval::Context, args: Vec<Valu
         ));
     }
 
-    let mut shape_driver = match eval.font_shape_fn.take() {
-        Some(driver) => driver,
-        // GNU: `font->driver->shape == NULL` → the value is nil.
-        None => return Ok(Value::NIL),
-    };
+    FontShapeDriverScope::run(eval, args[0], args[1])
+}
 
+// Keep shaping's validation/cache walk outside the driver's restoration scope.
+// The non-generic call gives the RAII owner one normal return and one unwind
+// edge without changing the GNU retry, validation or caching rules.
+#[inline(never)]
+fn shape_gstring_with_driver(
+    eval: &mut super::eval::Context,
+    shape_driver: &mut FontShapeFn,
+    mut gstring: Value,
+    direction: Value,
+) -> EvalResult {
     // Try at most three times with a larger gstring each time
     // (src/font.c Ffont_shape_gstring).
-    let mut gstring = args[0];
     let mut shaped_count = None;
     for _ in 0..3 {
-        match shape_driver(eval, gstring.clone(), args[1]) {
+        match shape_driver(eval, gstring.clone(), direction) {
             GstringShapeOutcome::Shaped(n) => {
                 shaped_count = Some(n);
                 break;
@@ -4177,13 +4305,11 @@ pub(crate) fn font_shape_gstring(eval: &mut super::eval::Context, args: Vec<Valu
     // returns the cached gstring instead of re-shaping.
     let cache_key = gstring_shape_cache_key(&gstring);
     if let Some(cached) = eval.gstring_shape_cache.get(&cache_key) {
-        eval.font_shape_fn = Some(shape_driver);
         return Ok(cached.clone());
     }
     let id = eval.gstring_shape_cache.len() as i64;
     gstring.set_vector_slot(1, Value::fixnum(id));
     eval.gstring_shape_cache.insert(cache_key, gstring.clone());
-    eval.font_shape_fn = Some(shape_driver);
     Ok(gstring)
 }
 
@@ -4306,3 +4432,7 @@ pub(crate) fn font_variation_glyphs(args: Vec<Value>) -> EvalResult {
 #[cfg(test)]
 #[path = "tests/font_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/family_snapshot_test.rs"]
+mod family_snapshot_tests;

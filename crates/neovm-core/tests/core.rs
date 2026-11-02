@@ -7,6 +7,12 @@
 
 mod common;
 
+#[path = "pentry_inventory_generator.rs"]
+mod pentry_inventory_generator;
+
+#[path = "dump_environment.rs"]
+mod dump_environment;
+
 #[path = "compat_all.rs"]
 mod compat_all;
 
@@ -34,9 +40,6 @@ mod gdm_region;
 #[path = "gdm_widths.rs"]
 mod gdm_widths;
 
-#[path = "p2ht_contracts.rs"]
-mod p2ht_contracts;
-
 #[path = "pixel_measurement.rs"]
 mod pixel_measurement;
 
@@ -48,3 +51,9 @@ mod coding_detection;
 
 #[path = "font_coverage.rs"]
 mod font_coverage;
+
+#[path = "nmjit_n1.rs"]
+mod nmjit_n1;
+
+#[path = "thread_soak.rs"]
+mod thread_soak;

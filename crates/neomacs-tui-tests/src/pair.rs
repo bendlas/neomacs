@@ -81,6 +81,21 @@ pub fn boot_pair_with_erase_char(
     (gnu, neo)
 }
 
+/// Pin the calendar fixture's date without changing the host clock.
+///
+/// GNU `calendar-current-date` (calendar.el:2028) obtains the civil date from
+/// `decode-time`, then implements OFFSET through Gregorian absolute days.
+/// These command-workflow tests supply May 8, 2026 at that clock boundary;
+/// the real calendar command, offset conversion and raw display stay intact.
+/// The override belongs to these two test processes and ends with them.
+pub fn pin_calendar_fixture_date(gnu: &mut TuiSession, neo: &mut TuiSession) {
+    eval_expression(
+        gnu,
+        neo,
+        r#"(progn (require 'calendar) (defun calendar-current-date (&optional offset) (if (zerop (or offset 0)) '(5 8 2026) (calendar-gregorian-from-absolute (+ (or offset 0) (calendar-absolute-from-gregorian '(5 8 2026)))))) nil)"#,
+    );
+}
+
 /// Read `session` until its rendered grid stops changing, with no round cap.
 pub fn settle_session(session: &mut TuiSession) {
     let mut previous = session.text_grid();
@@ -150,6 +165,10 @@ pub fn resize_both(gnu: &mut TuiSession, neo: &mut TuiSession, rows: u16, cols: 
 /// Wait until `predicate` is satisfied on both sessions or `timeout`
 /// elapses. Polls both PTYs concurrently in short interleaved slices,
 /// same strategy as `boot_pair` phase 1.
+///
+/// On timeout this returns normally (the loop breaks) and does not panic:
+/// callers that depend on the postcondition must assert it themselves, as
+/// [`eval_expression`] does for the minibuffer exit barrier.
 pub fn wait_for_both<F>(gnu: &mut TuiSession, neo: &mut TuiSession, timeout: Duration, predicate: F)
 where
     F: Fn(&[String]) -> bool + Copy,
@@ -217,7 +236,62 @@ pub fn wait_for_both_mx_suggestion(
     }
 }
 
-pub fn eval_expression(gnu: &mut TuiSession, neo: &mut TuiSession, expression: &str) {
+/// The TTY menu bar's stable prefix.  The trailing items depend on the
+/// selected window's local map; see [`MINIBUF_MENU_ITEM`].
+const TTY_MENU_BAR_PREFIX: &str = "File Edit Options Buffers";
+/// The menu-bar item that only a minibuffer's local map contributes (GNU
+/// `lisp/menu-bar.el` defines `[menu-bar minibuf]` on `minibuffer-local-map`
+/// and `minibuffer-local-completion-map`).  The TTY menu bar shows it while
+/// any minibuffer is active and drops it once the minibuffer exits; Neomacs
+/// renders the same item.  Observed on the pair harness: both editors show
+/// `File Edit Options Buffers Tools Minibuf Help` only inside `M-:` and
+/// `... Lisp-Interaction Help` at rest and after RET.
+const MINIBUF_MENU_ITEM: &str = "Minibuf";
+
+/// Whether the screen shows that the eval minibuffer has exited.
+///
+/// No single observable is enough:
+/// - a long form scrolls the `Eval:` prompt row out of view while the
+///   minibuffer is still open, so the prompt's absence alone is a false
+///   "exited" signal;
+/// - the menu bar keeps its `Minibuf` item until the minibuffer exits, and
+///   it scrolls independently of the minibuffer contents;
+/// - for a multi-line form the last visible row keeps showing the form's
+///   tail (or the wrapped tail of its last line) until the minibuffer exits,
+///   so the echo of the unsubmitted form cannot pass for a submitted one.
+fn minibuffer_exited(grid: &[String], expression: &str) -> bool {
+    if grid.iter().any(|row| row.contains("Eval:")) {
+        return false;
+    }
+    if grid
+        .iter()
+        .any(|row| row.contains(TTY_MENU_BAR_PREFIX) && row.contains(MINIBUF_MENU_ITEM))
+    {
+        return false;
+    }
+    if !expression.contains('\n') {
+        return true;
+    }
+    let last_line = expression
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    let last_row = grid
+        .iter()
+        .rev()
+        .find(|row| !row.trim().is_empty())
+        .map(|row| row.trim())
+        .unwrap_or("");
+    !(!last_line.is_empty() && !last_row.is_empty() && last_line.ends_with(last_row))
+}
+
+/// Type EXPRESSION at the `M-:` prompt and submit it.
+///
+/// Returns as soon as RET is written; the callers decide whether the
+/// minibuffer must exit before they return.
+fn type_expression(gnu: &mut TuiSession, neo: &mut TuiSession, expression: &str) {
     send_both(gnu, neo, "M-:");
     let prompt_ready = |grid: &[String]| grid.last().is_some_and(|row| row.contains("Eval:"));
     wait_for_both(gnu, neo, Duration::from_secs(8), prompt_ready);
@@ -227,13 +301,102 @@ pub fn eval_expression(gnu: &mut TuiSession, neo: &mut TuiSession, expression: &
     send_both(gnu, neo, "RET");
 }
 
-pub fn eval_expression_one(session: &mut TuiSession, expression: &str) {
+fn type_expression_one(session: &mut TuiSession, expression: &str) {
     session.send_key("M-:");
     let prompt_ready = |grid: &[String]| grid.last().is_some_and(|row| row.contains("Eval:"));
     session.read_until(Duration::from_secs(8), prompt_ready);
     session.read(Duration::from_millis(300));
     session.paste(expression);
     session.send_key("RET");
+}
+
+/// Evaluate EXPRESSION at the keyboard and return only after the eval
+/// minibuffer has exited in both editors.
+///
+/// The pasted expression is echoed in the minibuffer while it is still
+/// unsubmitted, and that echo contains the expression's own string literals.
+/// A caller that waits for displayed buffer text can therefore match the echo
+/// before RET has been processed, and its next exact-display observation then
+/// runs against a half-transitioned frame (observed on the TUI shard as GNU
+/// still in `Eval:` while Neomacs had already switched buffers).  Waiting for
+/// [`minibuffer_exited`] makes every later observation one of a submitted
+/// command, so the callers' own display predicates cannot be satisfied by
+/// their source text.
+///
+/// A form that intentionally enters a minibuffer of its own must use
+/// [`eval_expression_enters_minibuffer`] instead: this function asserts that
+/// the minibuffer is gone when it returns.
+pub fn eval_expression(gnu: &mut TuiSession, neo: &mut TuiSession, expression: &str) {
+    eval_expression_within(gnu, neo, expression, Duration::from_secs(8));
+}
+
+/// [`eval_expression`] with an explicit barrier bound, for forms whose own
+/// evaluation may legitimately take longer than the default: the minibuffer
+/// exits on RET but its row is repainted only after the submitted command
+/// returns, so a caller that waits for a slow form's side effect needs the
+/// barrier to tolerate that form's own budget.
+pub fn eval_expression_within(
+    gnu: &mut TuiSession,
+    neo: &mut TuiSession,
+    expression: &str,
+    timeout: Duration,
+) {
+    type_expression(gnu, neo, expression);
+    let exited = |grid: &[String]| minibuffer_exited(grid, expression);
+    wait_for_both(gnu, neo, timeout, exited);
+    // wait_for_both returns on timeout; a barrier that times out must fail
+    // loudly with both grids instead of letting the caller race the editor.
+    let gnu_grid = gnu.text_grid();
+    let neo_grid = neo.text_grid();
+    if !minibuffer_exited(&gnu_grid, expression) || !minibuffer_exited(&neo_grid, expression) {
+        panic!(
+            "eval_expression timed out waiting for the minibuffer to exit \
+             (wait_for_both returns on timeout). Use \
+             eval_expression_enters_minibuffer for a form that keeps a \
+             minibuffer open. expression={:?}\nGNU grid:\n{}\n\
+             Neomacs grid:\n{}",
+            expression.lines().next().unwrap_or(expression),
+            gnu_grid.join("\n"),
+            neo_grid.join("\n"),
+        );
+    }
+}
+
+pub fn eval_expression_one(session: &mut TuiSession, expression: &str) {
+    eval_expression_one_within(session, expression, Duration::from_secs(8));
+}
+
+/// [`eval_expression_one`] with an explicit barrier bound.
+pub fn eval_expression_one_within(session: &mut TuiSession, expression: &str, timeout: Duration) {
+    type_expression_one(session, expression);
+    let exited = |grid: &[String]| minibuffer_exited(grid, expression);
+    session.read_until(timeout, exited);
+    // read_until is silent on timeout; fail loudly here, as in
+    // `eval_expression`.
+    let grid = session.text_grid();
+    assert!(
+        minibuffer_exited(&grid, expression),
+        "eval_expression_one timed out waiting for the minibuffer to exit; \
+         expression={:?}:\n{}",
+        expression.lines().next().unwrap_or(expression),
+        grid.join("\n"),
+    );
+}
+
+/// Evaluate EXPRESSION whose evaluation enters a minibuffer of its own
+/// (`read-string`, `completing-read`, `y-or-n-p`, a recursive edit, ...).
+///
+/// Unlike [`eval_expression`] this returns as soon as RET is written: the
+/// caller owns the new minibuffer and must drive it (type the answer, send
+/// RET or C-g, ...) before its next display observation.  The separate,
+/// explicitly named entry point keeps that intent typed: a prompt-leaving
+/// form must never be passed to `eval_expression` silently.
+pub fn eval_expression_enters_minibuffer(
+    gnu: &mut TuiSession,
+    neo: &mut TuiSession,
+    expression: &str,
+) {
+    type_expression(gnu, neo, expression);
 }
 
 /// Remove repository-specific state from paired source-tree fixtures by
@@ -265,17 +428,31 @@ pub fn use_backend_only_vc_mode_line(gnu: &mut TuiSession, neo: &mut TuiSession)
     eval_expression(gnu, neo, "(setq vc-display-status nil)");
 }
 
-/// Make compilation and diff buffers' wall-clock annotations deterministic.
+/// Make compilation and diff buffers' displays deterministic.
 ///
-/// The advice is scoped to `compilation-start`, `compilation-handle-exit` and
-/// `diff-sentinel`: editor timers and process polling continue to observe
-/// real time, while the buffers' "started at"/"finished" annotations always
+/// Two determinism problems are solved here.  Wall-clock annotations: the
+/// advice is scoped to `compilation-start`, `compilation-handle-exit` and
+/// `diff-sentinel`, so editor timers and process polling continue to observe
+/// real time while the buffers' "started at"/"finished" annotations always
 /// receive the same timestamp and a 0.01-second elapsed duration in both
-/// sessions.  Both editors necessarily run the command seconds apart (the pair
-/// sends the same key to each editor in turn), so the raw clock can never
-/// match.  `diff-sentinel` (lisp/vc/diff.el) writes its own "Diff finished"
-/// timestamp rather than going through compilation mode.
-pub fn use_deterministic_compilation_exit_time(gnu: &mut TuiSession, neo: &mut TuiSession) {
+/// sessions.  Both editors necessarily run the command seconds apart (the
+/// pair sends the same key to each editor in turn), so the raw clock can
+/// never match.  `diff-sentinel` (lisp/vc/diff.el) writes its own "Diff
+/// finished" timestamp rather than going through compilation mode.
+///
+/// Settled display: the same advice forces a complete frame redraw after the
+/// command starts and after the process finishes.  GNU's TTY redisplay can
+/// keep the pre-split screen when the compilation output is processed before
+/// the new window's first redisplay: the output rows are painted later, but
+/// the window's header rows, the vertical border and the menu bar are not
+/// (observed on the TUI shard: GNU still showed the "Minibuf" menu and an
+/// unpainted right window while Neo had painted the whole frame).
+/// `redraw-display` clears the frame and every window's current matrix on
+/// both editors (GNU `redraw_frame`, dispnew.c; Neo publishes the same
+/// full-frame redraw and menu-bar rebuild), so the paired exact-display
+/// assertion observes the settled frame instead of a half-updated GNU one.
+/// It changes no buffer or window state.
+pub fn use_deterministic_compilation_setup(gnu: &mut TuiSession, neo: &mut TuiSession) {
     let expression = r##"(progn
       (require 'compile)
       (require 'cl-lib)
@@ -294,12 +471,20 @@ pub fn use_deterministic_compilation_exit_time(gnu: &mut TuiSession, neo: &mut T
         (cl-letf (((symbol-function 'current-time-string)
                    (lambda (&optional _time _zone) "Wed Sep  2 00:00:00 2026")))
           (apply original args)))
+      (defun neomacs-tui--redraw-after-process-display (&rest _args)
+        (redraw-display))
       (advice-add 'compilation-handle-exit :around
                   #'neomacs-tui--stable-compilation-exit-time)
       (advice-add 'compilation-start :around
                   #'neomacs-tui--stable-compilation-start-time)
       (advice-add 'diff-sentinel :around
-                  #'neomacs-tui--stable-diff-sentinel-time))"##;
+                  #'neomacs-tui--stable-diff-sentinel-time)
+      (advice-add 'compilation-start :after
+                  #'neomacs-tui--redraw-after-process-display)
+      (advice-add 'compilation-handle-exit :after
+                  #'neomacs-tui--redraw-after-process-display)
+      (advice-add 'diff-sentinel :after
+                  #'neomacs-tui--redraw-after-process-display))"##;
     eval_expression(gnu, neo, expression);
 }
 

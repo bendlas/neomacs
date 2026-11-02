@@ -1,6 +1,7 @@
 use super::*;
 use crate::emacs_core::error::{FlowKind, FlowRef, FlowResultExt as _};
 use crate::emacs_core::eval::Context;
+use crate::host_input::HostInputPublisher;
 use malachite::integer::Integer;
 
 /// Test helper: create a fresh eval context for locate-file tests.
@@ -25,6 +26,112 @@ fn eval_buffer_evaluates_current_buffer_forms() {
     assert_eq!(
         ev.obarray.symbol_value_copied("lread-eb-b"),
         Some(Value::fixnum(12))
+    );
+}
+
+/// GNU's reader consults `read-symbol-shorthands` while reading
+/// (src/lread.c:4956-5010), so `eval-buffer` applies a buffer-local or
+/// dynamically bound value, not only the file-load path (issue #658).
+#[test]
+fn eval_buffer_applies_read_symbol_shorthands_from_the_current_binding() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    ev.buffers
+        .current_buffer_mut()
+        .expect("current buffer")
+        .insert("(setq oi-unit-local 7)");
+    ev.eval_str(
+        "(progn
+           (make-local-variable 'read-symbol-shorthands)
+           (set 'read-symbol-shorthands '((\"oi-\" . \"gptel-openrouter-\"))))",
+    )
+    .expect("install buffer-local shorthands");
+    builtin_eval_buffer(&mut ev, vec![]).expect("eval-buffer");
+    assert_eq!(
+        ev.obarray
+            .symbol_value_copied("gptel-openrouter-unit-local"),
+        Some(Value::fixnum(7)),
+        "a buffer-local shorthand must rewrite the evaluated symbol"
+    );
+    assert_eq!(
+        ev.obarray.symbol_value_copied("oi-unit-local"),
+        None,
+        "the short spelling must not be interned as a variable"
+    );
+
+    ev.buffers
+        .current_buffer_mut()
+        .expect("current buffer")
+        .insert("(setq zz-unit-dynamic 9)");
+    ev.eval_str(
+        "(let ((read-symbol-shorthands '((\"zz-\" . \"longzz-\"))))
+           (eval-buffer))",
+    )
+    .expect("eval-buffer under a dynamic binding");
+    assert_eq!(
+        ev.obarray.symbol_value_copied("longzz-unit-dynamic"),
+        Some(Value::fixnum(9)),
+        "a dynamically bound shorthand must rewrite the evaluated symbol"
+    );
+    assert_eq!(ev.obarray.symbol_value_copied("zz-unit-dynamic"), None);
+}
+
+#[test]
+fn eval_buffer_refreshes_read_symbol_shorthands_between_forms() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    ev.buffers
+        .current_buffer_mut()
+        .expect("current buffer")
+        .insert(
+            "(setq aa-unit-midbuffer 1)\n\
+             (setq read-symbol-shorthands '((\"bb-\" . \"longbb-\")))\n\
+             (setq bb-unit-midbuffer 2)\n",
+        );
+    ev.eval_str(
+        "(progn
+           (make-local-variable 'read-symbol-shorthands)
+           (set 'read-symbol-shorthands '((\"aa-\" . \"longaa-\"))))",
+    )
+    .expect("install buffer-local shorthands");
+    builtin_eval_buffer(&mut ev, vec![]).expect("eval-buffer");
+    assert_eq!(
+        ev.obarray.symbol_value_copied("longaa-unit-midbuffer"),
+        Some(Value::fixnum(1)),
+        "the first form must use the binding in effect when it is read"
+    );
+    assert_eq!(
+        ev.obarray.symbol_value_copied("longbb-unit-midbuffer"),
+        Some(Value::fixnum(2)),
+        "a form that changes the binding must affect the forms after it"
+    );
+    assert_eq!(ev.obarray.symbol_value_copied("aa-unit-midbuffer"), None);
+    assert_eq!(ev.obarray.symbol_value_copied("bb-unit-midbuffer"), None);
+}
+
+#[test]
+fn eval_buffer_read_uses_the_current_read_symbol_shorthands() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    ev.buffers
+        .current_buffer_mut()
+        .expect("current buffer")
+        .insert(
+            "(setq read-symbol-shorthands '((\"rd-\" . \"longrd-\")))\n\
+             (setq gptel-unit-captured (symbol-name (read)))\n\
+             rd-unit-live\n",
+        );
+    ev.eval_str(
+        "(progn
+           (make-local-variable 'read-symbol-shorthands)
+           (set 'read-symbol-shorthands '((\"aa-\" . \"longaa-\"))))",
+    )
+    .expect("install buffer-local shorthands");
+    builtin_eval_buffer(&mut ev, vec![]).expect("eval-buffer");
+    assert_eq!(
+        ev.obarray.symbol_value_copied("gptel-unit-captured"),
+        Some(Value::string("longrd-unit-live")),
+        "(read) must consult the binding that is current when it runs"
     );
 }
 
@@ -812,8 +919,8 @@ fn read_event_returns_nil() {
 fn read_event_without_inherited_input_method_preserves_raw_tty_bytes() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
         "é".as_bytes().to_vec(),
         0,
@@ -834,8 +941,8 @@ fn read_event_with_inherited_input_method_decodes_tty_bytes() {
     // context has GNU `create_terminal`'s `no-conversion`.
     ev.eval_str("(set-keyboard-coding-system-internal 'utf-8-unix)")
         .expect("set the keyboard coding");
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
         "é".as_bytes().to_vec(),
         0,
@@ -917,7 +1024,11 @@ fn read_event_preserves_existing_command_keys_context() {
 
 #[test]
 fn read_event_echoes_invoking_keys_and_new_event_after_gnu_delay() {
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = crate::emacs_core::eval::RedisplayHookPolicyGuard::legacy();
     let mut ev = Context::new();
     ev.assign("noninteractive", Value::NIL);
     ev.assign("echo-keystrokes", Value::make_float(0.005));
@@ -926,22 +1037,33 @@ fn read_event_echoes_invoking_keys_and_new_event_after_gnu_delay() {
     ev.assign("help-event-list", Value::list(vec![Value::symbol("help")]));
     ev.set_read_command_keys(vec![Value::fixnum(17)]); // C-q
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let notifier = ev.wait_notifier();
-    let sender = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('1'),
-        ))
-        .expect("send event after the echo delay");
-        if let Some(notifier) = notifier {
-            notifier.notify().expect("wake read-event input wait");
+    const DECORATED: &str = "C-q- (C-h for help)";
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('1'),
+    )]);
+    install_after_redisplay(&mut ev, gate, |context| {
+        match context.current_message_text() {
+            Some(text) if text == DECORATED => Readiness::Ready(WaitWitness::EchoDecoration(text)),
+            Some(_) | None => Readiness::Pending,
         }
     });
 
-    let event = builtin_read_event(&mut ev, vec![]).expect("read-event");
-    sender.join().expect("input sender");
+    let event = builtin_read_event(&mut ev, vec![]);
+    let observed = publication
+        .finish()
+        .expect("required observed wait publication");
+    let event = event.expect("read-event");
+    assert_eq!(
+        observed.witness,
+        WaitWitness::EchoDecoration(DECORATED.to_owned())
+    );
+    assert!(observed.entry.requested_timeout() > std::time::Duration::ZERO);
+    assert!(matches!(
+        observed.entry.interest(),
+        crate::emacs_core::process::ProcessWaitBackendInterest::NotificationsOnly
+            | crate::emacs_core::process::ProcessWaitBackendInterest::NotificationsAndProcesses
+    ));
 
     assert_eq!(event, Value::fixnum('1' as i64));
     // While read-event waits past `echo-keystrokes', echo_now shows the
@@ -997,8 +1119,7 @@ fn read_event_with_float_seconds_does_not_set_command_keys_when_empty() {
 fn read_event_with_interactive_timeout_returns_nil() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = HostInputPublisher::install(&mut ev);
 
     let start = std::time::Instant::now();
     let result = builtin_read_event(
@@ -1323,15 +1444,17 @@ fn read_char_exclusive_skips_non_character_and_leaves_tail() {
 fn get_load_suffixes_returns_list() {
     crate::test_utils::init_test_tracing();
     let ev = Context::new();
-    // GNU `Fget_load_suffixes` cross-products `load-suffixes` with
-    // `load-file-rep-suffixes`.  The empty representation suffix extends each
-    // load suffix; it is not returned as its own suffix.
+    // GNU syms_of_lread starts from (".elc" ".el"), conses MODULES_SUFFIX and
+    // then MODULES_SECONDARY_SUFFIX (src/lread.c:5623-5629).  On darwin the
+    // secondary `.so` is therefore the FIRST startup suffix, and the build's
+    // own table is the only correct expectation.
+    let expected = load_suffixes_startup_values_for_os(std::env::consts::OS);
     let result = builtin_get_load_suffixes(ev.variables(), vec![]).unwrap();
     let items = list_to_vec(&result).unwrap();
-    assert_eq!(items.len(), 3);
-    assert_eq!(items[0].as_utf8_str(), Some(module_file_suffix()));
-    assert_eq!(items[1].as_utf8_str(), Some(".elc"));
-    assert_eq!(items[2].as_utf8_str(), Some(".el"));
+    assert_eq!(items.len(), expected.len());
+    for (item, suffix) in items.iter().zip(&expected) {
+        assert_eq!(item.as_utf8_str(), Some(*suffix));
+    }
 }
 
 #[test]
@@ -1353,10 +1476,26 @@ fn get_load_suffixes_cross_products_rep_suffixes() {
         .into_iter()
         .map(|v| v.as_utf8_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(
-        rendered,
-        vec![module_file_suffix(), ".elc", ".elc.gz", ".el", ".el.gz"]
-    );
+
+    // Mirror GNU Fget_load_suffixes (src/lread.c:967-990): every load suffix
+    // is concatenated with every representation suffix, except a non-empty
+    // representation of a module suffix when that representation is in
+    // `jka-compr-load-suffixes`.  Both MODULES_SUFFIX and (on darwin)
+    // MODULES_SECONDARY_SUFFIX take part in that test.
+    let module_suffixes = module_suffixes();
+    let mut expected = Vec::new();
+    for suffix in load_suffixes_startup_values_for_os(std::env::consts::OS) {
+        for representation in ["", ".gz"] {
+            if !representation.is_empty()
+                && module_suffixes.matches(suffix.as_bytes())
+                && representation == ".gz"
+            {
+                continue;
+            }
+            expected.push(format!("{suffix}{representation}"));
+        }
+    }
+    assert_eq!(rendered, expected);
 }
 
 #[test]

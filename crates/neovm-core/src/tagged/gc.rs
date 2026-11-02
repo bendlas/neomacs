@@ -45,6 +45,9 @@ use std::cell::Cell;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub(crate) mod function_write_hooks;
+pub(crate) mod symbol_table;
+
 mod cache_root_scan;
 pub(crate) use cache_root_scan::CacheRootScan;
 
@@ -101,6 +104,8 @@ pub enum HeapWriteKind {
     /// names its kind like every other traced veclike, and the barrier logs the
     /// pre-overwrite `interactive_form` (covered by `collect_veclike_children`).
     ModuleFunction,
+    /// Owned thread/mutex/condition payload before any of its children change.
+    ThreadingPayload,
 }
 
 /// A single heap mutation event.
@@ -394,16 +399,22 @@ pub struct TaggedHeap {
     /// `mark_and_sweep_weak_table_contents`). Holds raw object pointers, valid
     /// only within a single collection; cleared each cycle.
     weak_hash_tables: Vec<*mut HashTableObj>,
-    /// Weak hash tables that have become PERMANENT (tenured old generation or
-    /// mapped pdump image). The main mark never re-runs `trace_veclike` on a
-    /// permanent-black object, so such a table would otherwise never re-register
-    /// itself for the weak sweep and its entries would be pinned forever (a
-    /// weak-table leak: GNU re-sweeps every weak table on every GC). Populated
-    /// at `promote_and_blacken` (tenuring) and at mapped-dump registration;
-    /// seeded into `weak_hash_tables` at the start of every `mark_and_sweep_
-    /// weak_tables` so permanent weak tables are swept against the CURRENT cycle's
-    /// marks exactly like young ones. Permanent, so its pointers never dangle.
-    permanent_weak_hash_tables: Vec<*mut HashTableObj>,
+    /// Weak hash tables that must be re-swept on EVERY collection without
+    /// relying on the mark walk to re-register them: image residents (mapped
+    /// dump objects and loader-reconstructed permanent rows) and tenured
+    /// runtime tables. The main mark never re-runs `trace_veclike` on a
+    /// permanent-black object, and a tenured runtime table is black during a
+    /// minor, so any of them would otherwise never re-register itself for the
+    /// weak sweep and its entries would be pinned forever (a weak-table leak:
+    /// GNU re-sweeps every weak table on every GC). Populated by
+    /// `promote_and_blacken` and `promote_arena_pages` (every weak-table
+    /// survivor) and at mapped-dump registration; seeded into
+    /// `weak_hash_tables` at the start of every `mark_and_sweep_weak_tables`
+    /// so these tables are swept against the CURRENT cycle's marks exactly
+    /// like young ones. Image/mapped pointers never dangle; a freed runtime
+    /// table is purged from this vector and its membership set in
+    /// `free_gc_object`.
+    always_swept_weak_tables: Vec<*mut HashTableObj>,
     /// Every live finalizer object, registered at allocation — the Rust-side
     /// equivalent of GNU's intrusive `finalizers` list (alloc.c). Scanned at
     /// mark termination by `mark_and_queue_doomed_finalizers`: unmarked
@@ -550,8 +561,8 @@ pub struct TaggedHeap {
     /// with a linear contains per table, O(T^2) across a cycle. The vector
     /// stays authoritative for deterministic sweep order.
     weak_hash_tables_set: rustc_hash::FxHashSet<*mut HashTableObj>,
-    /// Membership shadow for `permanent_weak_hash_tables` (same pattern).
-    permanent_weak_hash_tables_set: rustc_hash::FxHashSet<*mut HashTableObj>,
+    /// Membership shadow for `always_swept_weak_tables` (same pattern).
+    always_swept_weak_tables_set: rustc_hash::FxHashSet<*mut HashTableObj>,
     mapped_veclike_index_by_addr: FxHashMap<usize, usize>,
     mapped_string_index_by_addr: FxHashMap<usize, usize>,
     window_registry: FxHashMap<u64, TaggedValue>,
@@ -952,6 +963,12 @@ pub struct TaggedHeap {
     /// Executing mutator's protocol followed by this heap's stopped-handshake
     /// window mirrors. The journal allocation stays with ObservationWorld.
     store: std::mem::MaybeUninit<super::collection_reads::StoreState>,
+
+    /// Creation-order identities for the final overlay precedence tie-break
+    /// (`OverlaySerial`). One counter per World's heap; atomic so the World
+    /// is N-mutator ready. Appended after the frozen store ABI fields, so no
+    /// pinned offset moves.
+    overlay_serial: crate::heap_types::OverlaySerialCounter,
 }
 
 impl Default for TaggedHeap {
@@ -992,6 +1009,18 @@ pub(crate) fn set_verify_marked_objects_for_test(on: bool) {
 
 static_assertions::assert_not_impl_any!(TaggedHeap: Send, Sync);
 
+/// Outcome of [`TaggedHeap::note_image_object`]: whether the object now carries
+/// the loader's image-residency stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageStamp {
+    /// The header now carries `HeaderFlags::image_resident`.
+    Stamped,
+    /// The object cannot carry the stamp: a cons (no header), a mapped image
+    /// object (residency lives in the mapped side tables), or an object this
+    /// heap does not own.
+    NotStamped,
+}
+
 impl TaggedHeap {
     pub fn new() -> Self {
         super::collection_reads::initialize();
@@ -1031,8 +1060,8 @@ impl TaggedHeap {
             marked_symbols: SymbolMarkBits::default(),
             weak_hash_tables: Vec::new(),
             weak_hash_tables_set: rustc_hash::FxHashSet::default(),
-            permanent_weak_hash_tables: Vec::new(),
-            permanent_weak_hash_tables_set: rustc_hash::FxHashSet::default(),
+            always_swept_weak_tables: Vec::new(),
+            always_swept_weak_tables_set: rustc_hash::FxHashSet::default(),
             finalizer_registry: Vec::new(),
             doomed_finalizer_functions: Vec::new(),
             pending_surface_destroys: Vec::new(),
@@ -1070,6 +1099,7 @@ impl TaggedHeap {
             image_premarked: false,
             #[cfg(test)]
             mapped_veclike_traces: 0,
+            overlay_serial: crate::heap_types::OverlaySerialCounter::new(),
             dirty_owner_bits: FxHashSet::default(),
             dirty_writes: Vec::new(),
             gc_collections: 0,
@@ -1630,6 +1660,38 @@ impl TaggedHeap {
         }
     }
 
+    /// Stamp VALUE, a heap object the pdump loader reconstructed from a
+    /// dump-image row, as an image resident.
+    ///
+    /// The first partition cycle's promotion makes exactly these objects
+    /// permanent; every other survivor is tenured only. Mapped image objects
+    /// need no stamp (their residency is the mapped mark side tables), and
+    /// conses have no header: both are ignored, as is anything this heap does
+    /// not own.
+    ///
+    /// The loader calls this once per reconstructed image row before the
+    /// image is published, so the byte is written before any mutator or
+    /// collector can observe the object.
+    pub(crate) fn note_image_object(&mut self, value: TaggedValue) -> ImageStamp {
+        if value.is_cons() {
+            return ImageStamp::NotStamped;
+        }
+        let Some(addr) = Self::value_heap_addr(value) else {
+            return ImageStamp::NotStamped;
+        };
+        if self.owner_is_mapped(value) || !self.owns_heap_value_object(value, addr) {
+            return ImageStamp::NotStamped;
+        }
+        // SAFETY: the ownership oracle just proved this is a live initialized
+        // non-cons heap object, and the loader runs single-threaded before the
+        // image is published, so no mark or mutator reads the byte.
+        unsafe {
+            let header = &mut *(addr as *mut GcHeader);
+            header.flags = header.flags.with_image_resident();
+        }
+        ImageStamp::Stamped
+    }
+
     pub fn dirty_owner_count(&self) -> usize {
         self.dirty_owners.len()
     }
@@ -2051,9 +2113,9 @@ impl TaggedHeap {
                         VecLikeType::SymbolWithPos => size_of::<SymbolWithPosObj>(),
                         VecLikeType::Finalizer => size_of::<FinalizerObj>(),
                         VecLikeType::Sqlite => size_of::<SqliteObj>(),
-                        VecLikeType::Thread | VecLikeType::Mutex | VecLikeType::CondVar => {
-                            size_of::<ThreadingHandleObj>()
-                        }
+                        VecLikeType::Thread => (&*(ptr as *const ThreadObj)).owned_bytes(),
+                        VecLikeType::Mutex => (&*(ptr as *const MutexObj)).owned_bytes(),
+                        VecLikeType::CondVar => (&*(ptr as *const CondVarObj)).owned_bytes(),
                         VecLikeType::UserPtr => size_of::<UserPtrObj>(),
                         VecLikeType::ModuleFunction => size_of::<ModuleFunctionObj>(),
                     }
@@ -2182,43 +2244,6 @@ impl TaggedHeap {
             stats = stats.add(Self::lambda_params_payload_layout(params));
         }
         stats
-    }
-
-    fn veclike_payload_layout(header: *const VecLikeHeader) -> PayloadLayout {
-        unsafe {
-            match (*header).type_tag {
-                VecLikeType::Vector => {
-                    Self::value_vec_payload_layout(&(*(header as *const VectorObj)).data)
-                }
-                VecLikeType::Lambda => {
-                    let object = &*(header as *const LambdaObj);
-                    Self::closure_payload_layout(&object.data, object.parsed_params.get())
-                }
-                VecLikeType::Macro => {
-                    let object = &*(header as *const MacroObj);
-                    Self::closure_payload_layout(&object.data, object.parsed_params.get())
-                }
-                VecLikeType::ByteCode => {
-                    Self::bytecode_payload_layout(&*(header as *const ByteCodeObj))
-                }
-                VecLikeType::Record | VecLikeType::WindowConfiguration => {
-                    Self::value_vec_payload_layout(&(*(header as *const RecordObj)).data)
-                }
-                VecLikeType::Font => {
-                    Self::value_vec_payload_layout(&(*(header as *const FontObj)).data.fields)
-                }
-                VecLikeType::CharTable => {
-                    Self::value_vec_payload_layout(&(*(header as *const CharTableObj)).extras)
-                }
-                VecLikeType::SubCharTable => {
-                    Self::value_vec_payload_layout(&(*(header as *const SubCharTableObj)).contents)
-                }
-                VecLikeType::Obarray => {
-                    Self::value_vec_payload_layout(&(*(header as *const ObarrayObj)).buckets)
-                }
-                _ => PayloadLayout::default(),
-            }
-        }
     }
 
     fn boxed_class(header: *const GcHeader) -> &'static str {
@@ -2472,57 +2497,6 @@ impl TaggedHeap {
         self.marker_chain_head_slots = slots;
     }
 
-    /// Walk each installed buffer-chain head slot and splice out markers
-    /// whose GC mark bit is clear. Runs between `mark_all` and
-    /// `sweep_objects` so reading `header.gc.marked` is sound (the
-    /// allocation is still live). Mirrors GNU Emacs `sweep_buffer →
-    /// unchain_dead_markers` (alloc.c).
-    fn unchain_dead_markers(&mut self) {
-        // Take the slot list out so we don't alias self while iterating.
-        let slots = std::mem::take(&mut self.marker_chain_head_slots);
-        let parity = self.mark_parity;
-        let scope = self.collection_scope();
-        let (dump_lo, dump_hi) = (self.dump_addr_lo, self.dump_addr_hi);
-        for slot in slots {
-            unsafe {
-                let mut prev_slot: *mut *mut MarkerObj = slot;
-                while !(*prev_slot).is_null() {
-                    let curr = *prev_slot;
-                    // Buffer marker chains can hold TENURED markers (promoted
-                    // at the first partition cycle): their bit froze at
-                    // promotion and must not be interpreted against the
-                    // current parity — tenured ≡ permanently live.
-                    //
-                    // A marker in the mapped image (a dumped marker Lisp
-                    // later pointed into a buffer, e.g. `view-lossage`'s
-                    // `help-window-point-marker`) is permanently live too:
-                    // image objects are never freed, and their header bit
-                    // keeps the value the loader wrote, which reads as dead
-                    // at every other parity. Its mark lives in the side
-                    // table, not the header -- reading the header spliced it
-                    // out of the chain at the first GC, after which it no
-                    // longer moved with insertions and deletions. Keeping an
-                    // unreachable image marker chained costs one node and
-                    // cannot dangle.
-                    let addr = curr as usize;
-                    if (addr >= dump_lo && addr < dump_hi)
-                        || (*curr).header.gc.black_by_generation(scope)
-                        || (*curr).header.gc.is_marked_at(parity)
-                    {
-                        // Live — advance prev
-                        prev_slot = &mut (*curr).data.next_marker;
-                    } else {
-                        // Dead — splice out. The generic `sweep_objects`
-                        // pass frees the allocation.
-                        *prev_slot = (*curr).data.next_marker;
-                        (*curr).data.next_marker = std::ptr::null_mut();
-                        (*curr).data.chained = false;
-                    }
-                }
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -2591,8 +2565,8 @@ impl TaggedHeap {
 /// counts, a size-class histogram over TOTAL object bytes (fixed struct +
 /// separately-allocated payload storage, via `object_bytes_from_header`),
 /// per-kind byte totals, and the peak `non_cons_object_addrs` population.
-/// Compiled ONLY under `cfg(test)` (the consuming probes are in-crate
-/// `#[ignore]`d tests), so production builds carry zero instrumentation.
+/// Compiled ONLY under `cfg(test)` (the consuming probes are behind the
+/// `perf-probes` feature), so production builds carry zero instrumentation.
 /// Global statics are correct here because nextest runs each probe in its own
 /// process, so the counters observe exactly one workload.
 #[cfg(test)]
@@ -2808,6 +2782,8 @@ use chunk_map::{CHUNK_CLASS_COUNT, ChunkClass, ChunkEntry, ChunkMap, HeapChunkMa
 mod census;
 mod cold_gc;
 mod facade_mark;
+mod gen1_admission;
+pub use gen1_admission::{Gen1Admission, Gen1AdmissionError};
 mod mutator_registration;
 #[cfg(test)]
 use census::CensusRecord;
@@ -2821,18 +2797,19 @@ pub use facade_mark::{
 pub(crate) use mutator_registration::symbol_functions::boundary as function_boundary_testkit;
 pub use mutator_registration::{
     AllStopped, AllStoppedFailure, CollectionError, CollectionReport, FunctionActivation,
-    FunctionCallCache, FunctionError, FunctionStep, GlobalError, InitialInternError, KeeperSymbols,
-    KeeperTableMut, Mode, Mutator, MutatorEntry, MutatorFinishFailure, MutatorKey, MutatorPermit,
-    MutatorStartFailure, NativeReturn, NativeRoots, OwnerPublication, OwnerRootSlot,
+    FunctionCallCache, FunctionError, FunctionSelection, FunctionStep, GlobalError,
+    InitialInternError, KeeperSymbols, KeeperTableMut, MinorCollectionError, Mode, Mutator,
+    MutatorEntry, MutatorFinishFailure, MutatorKey, MutatorPermit, MutatorStartFailure,
+    NativeReturn, NativeRoots, OwnerPublication, OwnerRootSlot, ParallelExecutionAdmission,
     ParallelHeapEra, Phase, PlainSymbolBacking, RegistrationCensus, RegistrationError, Rendezvous,
     RendezvousError, Request, ResumeGcImage, ResumeGcImageFailure, RootedRetireFailure, RunAccess,
     RunSlice, SealedTableAccess, SliceRoot, Snapshot, StoppedSummaries, SymbolHandle, SymbolMut,
     SymbolRef, TableMut, TableRef, YoungWorkerLoan,
 };
 
-pub(crate) use mutator_registration::{
-    OwnerRootAdmission, StoppedRootAdmission, SymbolReadToken, SymbolWriteToken,
-};
+#[cfg(test)]
+pub(crate) use crate::emacs_core::eval::world::WorldProofEra as ProofEra;
+pub(crate) use mutator_registration::facade::*;
 
 mod alloc_region;
 #[cfg(test)]
@@ -2888,11 +2865,6 @@ mod cons_alloc_tests;
 #[cfg(test)]
 #[path = "gc/tests/fake_image.rs"]
 pub(crate) mod fake_image;
-/// The header's generation byte, THE generation predicate per collection
-/// scope, the byte map, and the first cycle's promotion to permanent.
-#[cfg(test)]
-#[path = "gc/tests/generation_test.rs"]
-mod generation_tests;
 #[cfg(test)]
 #[path = "gc/tests/generational_verifier_test.rs"]
 mod generational_verifier_tests;
@@ -2912,17 +2884,6 @@ mod symbol_with_pos_arena_tests;
 #[cfg(test)]
 #[path = "gc/tests/vec_scan_test.rs"]
 mod vec_scan_tests;
-
-/// Test-only growth helper mirroring the production insert resize policy closely
-/// enough to force rehashes during the concurrent-mark stress test.
-#[cfg(test)]
-fn maybe_resize_for_test(ht: &mut crate::emacs_core::value::LispHashTable) {
-    let len = ht.data.len() as i64;
-    if len >= ht.size {
-        ht.size = if ht.size == 0 { 6 } else { ht.size * 2 };
-        ht.data.reserve(ht.size as usize);
-    }
-}
 
 #[cfg(test)]
 #[path = "gc/tests/age_mirror_test.rs"]

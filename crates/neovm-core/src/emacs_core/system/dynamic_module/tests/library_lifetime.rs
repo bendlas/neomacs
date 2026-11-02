@@ -49,6 +49,14 @@ fn sandbox() -> Option<PathBuf> {
         })
 }
 
+/// A child either inherits the runner's PID isolation or enters it through
+/// the campaign launcher. A systemd scope cannot be nested from that PID
+/// namespace: its bus peer cannot authenticate the namespace-local process.
+enum ChildIsolation {
+    Inherited,
+    Launch(PathBuf),
+}
+
 fn lifetime_case(case: &str, result_code: i32, init_status: i32, pending_exit: &str) {
     let function = format!("{case}-hello");
     if std::env::var(CHILD_CASE).as_deref() == Ok(case) {
@@ -96,12 +104,17 @@ fn lifetime_case(case: &str, result_code: i32, init_status: i32, pending_exit: &
         return;
     }
 
-    let Some(sandbox) = sandbox() else {
-        tracing::warn!(
-            case,
-            "module lifetime probe requires a Lisp sandbox; skipped"
-        );
-        return;
+    let isolation = if std::env::var("CARFRAME_TEST_IN_SANDBOX").as_deref() == Ok("1") {
+        ChildIsolation::Inherited
+    } else {
+        let Some(sandbox) = sandbox() else {
+            tracing::warn!(
+                case,
+                "module lifetime probe requires a Lisp sandbox; skipped"
+            );
+            return;
+        };
+        ChildIsolation::Launch(sandbox)
     };
 
     let directory = neomacs_infra::workspace_root()
@@ -156,21 +169,19 @@ fn lifetime_case(case: &str, result_code: i32, init_status: i32, pending_exit: &
     };
 
     if std::env::var("UPDATE_EXPECT").as_deref() == Ok("1") {
-        let emacs = std::env::var_os("EMACS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/bin/emacs")
-            });
         let form = format!(
             "(progn (condition-case e (module-load {:?}) (error (prin1 (car e)))) (princ \":\") (princ ({function})))",
             library.to_str().unwrap(),
         );
-        let mut oracle = Command::new(&sandbox);
-        oracle
-            .arg(emacs)
-            .args(["-Q", "--batch", "--eval"])
-            .arg(form);
-        expected = String::from_utf8(checked_output(oracle).stdout).unwrap();
+        let mut oracle = crate::test_utils::gnu_refresh_command();
+        oracle.args(["-Q", "--batch", "--eval"]).arg(form);
+        let output = oracle.output().expect("start sandboxed GNU oracle");
+        assert!(
+            output.status.success(),
+            "GNU module lifetime oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        expected = String::from_utf8(output.stdout).unwrap();
         let fixture = neomacs_infra::crate_root!()
             .join("src/emacs_core/system/dynamic_module/tests/library_lifetime")
             .join(format!("{case}.expect"));
@@ -181,9 +192,14 @@ fn lifetime_case(case: &str, result_code: i32, init_status: i32, pending_exit: &
         "{}::{case}_keeps_published_function_callable",
         module_path!()
     );
-    let mut child = Command::new(sandbox);
+    let executable = std::env::current_exe().unwrap();
+    let (program, prefix) = match isolation {
+        ChildIsolation::Inherited => (executable, Vec::new()),
+        ChildIsolation::Launch(sandbox) => (sandbox, vec![executable]),
+    };
+    let mut child = Command::new(program);
     child
-        .arg(std::env::current_exe().unwrap())
+        .args(prefix)
         .args([
             "--exact",
             test_name.strip_prefix("neovm_core::").unwrap(),

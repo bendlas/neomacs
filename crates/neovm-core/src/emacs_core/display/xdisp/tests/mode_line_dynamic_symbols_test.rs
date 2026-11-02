@@ -1,6 +1,6 @@
 use super::super::{
-    ModeLineRendered, format_mode_line_recursive, format_mode_line_recursive_in_state,
-    format_mode_line_recursive_in_state_with_eval_rooted, mode_line_gc,
+    ModeLineRendered, format_mode_line_for_target, format_mode_line_recursive_in_state,
+    format_mode_line_recursive_in_state_with_eval_rooted, mode_line_gc, mode_line_string::Risk,
     mode_line_symbol_value_in_state,
 };
 use super::*;
@@ -52,8 +52,16 @@ fn render_into(
 ) {
     match walker {
         Walker::Context => {
-            format_mode_line_recursive(ctx, pctx, &format, rendered, 0, false, None)
-                .expect("context walk");
+            format_mode_line_for_target(
+                ctx,
+                pctx,
+                &format,
+                rendered,
+                0.into(),
+                Risk::Trusted,
+                None,
+            )
+            .expect("context walk");
         }
         Walker::State => {
             assert!(!format_mode_line_recursive_in_state(
@@ -90,11 +98,16 @@ fn render_into(
 
 /// Like the existing exact-clock fixtures, run without unrelated registry
 /// writers. The SAME owned formatter state/accumulator survives both halves.
+/// Marker for the fresh process the exact-census fixture below spawns; the
+/// exact registry epoch/count values only hold in an otherwise-unwritten process.
+const P3SYM_MODE_LINE_CHILD_ENV: &str = "NEOVM_TEST_P3SYM_MODE_LINE_CHILD";
+
 #[cfg(not(feature = "gc-memory-telemetry"))]
 #[test]
-#[ignore = "exact process registry epoch/count; run alone"]
-fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth() {
-    use crate::emacs_core::intern::EpochCachedSymbol;
+fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth_child() {
+    if std::env::var_os(P3SYM_MODE_LINE_CHILD_ENV).is_none() {
+        return;
+    }
     const NAME: &str = "p3sym-c5-held-pass";
     let oracle: Vec<_> = include_str!(
         "../../../../tagged/gc/mutator_registration/symbol_intern_pass_oracle.expected"
@@ -112,8 +125,11 @@ fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth() {
         let pctx = ModeLinePercentContext::default();
         let held = pctx.resolve_dynamic_symbol(NAME);
         let old_id = held.0;
-        let fixed = EpochCachedSymbol::new(NAME);
-        assert_eq!(fixed.get(), old_id);
+        assert_eq!(
+            crate::emacs_core::intern::lookup_interned(NAME),
+            Some(old_id),
+            "the registry keeps the canonical identity across fresh intern growth"
+        );
         let format = Value::from_sym_id(old_id); // Immediate scalar identity.
         let mut output = ModeLineRendered::default();
         render_into(&mut ctx, &pctx, format, walker, &mut output);
@@ -140,7 +156,7 @@ fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth() {
         // No VariableView, RefCell borrow, string Value or Context view enters
         // this closure. Held identity/pass/output are accessed only on return.
         let receipt = ctx
-            .admit_owned_parallel(|projection| {
+            .admit_owned_proof_parallel(|projection| {
                 let receipt = projection.era().c5_intern_growth_for_test(holders);
                 let (collector, keeper) = projection.finish().expect("C5 pass clean era finish");
                 (collector, keeper, receipt)
@@ -168,9 +184,9 @@ fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth() {
             Some("A")
         );
         assert_eq!(
-            fixed.get(),
-            old_id,
-            "fixed resolver revalidates the same scalar identity"
+            crate::emacs_core::intern::lookup_interned(NAME),
+            Some(old_id),
+            "fresh intern growth leaves the canonical identity unchanged"
         );
         reset_intern_calls();
         let resolved = pctx.resolve_dynamic_symbol(NAME);
@@ -220,6 +236,28 @@ fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth() {
     }
 }
 
+#[cfg(not(feature = "gc-memory-telemetry"))]
+#[test]
+fn p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "p3sym_c5_mode_line_held_identity_survives_fresh_intern_growth_child",
+            "--test-threads",
+            "1",
+        ])
+        .env(P3SYM_MODE_LINE_CHILD_ENV, "1")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run the exact-census child");
+    assert!(
+        output.status.success(),
+        "exact-census child failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn mode_line_dynamic_symbols_intern_once_then_warm_all_walkers() {
     let mut ctx = context();
@@ -250,6 +288,29 @@ fn mode_line_dynamic_symbols_intern_once_then_warm_all_walkers() {
                 "warm pass interned {calls:?}"
             );
         }
+    }
+}
+
+/// The formatter reads a symbol-valued format element by identity, as GNU's
+/// `display_mode_element` does (`XSYMBOL (elt)`); a canonical symbol must not
+/// need a by-name resolution at any of the three walkers.
+#[test]
+fn canonical_format_symbols_render_without_interning() {
+    let mut ctx = context();
+    let name = "ttykey-k13-canonical-format-symbol";
+    ctx.set_variable(name, Value::string("X"));
+    let symbol = Value::from_sym_id(intern(name));
+    let format = Value::list(vec![Value::string(""), symbol]);
+    for walker in [Walker::Context, Walker::State, Walker::StateWithEval] {
+        let pctx = ModeLinePercentContext::default();
+        reset_intern_calls();
+        let output = render(&mut ctx, &pctx, format, walker);
+        assert_eq!(output, "X");
+        let calls = intern_call_names();
+        assert!(
+            !calls.iter().any(|called| called == name),
+            "canonical format symbol interned on a cold pass: {calls:?}"
+        );
     }
 }
 
@@ -423,7 +484,7 @@ fn mode_line_dynamic_symbols_split_callback_keeps_live_value_reads() {
 }
 
 #[test]
-fn mode_line_dynamic_symbols_eval_reinterns_after_actual_registry_change() {
+fn mode_line_dynamic_symbols_eval_retains_object_after_actual_registry_change() {
     let mut ctx = context();
     let name = "ttykey-k5-dynamic-eval-reintern";
     let format = ctx
@@ -447,7 +508,8 @@ fn mode_line_dynamic_symbols_eval_reinterns_after_actual_registry_change() {
         Some(Value::T),
         "the callback must reach its successful reintern marker"
     );
-    assert_eq!(output, "oldnew");
+    // GNU retained-during-reintern TTY oracle produces OLDOLD.
+    assert_eq!(output, "oldold");
     assert_ne!(intern(name), old, "actual registry identity changed");
     assert_eq!(pctx.resolve_dynamic_symbol(name).0, intern(name));
 }
@@ -474,7 +536,7 @@ fn mode_line_dynamic_symbols_restore_invalidates_only_pass_identities() {
 }
 
 #[test]
-fn mode_line_dynamic_symbols_keep_spelling_semantics_for_noncanonical_and_encoded_names() {
+fn mode_line_dynamic_symbols_keep_object_identity_for_noncanonical_and_encoded_names() {
     let mut ctx = context();
     for (name, atom) in [
         (
@@ -500,7 +562,7 @@ fn mode_line_dynamic_symbols_keep_spelling_semantics_for_noncanonical_and_encode
         for walker in [Walker::Context, Walker::State, Walker::StateWithEval] {
             assert_eq!(
                 render(&mut ctx, &ModeLinePercentContext::default(), format, walker),
-                "spelling"
+                "input-object"
             );
         }
     }
@@ -516,12 +578,12 @@ fn mode_line_dynamic_symbols_keep_spelling_semantics_for_noncanonical_and_encode
             Value::from_sym_id(uninterned),
             Walker::Context
         ),
-        "canonical"
+        "uninterned"
     );
 }
 
 #[test]
-fn mode_line_dynamic_symbols_keep_positioned_and_invalid_utf8_admission() {
+fn mode_line_dynamic_symbols_physical_atom_and_conditional_admission_matches_gnu() {
     let mut ctx = context();
     let name = "ttykey-k5-dynamic-positioned";
     ctx.set_variable(name, Value::string("positioned"));
@@ -546,12 +608,33 @@ fn mode_line_dynamic_symbols_keep_positioned_and_invalid_utf8_admission() {
             positioned,
             Walker::Context
         ),
-        "positioned"
+        "*invalid*"
+    );
+    // GNU's conditional CAR uses SYMBOLP/XSYMBOL, unlike atom dispatch.
+    let actual = intern_uninterned(name);
+    ctx.obarray.set_symbol_value_id(actual, Value::NIL);
+    ctx.obarray.set_symbol_value_id(intern(name), Value::T);
+    let positioned_actual = ctx
+        .tagged_heap
+        .alloc_symbol_with_pos(Value::from_sym_id(actual), Value::fixnum(7));
+    let conditional = Value::list(vec![
+        positioned_actual,
+        Value::string("TRUE"),
+        Value::string("FALSE"),
+    ]);
+    assert_eq!(
+        render(
+            &mut ctx,
+            &ModeLinePercentContext::default(),
+            conditional,
+            Walker::Context
+        ),
+        "FALSE"
     );
     let atom = LispString::from_unibyte_slice(b"ttykey-k5-dynamic-invalid-\xff");
     let invalid = ctx.obarray.intern_lisp_string(&atom);
     ctx.obarray
-        .set_symbol_value_id(invalid, Value::string("must-not-render"));
+        .set_symbol_value_id(invalid, Value::string("ACTUAL-INTERNED-BYTE"));
     assert!(Value::from_sym_id(invalid).as_bare_symbol_name().is_none());
     for walker in [Walker::Context, Walker::State, Walker::StateWithEval] {
         assert_eq!(
@@ -561,7 +644,7 @@ fn mode_line_dynamic_symbols_keep_positioned_and_invalid_utf8_admission() {
                 Value::from_sym_id(invalid),
                 walker
             ),
-            ""
+            "ACTUAL-INTERNED-BYTE"
         );
     }
 }
@@ -602,4 +685,95 @@ fn mode_line_dynamic_symbols_plain_void_and_alias_void_match_owner_fallback() {
         );
     }
     ctx.unbind_to(depth);
+}
+
+/// GNU 31.1 initialized-TTY oracle: make-symbol's value and risk property,
+/// not those of an interned same-name symbol, own the formatter's reads.
+#[test]
+fn mode_line_symbol_object_identity_and_conditional_match_gnu() {
+    let mut ctx = context();
+    let name = "mode-line-symbol-object-identity";
+    let canonical = intern(name);
+    let actual = intern_uninterned(name);
+    ctx.obarray
+        .set_symbol_value_id(canonical, Value::string("CANONICAL"));
+    ctx.obarray
+        .set_symbol_value_id(actual, Value::string("ACTUAL"));
+    let format = Value::from_sym_id(actual);
+    assert_eq!(
+        render(
+            &mut ctx,
+            &ModeLinePercentContext::default(),
+            format,
+            Walker::Context
+        ),
+        "ACTUAL"
+    );
+    ctx.obarray.set_symbol_value_id(actual, Value::NIL);
+    ctx.obarray.set_symbol_value_id(canonical, Value::T);
+    let conditional = Value::list(vec![format, Value::string("TRUE"), Value::string("FALSE")]);
+    assert_eq!(
+        render(
+            &mut ctx,
+            &ModeLinePercentContext::default(),
+            conditional,
+            Walker::Context
+        ),
+        "FALSE"
+    );
+}
+
+#[test]
+fn mode_line_symbol_object_risk_property_matches_gnu() {
+    let mut ctx = context();
+    let name = "mode-line-symbol-object-risk";
+    let canonical = intern(name);
+    let actual = intern_uninterned(name);
+    let value = ctx
+        .eval_str("'(:eval (propertize \"RISK-EVAL\" 'ep33-symbol-probe-property 'present))")
+        .expect("GNU probe value");
+    ctx.obarray.set_symbol_value_id(canonical, value);
+    ctx.obarray.set_symbol_value_id(actual, value);
+    let risk = ModeLineSymbol::RiskyLocalVariable.id();
+    ctx.obarray
+        .put_property_id(actual, risk, Value::T)
+        .expect("valid risk plist");
+    ctx.obarray
+        .put_property_id(canonical, risk, Value::NIL)
+        .expect("valid risk plist");
+    let format = Value::from_sym_id(actual);
+    let mut rendered = ModeLineRendered::default();
+    render_into(
+        &mut ctx,
+        &ModeLinePercentContext::default(),
+        format,
+        Walker::Context,
+        &mut rendered,
+    );
+    assert_eq!(
+        rendered.text,
+        "RISK-EVAL".chars().map(u32::from).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rendered.text_props.get_property_at_char_pos(
+            crate::buffer::CharPos0::new(0),
+            Value::symbol("ep33-symbol-probe-property"),
+        ),
+        Some(Value::symbol("present"))
+    );
+    ctx.obarray
+        .put_property_id(actual, risk, Value::NIL)
+        .expect("valid risk plist");
+    ctx.obarray
+        .put_property_id(canonical, risk, Value::T)
+        .expect("valid risk plist");
+    assert_eq!(
+        render(
+            &mut ctx,
+            &ModeLinePercentContext::default(),
+            format,
+            Walker::Context
+        ),
+        ""
+    );
 }

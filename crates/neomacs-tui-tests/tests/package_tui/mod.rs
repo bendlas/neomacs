@@ -35,11 +35,43 @@ pub mod scenario {
     };
 }
 
+/// The eval barrier every package-TUI pair uses before its next command.
+///
+/// Evaluate a form through `M-:` and return only after the eval minibuffer
+/// has exited in both editors, through the same `minibuffer_exited` contract
+/// the paired TUI suites use (no `Eval:` prompt row, no `Minibuf` menu item,
+/// and no multi-line tail still echoing the unsubmitted form).  Driving the
+/// next command before this barrier lets a keystroke land inside the eval
+/// minibuffer: on a loaded runner the following prompt then paints over the
+/// previous echo row's tail, and the next stage observes a
+/// half-transitioned screen (TUI shard 16, helm_pydoc: `M-x` was sent
+/// 0.15 ms after the eval RET and the prompt check saw
+/// `M-x <stale echo tail>` instead of `M-x`).
+pub fn eval_pair_expression(pair: &mut scenario::PackageTuiPair, expression: &str) {
+    neomacs_tui_tests::pair::eval_expression(&mut pair.gnu, &mut pair.neo, expression);
+}
+
+/// As [`eval_pair_expression`] for a form that intentionally enters a
+/// minibuffer of its own (`read-from-minibuffer`, `completing-read`, ...):
+/// returns as soon as RET is written; the caller owns the new minibuffer and
+/// must drive it before its next display observation.
+pub fn eval_pair_expression_enters_minibuffer(
+    pair: &mut scenario::PackageTuiPair,
+    expression: &str,
+) {
+    neomacs_tui_tests::pair::eval_expression_enters_minibuffer(
+        &mut pair.gnu,
+        &mut pair.neo,
+        expression,
+    );
+}
+
 // ── Pins (rows of the lock manifests) ──────────────────────────────────
 
 pub const ACE_WINDOW_MELPA_PIN: (&str, &str) = ("ace-window", "20220911.358");
 pub const BEACON_MELPA_PIN: (&str, &str) = ("beacon", "20220730.100");
-pub const COMPAT_GNU_ELPA_PIN: (&str, &str) = ("compat", "31.1.0.0");
+pub const COMPAT_GNU_ELPA_PIN: neomacs_melpa_test_support::GnuElpaPackage =
+    neomacs_melpa_test_support::GnuElpaPackage::COMPAT;
 pub const CORFU_MELPA_PIN: (&str, &str) = ("corfu", "20260802.2028");
 pub const GRUVBOX_THEME_MELPA_PIN: (&str, &str) = ("gruvbox-theme", "20250117.222");
 pub const HELM_CORE_MELPA_PIN: (&str, &str) = ("helm-core", "20260720.1307");
@@ -80,7 +112,7 @@ impl PackageOracle {
 
     /// Prepare one pinned GNU ELPA package and select its Elisp source file.
     pub fn new_from_gnu_elpa(
-        package: (&str, &str),
+        package: neomacs_melpa_test_support::GnuElpaPackage,
         source_file_name: &str,
     ) -> Result<Self, String> {
         let package_dir = neomacs_melpa_test_support::prepare_cached_gnu_elpa_package(
@@ -88,7 +120,11 @@ impl PackageOracle {
             package,
         )?;
         Ok(Self {
-            packages: PreparedPackageSet::from_package_dir(package, source_file_name, package_dir)?,
+            packages: PreparedPackageSet::from_package_dir(
+                (package.name(), package.version()),
+                source_file_name,
+                package_dir,
+            )?,
         })
     }
 
@@ -99,12 +135,15 @@ impl PackageOracle {
     }
 
     /// Mount one exact pinned package as an additional dependency.
-    pub fn with_gnu_elpa_dependency(self, package: (&str, &str)) -> Result<Self, String> {
+    pub fn with_gnu_elpa_dependency(
+        self,
+        package: neomacs_melpa_test_support::GnuElpaPackage,
+    ) -> Result<Self, String> {
         let package_dir = neomacs_melpa_test_support::prepare_cached_gnu_elpa_package(
             &EmacsRuntime::gnu_emacs(),
             package,
         )?;
-        self.with_prepared_dependency(package, package_dir)
+        self.with_prepared_dependency((package.name(), package.version()), package_dir)
     }
 
     fn with_prepared_dependency(
@@ -129,7 +168,8 @@ impl PackageOracle {
         let package_dir = neomacs_melpa_test_support::prepare_cached_locked_melpa_package(
             &EmacsRuntime::gnu_emacs(),
             package,
-        )?;
+        )?
+        .into_package_dir();
         self.with_prepared_dependency(package, package_dir)
     }
 

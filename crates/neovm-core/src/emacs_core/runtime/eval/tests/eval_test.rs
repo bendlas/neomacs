@@ -1,4 +1,27 @@
 use super::*;
+
+/// GNU `Fprogn` (eval.c:440-445) reads the rest of the body list BEFORE
+/// evaluating each form; a form that mutates its own containing list must
+/// not skip its later siblings. Neo used to re-read the cdr after the call.
+#[test]
+fn progn_reads_the_body_tail_before_evaluating_a_form() {
+    let mut ctx = Context::new();
+    let value = ctx
+        .eval_str(
+            "(progn
+               (setq jc-progn-l
+                     (list 'progn '(setcdr (cdr jc-progn-l) nil) '(setq jc-progn-x 1)))
+               (eval jc-progn-l)
+               (condition-case nil (list jc-progn-x) (error 'unbound)))",
+        )
+        .unwrap();
+    assert_eq!(
+        crate::emacs_core::print::print_value(&value),
+        "(1)",
+        "progn skipped a sibling after the body list was mutated"
+    );
+}
+
 use crate::emacs_core::eval::VariableView;
 use crate::emacs_core::symbol::CanonicalAccess;
 
@@ -25,6 +48,10 @@ mod gd_b_safe_call;
 #[cfg(test)]
 #[path = "gd_b_signal_room.rs"]
 mod gd_b_signal_room;
+
+#[cfg(test)]
+#[path = "depth_floor_visible.rs"]
+mod depth_floor_visible;
 
 #[cfg(test)]
 #[path = "gd_b_signals.rs"]
@@ -1569,8 +1596,7 @@ fn read_char_applies_resize_event_before_returning_next_keypress() {
         .create_frame("F1", 960, 640, crate::buffer::BufferId(1));
     assert_eq!(ev.frames.selected_frame().map(|frame| frame.id), Some(fid));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 700,
@@ -1596,8 +1622,7 @@ fn read_char_applies_resize_event_before_returning_next_keypress() {
 fn read_char_exposes_raw_tty_escape_without_a_native_timeout() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(vec![0x1b], 0))
         .unwrap();
@@ -1613,8 +1638,7 @@ fn read_char_decodes_utf8_tty_input_split_across_host_reads() {
     // context has GNU `create_terminal`'s `no-conversion`.
     ev.eval_str("(set-keyboard-coding-system-internal 'utf-8-unix)")
         .expect("set the keyboard coding");
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     let bytes = "中".as_bytes();
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
@@ -1641,8 +1665,7 @@ fn read_char_applies_keyboard_coding_system_to_raw_tty_bytes() {
         crate::tagged::value::SymbolMode::Bare,
     )
     .expect("set keyboard coding system");
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(vec![0xa4], 0))
         .unwrap();
@@ -1663,8 +1686,7 @@ fn read_char_preserves_emacs_internal_raw_byte_characters() {
     let raw = crate::emacs_core::emacs_char::EmacsChar::from_byte8(0xa4);
     let mut encoded = [0_u8; crate::emacs_core::emacs_char::MAX_MULTIBYTE_LENGTH];
     let encoded_len = raw.char_string(&mut encoded);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
         encoded[..1].to_vec(),
@@ -1693,8 +1715,7 @@ fn read_char_streams_multibyte_keyboard_coding_across_host_reads() {
         crate::tagged::value::SymbolMode::Bare,
     )
     .expect("set keyboard coding system");
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(vec![0xa4], 0))
         .unwrap();
@@ -1731,8 +1752,8 @@ fn read_key_sequence_translates_raw_tty_csi_through_input_decode_map() {
         crate::tagged::SymbolMode::Bare,
     )
     .expect("define CSI translation");
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
         b"\x1b[A".to_vec(),
         0,
@@ -1742,6 +1763,50 @@ fn read_key_sequence_translates_raw_tty_csi_through_input_decode_map() {
     let (keys, binding) = ev.read_key_sequence().expect("read translated CSI");
     assert_eq!(keys, vec![Value::symbol("up")]);
     assert_eq!(binding, Value::symbol("neomacs-test-up-command"));
+}
+
+#[test]
+fn read_key_sequence_keeps_events_after_an_earlier_decode_translation() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = Context::new();
+    let global_map = crate::emacs_core::keymap::make_sparse_list_keymap();
+    install_global_map_for_test(&mut ev, global_map);
+    let ctrl_x = Value::fixnum(0x18);
+    let ctrl_c = Value::fixnum(0x03);
+    crate::emacs_core::keymap::list_keymap_define_seq(
+        global_map,
+        &[ctrl_x, ctrl_c],
+        Value::symbol("neomacs-test-kill-command"),
+        crate::tagged::SymbolMode::Bare,
+    )
+    .expect("define C-x C-c");
+    // Each prefix key maps to itself in input-decode-map.
+    let input_decode_map = ev
+        .eval_symbol("input-decode-map")
+        .expect("input-decode-map");
+    for key in [ctrl_x, ctrl_c] {
+        crate::emacs_core::keymap::list_keymap_define_seq(
+            input_decode_map,
+            &[key],
+            Value::vector(vec![key]),
+            crate::tagged::SymbolMode::Bare,
+        )
+        .expect("define identity translation");
+    }
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
+    tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
+        vec![0x18, 0x03],
+        0,
+    ))
+    .unwrap();
+    // Close the channel so a reader that lost C-c fails with quit instead of
+    // waiting forever for another key.
+    drop(tx);
+
+    let (keys, binding) = ev.read_key_sequence().expect("read C-x C-c");
+    assert_eq!(keys, vec![ctrl_x, ctrl_c]);
+    assert_eq!(binding, Value::symbol("neomacs-test-kill-command"));
 }
 
 #[test]
@@ -1765,8 +1830,7 @@ fn read_char_switches_active_kboard_to_keypress_source_frame_terminal() {
     ev.sync_keyboard_terminal_owner();
     assert_eq!(ev.command_loop.keyboard.active_terminal_id(), 0);
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::key_press_in_frame(
         crate::keyboard::KeyEvent::char('z'),
@@ -1862,12 +1926,11 @@ fn read_char_prefers_ready_keypress_over_due_timer_callback() {
         )]),
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('a'),
     ))
     .expect("queue ready keypress");
-    ev.input_rx = Some(rx);
 
     let event = ev.read_char().expect("read_char should return keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
@@ -1918,14 +1981,15 @@ fn read_char_prefers_ready_keypress_over_process_filter_callback() {
     )
     .expect("install process priority filter");
 
-    std::thread::sleep(Duration::from_millis(20));
+    ev.processes
+        .wait_for_child_stdout_readable_for_test(pid, Duration::from_secs(5))
+        .expect("actual undrained child output before ready keypress");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('a'),
     ))
     .expect("queue ready keypress");
-    ev.input_rx = Some(rx);
 
     let event = ev.read_char().expect("read_char should return keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
@@ -1968,8 +2032,7 @@ fn read_char_triggers_redisplay_after_resize_event() {
             .push((frame.width, frame.height));
     }));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
 
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 700,
@@ -2000,7 +2063,7 @@ fn read_char_redisplays_when_resize_arrives_after_pre_block_redisplay() {
     let redisplay_calls = Rc::new(RefCell::new(Vec::new()));
     let redisplay_calls_in_cb = redisplay_calls.clone();
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     let tx_in_cb = tx.clone();
     let injected = Rc::new(RefCell::new(false));
     let injected_in_cb = injected.clone();
@@ -2032,8 +2095,6 @@ fn read_char_redisplays_when_resize_arrives_after_pre_block_redisplay() {
         }
     }));
 
-    ev.input_rx = Some(rx);
-
     let event = ev.read_char().expect("read_char should return a keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(*redisplay_calls.borrow(), vec![(960, 640), (700, 800)]);
@@ -2041,6 +2102,7 @@ fn read_char_redisplays_when_resize_arrives_after_pre_block_redisplay() {
 
 #[test]
 fn read_char_respects_inhibit_redisplay_during_input_wait() {
+    use crate::test_utils::input_wait::{InputGateOwner, WaitWitness};
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
     ev.obarray.set_symbol_value("inhibit-redisplay", Value::T);
@@ -2051,25 +2113,18 @@ fn read_char_respects_inhibit_redisplay_during_input_wait() {
         *redisplay_count_in_cb.borrow_mut() += 1;
     }));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let notifier = ev.wait_notifier();
-    // Keep one sender alive: dropping the last tx disconnects the channel,
-    // which the input machinery treats as terminal-gone -> quit (timing flake;
-    // see the sit-for soak fix).
-    let _tx_keepalive = tx.clone();
-    thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('a'),
-        ))
-        .expect("send keypress");
-        if let Some(notifier) = notifier {
-            notifier.notify().expect("wake command-input wait");
-        }
-    });
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('a'),
+    )]);
+    gate.arm(&mut ev, WaitWitness::InputWaitEntered);
 
-    let event = ev.read_char().expect("read_char should return keypress");
+    let event = ev.read_char();
+    let observed = publication
+        .finish()
+        .expect("required observed wait publication");
+    let event = event.expect("read_char should return keypress");
+    assert_eq!(observed.witness, WaitWitness::InputWaitEntered);
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(*redisplay_count.borrow(), 0);
 }
@@ -2433,7 +2488,7 @@ fn read_char_does_not_redisplay_again_when_monitor_change_arrives_after_pre_bloc
     let redisplay_count = Rc::new(RefCell::new(0usize));
     let redisplay_count_in_cb = Rc::clone(&redisplay_count);
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     let tx_in_cb = tx.clone();
     let injected = Rc::new(RefCell::new(false));
     let injected_in_cb = Rc::clone(&injected);
@@ -2465,8 +2520,6 @@ fn read_char_does_not_redisplay_again_when_monitor_change_arrives_after_pre_bloc
         }
     }));
 
-    ev.input_rx = Some(rx);
-
     let event = ev.read_char().expect("read_char should return a keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(*redisplay_count.borrow(), 1);
@@ -2493,8 +2546,8 @@ fn redisplay_applies_pending_resize_before_callback() {
             .push((frame.width, frame.height));
     }));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 700,
         height: 800,
@@ -2547,12 +2600,11 @@ fn recursive_edit_runs_top_level_before_outer_command_loop_reads_input() {
     let mut ev = Context::new();
     let _ = ev.eval_str_each("(setq top-level '(setq neo-top-level-hit t))");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::WindowClose { emacs_frame_id: 0 })
         .expect("queue close request");
     drop(tx);
 
-    ev.input_rx = Some(rx);
     ev.command_loop.running = true;
     // A window-close request from the display ends the loop through a quit that
     // only an interactive session survives (GNU `cmd_error_internal` kills a
@@ -2581,10 +2633,9 @@ fn nested_recursive_edit_propagates_top_level_and_runs_unwind_cleanup() {
     assert!(ev.frames.select_frame(frame), "test needs a selected frame");
     let global_map = crate::emacs_core::keymap::make_sparse_list_keymap();
     install_global_map_for_test(&mut ev, global_map);
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     drop(tx);
 
-    ev.input_rx = Some(rx);
     ev.command_loop.running = true;
     // Simulate an already-active outer command loop. The recursive-edit
     // below must not catch the top-level throw meant to unwind it.
@@ -2718,12 +2769,12 @@ fn command_loop_runs_initial_post_command_hook_before_first_command() {
 fn read_char_requeues_keypress_and_throws_on_input() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('a'),
     ))
     .expect("queue keypress");
-    ev.input_rx = Some(rx);
+
     ev.obarray
         .set_symbol_value("throw-on-input", Value::symbol("tag"));
 
@@ -2745,10 +2796,10 @@ fn read_char_requeues_keypress_and_throws_on_input() {
 fn read_char_window_close_honors_throw_on_input_before_quit() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::WindowClose { emacs_frame_id: 0 })
         .expect("queue close request");
-    ev.input_rx = Some(rx);
+
     ev.obarray
         .set_symbol_value("throw-on-input", Value::symbol("tag"));
 
@@ -2777,12 +2828,12 @@ fn read_char_window_close_uses_special_event_map_handler_when_loaded() {
     let frame = ev.frames.create_frame("F1", 80, 24, scratch);
     install_minimal_special_event_command_runtime(&mut ev);
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::WindowClose {
         emacs_frame_id: frame.0,
     })
     .expect("queue window close");
-    ev.input_rx = Some(rx);
+
     ev.command_loop.running = true;
 
     let event = match ev.read_char_with_timeout(Some(Duration::from_millis(0))) {
@@ -2820,8 +2871,8 @@ fn read_char_disconnected_input_uses_noelisp_terminal_teardown() {
         25,
         scratch,
     );
-    let (tx, rx) = crossbeam_channel::unbounded::<crate::keyboard::InputEvent>();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     drop(tx);
 
     ev.eval_str(
@@ -2855,7 +2906,7 @@ fn read_char_disconnected_input_uses_noelisp_terminal_teardown() {
     assert!(
         crate::emacs_core::terminal::pure::builtin_terminal_live_p(
             &mut ev,
-            vec![crate::emacs_core::terminal::pure::terminal_handle_value()]
+            &vec![crate::emacs_core::terminal::pure::terminal_handle_value()]
         )
         .unwrap()
         .is_nil(),
@@ -2881,12 +2932,12 @@ fn read_char_disconnected_input_uses_noelisp_terminal_teardown() {
 fn eval_list_form_throws_on_pending_host_input() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('a'),
     ))
     .expect("queue keypress");
-    ev.input_rx = Some(rx);
+
     ev.set_variable("throw-on-input", Value::symbol("tag"));
 
     let result = ev.eval_str("(list 1 2)");
@@ -2905,10 +2956,10 @@ fn eval_list_form_throws_on_pending_host_input() {
 fn presentation_retirement_does_not_interrupt_while_no_input() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::PresentationRetired { presentation: 7 })
         .expect("queue presentation retirement");
-    ev.input_rx = Some(rx);
+
     ev.set_variable("throw-on-input", Value::symbol("tag"));
 
     let result = ev
@@ -3006,7 +3057,8 @@ fn presentation_retirement_does_not_preempt_timer_batches() {
                      (if (< neo-retirement-timer-count 3)
                          (progn
                            (aset neo-retirement-timer 0 nil)
-                           (setq timer-list (list neo-retirement-timer))))))
+                           (setq timer-list (list neo-retirement-timer)))
+                       (setq unread-command-events '(?x)))))
              (fset 'timer-event-handler
                    (lambda (timer)
                      (setq timer-list (delq timer timer-list))
@@ -3014,37 +3066,44 @@ fn presentation_retirement_does_not_preempt_timer_batches() {
     )
     .expect("install timer-batch probe");
     ev.set_variable("timer-list", Value::list(vec![timer]));
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
     tx.send(crate::keyboard::InputEvent::PresentationRetired { presentation: 77 })
         .expect("queue renderer acknowledgement");
-    ev.input_rx = Some(rx);
-
+    // Callback three, rather than elapsed wall time, completes the wait. The
+    // long deadline only bounds a broken wait; an acknowledgement is not input.
     let outcome = ev
-        .wait_for_command_input(Some(std::time::Instant::now() + Duration::from_millis(50)))
-        .expect("wait should reach its deadline");
+        .wait_for_command_input(Some(std::time::Instant::now() + Duration::from_secs(10)))
+        .expect("the third timer batch should queue command input");
 
-    assert_eq!(
-        outcome,
-        crate::emacs_core::wait::CommandInputWaitOutcome::DeadlineElapsed
-    );
     assert_eq!(
         ev.eval_symbol("neo-retirement-timer-count")
             .expect("timer count"),
         Value::fixnum(3),
         "the internal acknowledgement must not end the wait between timer batches"
     );
+    assert_eq!(
+        outcome,
+        crate::emacs_core::wait::CommandInputWaitOutcome::InputPending
+    );
+    assert_eq!(
+        ev.peek_unread_command_event(),
+        Some(Value::fixnum('x' as i64))
+    );
 }
 
 #[test]
 fn retirement_wakeup_returns_to_same_blocking_read_without_redisplay_loop() {
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = RedisplayHookPolicyGuard::legacy();
     let mut ev = Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let input_owner = InputGateOwner::install(&mut ev);
 
     let redisplays = Rc::new(RefCell::new(0));
     let redisplays_in_callback = Rc::clone(&redisplays);
-    let retirement_tx = tx.clone();
+    let retirement_tx = input_owner.publisher();
     ev.redisplay_fn = Some(Box::new(move |_| {
         *redisplays_in_callback.borrow_mut() += 1;
         retirement_tx
@@ -3052,18 +3111,22 @@ fn retirement_wakeup_returns_to_same_blocking_read_without_redisplay_loop() {
             .expect("queue renderer acknowledgement");
     }));
 
-    let key_sender = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('x'),
-        ))
-        .expect("queue delayed key");
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('x'),
+    )]);
+    install_after_redisplay(&mut ev, gate, |_| {
+        Readiness::Ready(WaitWitness::RetirementDrained)
     });
 
-    let event = ev
-        .read_char_with_timeout(Some(std::time::Duration::from_secs(1)))
-        .expect("read should succeed");
-    key_sender.join().expect("key sender should finish");
+    let event = ev.read_char_with_timeout(Some(std::time::Duration::from_secs(1)));
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::RetirementDrained
+    );
+    let event = event.expect("read should succeed");
 
     assert_eq!(event, Some(Value::fixnum('x' as i64)));
     assert_eq!(
@@ -3085,8 +3148,8 @@ fn frame_native_width_syncs_pending_resize_without_read_char() {
         .expect("frame should exist")
         .set_parameter(Value::symbol("window-system"), Value::symbol("x"));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 700,
         height: 800,
@@ -3112,8 +3175,8 @@ fn fire_pending_timers_does_not_service_pending_resize_input() {
         .frames
         .create_frame("F1", 960, 640, crate::buffer::BufferId(1));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Resize {
         width: 700,
         height: 800,
@@ -3131,6 +3194,7 @@ fn fire_pending_timers_does_not_service_pending_resize_input() {
 
 #[test]
 fn wait_for_pending_resize_events_blocks_until_resize_and_preserves_keypress() {
+    use crate::test_utils::input_wait::{InputGateOwner, WaitWitness};
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
     let fid = ev
@@ -3138,28 +3202,27 @@ fn wait_for_pending_resize_events_blocks_until_resize_and_preserves_keypress() {
         .create_frame("F1", 960, 640, crate::buffer::BufferId(1));
     assert_eq!(ev.frames.selected_frame().map(|frame| frame.id), Some(fid));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    // Keep one sender alive: dropping the last tx disconnects the channel,
-    // which the input machinery treats as terminal-gone -> quit (timing flake;
-    // see the sit-for soak fix).
-    let _tx_keepalive = tx.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
-        tx.send(crate::keyboard::InputEvent::Resize {
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![
+        crate::keyboard::InputEvent::Resize {
             width: 700,
             height: 800,
             scale_factor: 1.0,
             emacs_frame_id: 0,
-        })
-        .expect("send resize");
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('r'),
-        ))
-        .expect("send following keypress");
-    });
+        },
+        crate::keyboard::InputEvent::key_press(crate::keyboard::KeyEvent::char('r')),
+    ]);
+    gate.arm(&mut ev, WaitWitness::InputWaitEntered);
 
-    assert!(ev.wait_for_pending_resize_events(Duration::from_secs(1)));
+    let resized = ev.wait_for_pending_resize_events(Duration::from_secs(1));
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::InputWaitEntered
+    );
+    assert!(resized);
     let frame = ev.frames.get(fid).expect("frame should exist");
     assert_eq!(frame.width, 700);
     assert_eq!(frame.height, 800);
@@ -3182,8 +3245,8 @@ fn frame_native_width_syncs_pending_resize_behind_focus_event() {
         .expect("frame should exist")
         .set_parameter(Value::symbol("window-system"), Value::symbol("x"));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Focus {
         focused: true,
         emacs_frame_id: 0,
@@ -3626,6 +3689,7 @@ fn read_key_sequence_function_translation_receives_prompt() {
         ))
         .expect("read translated key sequence");
 
+    let binding = binding.executed();
     assert_eq!(keys, vec![Value::symbol("f1")]);
     assert_eq!(
         binding,
@@ -4003,6 +4067,7 @@ fn read_key_sequence_dont_downcase_last_restores_original_event() {
         ))
         .expect("read shifted key without downcasing");
 
+    let binding = binding.executed();
     assert_eq!(keys, vec![Value::fixnum('A' as i64)]);
     assert_eq!(
         binding,
@@ -4155,8 +4220,8 @@ fn raw_tty_input_switches_to_the_frame_owned_by_that_terminal_before_the_charact
     assert_ne!(first_secondary_id, second_id);
     ev.frames.select_frame(crate::window::FrameId(second_id));
     ev.frames.select_frame(crate::window::FrameId(first_id));
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.init_input_system(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+    ev.init_input_system();
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes_for_terminal(
         b"x".to_vec(),
         17,
@@ -4272,6 +4337,7 @@ fn read_key_sequence_can_return_switch_frame_at_sequence_start() {
         ))
         .expect("read switch-frame sequence");
 
+    let binding = binding.executed();
     assert_eq!(
         keys,
         vec![Value::list(vec![
@@ -4535,6 +4601,7 @@ fn read_key_sequence_can_return_select_window_at_sequence_start() {
         ))
         .expect("read select-window sequence");
 
+    let binding = binding.executed();
     assert_eq!(
         keys,
         vec![Value::list(vec![
@@ -4756,6 +4823,17 @@ fn read_key_sequence_uses_clicked_window_local_map_for_mouse_event() {
             }],
         }]);
 
+    // GNU drops an up event with no matching down (src/keyboard.c:6628-6632),
+    // so model the complete click gesture.
+    ev.command_loop.keyboard.pending_input_events.push_back(
+        crate::keyboard::InputEvent::MousePress {
+            button: crate::keyboard::MouseButton::Left,
+            x: click_x,
+            y: click_y,
+            modifiers: crate::keyboard::Modifiers::none(),
+            target_frame_id: fid.0,
+        },
+    );
     ev.command_loop.keyboard.pending_input_events.push_back(
         crate::keyboard::InputEvent::MouseRelease {
             button: crate::keyboard::MouseButton::Left,
@@ -5472,6 +5550,17 @@ fn read_key_sequence_uses_clicked_window_buffer_local_minor_mode_maps() {
             }],
         }]);
 
+    // GNU drops an up event with no matching down (src/keyboard.c:6628-6632),
+    // so model the complete click gesture.
+    ev.command_loop.keyboard.pending_input_events.push_back(
+        crate::keyboard::InputEvent::MousePress {
+            button: crate::keyboard::MouseButton::Left,
+            x: click_x,
+            y: click_y,
+            modifiers: crate::keyboard::Modifiers::none(),
+            target_frame_id: fid.0,
+        },
+    );
     ev.command_loop.keyboard.pending_input_events.push_back(
         crate::keyboard::InputEvent::MouseRelease {
             button: crate::keyboard::MouseButton::Left,
@@ -5562,6 +5651,17 @@ fn read_key_sequence_prefixes_mode_line_mouse_click_for_lookup() {
             rows: Vec::new(),
         }]);
 
+    // GNU drops an up event with no matching down (src/keyboard.c:6628-6632),
+    // so model the complete click gesture.
+    ev.command_loop.keyboard.pending_input_events.push_back(
+        crate::keyboard::InputEvent::MousePress {
+            button: crate::keyboard::MouseButton::Left,
+            x: click_x,
+            y: click_y,
+            modifiers: crate::keyboard::Modifiers::none(),
+            target_frame_id: fid.0,
+        },
+    );
     ev.command_loop.keyboard.pending_input_events.push_back(
         crate::keyboard::InputEvent::MouseRelease {
             button: crate::keyboard::MouseButton::Left,
@@ -5661,8 +5761,8 @@ fn redisplay_preserves_non_resize_input_for_read_char() {
         .create_frame("F1", 960, 640, crate::buffer::BufferId(1));
     assert_eq!(ev.frames.selected_frame().map(|frame| frame.id), Some(fid));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('a'),
     ))
@@ -5920,35 +6020,46 @@ fn next_input_wait_timeout_accounts_for_gnu_idle_timer_list_when_idle() {
 
 #[test]
 fn read_char_fires_bootstrapped_gnu_run_with_timer_while_waiting_for_input() {
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = RedisplayHookPolicyGuard::legacy();
     let mut ev = runtime_startup_context();
+    crate::test_utils::input_wait::select_visible_fixture(&mut ev, "*timer-wait*");
 
     ev.eval_str(
         r#"(progn
            (setq vm-timer-fired nil)
            (run-with-timer
             0.01 nil
-            (lambda () (setq vm-timer-fired 'done))))"#,
+            (lambda () (insert "timer completed")
+              (setq vm-timer-fired 'done))))"#,
     )
     .expect("schedule GNU Lisp timer");
 
-    let tx = input_wait::InputPublisher::install(&mut ev);
-    // Keep one sender alive: dropping the last tx disconnects the channel,
-    // which the input machinery treats as terminal-gone -> quit (timing flake;
-    // see the sit-for soak fix).
-    let _tx_keepalive = tx.clone();
-    let sender = thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('a'),
-        ))
-        .expect("send keypress");
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('a'),
+    )]);
+    install_after_redisplay(&mut ev, gate, |context| {
+        match context.eval_symbol("vm-timer-fired").ok() {
+            Some(value) if value == Value::symbol("done") => {
+                Readiness::Ready(WaitWitness::TimerCompleted)
+            }
+            Some(_) | None => Readiness::Pending,
+        }
     });
 
-    let event = ev
-        .read_char()
-        .expect("read_char should return queued keypress");
-    sender.join().expect("input publisher thread");
+    let event = ev.read_char();
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::TimerCompleted
+    );
+    let event = event.expect("read_char should return queued keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(
         ev.eval_symbol("vm-timer-fired")
@@ -5959,8 +6070,13 @@ fn read_char_fires_bootstrapped_gnu_run_with_timer_while_waiting_for_input() {
 
 #[test]
 fn read_char_fires_bootstrapped_gnu_run_with_idle_timer_while_waiting_for_input() {
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = RedisplayHookPolicyGuard::legacy();
     let mut ev = runtime_startup_context();
+    crate::test_utils::input_wait::select_visible_fixture(&mut ev, "*idle-wait*");
 
     ev.eval_str(
         r#"(progn
@@ -5969,28 +6085,34 @@ fn read_char_fires_bootstrapped_gnu_run_with_idle_timer_while_waiting_for_input(
            (run-with-idle-timer
             0.01 nil
             (lambda ()
+              (insert "timer completed")
               (setq vm-idle-fired 'done)
               (setq vm-idle-snapshot (current-idle-time)))))"#,
     )
     .expect("schedule GNU Lisp idle timer");
 
-    let tx = input_wait::InputPublisher::install(&mut ev);
-    // Keep one sender alive: dropping the last tx disconnects the channel,
-    // which the input machinery treats as terminal-gone -> quit (timing flake;
-    // see the sit-for soak fix).
-    let _tx_keepalive = tx.clone();
-    let sender = thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('a'),
-        ))
-        .expect("send keypress");
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('a'),
+    )]);
+    install_after_redisplay(&mut ev, gate, |context| {
+        match context.eval_symbol("vm-idle-fired").ok() {
+            Some(value) if value == Value::symbol("done") => {
+                Readiness::Ready(WaitWitness::IdleTimerCompleted)
+            }
+            Some(_) | None => Readiness::Pending,
+        }
     });
 
-    let event = ev
-        .read_char()
-        .expect("read_char should return queued keypress");
-    sender.join().expect("input publisher thread");
+    let event = ev.read_char();
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::IdleTimerCompleted
+    );
+    let event = event.expect("read_char should return queued keypress");
     assert_eq!(event, Value::fixnum('a' as i64));
     assert_eq!(
         ev.eval_symbol("vm-idle-fired")
@@ -6015,15 +6137,17 @@ fn read_char_fires_bootstrapped_gnu_run_with_idle_timer_while_waiting_for_input(
 /// must fire again after the editing command when Emacs becomes idle.
 #[test]
 fn repeating_idle_timer_rearms_after_user_input_starts_new_idle_epoch() {
+    use crate::test_utils::input_wait::IdleEpoch;
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = RedisplayHookPolicyGuard::legacy();
     let mut ev = runtime_startup_context();
+    crate::test_utils::input_wait::select_visible_fixture(&mut ev, "*repeating-idle-wait*");
 
-    // Retire the dump's first GC cycle (promotion + blackening) before the
-    // timed part: the bootstrap used to run synchronously inside setup eval,
-    // but the concurrent first cycle terminates at a LATER safe point — in a
-    // debug build that ~80ms termination can land inside one of this test's
-    // 80ms idle windows and eat the timer's epoch. This test is about idle
-    // epochs, not GC pause placement.
+    // Retire bootstrap GC before exercising the two idle epochs. Readiness
+    // comes from the timer count in each epoch, never elapsed wall time.
     ev.eval_str("(garbage-collect)")
         .expect("retire bootstrap GC");
     ev.eval_str(
@@ -6032,35 +6156,62 @@ fn repeating_idle_timer_rearms_after_user_input_starts_new_idle_epoch() {
            (run-with-idle-timer
             0.01 t
             (lambda ()
+              (insert "idle epoch completed")
               (setq vm-repeating-idle-count
                     (1+ vm-repeating-idle-count)))))"#,
     )
     .expect("schedule repeating GNU Lisp idle timer");
 
-    let tx = input_wait::InputPublisher::install(&mut ev);
-    let _tx_keepalive = tx.clone();
-    let sender = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(80));
-        tx.send(crate::keyboard::InputEvent::key_press(
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (first, first_publication) =
+        input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char('a'),
-        ))
-        .expect("send first keypress");
-        thread::sleep(Duration::from_millis(80));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('b'),
-        ))
-        .expect("send second keypress");
+        )]);
+    install_after_redisplay(&mut ev, first, |context| {
+        match context.eval_symbol("vm-repeating-idle-count").ok() {
+            Some(value) if value == Value::fixnum(1) => {
+                Readiness::Ready(WaitWitness::IdleEpoch(IdleEpoch::First))
+            }
+            Some(_) | None => Readiness::Pending,
+        }
     });
-
+    let first_event = ev.read_char();
     assert_eq!(
-        ev.read_char().expect("read first keypress"),
+        first_publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::IdleEpoch(IdleEpoch::First)
+    );
+    assert_eq!(
+        first_event.expect("read first keypress"),
         Value::fixnum('a' as i64)
     );
+
+    let (second, second_publication) =
+        input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+            crate::keyboard::KeyEvent::char('b'),
+        )]);
+    install_after_redisplay(&mut ev, second, |context| {
+        match context.eval_symbol("vm-repeating-idle-count").ok() {
+            Some(value) if value == Value::fixnum(2) => {
+                Readiness::Ready(WaitWitness::IdleEpoch(IdleEpoch::Second))
+            }
+            Some(_) | None => Readiness::Pending,
+        }
+    });
+    let second_event = ev.read_char();
     assert_eq!(
-        ev.read_char().expect("read second keypress"),
+        second_publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::IdleEpoch(IdleEpoch::Second)
+    );
+    assert_eq!(
+        second_event.expect("read second keypress"),
         Value::fixnum('b' as i64)
     );
-    sender.join().expect("input publisher thread");
     assert_eq!(
         ev.eval_symbol("vm-repeating-idle-count")
             .expect("idle timer count should be bound"),
@@ -6082,12 +6233,16 @@ fn repeating_idle_timer_rearms_after_user_input_starts_new_idle_epoch() {
 /// `this-command-keys` (as if a `C-x r s` invocation had just been read),
 /// arms an idle timer that snapshots `(this-command-keys-vector)` while the
 /// nested `read_key_sequence` (continue-echo = nil) is waiting, and delivers
-/// the real key only after a delay so the idle timer fires first. The
-/// snapshot MUST be empty — proving the stale invoking sequence was cleared at
+/// the real key only after observing the idle snapshot and entering the
+/// next positive input wait. The snapshot MUST be empty — proving the stale invoking sequence was cleared at
 /// entry — and the read must still return the freshly delivered key.
 #[test]
 fn read_key_sequence_clears_stale_this_command_keys_at_entry_for_idle_probe() {
+    use crate::test_utils::input_wait::{
+        InputGateOwner, Readiness, WaitWitness, install_after_redisplay,
+    };
     crate::test_utils::init_test_tracing();
+    let _policy = RedisplayHookPolicyGuard::legacy();
     let mut ev = runtime_startup_context();
     let scratch = ev.buffers.create_buffer("*rks-entry-clear*");
     ev.buffers.set_current(scratch);
@@ -6116,31 +6271,39 @@ fn read_key_sequence_clears_stale_this_command_keys_at_entry_for_idle_probe() {
              (run-with-idle-timer
               0.01 nil
               (lambda ()
+                (insert "command-key snapshot captured")
                 (setq rks-idle-snapshot (this-command-keys-vector)))))"#,
     )
     .expect("arm idle snapshot timer");
 
-    // Deliver the real key only after a delay so the idle timer fires first.
-    let tx = input_wait::InputPublisher::install(&mut ev);
-    let _tx_keepalive = tx.clone();
-    let sender = thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(120));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('a'),
-        ))
-        .expect("send keypress");
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('a'),
+    )]);
+    install_after_redisplay(&mut ev, gate, |context| {
+        match context.eval_symbol("rks-idle-snapshot").ok() {
+            Some(value) if value.is_vector() => {
+                Readiness::Ready(WaitWitness::CommandKeysSnapshotCaptured)
+            }
+            Some(_) | None => Readiness::Pending,
+        }
     });
 
-    let (keys, _binding) = ev
-        .read_key_sequence_with_options(crate::keyboard::ReadKeySequenceOptions::new(
-            Value::NIL,
-            false, // continue-echo = nil -> clear stale this-command-keys
-            false,
-            false,
-        ))
-        .expect("nested read should return the freshly delivered key");
+    let read = ev.read_key_sequence_with_options(crate::keyboard::ReadKeySequenceOptions::new(
+        Value::NIL,
+        false, // continue-echo = nil -> clear stale this-command-keys
+        false,
+        false,
+    ));
 
-    sender.join().expect("input publisher thread");
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::CommandKeysSnapshotCaptured
+    );
+    let (keys, _binding) = read.expect("nested read should return the freshly delivered key");
     assert_eq!(
         keys,
         vec![Value::fixnum('a' as i64)],
@@ -11766,7 +11929,7 @@ fn run_window_configuration_change_hook_uses_window_buffer_context() {
     let buf2 = ev.buffers.create_buffer("wcch-b");
     ev.switch_current_buffer(buf1).expect("switch to buf1");
 
-    let selected_window = crate::emacs_core::window_cmds::builtin_selected_window(&mut ev, vec![])
+    let selected_window = crate::emacs_core::window_cmds::builtin_selected_window(&mut ev, &vec![])
         .expect("selected window");
     crate::emacs_core::window_cmds::builtin_set_window_buffer(
         &mut ev,
@@ -14362,10 +14525,7 @@ fn while_no_input_catches_pending_key_queued_during_body() {
            (error err))",
     );
 
-    assert_eq!(
-        crate::emacs_core::error::format_eval_result(&result),
-        "OK t"
-    );
+    assert_eq!(crate::emacs_core::format_eval_result(&result), "OK t");
 }
 
 #[test]
@@ -14417,10 +14577,7 @@ fn while_no_input_catches_pending_key_across_load_boundary() {
             neo-loaded-after-input))",
     );
 
-    assert_eq!(
-        crate::emacs_core::error::format_eval_result(&result),
-        "OK (t nil)"
-    );
+    assert_eq!(crate::emacs_core::format_eval_result(&result), "OK (t nil)");
 }
 
 #[test]
@@ -14467,7 +14624,7 @@ fn with_selected_window_restores_after_while_no_input_keyboard_interrupt() {
     );
 
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&result),
+        crate::emacs_core::format_eval_result(&result),
         // GNU 31.0.90 (`-nw` under tmux, C-n typed while the body ran): the
         // interrupting key stays pending — `input-pending-p' is t afterwards for a
         // `sleep-for' body and for a pure CPU loop. `(read-event nil nil 0)'
@@ -14522,7 +14679,7 @@ fn while_no_input_unwinds_inner_with_selected_window_on_keyboard_input() {
     );
 
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&result),
+        crate::emacs_core::format_eval_result(&result),
         // GNU 31.0.90 (`-nw` under tmux, C-n typed while the body ran): the
         // interrupting key stays pending — `input-pending-p' is t afterwards for a
         // `sleep-for' body and for a pure CPU loop. `(read-event nil nil 0)'
@@ -14535,28 +14692,16 @@ fn while_no_input_unwinds_inner_with_selected_window_on_keyboard_input() {
 
 #[test]
 fn sit_for_requeues_delayed_input_after_with_selected_window_cleanup() {
+    use crate::test_utils::input_wait::{InputGateOwner, WaitWitness};
     crate::test_utils::init_test_tracing();
 
     let mut ev = runtime_startup_context();
     ev.set_variable("noninteractive", Value::NIL);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-
-    // Keep one sender alive for the whole test: dropping the last sender
-    // disconnects the channel, which the input machinery treats as
-    // terminal-gone -> quit. The test models a terminal that stays connected
-    // and delivers one delayed key — without this, any input poll that lands
-    // after the spawned thread exits (timing-dependent; reliably triggered by
-    // JIT compile pauses under NEOVM_JIT_THRESHOLD=1) sees Disconnected and
-    // the whole form signals (quit).
-    let _tx_keepalive = tx.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(10));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char_with_mods('n', crate::keyboard::Modifiers::ctrl()),
-        ))
-        .expect("send delayed C-n");
-    });
+    let input_owner = InputGateOwner::install(&mut ev);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char_with_mods('n', crate::keyboard::Modifiers::ctrl()),
+    )]);
+    gate.arm(&mut ev, WaitWitness::InputWaitEntered);
 
     let result = ev.eval_str(
         r#"(let* ((w1 (selected-window))
@@ -14573,7 +14718,14 @@ fn sit_for_requeues_delayed_input_after_with_selected_window_cleanup() {
     );
 
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&result),
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::InputWaitEntered
+    );
+    assert_eq!(
+        crate::emacs_core::format_eval_result(&result),
         "OK (nil t t 14)"
     );
 }
@@ -14638,7 +14790,7 @@ fn safe_run_hook_preserves_selected_window_after_while_no_input_interrupt() {
     );
 
     assert_eq!(
-        crate::emacs_core::error::format_eval_result(&result),
+        crate::emacs_core::format_eval_result(&result),
         // GNU 31.0.90 (`-nw` under tmux, C-n typed while the body ran): the
         // interrupting key stays pending — `input-pending-p' is t afterwards for a
         // `sleep-for' body and for a pure CPU loop. `(read-event nil nil 0)'
@@ -15183,11 +15335,14 @@ fn finalizer_type_of_and_prints_opaquely() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
 
-    let results = ev.eval_str_each("(type-of (make-finalizer #'ignore))");
+    // `Context::new()` is a bare evaluator with no dumped subrs, so `ignore'
+    // is not fbound here; GNU `Fmake_finalizer' checks FUNCTIONP at creation,
+    // and a lambda is a function in every context.
+    let results = ev.eval_str_each("(type-of (make-finalizer (lambda ())))");
     assert_eq!(format_eval_result(&results[0]), "OK finalizer");
-    let results = ev.eval_str_each("(cl-type-of (make-finalizer #'ignore))");
+    let results = ev.eval_str_each("(cl-type-of (make-finalizer (lambda ())))");
     assert_eq!(format_eval_result(&results[0]), "OK finalizer");
-    let results = ev.eval_str_each("(prin1-to-string (make-finalizer #'ignore))");
+    let results = ev.eval_str_each("(prin1-to-string (make-finalizer (lambda ())))");
     assert_eq!(format_eval_result(&results[0]), "OK \"#<finalizer>\"");
 }
 
@@ -17017,7 +17172,7 @@ fn jit_subr_spec_tracks_redefinition_and_rearms() {
 fn jit_subr_spec_arity_and_variadic_stay_generic() {
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
-    use crate::emacs_core::error::map_flow;
+    use crate::emacs_core::print::map_flow;
     let mut ev = Context::new();
 
     // n=2 < put's min_args=3: no site; identical signal hot vs cold.
@@ -17142,7 +17297,7 @@ fn jit_subr_spec_string_queries_match_interpreter() {
                 assert_eq!(sig.symbol_name(), "wrong-number-of-arguments");
                 assert_eq!(sig.data.last(), Some(&Value::fixnum(nargs as i64)));
                 errors.push(format_eval_result(&Err(
-                    crate::emacs_core::error::map_flow(flow),
+                    crate::emacs_core::print::map_flow(flow),
                 )));
             }
             assert_eq!(errors[0], errors[1], "{name}: arity {nargs}");
@@ -17252,7 +17407,7 @@ fn jit_subr_spec_position_queries_match_interpreter() {
                     }
                 }
                 results.push(format_eval_result(
-                    &result.map_err(crate::emacs_core::error::map_flow),
+                    &result.map_err(crate::emacs_core::print::map_flow),
                 ));
             }
             assert_eq!(results[0], results[1], "{name}: {form}");
@@ -17276,7 +17431,7 @@ fn jit_subr_spec_position_queries_match_interpreter() {
                 assert_eq!(sig.symbol_name(), "wrong-number-of-arguments");
                 assert_eq!(sig.data.last(), Some(&Value::fixnum(nargs as i64)));
                 errors.push(format_eval_result(&Err(
-                    crate::emacs_core::error::map_flow(flow),
+                    crate::emacs_core::print::map_flow(flow),
                 )));
             }
             assert_eq!(errors[0], errors[1], "{name}: arity {nargs}");
@@ -17410,7 +17565,7 @@ fn jit_subr_spec_fixed_return_preserves_unwind_protocol() {
             } else {
                 assert!(result.is_err(), "non-local return must propagate");
             }
-            let result = format_eval_result(&result.map_err(crate::emacs_core::error::map_flow));
+            let result = format_eval_result(&result.map_err(crate::emacs_core::print::map_flow));
             let state = ev
                 .eval_str("(list neo-return-binding neo-return-debug neo-return-hook)")
                 .expect("return protocol state");
@@ -17650,7 +17805,7 @@ fn jit_subr_spec_many_side_effect_goldens_match_interp() {
 fn jit_subr_spec_many_signal_parity_armed_vs_interp() {
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
-    use crate::emacs_core::error::map_flow;
+    use crate::emacs_core::print::map_flow;
     let mut ev = Context::new();
     ev.eval_str("(insert \"hello (world\")").expect("buffer"); // unbalanced paren
 
@@ -17735,7 +17890,7 @@ fn jit_subr_spec_many_signal_parity_armed_vs_interp() {
 fn jit_subr_spec_many_put_text_property_arity_and_effect() {
     crate::test_utils::init_test_tracing();
     crate::emacs_core::jit::compile::force_profit_gate_for_test(false);
-    use crate::emacs_core::error::map_flow;
+    use crate::emacs_core::print::map_flow;
     let mut ev = Context::new();
     ev.eval_str("(insert \"hello world\")").expect("buffer");
 
@@ -19638,7 +19793,7 @@ fn jit_bench_big_body_value(tier: BenchTier) -> Value {
 /// process-per-test makes the in-test set reliable).
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_big_body_matcher_shape() {
     crate::test_utils::init_test_tracing();
     // SAFETY: single-threaded test process; set before any JIT dispatch.
@@ -19718,7 +19873,7 @@ fn jit_bench_min(
 /// is free of cross-process CPU-frequency variance.
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_fib() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -19743,7 +19898,7 @@ fn jit_bench_fib() {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_loop() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -19822,7 +19977,7 @@ fn jit_bench_call_bound_caller(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_call_bound_loop() {
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -19930,7 +20085,7 @@ fn jit_bench_builtin_bound_caller(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_builtin_bound_loop() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -19964,7 +20119,7 @@ fn jit_bench_builtin_bound_loop() {
 /// no-warmup throughput the prewarm delivers from call 1).
 #[cfg(all(feature = "jit", target_os = "linux"))]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn aot_bench_compute_loop() {
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -20030,12 +20185,15 @@ fn aot_bench_compute_loop() {
     let ctx = &mut ev as *mut Context;
     let n = 2_000_000i64;
     let want = Value::make_int(n * (n + 1) / 2);
-    let first = crate::emacs_core::jit::cache::try_run_compiled(
-        ctx,
-        &aot_fn,
-        aot_val,
-        &[Value::make_int(n)],
-    )
+    // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+    let first = unsafe {
+        crate::emacs_core::jit::cache::try_run_compiled(
+            ctx,
+            &aot_fn,
+            aot_val,
+            &[Value::make_int(n)],
+        )
+    }
     .expect("aot run ok");
     assert_eq!(first, Some(want.bits()), "AOT compute result");
     assert_eq!(
@@ -20050,12 +20208,15 @@ fn aot_bench_compute_loop() {
         let mut best = std::time::Duration::MAX;
         for _ in 0..9 {
             let t = std::time::Instant::now();
-            let r = crate::emacs_core::jit::cache::try_run_compiled(
-                ctx,
-                &aot_fn,
-                aot_val,
-                &[Value::make_int(n)],
-            )
+            // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+            let r = unsafe {
+                crate::emacs_core::jit::cache::try_run_compiled(
+                    ctx,
+                    &aot_fn,
+                    aot_val,
+                    &[Value::make_int(n)],
+                )
+            }
             .expect("aot run");
             best = best.min(t.elapsed());
             assert_eq!(r, Some(want.bits()));
@@ -20091,7 +20252,7 @@ fn aot_bench_compute_loop() {
 /// native+spec faster) is the ship/defer signal.
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_call_heavy_fontlock_reweight() {
     use crate::emacs_core::bytecode::opcode::Op;
     use crate::emacs_core::jit::compile;
@@ -20259,7 +20420,7 @@ fn jit_bench_call_heavy_fontlock_reweight() {
 /// shows no meaningful win, the re-weight cannot help the realistic shape either.
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_spec_call_dispatch_upper_bound() {
     use crate::emacs_core::jit::compile;
     crate::test_utils::init_test_tracing();
@@ -20357,7 +20518,7 @@ fn jit_bench_spec_call_dispatch_upper_bound() {
 /// in this body, so its `.so` dlopens in the unit-test binary) + inject + force.
 #[cfg(all(feature = "jit", target_os = "linux"))]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn aot_bench_real_algorithm() {
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -20460,12 +20621,15 @@ fn aot_bench_real_algorithm() {
 
     // Confirm AOT-served at heat=0 + correct result (collatz(27)=111).
     let n0 = 27i64;
-    let r0 = crate::emacs_core::jit::cache::try_run_compiled(
-        ctx,
-        &aot_fn,
-        aot_val,
-        &[Value::make_int(n0)],
-    )
+    // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+    let r0 = unsafe {
+        crate::emacs_core::jit::cache::try_run_compiled(
+            ctx,
+            &aot_fn,
+            aot_val,
+            &[Value::make_int(n0)],
+        )
+    }
     .expect("aot run ok");
     assert_eq!(
         r0,
@@ -20508,12 +20672,15 @@ fn aot_bench_real_algorithm() {
                     let mut acc = 0i64;
                     for _ in 0..reps {
                         for &n in calls {
-                            let r = crate::emacs_core::jit::cache::try_run_compiled(
-                                ctx,
-                                aot_fn,
-                                aot_val2,
-                                &[Value::make_int(n)],
-                            )
+                            // SAFETY: `ctx` is the live `Context` this test owns; the call runs in this thread under the dormant-Context contract.
+                            let r = unsafe {
+                                crate::emacs_core::jit::cache::try_run_compiled(
+                                    ctx,
+                                    aot_fn,
+                                    aot_val2,
+                                    &[Value::make_int(n)],
+                                )
+                            }
                             .expect("aot run")
                             .expect("aot served");
                             acc += Value::from_bits(r).as_fixnum().expect("fixnum");
@@ -20578,7 +20745,7 @@ fn aot_bench_real_algorithm() {
 ///     --run-ignored ignored-only --no-capture vm_op_mix_loop
 #[cfg(all(feature = "jit", feature = "vm-profile"))]
 #[test]
-#[ignore = "profiling aid; run explicitly with --features vm-profile --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn vm_op_mix_loop() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -20609,7 +20776,7 @@ fn vm_op_mix_loop() {
 ///     --run-ignored ignored-only --no-capture vm_op_mix_real_elisp
 #[cfg(feature = "vm-profile")]
 #[test]
-#[ignore = "profiling aid; run explicitly with --features vm-profile --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn vm_op_mix_real_elisp() {
     crate::test_utils::init_test_tracing();
     // SAFETY: nextest runs each test in its own process; this write happens before
@@ -20647,7 +20814,7 @@ fn vm_op_mix_real_elisp() {
 ///     --run-ignored ignored-only --no-capture vm_subr_mix_byte_compile
 #[cfg(feature = "vm-profile")]
 #[test]
-#[ignore = "profiling aid; run explicitly with --features vm-profile --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn vm_subr_mix_byte_compile() {
     crate::test_utils::init_test_tracing();
     // SAFETY: nextest runs each test in its own process; this write happens
@@ -20699,7 +20866,7 @@ fn vm_subr_mix_byte_compile() {
 ///     --run-ignored ignored-only --no-capture vm_subr_mix_fontlock
 #[cfg(feature = "vm-profile")]
 #[test]
-#[ignore = "profiling aid; run explicitly with --features vm-profile --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn vm_subr_mix_fontlock() {
     use crate::emacs_core::bytecode::vm::vm_profile;
     crate::test_utils::init_test_tracing();
@@ -20842,7 +21009,7 @@ fn vm_subr_mix_fontlock() {
 ///     --run-ignored ignored-only --no-capture -E 'test(jit_compile_time_profile)'
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "profiling aid; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn jit_compile_time_profile() {
     crate::test_utils::init_test_tracing();
     let mut ev = crate::test_utils::runtime_startup_context();
@@ -20984,7 +21151,7 @@ fn vm_bench_min_call(
 ///   cargo nextest run -p neovm-core --release \
 ///     --run-ignored ignored-only --no-capture -E 'test(vm_bench_call_dispatch)'
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn vm_bench_call_dispatch_closure_sym_vs_val() {
     use crate::emacs_core::bytecode::ByteCodeFunction;
     use crate::emacs_core::bytecode::opcode::Op;
@@ -21087,7 +21254,7 @@ fn vm_bench_varref_loop_caller(var_sym: Value) -> Value {
 ///   cargo nextest run -p neovm-core --release \
 ///     --run-ignored ignored-only --no-capture -E 'test(vm_bench_varref)'
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn vm_bench_varref_localized_vs_plain() {
     crate::test_utils::init_test_tracing();
     // SAFETY: nextest per-process isolation; set before the VM reads the gate.
@@ -21355,7 +21522,7 @@ fn jit_bench_cbsym_value(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_cbsym() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -21420,7 +21587,7 @@ fn jit_bench_cbsym_goto_value(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_cbsym_goto() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -21489,7 +21656,7 @@ fn jit_bench_subr_value(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_subr() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -21569,7 +21736,7 @@ fn jit_bench_many_value(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_many() {
     crate::test_utils::init_test_tracing();
     // Call-DOMINATED body (3 Many calls vs 2 arith) — NotProfitable by default,
@@ -21651,7 +21818,7 @@ fn jit_bench_pred_value(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_pred() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -21716,7 +21883,7 @@ fn jit_bench_cons_value(tier: BenchTier) -> Value {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "macro benchmark; run explicitly in release"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_cons() {
     crate::test_utils::init_test_tracing();
     let mut ev = Context::new();
@@ -22431,7 +22598,7 @@ fn eval_sub_exact_gc_retains_cons_form() {
     ]);
     let result = ev
         .eval_sub(form)
-        .map_err(crate::emacs_core::error::map_flow);
+        .map_err(crate::emacs_core::print::map_flow);
 
     assert_eq!(format_eval_result(&result), "OK 9");
     assert!(ev.gc_count > 0, "exact eval_sub path should trigger GC");
@@ -22446,7 +22613,7 @@ fn apply_exact_gc_retains_rooted_args() {
     let arg = Value::cons(Value::fixnum(12), Value::fixnum(13));
     let result = ev
         .apply(Value::symbol("car"), vec![arg])
-        .map_err(crate::emacs_core::error::map_flow);
+        .map_err(crate::emacs_core::print::map_flow);
 
     assert_eq!(format_eval_result(&result), "OK 12");
     assert!(ev.gc_count > 0, "exact apply path should trigger GC");
@@ -23949,6 +24116,12 @@ fn command_loop_input_interval_triggers_auto_save_hook() {
 /// Emacs subsequently remains idle for `auto-save-timeout` seconds.  The
 /// timeout is independent of `auto-save-interval`; disabling the event-count
 /// trigger must not disable the idle trigger.
+///
+/// No clock decides when the loop stops: the auto-save hook itself queues the
+/// stop key on `unread-command-events`, which GNU `read_char` rereads right
+/// after the idle `Fdo_auto_save` (keyboard.c:2964-2970, 2990-2992).  The idle
+/// deadline is therefore the only timed step, and a starved runner can only
+/// delay it.
 #[test]
 fn command_loop_idle_timeout_triggers_auto_save_hook() {
     crate::test_utils::init_test_tracing();
@@ -23978,7 +24151,9 @@ fn command_loop_idle_timeout_triggers_auto_save_hook() {
              (setq auto-save-hook
                    (list (lambda ()
                            (setq neo-idle-auto-save-hook-count
-                                 (1+ neo-idle-auto-save-hook-count)))))
+                                 (1+ neo-idle-auto-save-hook-count))
+                           (setq unread-command-events
+                                 (append unread-command-events (list ?q))))))
              (fset 'neo-stop-idle-auto-save-probe-command
                    (lambda ()
                      (interactive)
@@ -23988,27 +24163,35 @@ fn command_loop_idle_timeout_triggers_auto_save_hook() {
     )
     .expect("install idle auto-save command-loop probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
-    let _tx_keepalive = tx.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        tx.send(crate::keyboard::InputEvent::key_press(
+    let input = crate::host_input::HostInputPublisher::install(&mut ev);
+    input
+        .send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char('a'),
         ))
-        .expect("send editing keypress");
-        // Bound the test even while the idle auto-save implementation is
-        // absent: this real command stops the loop after the GNU deadline.
-        thread::sleep(Duration::from_millis(1_950));
-        tx.send(crate::keyboard::InputEvent::key_press(
-            crate::keyboard::KeyEvent::char('q'),
-        ))
-        .expect("send stop keypress");
+        .expect("queue editing keypress");
+    // Without an idle auto-save the loop would wait for input forever.  The
+    // guard turns that regression into the assertion below instead of a
+    // nextest timeout; a passing run cancels it long before it fires.
+    let (loop_returned, cancel_guard) = crossbeam_channel::bounded::<()>(0);
+    let guard_input = input.clone();
+    let guard = thread::spawn(move || {
+        const HANG_GUARD: Duration = Duration::from_secs(300);
+        if let Err(crossbeam_channel::RecvTimeoutError::Timeout) =
+            cancel_guard.recv_timeout(HANG_GUARD)
+        {
+            guard_input
+                .send(crate::keyboard::InputEvent::key_press(
+                    crate::keyboard::KeyEvent::char('q'),
+                ))
+                .expect("stop a loop that never auto-saved");
+        }
     });
     ev.command_loop.running = true;
 
-    ev.recursive_edit_inner()
-        .expect("command loop should exit through the stop command");
+    let result = ev.recursive_edit_inner();
+    drop(loop_returned);
+    guard.join().expect("hang guard");
+    result.expect("command loop should exit through the stop command");
 
     assert_eq!(
         ev.eval_symbol("neo-idle-auto-save-hook-count")
@@ -24170,8 +24353,8 @@ fn yes_or_no_p_preserves_callers_real_this_command() {
     )
     .expect("install yes-or-no-p caller-preservation probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     let _tx_keepalive = tx;
     for event in ['a', 'y', 'e', 's', '\r'] {
         ev.command_loop
@@ -24222,7 +24405,7 @@ fn command_loop_dispatches_select_window_before_following_key() {
         .unwrap_or_else(|error| {
             panic!(
                 "create second window: {}",
-                crate::emacs_core::error::format_eval_result(&Err(error))
+                crate::emacs_core::format_eval_result(&Err(error))
             )
         });
     let target_window_id = target_window
@@ -24555,7 +24738,7 @@ fn bench_jit_vs_vm_loop() {
 /// under debug therefore wins in release a fortiori.
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "manual perf measurement; A/B via NEOVM_JIT_THRESHOLD, one process per value"]
+#[cfg(feature = "perf-probes")]
 fn jit_bench_threshold_economics() {
     crate::test_utils::init_test_tracing();
     use crate::emacs_core::bytecode::ByteCodeFunction;
@@ -25282,7 +25465,7 @@ fn gc_concurrent_obarray_scan_vs_defalias_churn() {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture -E 'test(gc_drain_kinds_profile_pdump)'
 #[test]
-#[ignore = "profiling aid; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn gc_drain_kinds_profile_pdump() {
     gc_drain_kinds_profile(true, 400);
 }
@@ -25292,7 +25475,7 @@ fn gc_drain_kinds_profile_pdump() {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture -E 'test(gc_drain_kinds_profile_plain)'
 #[test]
-#[ignore = "profiling aid; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn gc_drain_kinds_profile_plain() {
     gc_drain_kinds_profile(false, 400);
 }
@@ -25403,7 +25586,7 @@ fn alloc_class_profile(pdump: bool) {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture -E 'test(alloc_class_profile_pdump)'
 #[test]
-#[ignore = "profiling aid; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn alloc_class_profile_pdump() {
     alloc_class_profile(true);
 }
@@ -25413,7 +25596,7 @@ fn alloc_class_profile_pdump() {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture -E 'test(alloc_class_profile_plain)'
 #[test]
-#[ignore = "profiling aid; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn alloc_class_profile_plain() {
     alloc_class_profile(false);
 }
@@ -25460,7 +25643,7 @@ fn bc_isolation_phase(ev: &mut Context, label: &str, defun: &str, call: &str, ou
 ///   cargo nextest run -p neovm-core --run-ignored ignored-only \
 ///     --no-capture -E 'test(alloc_probe_bytecode_hash_isolation)'
 #[test]
-#[ignore = "profiling aid; run explicitly with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn alloc_probe_bytecode_hash_isolation() {
     use crate::tagged::gc::alloc_probe;
     crate::test_utils::init_test_tracing();
@@ -28268,8 +28451,8 @@ fn native_input_progress_waits_through_command_hooks_and_finalization() {
     let stream = neomacs_display_protocol::input_progress::InputStream::default();
     let receipt = stream.issue().unwrap();
     let frame = ev.frames.selected_frame().unwrap().id.0;
-    let (tx, rx) = crossbeam_channel::unbounded();
-    ev.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut ev);
+
     tx.send(crate::keyboard::InputEvent::Tracked {
         receipt: receipt.clone(),
         event: Box::new(crate::keyboard::InputEvent::KeyPress {

@@ -18,6 +18,7 @@ use winit::window::{
 
 use super::cursor::{CursorState, CursorTarget};
 pub(crate) use super::frame_compositor::{FrameCompositor, RetainedCursorCell, RetainedStatic};
+use super::frame_sched::RenderWork;
 use super::geometry_hints::apply_window_geometry_hints;
 use super::state::{
     FpsCounter, GuiChromeInteractionState, IdleDimState, ImeCursorArea, PendingPointerDamage,
@@ -38,7 +39,7 @@ use neomacs_display_protocol::{
 use neomacs_renderer_wgpu::{WgpuGlyphAtlas, WgpuRenderer};
 use neovm_core::window::GuiFrameGeometryHints;
 
-use crate::thread_comm::WindowFullscreenMode;
+use crate::thread_comm::{WindowFullscreenMode, WindowVisibility};
 
 /// How close together two titlebar clicks must be to count as a double click.
 const TITLEBAR_DOUBLE_CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -423,6 +424,8 @@ pub(crate) enum ChromePress {
 /// [`FrameLifecycle::Active`].
 pub(crate) struct GuiFrameWindowState {
     pub(super) lifecycle: FrameLifecycle,
+    /// Logical mapping intent survives native-surface suspension/recreation.
+    pub(super) visibility: WindowVisibility,
     /// A scale notification is not yet a size observation. Keep it out of
     /// committed render geometry until the corresponding native size is known.
     pub(super) pending_scale_factor: Option<f64>,
@@ -1119,6 +1122,11 @@ impl GuiFrameRenderState {
     }
 
     pub(super) fn clear_ime_preedit(&mut self) {
+        // Cursor synchronization calls this on every poll when the selected
+        // window hides its cursor. An already-empty composition owes no paint.
+        if !self.input_method.has_preedit() {
+            return;
+        }
         self.input_method.clear();
         self.compositor.dirty = true;
     }
@@ -1142,8 +1150,17 @@ impl GuiFrameRenderState {
         self.compositor.cursor_dirty && self.compositor.current_frame.is_some()
     }
 
-    pub(super) fn begin_presentable_render(&mut self) {
-        self.compositor.dirty = false;
+    /// Consume only the damage the selected rendering strategy will paint.
+    /// A cursor composite cannot satisfy pending scene damage, even if it
+    /// reaches the surface before the scene's paced redisplay deadline.
+    pub(super) fn begin_presentable_render(&mut self, work: RenderWork) {
+        match work {
+            RenderWork::None => return,
+            RenderWork::CompositeOnly { .. } => {}
+            RenderWork::RepaintLayers { .. } | RenderWork::RebuildScene => {
+                self.compositor.dirty = false;
+            }
+        }
         self.compositor.cursor_dirty = false;
         // The measurement baseline advances here and nowhere else, because this
         // is the first point at which the retained presentation is committed to
@@ -1483,7 +1500,31 @@ impl FrameLifecycle {
     }
 }
 
+pub(super) fn apply_window_visibility(window: &dyn Window, visibility: WindowVisibility) {
+    match visibility {
+        WindowVisibility::Visible => {
+            window.set_visible(true);
+            window.set_minimized(false);
+        }
+        WindowVisibility::Iconified => {
+            window.set_visible(true);
+            window.set_minimized(true);
+        }
+        WindowVisibility::Invisible => {
+            window.set_minimized(false);
+            window.set_visible(false);
+        }
+    }
+}
+
 impl GuiFrameWindowState {
+    pub(super) fn set_visibility(&mut self, visibility: WindowVisibility) {
+        self.visibility = visibility;
+        if let Some(window) = self.window() {
+            apply_window_visibility(window.as_ref(), visibility);
+        }
+    }
+
     /// Redraw is also winit's safe-area-change notification. Observe native
     /// chrome here so an inset-only change reaches layout without requiring
     /// a surface resize event.
@@ -1929,6 +1970,7 @@ pub(crate) struct PendingWindow {
     pub geometry_hints: GuiFrameGeometryHints,
     /// Create the window override-redirect (GNU's `x-no-window-manager`).
     pub override_redirect: bool,
+    pub visibility: WindowVisibility,
 }
 
 impl GuiFrameWindowManager {
@@ -2070,6 +2112,7 @@ impl GuiFrameWindowManager {
         title: String,
         geometry_hints: GuiFrameGeometryHints,
         override_redirect: bool,
+        visibility: WindowVisibility,
     ) {
         self.pending_creates.push(PendingWindow {
             emacs_frame_id,
@@ -2078,7 +2121,30 @@ impl GuiFrameWindowManager {
             title,
             geometry_hints,
             override_redirect,
+            visibility,
         });
+    }
+
+    /// Retain visibility even while native creation is pending.
+    pub(super) fn set_visibility(
+        &mut self,
+        emacs_frame_id: u64,
+        visibility: WindowVisibility,
+    ) -> bool {
+        if let Some(window) = self.get_mut(emacs_frame_id) {
+            window.set_visibility(visibility);
+            return true;
+        }
+        let mut found = false;
+        for pending in self
+            .pending_creates
+            .iter_mut()
+            .filter(|pending| pending.emacs_frame_id == emacs_frame_id)
+        {
+            pending.visibility = visibility;
+            found = true;
+        }
+        found
     }
 
     /// Schedule a window for destruction.
@@ -2113,6 +2179,7 @@ impl GuiFrameWindowManager {
 
             let attrs = winit::window::WindowAttributes::default()
                 .with_title(&req.title)
+                .with_visible(req.visibility.is_visible_or_iconified())
                 .with_surface_size(window_size_from_emacs_pixels(req.width, req.height))
                 .with_transparent(true)
                 .with_decorations(self.chrome_defaults.decorations_enabled);
@@ -2129,6 +2196,9 @@ impl GuiFrameWindowManager {
             match event_loop.create_window(attrs) {
                 Ok(window) => {
                     let window: Arc<dyn winit::window::Window> = Arc::from(window);
+                    if matches!(req.visibility, WindowVisibility::Iconified) {
+                        window.set_minimized(true);
+                    }
                     window_icon.apply(window.as_ref());
                     let raw_scale_factor = window.scale_factor();
                     let scale_factor = effective_window_scale_factor(raw_scale_factor);
@@ -2241,6 +2311,7 @@ impl GuiFrameWindowManager {
                     self.windows.insert(
                         FrameKey::Adopted(req.emacs_frame_id),
                         GuiFrameWindowState {
+                            visibility: req.visibility,
                             pending_scale_factor: None,
                             lifecycle: FrameLifecycle::Active {
                                 native: GuiFrameNativeWindowState {

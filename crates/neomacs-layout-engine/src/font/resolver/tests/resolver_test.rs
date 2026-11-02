@@ -657,6 +657,79 @@ struct MetricBackend {
     probes: Arc<AtomicUsize>,
 }
 
+struct ExactLookupBackend {
+    selected: FontCandidate,
+    lookups: Arc<AtomicUsize>,
+}
+
+impl FontBackend for ExactLookupBackend {
+    fn kind(&self) -> FontBackendKind {
+        FontBackendKind::CoreText
+    }
+
+    fn list_families(&self) -> Vec<FontFamilyName> {
+        Vec::new()
+    }
+
+    fn resolve_family(&self, family: &str) -> String {
+        family.to_owned()
+    }
+
+    fn family_prefers_monospace(&self, _family: &str) -> bool {
+        false
+    }
+
+    fn list_candidates(&self, _query: &FontCandidateQuery) -> Vec<FontCandidate> {
+        panic!("exact observation must not use ordinary enumeration")
+    }
+
+    fn list_candidates_for_identity(
+        &self,
+        query: &FontCandidateQuery,
+        identity: &ResolvedFontIdentity,
+    ) -> Vec<FontCandidate> {
+        assert_eq!(*identity, self.selected.matched.identity);
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        match query.scope {
+            FontCandidateScope::All => vec![self.selected.clone()],
+            FontCandidateScope::Family(_) => Vec::new(),
+            _ => panic!("unexpected exact-observation scope"),
+        }
+    }
+
+    fn advance_catalog_generation(&mut self) {}
+
+    fn poll_catalog_change(&mut self) -> crate::font::catalog::FontCatalogChange {
+        crate::font::catalog::FontCatalogChange::Unchanged
+    }
+}
+
+#[test]
+fn exact_observation_dispatches_identity_lookup_for_both_scopes() {
+    let selected = candidate("Fixture", 400, FontSlant::Normal, 100);
+    let identity = selected.matched.identity.clone();
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let resolver = FontResolver::new(Box::new(ExactLookupBackend {
+        selected,
+        lookups: Arc::clone(&lookups),
+    }));
+
+    let observed = resolver
+        .observe_exact_font(&identity, "Synthetic fontdb family")
+        .expect("all-font identity lookup finds the selected face");
+    assert_eq!(observed.identity, identity);
+    assert_eq!(lookups.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        resolver.observe_exact_font(&identity, "Synthetic fontdb family"),
+        Some(observed)
+    );
+    assert_eq!(
+        lookups.load(Ordering::Relaxed),
+        2,
+        "cache hits skip discovery"
+    );
+}
+
 impl FontBackend for MetricBackend {
     fn kind(&self) -> FontBackendKind {
         FontBackendKind::CoreText
@@ -877,7 +950,11 @@ fn captured_character_policy_selects_on_a_thread_without_evaluator_state() {
             "fontset repertory is not native glyph coverage"
         );
         assert_eq!(
-            policy.families.search_order(str::to_owned),
+            policy
+                .families
+                .search_order(str::to_owned)
+                .map(Option::<String>::from)
+                .collect::<Vec<_>>(),
             vec![Some("Fixture Sans".into())]
         );
         let resolver = FontResolver::new(Box::new(CandidateBackend { candidates }));
@@ -894,13 +971,18 @@ fn captured_character_policy_selects_on_a_thread_without_evaluator_state() {
 
 #[test]
 fn captured_family_policy_keeps_alias_order_and_fallback_boundary() {
-    let families = CapturedFontFamilyPolicy::Inherited(vec!["Alias".into(), "Second".into()]);
+    let families = CapturedFontFamilyPolicy::Inherited(
+        ["Alias".into(), "Second".into()].into_iter().collect(),
+    );
     let resolve = |family: &str| match family {
         "Alias" => "Native".to_owned(),
         _ => family.to_owned(),
     };
     assert_eq!(
-        families.search_order(resolve),
+        families
+            .search_order(resolve)
+            .map(Option::<String>::from)
+            .collect::<Vec<_>>(),
         vec![
             Some("Native".into()),
             Some("Alias".into()),
@@ -909,11 +991,17 @@ fn captured_family_policy_keeps_alias_order_and_fallback_boundary() {
         ]
     );
     assert_eq!(
-        CapturedFontFamilyPolicy::Explicit("Alias".into()).search_order(resolve),
+        CapturedFontFamilyPolicy::Explicit("Alias".into())
+            .search_order(resolve)
+            .map(Option::<String>::from)
+            .collect::<Vec<_>>(),
         vec![Some("Native".into())]
     );
     assert_eq!(
-        CapturedFontFamilyPolicy::Inherited(Vec::new()).search_order(resolve),
+        CapturedFontFamilyPolicy::Inherited(std::iter::empty().collect())
+            .search_order(resolve)
+            .map(Option::<String>::from)
+            .collect::<Vec<_>>(),
         vec![None]
     );
 }
@@ -1118,3 +1206,6 @@ fn opening_by_spec_driver_fallback_replaces_unavailable_explicit_style_with_norm
     let opened = resolver.resolve_entity(&query).expect("fallback face");
     assert_eq!(opened.matched.weight(), Some(400));
 }
+
+#[path = "worker_family_laziness_test.rs"]
+mod worker_family_laziness_test;

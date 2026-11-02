@@ -25,7 +25,7 @@ use super::value::{Value, ValueKind, VecLikeType};
 use super::window_cmds::{
     DeleteFrameMode, FRAME_TEXT_LINES_PARAM, FRAME_TOTAL_COLS_PARAM, FRAME_TOTAL_LINES_PARAM,
     FrameResizeRequest, FrameSizeParam, LIVE_GUI_RESIZE_ACK_TIMEOUT, MIN_FRAME_TEXT_LINES,
-    delete_frame_owned, ensure_selected_frame_id_in_state, expect_int,
+    OtherFramePurpose, delete_frame_owned, ensure_selected_frame_id_in_state, expect_int,
     flush_pending_live_gui_resize, frame_is_top_level_non_window, frame_name_parameter_value,
     frame_non_text_total_height_pixels, frame_non_text_total_width_pixels_in_state,
     frame_realized_lines, frame_size_param_to_cells, frame_size_param_to_pixels,
@@ -262,7 +262,7 @@ pub(crate) fn builtin_make_frame_invisible(
         )?
     };
     let force = args.get(1).copied().unwrap_or(Value::NIL).is_truthy();
-    if !force && !other_frames_in_state(eval, fid, false) {
+    if !force && !other_frames_in_state(eval, fid, OtherFramePurpose::MakeInvisible) {
         return Err(signal(
             "error",
             vec![Value::string(
@@ -410,7 +410,7 @@ pub(crate) fn builtin_visible_frame_list(
 /// GNU Emacs returns the default character height in pixels for FRAME.
 pub(crate) fn builtin_frame_char_height(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     let (frames, buffers) = (&mut eval.frames, &mut eval.buffers);
     expect_max_args("frame-char-height", &args, 1)?;
@@ -429,7 +429,7 @@ pub(crate) fn builtin_frame_char_height(
 /// GNU Emacs returns the default character width in pixels for FRAME.
 pub(crate) fn builtin_frame_char_width(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     let (frames, buffers) = (&mut eval.frames, &mut eval.buffers);
     expect_max_args("frame-char-width", &args, 1)?;
@@ -782,6 +782,13 @@ pub(crate) fn builtin_set_frame_height(
     {
         ctx.gnu_mark_frame_redisplay(fid);
         ctx.gnu_mark_frame_window_change(fid);
+        // A child frame's new size reaches the compositor only through the
+        // PARENT's published display state, and a parent's redisplay
+        // signature does not carry a child's geometry: under the legacy
+        // policy the resize would be skipped and the child would keep its
+        // old size on screen (the animation fixture's 12s resize never
+        // reached the render thread).  Bump the generation as a move does.
+        ctx.invalidate_redisplay();
     }
     Ok(Value::NIL)
 }
@@ -885,6 +892,13 @@ pub(crate) fn builtin_set_frame_width(
     {
         ctx.gnu_mark_frame_redisplay(fid);
         ctx.gnu_mark_frame_window_change(fid);
+        // A child frame's new size reaches the compositor only through the
+        // PARENT's published display state, and a parent's redisplay
+        // signature does not carry a child's geometry: under the legacy
+        // policy the resize would be skipped and the child would keep its
+        // old size on screen (the animation fixture's 12s resize never
+        // reached the render thread).  Bump the generation as a move does.
+        ctx.invalidate_redisplay();
     }
     Ok(Value::NIL)
 }
@@ -1021,8 +1035,31 @@ pub(crate) fn builtin_set_frame_size(
     {
         ctx.gnu_mark_frame_redisplay(fid);
         ctx.gnu_mark_frame_window_change(fid);
+        // A child frame's new size reaches the compositor only through the
+        // PARENT's published display state, and a parent's redisplay
+        // signature does not carry a child's geometry: under the legacy
+        // policy the resize would be skipped and the child would keep its
+        // old size on screen (the animation fixture's 12s resize never
+        // reached the render thread).  Bump the generation as a move does.
+        ctx.invalidate_redisplay();
     }
     Ok(Value::NIL)
+}
+
+/// Schedule the repaint a frame's changed geometry needs.
+///
+/// A GUI frame's placement and size only reach the compositor through the
+/// next published display state.  A moved frame changes neither its root
+/// window nor the parent's redisplay signature; GNU moves the native window
+/// inside the same call (`set_frame_offset_hook`, src/frame.c:5366-5369),
+/// while Neomacs composites child frames itself, so publishing IS the move.
+/// A resized child frame has the same problem: the size lives in the child's
+/// geometry, which no parent signature covers.  Both redisplay policies are
+/// covered: the per-frame GNU mark (fset_redisplay) and the generation bump
+/// the legacy engine's idle-skip test reads.
+fn mark_frame_geometry_changed(eval: &mut super::eval::Context, frame: FrameId) {
+    eval.gnu_mark_frame_redisplay(frame);
+    eval.invalidate_redisplay();
 }
 
 /// `(set-frame-position FRAME X Y)` -> t.
@@ -1049,8 +1086,11 @@ pub(crate) fn builtin_set_frame_position(
     };
     let x = FramePositionSpec::from_coordinate(args[1], origin)?;
     let y = FramePositionSpec::from_coordinate(args[2], origin)?;
-    if frame.effective_window_system().is_some() || frame.parent_frame.as_frame_id().is_some() {
-        apply_frame_position(frames, fid, Some(x), Some(y));
+    let positioned =
+        frame.effective_window_system().is_some() || frame.parent_frame.as_frame_id().is_some();
+    let moved = positioned && apply_frame_position(frames, fid, Some(x), Some(y));
+    if moved {
+        mark_frame_geometry_changed(eval, fid);
     }
     Ok(Value::T)
 }
@@ -1097,7 +1137,9 @@ pub(crate) fn builtin_set_frame_size_and_position_pixelwise(
 
     builtin_set_frame_size(eval, vec![args[0], args[1], args[2], Value::T])?;
     if uses_window_system_pixels || is_child_frame {
-        apply_frame_position(&mut eval.frames, fid, Some(left), Some(top));
+        if apply_frame_position(&mut eval.frames, fid, Some(left), Some(top)) {
+            mark_frame_geometry_changed(eval, fid);
+        }
     } else {
         let frame = eval
             .frames
@@ -1403,7 +1445,7 @@ pub(crate) fn builtin_set_frame_window_state_change(
 
 pub(crate) fn builtin_frame_parameter(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_min_args("frame-parameter", &args, 2)?;
     expect_max_args("frame-parameter", &args, 2)?;
@@ -1603,7 +1645,7 @@ pub(crate) fn builtin_frame_child_frame_border_width(
 
 pub(crate) fn builtin_frame_internal_border_width(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_max_args("frame-internal-border-width", &args, 1)?;
     let fid = resolve_frame_id_in_state(
@@ -2057,7 +2099,9 @@ pub(crate) fn builtin_modify_frame_parameters(
         eval.gnu_mark_frame_redisplay(fid);
         eval.gnu_mark_frame_window_change(fid);
     }
-    apply_frame_position(&mut eval.frames, fid, requested_left, requested_top);
+    if apply_frame_position(&mut eval.frames, fid, requested_left, requested_top) {
+        mark_frame_geometry_changed(eval, fid);
+    }
 
     Ok(Value::NIL)
 }
@@ -2149,10 +2193,7 @@ pub(crate) fn builtin_framep(eval: &mut super::eval::Context, args: Vec<Value>) 
 }
 
 /// `(frame-live-p OBJ)` -> t if OBJ is a live frame object or frame id.
-pub(crate) fn builtin_frame_live_p(
-    eval: &mut super::eval::Context,
-    args: Vec<Value>,
-) -> EvalResult {
+pub(crate) fn builtin_frame_live_p(eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     let frames = &eval.frames;
     expect_args("frame-live-p", &args, 1)?;
     let id = match args[0].kind() {
@@ -2336,7 +2377,7 @@ pub(crate) fn request_live_gui_frame_resize_and_keep_pending(
     request: FrameResizeRequest,
 ) -> Result<(), Flow> {
     let (text_width_px, text_height_px) = request.text_pixels(frames, fid)?;
-    let (total_width_px, total_height_px, title, geometry_hints) = {
+    let (total_width_px, total_height_px, title, geometry_hints, visibility, decorated) = {
         let frame = frames
             .get(fid)
             .ok_or_else(|| signal("error", vec![Value::string("Frame not found")]))?;
@@ -2347,6 +2388,10 @@ pub(crate) fn request_live_gui_frame_resize_and_keep_pending(
             text_height_px.saturating_add(non_text_height).max(1),
             frame.host_title_lisp_string(),
             frame.gui_geometry_hints(),
+            frame.visibility,
+            frame
+                .known_parameter(FrameParam::Undecorated)
+                .is_none_or(|value| value.is_nil()),
         )
     };
 
@@ -2371,6 +2416,8 @@ pub(crate) fn request_live_gui_frame_resize_and_keep_pending(
         height: total_height_px,
         title,
         geometry_hints,
+        visibility,
+        decorated,
         fullscreen: None,
         override_redirect: false,
     })
@@ -2513,6 +2560,44 @@ pub(crate) fn frame_parameter_value(
             if frame.effective_window_system().is_none() =>
         {
             return Value::NIL;
+        }
+        // On a GUI frame GNU answers these four from the frame's realized
+        // state rather than from the stored parameter alist:
+        // `vertical-scroll-bars' comes from the internal type (left/right/nil)
+        // and `horizontal-scroll-bars' is normalized to t/nil
+        // (src/frame.c:4191-4198); `scroll-bar-width' and `scroll-bar-height'
+        // report the configured thickness, which is the toolkit default (16)
+        // when the frame names none and stays non-nil while the bars are
+        // switched off (src/frame.c:5437-5456).
+        FrameParamKey::Known(FrameParam::VerticalScrollBars) => {
+            return crate::window::frame_vertical_scroll_bar_side(frame).unwrap_or(Value::NIL);
+        }
+        FrameParamKey::Known(FrameParam::HorizontalScrollBars) => {
+            return if crate::window::frame_has_horizontal_scroll_bar(frame) {
+                Value::T
+            } else {
+                Value::NIL
+            };
+        }
+        FrameParamKey::Known(FrameParam::ScrollBarWidth)
+            if frame.effective_window_system().is_some() =>
+        {
+            let width = crate::window::frame_config_scroll_bar_width(frame);
+            return if width > 0 {
+                Value::fixnum(i64::from(width))
+            } else {
+                Value::NIL
+            };
+        }
+        FrameParamKey::Known(FrameParam::ScrollBarHeight)
+            if frame.effective_window_system().is_some() =>
+        {
+            let height = crate::window::frame_config_scroll_bar_height(frame);
+            return if height > 0 {
+                Value::fixnum(i64::from(height))
+            } else {
+                Value::NIL
+            };
         }
         FrameParamKey::Known(FrameParam::Font) if frame.effective_window_system().is_none() => {
             return Value::string("tty");

@@ -3,7 +3,7 @@ use crate::display_row::metrics::DisplayRowFallbackMetrics;
 
 fn face(family: &str, size: f32) -> ResolvedFace {
     let mut face = ResolvedFace::default();
-    face.font_family = family.to_string();
+    face.font_family = std::sync::Arc::from(family);
     face.font_weight = 400;
     face.italic = false;
     face.font_size = size;
@@ -29,7 +29,7 @@ fn basis<'a>(canonical: &'a ResolvedFace) -> DisplayHeightFaceBasis<'a> {
 fn height_adjusted_face_measures_the_scaled_font_when_a_service_is_available() {
     let _eval = neovm_core::emacs_core::Context::new();
     let canonical = face("Monospace", 13.0);
-    let mut service = FontMetricsService::new();
+    let mut service = crate::font::metrics::test_catalog::metrics_service();
 
     let measured = height_adjusted_face(
         &canonical,

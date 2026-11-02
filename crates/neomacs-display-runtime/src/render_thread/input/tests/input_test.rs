@@ -62,6 +62,18 @@ fn make_test_app(width: u32, height: u32, scale_factor: f64) -> RenderApp {
     make_test_app_with_input(width, height, scale_factor).0
 }
 
+/// Put the primary window in borderless mode with an explicit custom-titlebar
+/// height. Zero means no custom titlebar; the top rows stay buffer text.
+fn set_undecorated_titlebar_height(app: &mut RenderApp, height: f32) {
+    let chrome = app
+        .frame_windows
+        .primary_window_mut()
+        .expect("primary window state")
+        .chrome_mut();
+    chrome.decorations_enabled = false;
+    chrome.titlebar_height = height;
+}
+
 fn make_test_app_with_input(
     width: u32,
     height: u32,
@@ -1124,7 +1136,9 @@ fn real_layout_publication_routes_overlapping_children_by_published_z_order() {
             frame.top_pos = 15;
         }
     }
-    let mut engine = neomacs_layout_engine::LayoutEngine::new();
+    // Publication/z-order uses explicit logical metrics, as the nested-child
+    // fixture below does. No native font selection is part of this contract.
+    let mut engine = neomacs_layout_engine::LayoutEngine::new_without_font_metrics();
     let mut layout = |frame_id| match engine.redisplay_frame_attempt(&mut eval, frame_id) {
         neomacs_layout_engine::engine::FrameLayoutAttempt::Prepared(frame) => frame.materialize(),
         neomacs_layout_engine::engine::FrameLayoutAttempt::Aborted => {
@@ -2315,6 +2329,74 @@ fn resize_edge_returns_none_when_decorations_enabled() {
     assert_eq!(app.detect_resize_edge(400.0, 300.0), None);
 }
 
+#[test]
+fn resize_edge_top_requires_custom_titlebar() {
+    let mut app = make_test_app(800, 600, 1.0);
+    set_undecorated_titlebar_height(&mut app, 0.0);
+
+    // With no custom titlebar, the top rows are buffer text. The top edge
+    // must not turn a left press into a resize before it reaches the buffer.
+    assert_eq!(app.detect_resize_edge(400.0, 0.0), None);
+    assert_eq!(app.detect_resize_edge(400.0, 4.9), None);
+    // The top corners are buffer text too; side edges are gated below.
+    assert_eq!(app.detect_resize_edge(0.0, 0.0), None);
+    assert_eq!(app.detect_resize_edge(799.0, 0.0), None);
+
+    // An explicit custom titlebar restores the top resize edge.
+    set_undecorated_titlebar_height(&mut app, 30.0);
+    assert_eq!(
+        app.detect_resize_edge(400.0, 0.0),
+        Some(ResizeDirection::North)
+    );
+    assert_eq!(
+        app.detect_resize_edge(0.0, 0.0),
+        Some(ResizeDirection::NorthWest)
+    );
+    assert_eq!(
+        app.detect_resize_edge(799.0, 0.0),
+        Some(ResizeDirection::NorthEast)
+    );
+}
+
+#[test]
+fn resize_edge_sides_require_custom_titlebar() {
+    let mut app = make_test_app(800, 600, 1.0);
+    set_undecorated_titlebar_height(&mut app, 0.0);
+
+    // Side columns are buffer text when there is no custom titlebar, so a
+    // left press there must reach the buffer instead of resizing the frame.
+    assert_eq!(app.detect_resize_edge(0.0, 300.0), None);
+    assert_eq!(app.detect_resize_edge(4.9, 300.0), None);
+    assert_eq!(app.detect_resize_edge(795.0, 300.0), None);
+    assert_eq!(app.detect_resize_edge(799.0, 300.0), None);
+
+    // The bottom edge remains available for mouse resizing, including at
+    // the corners where the side edges no longer apply.
+    assert_eq!(
+        app.detect_resize_edge(400.0, 599.0),
+        Some(ResizeDirection::South)
+    );
+    assert_eq!(
+        app.detect_resize_edge(0.0, 599.0),
+        Some(ResizeDirection::South)
+    );
+    assert_eq!(
+        app.detect_resize_edge(799.0, 599.0),
+        Some(ResizeDirection::South)
+    );
+
+    // A custom titlebar restores both side edges.
+    set_undecorated_titlebar_height(&mut app, 30.0);
+    assert_eq!(
+        app.detect_resize_edge(0.0, 300.0),
+        Some(ResizeDirection::West)
+    );
+    assert_eq!(
+        app.detect_resize_edge(799.0, 300.0),
+        Some(ResizeDirection::East)
+    );
+}
+
 // ===================================================================
 // detect_resize_edge — corners (5px border zone)
 // ===================================================================
@@ -2322,11 +2404,7 @@ fn resize_edge_returns_none_when_decorations_enabled() {
 #[test]
 fn resize_edge_top_left_corner() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     assert_eq!(
         app.detect_resize_edge(0.0, 0.0),
         Some(ResizeDirection::NorthWest)
@@ -2340,11 +2418,7 @@ fn resize_edge_top_left_corner() {
 #[test]
 fn resize_edge_top_right_corner() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     // w=800, border=5 => on_right when x >= 795
     assert_eq!(
         app.detect_resize_edge(795.0, 0.0),
@@ -2359,11 +2433,7 @@ fn resize_edge_top_right_corner() {
 #[test]
 fn resize_edge_bottom_left_corner() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     // h=600, border=5 => on_bottom when y >= 595
     assert_eq!(
         app.detect_resize_edge(0.0, 595.0),
@@ -2378,11 +2448,7 @@ fn resize_edge_bottom_left_corner() {
 #[test]
 fn resize_edge_bottom_right_corner() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     assert_eq!(
         app.detect_resize_edge(795.0, 595.0),
         Some(ResizeDirection::SouthEast)
@@ -2400,11 +2466,7 @@ fn resize_edge_bottom_right_corner() {
 #[test]
 fn resize_edge_left() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     // Left edge, but not in top or bottom border zone
     assert_eq!(
         app.detect_resize_edge(0.0, 300.0),
@@ -2419,11 +2481,7 @@ fn resize_edge_left() {
 #[test]
 fn resize_edge_right() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     assert_eq!(
         app.detect_resize_edge(795.0, 300.0),
         Some(ResizeDirection::East)
@@ -2437,11 +2495,7 @@ fn resize_edge_right() {
 #[test]
 fn resize_edge_top() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     // Top edge, but not in left or right border zone
     assert_eq!(
         app.detect_resize_edge(400.0, 0.0),
@@ -2497,11 +2551,7 @@ fn resize_edge_interior_returns_none() {
 #[test]
 fn resize_edge_boundary_exact() {
     let mut app = make_test_app(800, 600, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     // x=5.0 is NOT on_left (on_left requires x < 5.0)
     assert_eq!(app.detect_resize_edge(5.0, 300.0), None);
     // x=4.999... is still on_left
@@ -2534,11 +2584,7 @@ fn resize_edge_boundary_exact() {
 #[test]
 fn resize_edge_small_window() {
     let mut app = make_test_app(10, 10, 1.0);
-    app.frame_windows
-        .primary_window_mut()
-        .expect("primary window state")
-        .chrome_mut()
-        .decorations_enabled = false;
+    set_undecorated_titlebar_height(&mut app, 30.0);
     // At (0,0) — top-left corner (left and top overlap)
     assert_eq!(
         app.detect_resize_edge(0.0, 0.0),
@@ -2561,6 +2607,30 @@ fn resize_edge_small_window() {
 // ===================================================================
 // titlebar_hit_test — decorations enabled (always 0)
 // ===================================================================
+
+#[test]
+fn undecorated_frame_titlebar_requires_explicit_height() {
+    use crate::thread_comm::{ConfigCommand, WindowCommand};
+
+    let mut app = make_test_app(800, 600, 1.0);
+    app.handle_window(WindowCommand::SetWindowDecorations { decorated: false });
+
+    // With `undecorated=t`, both of the first two 20-pixel text rows must
+    // remain editor input, including where titlebar buttons used to appear.
+    for x in [100.0, 680.0, 720.0, 780.0] {
+        for y in [10.0, 25.0] {
+            assert_eq!(app.titlebar_hit_test(x, y), 0, "text at ({x}, {y})");
+        }
+    }
+
+    // An explicit custom-titlebar request still enables its drag/buttons.
+    app.handle_config(ConfigCommand::SetTitlebarHeight { height: 30.0 });
+    assert_eq!(app.titlebar_hit_test(100.0, 10.0), 1);
+    assert_eq!(app.titlebar_hit_test(780.0, 10.0), 2);
+    app.handle_config(ConfigCommand::SetTitlebarHeight { height: 0.0 });
+    assert_eq!(app.titlebar_hit_test(100.0, 10.0), 0);
+    assert_eq!(app.titlebar_hit_test(780.0, 10.0), 0);
+}
 
 #[test]
 fn titlebar_returns_zero_when_decorations_enabled() {

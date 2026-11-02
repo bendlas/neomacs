@@ -403,15 +403,14 @@ fn vertical_motion_screen_extent(
     window: Option<Value>,
 ) -> ScreenLineExtent {
     let window_arg = window.unwrap_or(Value::NIL);
-    let body_width =
-        super::window_cmds::builtin_window_body_width(eval, vec![window_arg, Value::NIL])
-            .ok()
-            .and_then(|v| v.as_fixnum())
-            .filter(|n| *n > 1)
-            .map(|n| (n as usize).saturating_sub(1))
-            .unwrap_or(79)
-            .max(1);
-    let hscroll = super::window_cmds::builtin_window_hscroll(eval, vec![window_arg])
+    let body_width = super::window_cmds::builtin_window_body_width(eval, &[window_arg, Value::NIL])
+        .ok()
+        .and_then(|v| v.as_fixnum())
+        .filter(|n| *n > 1)
+        .map(|n| (n as usize).saturating_sub(1))
+        .unwrap_or(79)
+        .max(1);
+    let hscroll = super::window_cmds::builtin_window_hscroll(eval, &[window_arg])
         .ok()
         .and_then(|v| v.as_fixnum())
         .filter(|n| *n > 0)
@@ -493,26 +492,6 @@ fn current_screen_line_start_with_truncation(
     }
 }
 
-/// GNU `char_can_wrap_after` (src/xdisp.c:599-617) with the default
-/// `word-wrap-by-category` nil: a wrap MAY follow a whitespace glyph.
-///
-/// GNU asks the iterator (`IT_DISPLAYING_WHITESPACE`), i.e. the glyph actually
-/// being displayed; this scanner runs only when no realized row is available,
-/// so it asks the buffer character instead.
-fn char_can_wrap_after(code: u32) -> bool {
-    code == b' ' as u32 || code == b'\t' as u32
-}
-
-/// GNU `char_can_wrap_before` (src/xdisp.c:577-596) with the default
-/// `word-wrap-by-category` nil: a wrap MAY precede any non-whitespace glyph.
-///
-/// GNU's own comment is the reason for the asymmetry: "You cannot wrap before
-/// a space or tab because that way you'll have space and tab at the beginning
-/// of next line."
-fn char_can_wrap_before(code: u32) -> bool {
-    !char_can_wrap_after(code)
-}
-
 /// Where a [`LineWrap::WordWrap`] row is allowed to break, as GNU's `wrap_it`
 /// records it (src/xdisp.c:10280-10300).
 ///
@@ -540,11 +519,16 @@ impl WordWrapPoint {
 
     /// Observe the glyph at `pos` before it is placed, updating the saved wrap
     /// point the way GNU does inside `move_it_in_display_line_to`.
-    fn observe(&mut self, pos: EmacsBytePos, row_start: EmacsBytePos, code: u32) {
-        if self.may_wrap && char_can_wrap_before(code) && pos > row_start {
+    fn observe(
+        &mut self,
+        pos: EmacsBytePos,
+        row_start: EmacsBytePos,
+        opportunity: crate::window::WordWrapOpportunity,
+    ) {
+        if self.may_wrap && opportunity.before() && pos > row_start {
             self.saved = Some(pos);
         }
-        self.may_wrap = char_can_wrap_after(code);
+        self.may_wrap = opportunity.after();
     }
 
     /// Where the row breaks when the glyph at `overflow_at` does not fit.
@@ -570,12 +554,20 @@ mod screen_line_scan_seal {
 }
 
 /// Compile-time row-ending behavior for one forward scan. A policy carries no
-/// Context, buffer view or callback-spanning loan. Its only mutable state is the
-/// activation's optional word-break point.
+/// Context, buffer view or callback-spanning loan. Its state owns only native
+/// data, refreshed after any display stop that can enter Lisp.
 trait ScreenLineScanPolicy: screen_line_scan_seal::Sealed {
-    type State: Copy;
+    type State;
 
     fn initial() -> Self::State;
+
+    #[inline(always)]
+    fn after_display_stop(
+        _state: &mut Self::State,
+        _eval: &super::eval::Context,
+        _buffer_id: BufferId,
+    ) {
+    }
 
     #[inline(always)]
     fn observe(
@@ -695,16 +687,42 @@ impl ScreenLineScanPolicy for WindowWrapScan {
 }
 
 impl ScreenLineScanPolicy for WordWrapScan {
-    type State = WordWrapPoint;
+    type State = WordWrapScanState;
 
     #[inline(always)]
-    fn initial() -> WordWrapPoint {
-        WordWrapPoint::new()
+    fn initial() -> WordWrapScanState {
+        WordWrapScanState {
+            point: WordWrapPoint::new(),
+            policy: crate::window::WordWrapPolicy::default(),
+        }
+    }
+
+    fn after_display_stop(
+        state: &mut WordWrapScanState,
+        eval: &super::eval::Context,
+        buffer_id: BufferId,
+    ) {
+        use crate::window::{WindowLayoutVariable, WordWrapMode, WordWrapPolicy};
+        let Some(buffer) = eval.buffers.get(buffer_id) else {
+            return;
+        };
+        let mode = if eval
+            .variable_value_in_buffer(
+                Some(buffer),
+                WindowLayoutVariable::WordWrapByCategory.sym_id(),
+            )
+            .is_some_and(|value| value.is_truthy())
+        {
+            WordWrapMode::Category
+        } else {
+            WordWrapMode::Whitespace
+        };
+        state.policy = WordWrapPolicy::for_buffer(buffer, mode);
     }
 
     #[inline(always)]
     fn observe(
-        state: &mut WordWrapPoint,
+        state: &mut WordWrapScanState,
         eval: &super::eval::Context,
         buffer_id: BufferId,
         scan: EmacsBytePos,
@@ -716,21 +734,34 @@ impl ScreenLineScanPolicy for WordWrapScan {
             .get(buffer_id)
             .and_then(|buf| buf.char_code_after_emacs_byte_pos(scan))
         {
-            state.observe(scan, start, code);
+            state.point.observe(
+                scan,
+                start,
+                state
+                    .policy
+                    .opportunity(code, crate::window::WordWrapDirection::Forward),
+            );
         }
     }
 
     #[inline(always)]
-    fn break_step(state: WordWrapPoint, overflow_at: EmacsBytePos) -> ScreenLineStep {
+    fn break_step(state: WordWrapScanState, overflow_at: EmacsBytePos) -> ScreenLineStep {
         ScreenLineStep {
-            next: state.break_at(overflow_at),
-            end: if state.has_candidate() {
+            next: state.point.break_at(overflow_at),
+            end: if state.point.has_candidate() {
                 ScreenLineEnd::WordWrapPoint
             } else {
                 ScreenLineEnd::Edge
             },
         }
     }
+}
+
+/// The policy can survive a callback because it owns no live Lisp values.
+/// Display stops refresh it before the next character is observed.
+struct WordWrapScanState {
+    point: WordWrapPoint,
+    policy: crate::window::WordWrapPolicy,
 }
 
 /// Choose the mode once, retaining the original post-callback buffer reads.
@@ -780,6 +811,7 @@ fn next_screen_line_scan<P: ScreenLineScanPolicy>(
     while scan < point_max {
         #[cfg(test)]
         SCREEN_LINE_SCAN_STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
+        let probes_can_run = stop_cache.probes_at(scan.get());
         let Some(advance) = display_advance_at(eval, buffer_id, scan.get(), column, &stop_cache)?
         else {
             return Ok(None);
@@ -793,6 +825,9 @@ fn next_screen_line_scan<P: ScreenLineScanPolicy>(
                 next,
                 end: ScreenLineEnd::Newline,
             }));
+        }
+        if probes_can_run {
+            P::after_display_stop(&mut word_wrap, eval, buffer_id);
         }
         P::observe(&mut word_wrap, eval, buffer_id, scan, start);
         if let Some(step) = P::truncate_overflow(
@@ -938,7 +973,7 @@ fn truncated_logical_line_step(
 /// display properties, etc. In live frames, use fresh measured rows, querying
 /// the canonical producer when necessary. Until offscreen queries are supported,
 /// motion outside measured coverage still falls back to buffer scanning.
-pub(crate) fn vertical_motion(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+pub(crate) fn vertical_motion(eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     expect_args_range("vertical-motion", &args, 1, 3)?;
     // First arg can be LINES (integer) or (COLS . LINES) cons pair.
     // When (COLS . LINES), move LINES then position at column COLS.
@@ -1516,6 +1551,31 @@ pub(crate) fn dynamic_buffer_or_global_symbol_value(
     vars.value_by_name(name)
 }
 
+/// [`dynamic_buffer_or_global_symbol_value`] for a fixed GNU spelling.
+///
+/// Same per-buffer-slot / buffer-local / global precedence, entirely by
+/// identity: the handle is a compile-time id and the slot and buffer-local
+/// maps are keyed by the same identity.
+pub(crate) fn dynamic_buffer_or_global_symbol_value_fixed(
+    vars: VariableView<'_>,
+    _dynamic: &[OrderedRuntimeBindingMap],
+    buf: Option<&Buffer>,
+    symbol: &crate::emacs_core::intern::WellKnown,
+) -> Option<Value> {
+    let id = symbol.id();
+    if let Some(buf) = buf
+        && let Some(info) = crate::buffer::buffer::lookup_buffer_slot_by_sym_id(id)
+    {
+        return Some(buf.slots[info.offset.index()]);
+    }
+    if let Some(buf) = buf
+        && let Some(value) = buf.get_buffer_local_by_sym_id(id)
+    {
+        return Some(value);
+    }
+    vars.value(id)
+}
+
 /// A GNU tab stop width: only 1..=1000 are valid; other Lisp values mean eight.
 /// This immutable value is local to one scan and carries no mutator state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1656,6 +1716,12 @@ impl DisplayStopCache {
         Self {
             recompute_at: std::cell::Cell::new(0),
         }
+    }
+
+    /// The validation feature probes even below a cached stop. Consumers that
+    /// freeze native inputs must refresh after that path too.
+    fn probes_at(&self, byte: usize) -> bool {
+        cfg!(feature = "display-stop-validate") || byte >= self.recompute_at.get()
     }
 }
 
@@ -1926,7 +1992,7 @@ pub(crate) fn display_advance_at(
     // complete World read phase together instead of reacquiring the buffer.
     // The validation feature retains the existing probe decision and order.
     #[cfg(not(feature = "display-stop-validate"))]
-    if byte < stop.recompute_at.get() {
+    if !stop.probes_at(byte) {
         return Ok(DisplayCharacterPhase::from_context(ctx, buffer_id)
             .and_then(|phase| phase.advance(EmacsBytePos::new(byte), DisplayColumn::new(column))));
     }
@@ -3414,7 +3480,7 @@ pub(crate) fn compute_motion(eval: &mut super::eval::Context, args: Vec<Value>) 
 /// except the symbol `columns' returns that gutter in canonical columns.
 pub(crate) fn line_number_display_width(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_args_range("line-number-display-width", &args, 0, 1)?;
     let Some(frame) = eval.frames.selected_frame() else {
@@ -3431,7 +3497,7 @@ pub(crate) fn line_number_display_width(
         return Ok(Value::fixnum(0));
     };
     let enabled = buffer
-        .buffer_local_value("display-line-numbers")
+        .buffer_local_value_id(crate::emacs_core::intern::WellKnown::DisplayLineNumbers.id())
         .is_some_and(|value| value.is_truthy());
     if !enabled {
         return Ok(Value::fixnum(0));
@@ -3449,7 +3515,7 @@ pub(crate) fn line_number_display_width(
     let displayed_columns = digit_width + 2;
 
     match args.first() {
-        Some(value) if value == &Value::symbol("columns") => {
+        Some(value) if value == &Value::symbol(crate::emacs_core::intern::WellKnown::Columns) => {
             Ok(Value::make_float(displayed_columns as f64))
         }
         Some(value) if value.is_truthy() => Ok(Value::fixnum(displayed_columns * char_width)),
@@ -3464,3 +3530,17 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/scan_policy_test.rs"]
 mod scan_policy_tests;
+
+/// Carrier park: drop the last-known-column memo.
+pub(crate) fn reset_carrier_tls() {
+    LAST_KNOWN_COLUMN.with(|slot| slot.set(None));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        LAST_KNOWN_COLUMN.with(|slot| slot.get().is_some() as u64),
+    );
+}

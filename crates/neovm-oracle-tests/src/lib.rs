@@ -143,6 +143,7 @@ mod font_otf_availability_semantics;
 #[cfg(test)]
 #[path = "fontset_repertory_test.rs"]
 mod fontset_repertory;
+mod form_source_sweep;
 mod format;
 mod forward;
 mod frame;
@@ -302,12 +303,14 @@ mod or;
 mod oracle_harness_semantics;
 mod overlay_comprehensive_patterns;
 mod overlay_helper_semantics;
+mod package_eol_async_semantics;
 mod parse_colon_path_strict_edge_semantics;
 mod parse_time_semantics;
 mod pcase_comprehensive_patterns;
 mod pcase_switch_jump_table_semantics;
 #[cfg(test)]
 mod per_symbol_redefinition_semantics;
+mod platform_host_semantics;
 mod plist;
 mod point;
 mod pos_bol_eol_semantics;

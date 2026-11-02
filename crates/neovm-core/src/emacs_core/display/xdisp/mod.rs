@@ -21,14 +21,30 @@
 //! | --- | --- | --- | --- |
 //! | `NEOMACS_FONTIFICATION_RAW_BOUNDARY` | `on` | `off`; `on`/`1`/`true`/`yes` | Reuse exact bounded raw fontified scans only when existing category/alias/default absence proofs hold |
 //! | `NEOMACS_POSN_BOUNDED_TEXT` | `on` | `off`; `on`/`1`/`true`/`yes` | Bound text copied by approximate window-position fallbacks |
-//! | `NEOMACS_MODE_LINE_PROP_SLICE` | `off` | `off`; `on`/`1`/`true`/`yes` | Clip and graft literal source intervals with one plist copy |
 //! | `NEOMACS_MODE_LINE_PROP_BORROW` | `off` | `off`; `on`/`1`/`true`/`yes` | Borrow source string intervals during synchronous mode-line property reads |
 //! | `NEOMACS_MODE_LINE_NUMERIC_PADDING` | `on` | `off`; `on`/`1`/`true`/`yes` | Keep numeric-wrapper padding independent of inherited mode-line properties |
 //! | `NEOMACS_REDISPLAY_GNU_HOOKS` | `on` | `off`/`0`/`false`/`no`; `on`/`1`/`true`/`yes` | GNU redisplay transaction, owned pre targets, live hook order and core configuration-hook default; selected-mini preparation; renderer-inert snapshot positions |
 
+mod mode_line_append;
+mod mode_line_coding;
+use mode_line_coding::CodingAccess;
 #[path = "mode_line_flow.rs"]
 mod mode_line_flow_policy;
+mod mode_line_output;
 mod mode_line_point;
+mod mode_line_string;
+mod mode_line_target;
+mod mode_line_walk;
+use crate::emacs_core::emacs_char::EmacsChar;
+use mode_line_append::{
+    AppendAdmission, DecimalDigit, PercentAppendDriver, PercentWidth, TrailingPercent,
+    ZeroTerminator,
+};
+pub(crate) use mode_line_output::ModeLineOutputOwner;
+use mode_line_output::{ElementAttribution, ModeLineOutputScope, ModeLineStringTarget};
+use mode_line_target::{
+    DisplayTarget, PointFieldPolicy, PropertyApplication, StoredTarget, TargetPolicy,
+};
 
 #[inline]
 pub fn mode_line_flow_enabled() -> bool {
@@ -55,17 +71,23 @@ pub(crate) use super::invisibility::{Invisibility, text_prop_means_invisible};
 use super::symbol::LispVariableLocality;
 use super::value::*;
 use crate::buffer::{
-    AccessibleEmacsByteRange, Buffer, BufferId, CharLen, CharPos0, CharRange, EmacsBytePos,
-    EmacsByteRange, LispCharPos1, TextPropertyTable,
+    AccessibleEmacsByteRange, Buffer, BufferId, CharLen, CharPos0, CharRange, DisplayColumn,
+    EmacsBytePos, EmacsByteRange, LispCharPos1, TextPropertyTable,
 };
 use crate::emacs_core::error::LispCondition;
 use crate::emacs_core::error::{expect_args, expect_args_range};
+use crate::emacs_core::intern::WellKnown;
 use crate::window::{
-    DisplayRowSnapshot, FrameId, FrameManager, Window, WindowDisplaySnapshot, WindowId,
+    DisplayRowSnapshot, FrameId, FrameManager, Window, WindowChromeLine, WindowChromePresence,
+    WindowDisplaySnapshot, WindowId,
 };
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use strum::{EnumString, IntoStaticStr};
+
+// GNU's `Qfontification_functions`: the redisplay fontification demand probes
+// this hook on every pass and previously re-interned the spelling per probe.
+static FONTIFICATION_FUNCTIONS: WellKnown = WellKnown::FontificationFunctions;
 
 impl super::eval::Context {
     /// Choose a redisplay start by moving backward from point in display rows.
@@ -911,6 +933,7 @@ pub(crate) fn region_text_metrics_with_display(
     };
 
     let display_sym = Value::symbol("display");
+    let invisible_sym = Value::symbol("invisible");
     // GNU's `FETCH_BYTE (start_bpos) == '\n'`: a newline at FROM takes no place
     // on display, so the walk pretends to start at the next line's origin.
     let origin_is_newline = buf.emacs_byte_at_pos(range.from) == Some(b'\n');
@@ -944,6 +967,25 @@ pub(crate) fn region_text_metrics_with_display(
         // (see `load_overlay_strings`/`get_overlay_strings` in xdisp.c).  Each
         // contributes its own laid-out columns to the running line width.
         process_overlay_strings_at(eval, frame, buf, scan, &display_sym, &mut state);
+
+        // GNU's display iterator elides an `invisible` run
+        // (`handle_invisible_prop`, xdisp.c): the covered characters take no
+        // columns, and a spec element `(PROP . t)` shows one ellipsis glyph
+        // instead.  `org-string-width` depends on this -- a bracketed link's
+        // destination is hidden, so a clocktable cell measures the visible
+        // description rather than the raw markup -- and so do outlines and
+        // folded blocks.
+        if let Some((invisibility, run_end)) =
+            invisible_measure_run(eval, buf, scan, &invisible_sym, end)
+            && run_end > scan
+        {
+            if invisibility.shows_ellipsis() {
+                state.push_ellipsis();
+            }
+            state.last_code = None;
+            scan = run_end;
+            continue;
+        }
 
         // A `display` property (text property or overlay) whose value replaces
         // the text it covers -- a `(space ...)` stretch or an image -- defines
@@ -1164,6 +1206,13 @@ impl ScanState {
     /// End the row at the edge, as GNU's `MOVE_LINE_TRUNCATED` does.
     fn truncate_at_limit(&mut self) {
         self.line.truncated_at = self.edge.map(|edge| edge.x);
+    }
+
+    /// One ellipsis glyph for an ellipsis-bearing invisible run.  GNU shows a
+    /// single ellipsis for the whole run (`handle_invisible_prop`), and the
+    /// display table's default ellipsis is "...", three text cells.
+    fn push_ellipsis(&mut self) {
+        self.advance_columns(3.0);
     }
 
     /// Place a `display` spec's element on the current line, each in its own
@@ -1537,6 +1586,84 @@ fn display_element_run(
     };
 
     Some((element, run_end.min(region_end)))
+}
+
+/// GNU's invisible-run boundary for the measurement walk.
+///
+/// `handle_invisible_prop` (src/xdisp.c) advances the display iterator over
+/// text whose `invisible` property hides it under the buffer's
+/// `buffer-invisibility-spec`; the covered characters produce no glyphs, and
+/// a `(PROP . t)` element produces one ellipsis glyph instead.  The property
+/// resolves like `display_element_run` resolves `display` -- a non-nil
+/// overlay property wins, otherwise the text property applies -- and the run
+/// ends at the overlay's end or at the next property change.
+fn invisible_measure_run(
+    eval: &super::eval::Context,
+    buf: &Buffer,
+    pos: usize,
+    invisible_sym: &Value,
+    region_end: usize,
+) -> Option<(Invisibility, usize)> {
+    let charpos0 = buf.emacs_byte_pos_to_char_pos_clamped(EmacsBytePos::new(pos));
+    let charpos1 = charpos0.get() as i64 + 1;
+    let mut overlay = None;
+    let mut prop = Value::NIL;
+    if let Some((value, ov)) = super::textprop::buffer_overlay_property_at_byte_pos(
+        eval.variables(),
+        &eval.buffers,
+        buf,
+        pos,
+        *invisible_sym,
+        None,
+    ) && !value.is_nil()
+    {
+        prop = value;
+        overlay = Some(ov);
+    }
+    if overlay.is_none()
+        && let Ok(value) = super::textprop::builtin_get_text_property_in_state(
+            eval.variables(),
+            &eval.buffers,
+            &[Value::fixnum(charpos1), *invisible_sym],
+        )
+        && !value.is_nil()
+    {
+        prop = value;
+    }
+    if prop.is_nil() {
+        return None;
+    }
+    // `buffer-invisibility-spec` is a DEFVAR_PER_BUFFER: read the measured
+    // buffer's own binding, and only after a hiding property is present.
+    let spec = eval
+        .variables()
+        .value_in_buffer_by_name(Some(buf), "buffer-invisibility-spec")
+        .unwrap_or(Value::NIL);
+    let invisibility = text_prop_means_invisible(prop, spec);
+    if !invisibility.hides_source() {
+        return None;
+    }
+    let run_end = if let Some(ov) = overlay {
+        buf.overlays
+            .overlay_end_emacs_byte_pos(ov)
+            .map(|p| p.get())
+            .unwrap_or(region_end)
+    } else {
+        let run_end_char1 = super::textprop::builtin_next_single_property_change_in_state(
+            eval.variables(),
+            &eval.buffers,
+            &[Value::fixnum(charpos1), *invisible_sym],
+        )
+        .ok()
+        .and_then(|v| match v.kind() {
+            ValueKind::Fixnum(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or_else(|| buf.accessible_char_region().end().get() as i64 + 1);
+        buf.char_pos_to_emacs_byte_pos_clamped(CharPos0::new((run_end_char1 - 1).max(0) as usize))
+            .get()
+    };
+    Some((invisibility, run_end.min(region_end)))
 }
 
 /// The display extent of an image spec, in logical pixels.
@@ -1949,6 +2076,7 @@ pub(crate) fn builtin_format_mode_line(args: Vec<Value>) -> EvalResult {
 /// specs by recursively processing elements (symbols, strings, :eval, :propertize,
 /// and conditional cons cells).
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
+#[cfg(test)]
 pub(crate) fn format_mode_line_from_state(
     vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
@@ -1980,7 +2108,8 @@ pub(crate) fn format_mode_line_from_state(
 
     let format_val = args[0];
     let face_spec = resolve_mode_line_face_spec(&args);
-    let pctx = build_mode_line_percent_context(frames, &*buffers, None, vars, args.get(2));
+    let pctx =
+        build_mode_line_percent_context(frames, &*buffers, args.get(2), StoredTarget::NoProperties);
     let mut result = ModeLineRendered::default();
     let needs_eval = format_mode_line_recursive_in_state(
         vars,
@@ -2007,7 +2136,7 @@ pub(crate) fn format_mode_line_from_state(
 
 pub(crate) fn builtin_format_mode_line_ctx(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     finish_format_mode_line_in_eval(eval, &args)
 }
@@ -2064,7 +2193,7 @@ pub fn format_mode_line_for_display_with_sources(
     let condition_stack_base = mode_line_flow_policy::enabled().then(|| {
         let base = eval.condition_stack_len();
         eval.push_condition_frame(super::eval::ConditionFrame::ConditionCase {
-            conditions: Value::symbol("error"),
+            conditions: Value::symbol(WellKnown::Error),
             resume: super::eval::ResumeTarget::InterpreterConditionCase {
                 handler_index: 0,
                 condition_stack_base: base,
@@ -2101,7 +2230,22 @@ pub fn try_format_mode_line_for_display_with_sources(
     buffer: Value,
     target_cols: usize,
 ) -> Result<ModeLineDisplayOutput, Flow> {
-    try_format_mode_line_display(eval, format_val, window, buffer, target_cols, true)
+    let _display_scope = eval.mode_line_output_owner().enter_display();
+    try_format_mode_line_display(
+        eval,
+        format_val,
+        window,
+        buffer,
+        ModeLineDisplayDestination::Rows {
+            columns: DisplayColumn::new(target_cols),
+        },
+    )
+}
+
+/// Whether a mode/header/tab-line formatter is currently executing Lisp.
+/// This is independent of a deferred nonlocal exit from that formatter.
+pub fn mode_line_display_active(eval: &super::eval::Context) -> bool {
+    eval.mode_line_output_owner().display_active()
 }
 
 /// Frame-title evaluation uses the same safe evaluator, but unlike actual
@@ -2122,18 +2266,77 @@ pub fn try_format_frame_title_for_display(
             target_cols,
         ));
     }
-    try_format_mode_line_display(eval, format_val, window, buffer, target_cols, false)
-        .map(ModeLineDisplayOutput::into_value)
+    try_format_mode_line_display(
+        eval,
+        format_val,
+        window,
+        buffer,
+        ModeLineDisplayDestination::FrameTitle {
+            frame_columns: DisplayColumn::new(target_cols),
+        },
+    )
+    .map(ModeLineDisplayOutput::into_value)
 }
 
+#[derive(Clone, Copy)]
+enum ModeLineDisplayDestination {
+    Rows { columns: DisplayColumn },
+    FrameTitle { frame_columns: DisplayColumn },
+}
+
+struct ModeLineRenderRequest<'input, T: mode_line_walk::WalkPolicy> {
+    target: T,
+    window: Option<&'input Value>,
+    point_selection: mode_line_point::PointSelection,
+    format: &'input Value,
+    face: ModeLineFaceSpec,
+}
+
+#[inline(always)]
+fn render_mode_line_target<T: mode_line_walk::WalkPolicy>(
+    eval: &mut super::eval::Context,
+    request: ModeLineRenderRequest<'_, T>,
+    selection: Option<&mut mode_line_flow_policy::FormatSelection>,
+) -> Result<ModeLineDisplayOutput, Flow> {
+    let mut pctx = build_mode_line_percent_context(
+        &eval.frames,
+        &eval.buffers,
+        request.window,
+        request.target,
+    );
+    pctx.point
+        .enter_context(&mut eval.frames, &eval.buffers, request.point_selection);
+    let mut rendered = ModeLineRendered::default();
+    let _accumulator_roots = mode_line_gc::ScratchRoots::new();
+    mode_line_walk::with_root_scope(eval, |eval| {
+        for value in [pctx.frame_name, request.face.face].into_iter().flatten() {
+            eval.push_specpdl_root(value);
+        }
+        format_mode_line_for_target(
+            eval,
+            &pctx,
+            request.format,
+            &mut rendered,
+            0.into(),
+            mode_line_string::Risk::Trusted,
+            selection,
+        )
+        .map(|()| rendered.into_display_output(request.face))
+    })
+}
+
+#[inline(always)]
 fn try_format_mode_line_display(
     eval: &mut super::eval::Context,
     format_val: Value,
     window: Value,
     buffer: Value,
-    target_cols: usize,
-    save_match_data: bool,
+    destination: ModeLineDisplayDestination,
 ) -> Result<ModeLineDisplayOutput, Flow> {
+    let save_match_data = match destination {
+        ModeLineDisplayDestination::Rows { .. } => true,
+        ModeLineDisplayDestination::FrameTitle { .. } => false,
+    };
     let args = [format_val, Value::NIL, window, buffer];
     validate_optional_window_designator(
         eval,
@@ -2213,47 +2416,36 @@ fn try_format_mode_line_display(
     let result_value = if format_val.is_nil() {
         Ok(ModeLineDisplayOutput::from_root_string(Value::string("")))
     } else {
-        let face_spec = resolve_mode_line_face_spec(&args);
-        let mut pctx = build_mode_line_percent_context(
-            &eval.frames,
-            &eval.buffers,
-            Some(&eval.coding_systems),
-            eval.variables(),
-            args.get(2),
-        );
-        pctx.target = ModeLineTarget::Display {
-            columns: target_cols,
+        let face_spec = match destination {
+            ModeLineDisplayDestination::Rows { .. } => resolve_mode_line_face_spec(&args),
+            ModeLineDisplayDestination::FrameTitle { .. } => ModeLineFaceSpec {
+                no_props: true,
+                face: None,
+            },
         };
-        pctx.point.enter_context(
-            &mut eval.frames,
-            &eval.buffers,
-            mode_line_point::PointSelection::CurrentBuffer,
-        );
-        let mut rendered = ModeLineRendered::default();
-        {
-            // pctx caches heap Values (frame name, eol indicator) captured
-            // before the walk; an :eval that renames the frame would orphan
-            // them mid-walk. Root them for the walk's span.
-            let _accumulator_roots = mode_line_gc::ScratchRoots::new();
-            let pctx_root_scope = eval.save_specpdl_roots();
-            for value in [pctx.frame_name, pctx.eol_indicator, face_spec.face]
-                .into_iter()
-                .flatten()
-            {
-                eval.push_specpdl_root(value);
-            }
-            let output = format_mode_line_recursive(
+        match destination {
+            ModeLineDisplayDestination::Rows { columns } => render_mode_line_target(
                 eval,
-                &pctx,
-                &format_val,
-                &mut rendered,
-                0,
-                false,
+                ModeLineRenderRequest {
+                    target: DisplayTarget::new(columns),
+                    window: args.get(2),
+                    point_selection: mode_line_point::PointSelection::CurrentBuffer,
+                    format: &format_val,
+                    face: face_spec,
+                },
                 title_selection.as_mut(),
-            )
-            .map(|()| rendered.into_display_output(face_spec));
-            eval.restore_specpdl_roots(pctx_root_scope);
-            output
+            ),
+            ModeLineDisplayDestination::FrameTitle { frame_columns } => render_mode_line_target(
+                eval,
+                ModeLineRenderRequest {
+                    target: StoredTarget::Title { frame_columns },
+                    window: args.get(2),
+                    point_selection: mode_line_point::PointSelection::CurrentBuffer,
+                    format: &format_val,
+                    face: face_spec,
+                },
+                title_selection.as_mut(),
+            ),
         }
     };
 
@@ -2309,46 +2501,24 @@ pub(crate) fn finish_format_mode_line_in_eval(
         } else {
             let format_val = args[0];
             let face_spec = resolve_mode_line_face_spec(args);
-            let mut pctx = build_mode_line_percent_context(
-                &eval.frames,
-                &eval.buffers,
-                Some(&eval.coding_systems),
-                eval.variables(),
-                args.get(2),
-            );
+            let output_scope = ModeLineOutputScope::enter(eval, args)?;
             let point_selection = if mode_line_flow_policy::enabled() {
                 mode_line_point::PointSelection::CurrentBuffer
             } else {
                 mode_line_point::PointSelection::WindowSnapshot
             };
-            pctx.point
-                .enter_context(&mut eval.frames, &eval.buffers, point_selection);
-            let mut result = ModeLineRendered::default();
-            {
-                // pctx caches heap Values (frame name, eol indicator) captured
-                // before the walk; an :eval that renames the frame would orphan
-                // them mid-walk. Root them for the walk's span.
-                let _accumulator_roots = mode_line_gc::ScratchRoots::new();
-                let pctx_root_scope = eval.save_specpdl_roots();
-                for value in [pctx.frame_name, pctx.eol_indicator, face_spec.face]
-                    .into_iter()
-                    .flatten()
-                {
-                    eval.push_specpdl_root(value);
-                }
-                let output = format_mode_line_recursive(
-                    eval,
-                    &pctx,
-                    &format_val,
-                    &mut result,
-                    0,
-                    false,
-                    selection.as_mut(),
-                )
-                .map(|()| result.into_value(face_spec));
-                eval.restore_specpdl_roots(pctx_root_scope);
-                output
-            }
+            render_mode_line_target(
+                eval,
+                ModeLineRenderRequest {
+                    target: output_scope.target(),
+                    window: args.get(2),
+                    point_selection,
+                    format: &format_val,
+                    face: face_spec,
+                },
+                selection.as_mut(),
+            )
+            .map(ModeLineDisplayOutput::into_value)
         };
 
         result
@@ -2363,6 +2533,7 @@ pub(crate) fn finish_format_mode_line_in_eval(
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
+#[cfg(test)]
 pub(crate) fn finish_format_mode_line_in_state_with_eval(
     vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
@@ -2399,11 +2570,16 @@ pub(crate) fn finish_format_mode_line_in_state_with_eval(
     } else {
         let format_val = args[0];
         let face_spec = resolve_mode_line_face_spec(args);
-        let pctx = build_mode_line_percent_context(frames, &*buffers, None, vars, args.get(2));
+        let pctx = build_mode_line_percent_context(
+            frames,
+            &*buffers,
+            args.get(2),
+            StoredTarget::NoProperties,
+        );
         if let Some(face) = face_spec.face {
             roots.pin(face);
         }
-        for value in [pctx.frame_name, pctx.eol_indicator].into_iter().flatten() {
+        for value in [pctx.frame_name].into_iter().flatten() {
             roots.pin(value);
         }
         let mut result = ModeLineRendered::default();
@@ -2433,9 +2609,9 @@ pub(crate) fn finish_format_mode_line_in_state_with_eval(
     result
 }
 
-/// Fixed mode-line identities pre-resolve native spellings per registry epoch.
-/// The shared cache is safe for concurrent mutators; this enum holds no Lisp
-/// values or per-format mutable state. Resolve again after arbitrary Lisp.
+/// Fixed mode-line identities: GNU DEFSYM ids, constant and lock-free.
+/// The enum is safe to share across concurrent mutators; it holds no Lisp
+/// values or per-format mutable state, and the ids cannot change.
 #[derive(Clone, Copy, Debug, strum::EnumIter)]
 enum ModeLineSymbol {
     ModeName,
@@ -2449,32 +2625,32 @@ enum ModeLineSymbol {
 impl ModeLineSymbol {
     #[inline]
     fn id(self) -> crate::emacs_core::intern::SymId {
-        use crate::emacs_core::intern::EpochCachedSymbol;
+        use crate::emacs_core::intern::WellKnown;
 
         match self {
             Self::ModeName => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("mode-name");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::ModeName;
+                SYMBOL.id()
             }
             Self::DefaultDirectory => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("default-directory");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::DefaultDirectory;
+                SYMBOL.id()
             }
             Self::RiskyLocalVariable => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("risky-local-variable");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::RiskyLocalVariable;
+                SYMBOL.id()
             }
             Self::InhibitRedisplay => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("inhibit-redisplay");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::InhibitRedisplay;
+                SYMBOL.id()
             }
             Self::InhibitQuit => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("inhibit-quit");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::InhibitQuit;
+                SYMBOL.id()
             }
             Self::Eval => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("eval");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::Eval;
+                SYMBOL.id()
             }
         }
     }
@@ -2609,6 +2785,7 @@ fn mode_line_symbol_is_risky(obarray: &crate::emacs_core::symbol::Obarray, name:
         .is_some_and(|value| !value.is_nil())
 }
 
+#[cfg(test)]
 fn mode_line_conditional_branch(cdr: Value, branch_is_then: bool) -> Option<Value> {
     if !cdr.is_cons() {
         return None;
@@ -2628,7 +2805,7 @@ fn mode_line_conditional_branch(cdr: Value, branch_is_then: bool) -> Option<Valu
 ///
 /// Corresponds to the `struct window *w` and `struct frame *f` parameters
 /// in GNU's `decode_mode_spec` (xdisp.c:29083).
-struct ModeLinePercentContext {
+struct ModeLinePercentContext<T: TargetPolicy = StoredTarget<'static>> {
     /// Identity reuse is scoped to this formatter pass and existing registry epoch.
     dynamic_symbols: std::cell::RefCell<mode_line_symbols::DynamicSymbols>,
     /// Internal zero-based character offset of the first visible character.
@@ -2639,97 +2816,50 @@ struct ModeLinePercentContext {
     window_end: usize,
     /// Frame name for `%F`.  GNU: `f->title` then `f->name` then "Emacs".
     frame_name: Option<Value>,
-    /// Buffer coding presentation for `%z`/`%Z`.
-    /// GNU deliberately displays a blank instead of any coding mnemonic when
-    /// the buffer is unibyte.  The enum makes that state impossible to confuse
-    /// with a multibyte coding system whose mnemonic happens to be a space.
-    buffer_coding: BufferCodingDisplay,
-    /// The frame-dependent prefix GNU places before the buffer mnemonic.
-    /// A closed enum prevents a TTY context from existing without both coding
-    /// systems and keeps their GNU-defined ordering out of call sites.
-    frame_coding_mnemonics: FrameCodingMnemonics,
-    /// EOL type string for `%Z` (`:`, `\`, `/`, or undecided).
-    eol_indicator: Option<Value>,
+    /// Immutable class of the original format frame, not today's selection.
+    /// Coding values themselves are read only at each native `%z`/`%Z` stop.
+    coding_frame: mode_line_coding::CodingFrame,
     /// GNU's closed `mode_line_target` state.  This controls the target-specific
     /// `%-` expansion without letting an untyped optional width conflate string
     /// formatting with direct display formatting.
-    target: ModeLineTarget,
+    target: T,
     /// Context walks read live PT and the original window's shared counter;
     /// read-only split entry points retain their isolated native snapshot.
     point: mode_line_point::PointContext,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FrameCodingMnemonics {
-    WindowSystem,
-    Tty { keyboard: char, terminal: char },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BufferCodingDisplay {
-    Multibyte { mnemonic: char },
-    UnibyteBlank,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ModeLineTarget {
-    #[default]
-    String,
-    Display {
-        columns: usize,
-    },
-}
-
-impl BufferCodingDisplay {
-    /// GNU `decode_mode_spec` emits keyboard, terminal, then buffer coding on a
-    /// non-window-system frame.  It calls the same helper for all three, and
-    /// that helper blanks every mnemonic when the current buffer is unibyte
-    /// (`src/xdisp.c:29238-29276`).
-    fn with_frame(self, frame: FrameCodingMnemonics) -> String {
-        match (self, frame) {
-            (Self::Multibyte { mnemonic }, FrameCodingMnemonics::WindowSystem) => {
-                mnemonic.to_string()
-            }
-            (Self::Multibyte { mnemonic }, FrameCodingMnemonics::Tty { keyboard, terminal }) => {
-                format!("{keyboard}{terminal}{mnemonic}")
-            }
-            (Self::UnibyteBlank, FrameCodingMnemonics::WindowSystem) => " ".to_owned(),
-            (Self::UnibyteBlank, FrameCodingMnemonics::Tty { .. }) => "   ".to_owned(),
-        }
+impl Default for ModeLinePercentContext<StoredTarget<'static>> {
+    fn default() -> Self {
+        Self::new(StoredTarget::NoProperties)
     }
 }
 
-impl Default for ModeLinePercentContext {
-    fn default() -> Self {
+impl<T: TargetPolicy> ModeLinePercentContext<T> {
+    fn new(target: T) -> Self {
         Self {
             dynamic_symbols: Default::default(),
             window_start: 0,
             window_end: 0,
             frame_name: None,
-            buffer_coding: BufferCodingDisplay::Multibyte { mnemonic: '-' },
-            frame_coding_mnemonics: FrameCodingMnemonics::WindowSystem,
-            eol_indicator: None,
-            target: ModeLineTarget::String,
+            coding_frame: mode_line_coding::CodingFrame::WindowSystem,
+            target,
             point: mode_line_point::PointContext::default(),
         }
     }
 }
 
 /// Build a `ModeLinePercentContext` from frame/window/buffer state.
-fn build_mode_line_percent_context(
+fn build_mode_line_percent_context<T: TargetPolicy>(
     frames: &crate::window::FrameManager,
     buffers: &crate::buffer::BufferManager,
-    coding_systems: Option<&crate::emacs_core::coding::CodingSystemManager>,
-    vars: VariableView<'_>,
     window_arg: Option<&Value>,
-) -> ModeLinePercentContext {
-    let mut ctx = ModeLinePercentContext {
-        buffer_coding: BufferCodingDisplay::Multibyte { mnemonic: '-' },
-        ..Default::default()
-    };
+    target: T,
+) -> ModeLinePercentContext<T> {
+    let mut ctx = ModeLinePercentContext::new(target);
 
     // --- Frame name (GNU: f->title, f->name, "Emacs") ---
     if let Some(frame) = frames.selected_frame() {
+        ctx.coding_frame = mode_line_coding::CodingFrame::from(frame);
         let title = frame.title_value();
         if title.is_string() {
             ctx.frame_name = Some(title);
@@ -2803,60 +2933,6 @@ fn build_mode_line_percent_context(
         ctx.window_end = buf.point_max_char_pos().get();
     }
 
-    // --- Coding system mnemonic (GNU: decode_mode_spec_coding) ---
-    let cs_name = context_buffer
-        .and_then(|b| b.buffer_local_value("buffer-file-coding-system"))
-        .and_then(|v| v.as_bare_symbol_id());
-    let coding_mnemonic = cs_name
-        .map(|name| coding_system_mnemonic_char(coding_systems, name))
-        .unwrap_or('-');
-    ctx.buffer_coding = if context_buffer.is_some_and(|buffer| !buffer.get_multibyte()) {
-        BufferCodingDisplay::UnibyteBlank
-    } else {
-        BufferCodingDisplay::Multibyte {
-            mnemonic: coding_mnemonic,
-        }
-    };
-    if let Some(name) = cs_name {
-        ctx.eol_indicator = coding_system_eol_indicator_value(vars, name);
-    }
-
-    // --- Terminal and keyboard coding mnemonics (TTY only) ---
-    // GNU `decode_mode_spec` emits keyboard, terminal, then buffer.
-    if frames
-        .selected_frame()
-        .is_some_and(|frame| frame.effective_window_system().is_none())
-    {
-        let (keyboard, terminal) = if let Some(coding_systems) = coding_systems {
-            (
-                coding_system_mnemonic_char(
-                    Some(coding_systems),
-                    coding_systems.keyboard_coding_sym(),
-                ),
-                coding_system_mnemonic_char(
-                    Some(coding_systems),
-                    coding_systems.terminal_coding_sym(),
-                ),
-            )
-        } else {
-            let term_cs = vars
-                .value_by_name("terminal-coding-system")
-                .and_then(|v| v.as_bare_symbol_id());
-            let kbd_cs = vars
-                .value_by_name("keyboard-coding-system")
-                .and_then(|v| v.as_bare_symbol_id());
-            (
-                kbd_cs
-                    .map(|name| coding_system_mnemonic_char(None, name))
-                    .unwrap_or('-'),
-                term_cs
-                    .map(|name| coding_system_mnemonic_char(None, name))
-                    .unwrap_or('-'),
-            )
-        };
-        ctx.frame_coding_mnemonics = FrameCodingMnemonics::Tty { keyboard, terminal };
-    }
-
     ctx
 }
 
@@ -2897,77 +2973,10 @@ fn resolve_mode_line_window<'a>(
     None
 }
 
-/// Derive coding system mnemonic character from coding system name.
-///
-/// Matches GNU `decode_mode_spec_coding` heuristics for common systems.
-fn coding_system_mnemonic_char(
-    coding_systems: Option<&crate::emacs_core::coding::CodingSystemManager>,
-    cs_name: crate::emacs_core::intern::SymId,
-) -> char {
-    if let Some(mnemonic) = coding_systems.and_then(|manager| manager.mode_line_mnemonic(cs_name)) {
-        return mnemonic;
-    }
-    let cs_name = crate::emacs_core::intern::resolve_sym(cs_name);
-    let base = cs_name
-        .strip_suffix("-unix")
-        .or_else(|| cs_name.strip_suffix("-dos"))
-        .or_else(|| cs_name.strip_suffix("-mac"))
-        .unwrap_or(cs_name);
-    match base {
-        "utf-8"
-        | "utf-8-emacs"
-        | "utf-8-auto"
-        | "mule-utf-8"
-        | "utf-16"
-        | "utf-16-be"
-        | "utf-16-le"
-        | "utf-16be"
-        | "utf-16le"
-        | "utf-16be-with-signature"
-        | "utf-16le-with-signature" => 'U',
-        "undecided" | "prefer-utf-8" | "nil" => '-',
-        "raw-text" => '=',
-        "no-conversion" | "binary" => '=',
-        "us-ascii" | "ascii" => '.',
-        "iso-8859-1" | "iso-latin-1" | "latin-1" => '1',
-        "iso-8859-2" | "iso-latin-2" | "latin-2" => '2',
-        "iso-8859-3" | "latin-3" => '3',
-        "iso-8859-4" | "latin-4" => '4',
-        "iso-8859-5" | "latin-5" => '5',
-        "iso-2022-jp" | "junet" => 'J',
-        "euc-jp" => 'E',
-        "shift_jis" | "sjis" => 'S',
-        "iso-2022-kr" => 'K',
-        "euc-kr" => 'e',
-        "gb2312" | "euc-cn" | "cn-gb" => 'C',
-        "big5" => 'B',
-        _ => '-',
-    }
-}
-
-/// Derive EOL type indicator from coding system name, using the
-/// `eol-mnemonic-*` variables from the obarray (matches GNU semantics).
-fn coding_system_eol_indicator_value(
-    vars: VariableView<'_>,
-    cs_name: crate::emacs_core::intern::SymId,
-) -> Option<Value> {
-    let cs_name = crate::emacs_core::intern::resolve_sym(cs_name);
-    let var_name = if cs_name.ends_with("-dos") {
-        "eol-mnemonic-dos"
-    } else if cs_name.ends_with("-mac") {
-        "eol-mnemonic-mac"
-    } else if cs_name.ends_with("-unix") {
-        "eol-mnemonic-unix"
-    } else {
-        "eol-mnemonic-undecided"
-    };
-    vars.value_by_name(var_name)
-        .filter(|value| value.is_string() || value.as_char().is_some())
-}
-
 /// Check if a directory path looks like a Tramp remote path.
 ///
 /// Tramp paths match `/METHOD:...` where METHOD is a lowercase alpha string.
+#[inline(always)]
 fn is_remote_directory(dir: &str) -> bool {
     if !dir.starts_with('/') {
         return false;
@@ -3149,64 +3158,76 @@ fn with_mode_line_string_properties<R>(
     }
 }
 
-/// Immutable process selector, published by OnceLock. A source-slice graft
-/// uses only a synchronous immutable source borrow and an exclusive destination;
-/// no source Lisp state is retained between formatter elements or mutators.
-#[inline]
-fn mode_line_prop_slice_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = MODE_LINE_PROP_SLICE_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NEOMACS_MODE_LINE_PROP_SLICE")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("on" | "1" | "true" | "yes")
-        )
-    })
+/// The product always grafts directly. Unit tests retain the former two-step
+/// operation as an explicit reference, absent from production code.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModeLineSourceSliceTestMode {
+    Production,
+    TwoStepReference,
 }
 
 #[cfg(test)]
 thread_local! {
-    static MODE_LINE_PROP_SLICE_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
+    // Replace the existing override slot in place; do not add TLS storage.
+    static MODE_LINE_PROP_SLICE_OVERRIDE: std::cell::Cell<ModeLineSourceSliceTestMode> =
+        const { std::cell::Cell::new(ModeLineSourceSliceTestMode::Production) };
 }
 
 #[cfg(test)]
-fn set_mode_line_prop_slice_for_test(enabled: Option<bool>) {
-    MODE_LINE_PROP_SLICE_OVERRIDE.with(|cell| cell.set(enabled));
+static_assertions::assert_eq_size!(
+    std::cell::Cell<ModeLineSourceSliceTestMode>,
+    std::cell::Cell<Option<bool>>
+);
+#[cfg(test)]
+static_assertions::const_assert_eq!(
+    std::mem::align_of::<std::cell::Cell<ModeLineSourceSliceTestMode>>(),
+    std::mem::align_of::<std::cell::Cell<Option<bool>>>()
+);
+
+#[cfg(test)]
+fn replace_mode_line_source_slice_test_mode(
+    mode: ModeLineSourceSliceTestMode,
+) -> ModeLineSourceSliceTestMode {
+    MODE_LINE_PROP_SLICE_OVERRIDE.with(|cell| cell.replace(mode))
 }
 
-/// Preserve the legacy capture point and interval partition while removing
-/// the intermediate sliced table and its plist spine copies when selected.
+#[cfg(test)]
+fn restore_mode_line_source_slice_test_mode(mode: ModeLineSourceSliceTestMode) {
+    // A test guard cannot move to another thread. If that thread's TLS has
+    // already retired, there is no live state to restore; Drop must not panic.
+    let _ = MODE_LINE_PROP_SLICE_OVERRIDE.try_with(|cell| cell.set(mode));
+}
+
+/// Capture the same source range and preserve the existing interval partition,
+/// publishing fresh destination roots before any later Lisp callback. The
+/// canonical graft performs clipping and the single destination plist copy;
+/// neither source descriptors nor borrowed plist spines escape this call.
 #[inline]
 fn append_mode_line_source_slice(
     target: &mut ModeLineRendered,
     source: &TextPropertyTable,
-    start: usize,
-    end: usize,
-    offset: usize,
+    range: CharRange,
+    offset: CharLen,
 ) {
-    let range = display_char_range(start, end);
-    let offset = CharLen::new(offset);
-    if mode_line_prop_slice_enabled() {
-        if let Some(roots) = &mut target.gc_roots {
-            target
-                .text_props
-                .append_source_slice_at_char_offset_with_roots(source, range, offset, |value| {
-                    mode_line_gc::pin_accumulator_value(roots, value)
-                });
-        } else {
-            target
-                .text_props
-                .append_source_slice_at_char_offset(source, range, offset);
+    #[cfg(test)]
+    match MODE_LINE_PROP_SLICE_OVERRIDE.with(std::cell::Cell::get) {
+        ModeLineSourceSliceTestMode::Production => {}
+        ModeLineSourceSliceTestMode::TwoStepReference => {
+            target.append_properties(&source.slice_char_range(range), offset);
+            return;
         }
+    }
+    if let Some(roots) = &mut target.gc_roots {
+        target
+            .text_props
+            .append_source_slice_at_char_offset_with_roots(source, range, offset, |value| {
+                mode_line_gc::pin_accumulator_value(roots, value)
+            });
     } else {
-        target.append_properties(&source.slice_char_range(range), offset);
+        target
+            .text_props
+            .append_source_slice_at_char_offset(source, range, offset);
     }
 }
 
@@ -3317,6 +3338,7 @@ struct ModeLineFaceSpec {
 }
 
 impl ModeLineRendered {
+    #[inline(always)]
     fn root_for_walk(&mut self) {
         if self.gc_roots.is_none() {
             self.gc_roots = Some(mode_line_gc::pin_rendered_scratch(self));
@@ -3432,12 +3454,16 @@ impl ModeLineRendered {
         ));
     }
 
+    fn append_lisp_string_text(&mut self, string: &crate::heap_types::LispString) {
+        self.multibyte |= string.is_multibyte();
+        self.text.extend(mode_line_string_char_codes(string));
+    }
+
     fn append_string_value_preserving_props(&mut self, value: &Value) {
         match value.as_lisp_string() {
             Some(string) => {
                 let char_offset = self.char_len();
-                self.multibyte |= string.is_multibyte();
-                self.text.extend(mode_line_string_char_codes(string));
+                self.append_lisp_string_text(string);
                 self.record_source_span(char_offset, self.char_len(), *value, 0);
                 with_mode_line_string_properties(*value, |props| {
                     self.append_properties(props, CharLen::new(char_offset));
@@ -3499,7 +3525,12 @@ impl ModeLineRendered {
                 );
                 self.record_source_span(char_offset, self.char_len(), *value, start_char);
                 with_mode_line_string_properties(*value, |props| {
-                    append_mode_line_source_slice(self, props, start_char, end_char, char_offset);
+                    append_mode_line_source_slice(
+                        self,
+                        props,
+                        display_char_range(start_char, end_char),
+                        CharLen::new(char_offset),
+                    );
                 });
             }
             None => {
@@ -3520,9 +3551,8 @@ impl ModeLineRendered {
                         append_mode_line_source_slice(
                             self,
                             props,
-                            start_char,
-                            end_char,
-                            char_offset,
+                            display_char_range(start_char, end_char),
+                            CharLen::new(char_offset),
                         );
                     });
                 }
@@ -3636,13 +3666,13 @@ impl ModeLineRendered {
         });
     }
 
-    fn apply_propertize_properties(&mut self, props: Value, target: ModeLineTarget) {
-        match target {
-            ModeLineTarget::String => {
+    fn apply_propertize_properties<T: TargetPolicy>(&mut self, props: Value, _target: &T) {
+        match T::PROPERTY_APPLICATION {
+            PropertyApplication::MaterializeThenOverlay => {
                 self.materialize_display_min_width(props);
                 self.overlay_properties(props);
             }
-            ModeLineTarget::Display { .. } => {
+            PropertyApplication::OverlayThenDisplayWidths => {
                 self.overlay_properties(props);
                 self.note_display_min_width_transition(props);
             }
@@ -3943,6 +3973,14 @@ impl ModeLineRendered {
     fn into_value(self, face_spec: ModeLineFaceSpec) -> Value {
         self.into_display_output(face_spec).into_value()
     }
+
+    fn apply_element_attribution(&mut self, range: CharRange, attribution: ElementAttribution) {
+        if range.is_empty() {
+            return;
+        }
+        attribution.apply_to_table(&mut self.text_props, range);
+        self.pin_properties();
+    }
 }
 
 fn mode_line_display_min_width(props: Value) -> Option<ModeLineMinWidthRun> {
@@ -4143,19 +4181,21 @@ fn append_mode_line_percent_lisp_text_spec(
 }
 
 #[allow(clippy::too_many_arguments)] // split evaluator state avoids aliasing the full Context
-fn append_mode_line_string_in_state(
+#[cfg(test)]
+fn append_mode_line_string_in_state<T: TargetPolicy>(
     vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &crate::buffer::BufferManager,
     processes: &crate::emacs_core::process::ProcessManager,
     command_loop_depth: usize,
-    pctx: &ModeLinePercentContext,
+    pctx: &ModeLinePercentContext<T>,
     result: &mut ModeLineRendered,
     value: &Value,
     literal: bool,
 ) {
     append_mode_line_string_with_point_access(
         vars,
+        CodingAccess::SplitState,
         dynamic,
         buffers,
         processes,
@@ -4163,23 +4203,116 @@ fn append_mode_line_string_in_state(
         pctx,
         result,
         value,
-        literal,
+        ModeLineLiteral::from(literal),
+        NoModeLineNativeFieldLimit,
         &mut mode_line_point::Access::Snapshot,
     );
 }
 
-fn append_mode_line_string_in_eval(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModeLineLiteral {
+    Literal,
+    Expand,
+}
+
+impl From<bool> for ModeLineLiteral {
+    fn from(literal: bool) -> Self {
+        if literal { Self::Literal } else { Self::Expand }
+    }
+}
+
+/// Parsed native percent minimum width, before a stored target applies its
+/// character/column budget. Construction preserves the nonnegative i64 domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModeLineNativeFieldWidth(i64);
+
+static_assertions::assert_eq_size!(ModeLineNativeFieldWidth, i64);
+static_assertions::assert_impl_all!(ModeLineNativeFieldWidth: Copy, Send, Sync);
+
+impl ModeLineNativeFieldWidth {
+    const ZERO: Self = Self(0);
+    const MAX: Self = Self(i64::MAX);
+
+    fn append_decimal_digit(self, digit: DecimalDigit) -> Self {
+        Self(
+            self.0
+                .saturating_mul(10)
+                .saturating_add(i64::from(digit.value())),
+        )
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::ZERO
+    }
+
+    fn exceeds_char_len(self, length: CharLen) -> bool {
+        Self::try_from(length).is_ok_and(|length| self.0 > length.0)
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    fn cap_to_platform_character_domain(self) -> Self {
+        Self(self.0.min(i64::from(u32::MAX)))
+    }
+}
+
+impl From<ModeLineNativeFieldWidth> for i64 {
+    fn from(width: ModeLineNativeFieldWidth) -> Self {
+        width.0
+    }
+}
+
+impl TryFrom<ModeLineNativeFieldWidth> for CharLen {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(width: ModeLineNativeFieldWidth) -> Result<Self, Self::Error> {
+        usize::try_from(width.0).map(Self::new)
+    }
+}
+
+impl TryFrom<CharLen> for ModeLineNativeFieldWidth {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(length: CharLen) -> Result<Self, Self::Error> {
+        i64::try_from(length.get()).map(Self)
+    }
+}
+
+trait ModeLineNativeFieldLimit {
+    fn cap(&self, field_width: ModeLineNativeFieldWidth) -> ModeLineNativeFieldWidth;
+
+    #[inline(always)]
+    fn store_width(&self, field_width: ModeLineNativeFieldWidth) -> ModeLineNativeFieldWidth {
+        field_width
+    }
+}
+
+struct NoModeLineNativeFieldLimit;
+
+impl ModeLineNativeFieldLimit for NoModeLineNativeFieldLimit {
+    #[inline(always)]
+    fn cap(&self, field_width: ModeLineNativeFieldWidth) -> ModeLineNativeFieldWidth {
+        // Retain the character-domain bound on 32-bit targets; 64-bit native
+        // output needs no conversion. Stored targets own their CharLen cap.
+        #[cfg(target_pointer_width = "32")]
+        let field_width = field_width.cap_to_platform_character_domain();
+        field_width
+    }
+}
+
+fn append_mode_line_string_in_eval_with_field_limit<T: TargetPolicy>(
     eval: &mut super::eval::Context,
-    pctx: &ModeLinePercentContext,
+    pctx: &ModeLinePercentContext<T>,
     result: &mut ModeLineRendered,
     value: &Value,
-    literal: bool,
+    literal: ModeLineLiteral,
+    limit: impl ModeLineNativeFieldLimit,
 ) {
     let command_loop_depth = eval.recursive_command_loop_depth();
     let vars = VariableView::new(&eval.obarray, &eval.owner);
     let mut access = mode_line_point::Access::Live(&mut eval.frames);
     append_mode_line_string_with_point_access(
         vars,
+        CodingAccess::Registry(&eval.coding_systems),
         &[],
         &eval.buffers,
         &eval.processes,
@@ -4188,21 +4321,24 @@ fn append_mode_line_string_in_eval(
         result,
         value,
         literal,
+        limit,
         &mut access,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_mode_line_string_with_point_access(
+fn append_mode_line_string_with_point_access<T: TargetPolicy>(
     vars: VariableView<'_>,
+    coding: CodingAccess<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &crate::buffer::BufferManager,
     processes: &crate::emacs_core::process::ProcessManager,
     command_loop_depth: usize,
-    pctx: &ModeLinePercentContext,
+    pctx: &ModeLinePercentContext<T>,
     result: &mut ModeLineRendered,
     value: &Value,
-    literal: bool,
+    literal: ModeLineLiteral,
+    limit: impl ModeLineNativeFieldLimit,
     point_access: &mut mode_line_point::Access<'_>,
 ) {
     // `%` is ASCII (0x25), which can never appear as a UTF-8 continuation or
@@ -4215,11 +4351,12 @@ fn append_mode_line_string_with_point_access(
     } else {
         return;
     };
-    if literal || !has_percent {
+    if literal == ModeLineLiteral::Literal || !has_percent {
         result.append_string_value_preserving_props(value);
     } else {
         expand_mode_line_percent_in_state(
             vars,
+            coding,
             dynamic,
             buffers,
             processes,
@@ -4228,6 +4365,7 @@ fn append_mode_line_string_with_point_access(
             value,
             result,
             point_access,
+            limit,
         );
     }
 }
@@ -4273,230 +4411,35 @@ impl ModeLineTailCycle {
 /// - `(:eval FORM)`: evaluate FORM, use result as format
 /// - `(:propertize ELT PROPS...)`: process ELT and apply text properties
 /// - A cons `(SYMBOL . REST)`: if SYMBOL's value is non-nil, process REST
-fn format_mode_line_recursive(
+fn format_mode_line_for_target<T: mode_line_walk::WalkPolicy>(
     eval: &mut super::eval::Context,
-    pctx: &ModeLinePercentContext,
+    pctx: &ModeLinePercentContext<T>,
     format: &Value,
     result: &mut ModeLineRendered,
-    depth: usize,
-    risky: bool,
+    depth: mode_line_string::ElementDepth,
+    risk: mode_line_string::Risk,
     selection: Option<&mut mode_line_flow_policy::FormatSelection>,
 ) -> Result<(), Flow> {
-    if depth > 20 {
-        return Ok(()); // Guard against infinite recursion
-    }
-
-    // Formats have a per-element scope; accumulator mutations publish roots
-    // into the enclosing walk's scope, which also retains parent accumulators.
-    let root_scope = eval.save_specpdl_roots();
-    eval.push_specpdl_root(*format);
-    result.root_for_walk();
-    let output =
-        format_mode_line_recursive_rooted(eval, pctx, format, result, depth, risky, selection);
-    eval.restore_specpdl_roots(root_scope);
-    output
-}
-
-fn format_mode_line_recursive_rooted(
-    eval: &mut super::eval::Context,
-    pctx: &ModeLinePercentContext,
-    format: &Value,
-    result: &mut ModeLineRendered,
-    depth: usize,
-    risky: bool,
-    mut selection: Option<&mut mode_line_flow_policy::FormatSelection>,
-) -> Result<(), Flow> {
-    let symbol_mode = eval.symbol_mode();
-    match format.kind() {
-        ValueKind::Nil => {}
-
-        ValueKind::String => append_mode_line_string_in_eval(eval, pctx, result, format, false),
-
-        ValueKind::Fixnum(n) => {
-            let _ = n;
-        }
-
-        _ if format.is_symbol(symbol_mode) => {
-            // GNU xdisp.c:28438-28468 (display_mode_element, Lisp_Symbol
-            // branch): resolve the symbol's value and recurse. There is
-            // no special case for mode-line-front-space or
-            // mode-line-end-spaces — GNU treats every mode-line symbol
-            // the same way. Previously this branch short-circuited those
-            // two names to a single hardcoded space, which silently
-            // discarded the `(:eval (unless (display-graphic-p) "-%-"))`
-            // dash-fill construct that bindings.el installs on TTY.
-            if let Some(name) = format.as_symbol_name(symbol_mode)
-                && let Some((symbol, val)) = {
-                    let symbol = pctx.resolve_dynamic_symbol(name);
-                    symbol
-                        .value(eval.variables(), &eval.buffers)
-                        .map(|value| (symbol, value))
-                }
-                && !val.is_nil()
-            {
-                if val.is_string() {
-                    append_mode_line_string_in_eval(eval, pctx, result, &val, true);
-                } else {
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &val,
-                        result,
-                        depth + 1,
-                        risky || !symbol.is_risky(&eval.obarray),
-                        selection.as_deref_mut(),
-                    )?;
-                }
-            }
-        }
-
-        _ if format.is_cons() => {
-            let car = format.cons_car();
-            let cdr = format.cons_cdr();
-            // A nested :eval may detach these from FORMAT before collecting.
-            eval.push_specpdl_root(car);
-            eval.push_specpdl_root(cdr);
-
-            if car.is_symbol_named(":eval", symbol_mode) {
-                if risky {
-                    return Ok(());
-                }
-                if cdr.is_cons() {
-                    let form_val = cdr.cons_car();
-                    eval.push_specpdl_root(form_val);
-                    if let Some(selection) = selection.as_deref_mut() {
-                        selection.before_eval(eval);
-                    }
-                    let val = mode_line_flow_policy::eval_form(eval, &form_val)?;
-                    // The recursive entry roots the fresh return value before
-                    // a nested element can run Lisp again.
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &val,
-                        result,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
-                }
-                return Ok(());
-            }
-
-            if car.is_symbol_named(":propertize", symbol_mode) {
-                if risky {
-                    return Ok(());
-                }
-                if cdr.is_cons() {
-                    let elt = cdr.cons_car();
-                    let mut nested = ModeLineRendered::default();
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &elt,
-                        &mut nested,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
-                    nested.apply_propertize_properties(cdr.cons_cdr(), pctx.target);
-                    result.append_rendered(&nested);
-                }
-                return Ok(());
-            }
-
-            if let Some(lim) = car.as_fixnum() {
-                let mut nested = ModeLineRendered::default();
-                format_mode_line_recursive(
-                    eval,
-                    pctx,
-                    &cdr,
-                    &mut nested,
-                    depth + 1,
-                    risky,
-                    selection.as_deref_mut(),
-                )?;
-                append_mode_line_numeric_segment(
-                    result,
-                    &nested,
-                    if lim > 0 { lim } else { 0 },
-                    if lim < 0 { -lim } else { 0 },
-                );
-                return Ok(());
-            }
-
-            if car.is_symbol(symbol_mode) && !car.is_symbol_named("t", symbol_mode) {
-                if let Some(sym_name) = car.as_symbol_name(symbol_mode)
-                    && pctx
-                        .resolve_dynamic_symbol(sym_name)
-                        .value(eval.variables(), &eval.buffers)
-                        .is_some_and(|value| value.is_truthy())
-                    && let Some(branch) = mode_line_conditional_branch(cdr, true)
-                {
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &branch,
-                        result,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
-                } else if let Some(branch) = mode_line_conditional_branch(cdr, false) {
-                    format_mode_line_recursive(
-                        eval,
-                        pctx,
-                        &branch,
-                        result,
-                        depth + 1,
-                        risky,
-                        selection.as_deref_mut(),
-                    )?;
-                }
-                return Ok(());
-            }
-
-            // GNU FOR_EACH_TAIL_SAFE reads XCDR after rendering each element:
-            // :eval can detach or replace the remaining live list spine.
-            let mut tail = *format;
-            let tail_root = eval.push_specpdl_root_slot(tail);
-            let checkpoint_root = eval.push_specpdl_root_slot(tail);
-            let mut cycle = ModeLineTailCycle::new(tail);
-            while tail.is_cons() {
-                let element = tail.cons_car();
-                format_mode_line_recursive(
-                    eval,
-                    pctx,
-                    &element,
-                    result,
-                    depth + 1,
-                    risky,
-                    selection.as_deref_mut(),
-                )?;
-                tail = tail.cons_cdr();
-                eval.set_specpdl_root_slot(&tail_root, tail);
-                if cycle.step(tail, |checkpoint| {
-                    eval.set_specpdl_root_slot(&checkpoint_root, checkpoint);
-                }) {
-                    break;
-                }
-            }
-        }
-
-        _ => {
-            result.append_string_value_preserving_props(format);
-        }
-    }
-    Ok(())
+    mode_line_walk::walk(
+        eval,
+        pctx,
+        format,
+        result,
+        depth,
+        T::initial_controls(risk),
+        selection,
+    )
+    .map(|_| ())
 }
 
 #[allow(dead_code, clippy::too_many_arguments)] // split-state mode-line compatibility seam
+#[cfg(test)]
 fn format_mode_line_recursive_in_state(
     vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &crate::buffer::BufferManager,
     processes: &crate::emacs_core::process::ProcessManager,
-    pctx: &ModeLinePercentContext,
+    pctx: &ModeLinePercentContext<StoredTarget<'_>>,
     format: &Value,
     result: &mut ModeLineRendered,
     depth: usize,
@@ -4521,11 +4464,11 @@ fn format_mode_line_recursive_in_state(
             // No special case for mode-line-front-space or
             // mode-line-end-spaces; see the note on the equivalent
             // branch in `format_mode_line_recursive`.
-            if let Some(name) = format.as_bare_symbol_name()
-                && let Some((symbol, val)) = {
-                    let symbol = pctx.resolve_dynamic_symbol(name);
-                    symbol.value(vars, buffers).map(|value| (symbol, value))
-                }
+            if let Some(symbol) = format
+                .as_bare_symbol_id()
+                .map(mode_line_symbols::ResolvedModeLineSymbol::from)
+                && let Some((symbol, val)) =
+                    { symbol.value(vars, buffers).map(|value| (symbol, value)) }
                 && !val.is_nil()
             {
                 if val.is_string() {
@@ -4577,7 +4520,7 @@ fn format_mode_line_recursive_in_state(
                         depth + 1,
                         risky,
                     );
-                    nested.apply_propertize_properties(cdr.cons_cdr(), pctx.target);
+                    nested.apply_propertize_properties(cdr.cons_cdr(), &pctx.target);
                     result.append_rendered(&nested);
                     return needs_eval;
                 }
@@ -4607,11 +4550,11 @@ fn format_mode_line_recursive_in_state(
             }
 
             if car.is_bare_symbol() && !car.is_bare_symbol_named("t") {
-                let branch = if let Some(sym_name) = car.as_bare_symbol_name()
-                    && pctx
-                        .resolve_dynamic_symbol(sym_name)
-                        .value(vars, buffers)
-                        .is_some_and(|value| value.is_truthy())
+                let branch = if car
+                    .as_bare_symbol_id()
+                    .map(mode_line_symbols::ResolvedModeLineSymbol::from)
+                    .and_then(|symbol| symbol.value(vars, buffers))
+                    .is_some_and(|value| value.is_truthy())
                 {
                     mode_line_conditional_branch(cdr, true)
                 } else {
@@ -4666,12 +4609,13 @@ fn format_mode_line_recursive_in_state(
 }
 
 #[allow(clippy::too_many_arguments)] // split-state mode-line compatibility seam
+#[cfg(test)]
 fn format_mode_line_recursive_in_state_with_eval_rooted(
     vars: VariableView<'_>,
     dynamic: &[OrderedRuntimeBindingMap],
     buffers: &crate::buffer::BufferManager,
     processes: &crate::emacs_core::process::ProcessManager,
-    pctx: &ModeLinePercentContext,
+    pctx: &ModeLinePercentContext<StoredTarget<'_>>,
     format: &Value,
     result: &mut ModeLineRendered,
     depth: usize,
@@ -4700,11 +4644,11 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
             // No special case for mode-line-front-space or
             // mode-line-end-spaces; they are ordinary symbols whose
             // value must be resolved and recursed on.
-            if let Some(name) = format.as_bare_symbol_name()
-                && let Some((symbol, val)) = {
-                    let symbol = pctx.resolve_dynamic_symbol(name);
-                    symbol.value(vars, buffers).map(|value| (symbol, value))
-                }
+            if let Some(symbol) = format
+                .as_bare_symbol_id()
+                .map(mode_line_symbols::ResolvedModeLineSymbol::from)
+                && let Some((symbol, val)) =
+                    { symbol.value(vars, buffers).map(|value| (symbol, value)) }
                 && !val.is_nil()
             {
                 if val.is_string() {
@@ -4783,7 +4727,7 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
                         eval_form,
                         roots,
                     )?;
-                    nested.apply_propertize_properties(cdr.cons_cdr(), pctx.target);
+                    nested.apply_propertize_properties(cdr.cons_cdr(), &pctx.target);
                     result.append_rendered(&nested);
                 }
                 return Ok(());
@@ -4814,11 +4758,11 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
             }
 
             if car.is_bare_symbol() && !car.is_bare_symbol_named("t") {
-                let branch = if let Some(sym_name) = car.as_bare_symbol_name()
-                    && pctx
-                        .resolve_dynamic_symbol(sym_name)
-                        .value(vars, buffers)
-                        .is_some_and(|value| value.is_truthy())
+                let branch = if car
+                    .as_bare_symbol_id()
+                    .map(mode_line_symbols::ResolvedModeLineSymbol::from)
+                    .and_then(|symbol| symbol.value(vars, buffers))
+                    .is_some_and(|value| value.is_truthy())
                 {
                     mode_line_conditional_branch(cdr, true)
                 } else {
@@ -4877,32 +4821,119 @@ fn format_mode_line_recursive_in_state_with_eval_rooted(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // split evaluator state avoids aliasing the full Context
-fn expand_mode_line_percent_in_state(
-    vars: VariableView<'_>,
-    dynamic: &[OrderedRuntimeBindingMap],
-    buffers: &crate::buffer::BufferManager,
-    processes: &crate::emacs_core::process::ProcessManager,
-    command_loop_depth: usize,
-    pctx: &ModeLinePercentContext,
-    value: &Value,
+#[derive(Clone, Copy)]
+struct ModeLineCommandDepth(usize);
+static_assertions::assert_eq_size!(ModeLineCommandDepth, usize);
+impl From<usize> for ModeLineCommandDepth {
+    fn from(depth: usize) -> Self {
+        Self(depth)
+    }
+}
+impl ModeLineCommandDepth {
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Pure native memo owned by one append driver. The driver retains immutable
+/// buffer inputs for its whole string, making mutation/callback invalidation
+/// impossible. Stored emission constructs a fresh memo within each field's
+/// native borrow span and drops it before a callback request is consumed.
+#[derive(Default)]
+struct NativeSpecCache {
+    buf_name: std::cell::OnceCell<String>,
+    file_name_storage: std::cell::OnceCell<Option<String>>,
+    column_memo: Option<DisplayColumn>,
+}
+
+enum GlobalModeRequest<R> {
+    Literal,
+    Recursive(R),
+}
+trait NativeGlobalPolicy {
+    type Request;
+    fn request() -> GlobalModeRequest<Self::Request>;
+}
+struct LiteralGlobal;
+impl NativeGlobalPolicy for LiteralGlobal {
+    type Request = std::convert::Infallible;
+    fn request() -> GlobalModeRequest<Self::Request> {
+        GlobalModeRequest::Literal
+    }
+}
+struct RecursiveGlobal;
+impl NativeGlobalPolicy for RecursiveGlobal {
+    type Request = ();
+    fn request() -> GlobalModeRequest<Self::Request> {
+        GlobalModeRequest::Recursive(())
+    }
+}
+enum NativeSpecAction<R> {
+    Emitted,
+    RecurseGlobal(R),
+}
+
+fn append_unknown_mode_line_percent_spec(
     result: &mut ModeLineRendered,
-    point_access: &mut mode_line_point::Access<'_>,
+    code: char,
+    properties: &std::collections::HashMap<Value, Value>,
+    field_width: ModeLineNativeFieldWidth,
 ) {
-    let fmt_storage = if let Some(string) = value.as_lisp_string() {
-        crate::emacs_core::emacs_char::to_utf8_lossy(string.as_bytes())
-    } else if let Some(text) = value.as_utf8_str() {
-        text.to_owned()
-    } else {
-        return;
-    };
-    let fmt_str = fmt_storage.as_str();
+    let mut unknown = String::from("%");
+    unknown.push(code);
+    append_mode_line_percent_string_spec(result, &unknown, properties, i64::from(field_width));
+}
+
+/// A native borrow span contains no callback capability. Mutable frame and
+/// memo access cannot escape this per-field decoder call.
+struct NativeSpecInputs<'state, 'frame, T: TargetPolicy> {
+    vars: VariableView<'state>,
+    coding: CodingAccess<'state>,
+    dynamic: &'state [OrderedRuntimeBindingMap],
+    buffers: &'state crate::buffer::BufferManager,
+    processes: &'state crate::emacs_core::process::ProcessManager,
+    command_loop_depth: ModeLineCommandDepth,
+    pctx: &'state ModeLinePercentContext<T>,
+    point_access: &'state mut mode_line_point::Access<'frame>,
+    cache: &'state mut NativeSpecCache,
+}
+struct NativePercentField<'source> {
+    value: &'source Value,
+    position: CharPos0,
+    spec: Option<char>,
+    width: ModeLineNativeFieldWidth,
+}
+
+// ONE percent-spec dispatch. Stored callbacks occur only after its native
+// input borrow span has ended and its non-borrowing action is consumed.
+#[inline(always)]
+fn decode_one_native_spec<T: TargetPolicy, G: NativeGlobalPolicy>(
+    inputs: NativeSpecInputs<'_, '_, T>,
+    field: NativePercentField<'_>,
+    result: &mut ModeLineRendered,
+    limit: &impl ModeLineNativeFieldLimit,
+) -> NativeSpecAction<G::Request> {
+    let NativeSpecInputs {
+        vars,
+        coding,
+        dynamic,
+        buffers,
+        processes,
+        command_loop_depth,
+        pctx,
+        point_access,
+        cache,
+    } = inputs;
+    let NativePercentField {
+        value,
+        position: percent_position,
+        spec,
+        width: native_width,
+    } = field;
     let buf = buffers.current_buffer();
     // GNU decode_mode_spec reads each input in its matching switch arm.
     // This native expansion cannot run Lisp; share repeated name fields only
     // within this string, before the walker can run the next :eval.
-    let buf_name = std::cell::OnceCell::new();
-    let file_name_storage = std::cell::OnceCell::new();
     let modified = || buf.is_some_and(|b| b.is_modified());
     let read_only = || {
         buf.is_some_and(|b| {
@@ -4913,7 +4944,6 @@ fn expand_mode_line_percent_in_state(
     // A native string cannot evaluate Lisp or move point. Columns can share
     // their calculation here. Every %l must still decode and publish its next
     // shared base: reseating can invalidate that base before the next field.
-    let mut column_memo = None;
     let mut point_field = |field| -> usize {
         let Some(buffer) = buf else {
             return match field {
@@ -4924,487 +4954,568 @@ fn expand_mode_line_percent_in_state(
         match field {
             mode_line_point::Field::Line => {
                 let value = pctx.point.line_and_column(buffer, point_access);
-                column_memo = Some(value.column);
+                cache.column_memo = Some(DisplayColumn::new(value.column));
                 value.line
             }
-            mode_line_point::Field::Column => {
-                *column_memo.get_or_insert_with(|| pctx.point.column(buffer))
-            }
+            mode_line_point::Field::Column => cache
+                .column_memo
+                .get_or_insert_with(|| DisplayColumn::new(pctx.point.column(buffer)))
+                .get(),
         }
     };
 
-    let chars: Vec<char> = fmt_str.chars().collect();
-    let mut index = 0;
-    let mut literal_start = 0;
-
-    while index < chars.len() {
-        if chars[index] != '%' {
-            index += 1;
-            continue;
-        }
-
-        if literal_start < index {
-            result.append_string_char_slice_preserving_props(value, literal_start, index);
-        }
-
-        let percent_char_pos = index;
-        index += 1;
-
-        let mut field_width = 0_i64;
-        while index < chars.len() && chars[index].is_ascii_digit() {
-            let digit = chars[index] as u8;
-            field_width = field_width * 10 + i64::from(digit - b'0');
-            index += 1;
-        }
-
-        let props_at_percent = if value.is_string() {
-            with_mode_line_string_properties(*value, |table| {
-                table.get_properties_at_char_pos(CharPos0::new(percent_char_pos))
-            })
-            .unwrap_or_default()
-        } else {
-            Default::default()
-        };
-
-        match chars.get(index).copied() {
-            Some('b') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    buf_name.get_or_init(|| {
-                        buf.map(|b| b.name_runtime_string_owned())
-                            .unwrap_or_else(|| "*scratch*".to_string())
-                    }),
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
+    let decoded_width = limit.cap(native_width);
+    let stored_width = limit.store_width(decoded_width);
+    let field_width = i64::from(stored_width);
+    // Stored %M returns through the match without materializing this map.
+    let properties = std::cell::OnceCell::new();
+    let props_at_percent = || {
+        properties.get_or_init(|| {
+            if value.is_string() {
+                with_mode_line_string_properties(*value, |table| {
+                    table.get_properties_at_char_pos(percent_position)
+                })
+                .unwrap_or_default()
+            } else {
+                Default::default()
             }
-            Some('f') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    file_name_storage
-                        .get_or_init(|| {
-                            buf.and_then(|b| {
-                                b.file_name_value().as_lisp_string().map(|ls| {
-                                    crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes())
-                                })
+        })
+    };
+    match spec {
+        Some('M') => match G::request() {
+            GlobalModeRequest::Recursive(request) => {
+                return NativeSpecAction::RecurseGlobal(request);
+            }
+            GlobalModeRequest::Literal => {
+                append_unknown_mode_line_percent_spec(result, 'M', props_at_percent(), stored_width)
+            }
+        },
+        Some('b') => {
+            append_mode_line_percent_string_spec(
+                result,
+                cache.buf_name.get_or_init(|| {
+                    buf.map(|b| b.name_runtime_string_owned())
+                        .unwrap_or_else(|| "*scratch*".to_string())
+                }),
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('f') => {
+            append_mode_line_percent_string_spec(
+                result,
+                cache
+                    .file_name_storage
+                    .get_or_init(|| {
+                        buf.and_then(|b| {
+                            b.file_name_value().as_lisp_string().map(|ls| {
+                                crate::emacs_core::emacs_char::to_utf8_lossy(ls.as_bytes())
                             })
                         })
-                        .as_deref()
-                        .unwrap_or(""),
-                    &props_at_percent,
+                    })
+                    .as_deref()
+                    .unwrap_or(""),
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('i') => {
+            let size = buf
+                .map(|buffer| buffer.accessible_char_len().get())
+                .unwrap_or(0);
+            append_mode_line_percent_string_spec(
+                result,
+                &size.to_string(),
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('I') => {
+            let size = buf
+                .map(|buffer| buffer.accessible_char_len().get())
+                .unwrap_or(0);
+            append_mode_line_percent_string_spec(
+                result,
+                &mode_line_human_readable_size(size),
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('F') => {
+            // GNU xdisp.c:29208 — f->title, f->name, or "Emacs".
+            if let Some(frame_name) = pctx.frame_name {
+                append_mode_line_percent_lisp_text_spec(
+                    result,
+                    &frame_name,
+                    props_at_percent(),
                     field_width,
                 );
-                index += 1;
-            }
-            Some('i') => {
-                let size = buf
-                    .map(|buffer| buffer.accessible_char_len().get())
-                    .unwrap_or(0);
+            } else {
                 append_mode_line_percent_string_spec(
                     result,
-                    &size.to_string(),
-                    &props_at_percent,
+                    "Emacs",
+                    props_at_percent(),
                     field_width,
                 );
-                index += 1;
             }
-            Some('I') => {
-                let size = buf
-                    .map(|buffer| buffer.accessible_char_len().get())
-                    .unwrap_or(0);
-                append_mode_line_percent_string_spec(
-                    result,
-                    &mode_line_human_readable_size(size),
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('F') => {
-                // GNU xdisp.c:29208 — f->title, f->name, or "Emacs".
-                if let Some(frame_name) = pctx.frame_name {
-                    append_mode_line_percent_lisp_text_spec(
-                        result,
-                        &frame_name,
-                        &props_at_percent,
-                        field_width,
-                    );
+        }
+        Some('*') => {
+            append_mode_line_percent_string_spec(
+                result,
+                if read_only() {
+                    "%"
+                } else if modified() {
+                    "*"
                 } else {
-                    append_mode_line_percent_string_spec(
-                        result,
-                        "Emacs",
-                        &props_at_percent,
-                        field_width,
-                    );
-                }
-                index += 1;
+                    "-"
+                },
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('+') => {
+            append_mode_line_percent_string_spec(
+                result,
+                if modified() {
+                    "*"
+                } else if read_only() {
+                    "%"
+                } else {
+                    "-"
+                },
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('&') => {
+            append_mode_line_percent_string_spec(
+                result,
+                if modified() { "*" } else { "-" },
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('-') => {
+            // GNU xdisp.c:29154-29172 — `%-` dispatch depends on
+            // mode_line_target. MODE_LINE_STRING (the default,
+            // used by `(format-mode-line FORMAT)`) returns the
+            // literal two-dash string "--". MODE_LINE_DISPLAY
+            // (used by the redisplay walker) returns
+            // `lots_of_dashes` — enough dashes to fill the
+            // remaining row width; GNU's caller trims at
+            // `it->last_visible_x`.
+            //
+            // We model this with `pctx.target`: string mode emits "--";
+            // display mode emits `columns - current` dashes. The entry
+            // point that enables display mode is
+            //              `format_mode_line_for_display` below,
+            //              used by the layout engine for TTY and
+            //              GUI mode-line rendering.
+            // `%-` needs to read `result.char_len()` to compute
+            // the dash-fill width (in MODE_LINE_DISPLAY mode),
+            // but `append_spec` holds a captured mutable borrow
+            // on `result`. Drop the closure here by calling
+            // `append_mode_line_rendered_segment` directly with
+            // the pre-computed dash string.
+            let dash_string = pctx
+                .target
+                .dash_string(CharLen::new(result.char_len()), decoded_width);
+            let mut segment = ModeLineRendered::plain(&dash_string);
+            segment.overlay_property_map(props_at_percent().clone());
+            append_mode_line_rendered_segment(result, &segment, field_width, 0);
+        }
+        Some('%') => {
+            append_mode_line_percent_string_spec(result, "%", props_at_percent(), field_width);
+        }
+        Some('n') => {
+            append_mode_line_percent_string_spec(
+                result,
+                if buf.is_some_and(|b| b.is_narrowed()) {
+                    " Narrow"
+                } else {
+                    ""
+                },
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('s') => {
+            append_mode_line_percent_string_spec(
+                result,
+                mode_line_process_status_in_state(buffers, processes),
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('l') => match pctx.target.point_fields() {
+            PointFieldPolicy::Suppressed => {
+                append_mode_line_percent_string_spec(result, "", props_at_percent(), field_width);
             }
-            Some('*') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    if read_only() {
-                        "%"
-                    } else if modified() {
-                        "*"
-                    } else {
-                        "-"
-                    },
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('+') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    if modified() {
-                        "*"
-                    } else if read_only() {
-                        "%"
-                    } else {
-                        "-"
-                    },
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('&') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    if modified() { "*" } else { "-" },
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('-') => {
-                // GNU xdisp.c:29154-29172 — `%-` dispatch depends on
-                // mode_line_target. MODE_LINE_STRING (the default,
-                // used by `(format-mode-line FORMAT)`) returns the
-                // literal two-dash string "--". MODE_LINE_DISPLAY
-                // (used by the redisplay walker) returns
-                // `lots_of_dashes` — enough dashes to fill the
-                // remaining row width; GNU's caller trims at
-                // `it->last_visible_x`.
-                //
-                // We model this with `pctx.target`: string mode emits "--";
-                // display mode emits `columns - current` dashes. The entry
-                // point that enables display mode is
-                //              `format_mode_line_for_display` below,
-                //              used by the layout engine for TTY and
-                //              GUI mode-line rendering.
-                // `%-` needs to read `result.char_len()` to compute
-                // the dash-fill width (in MODE_LINE_DISPLAY mode),
-                // but `append_spec` holds a captured mutable borrow
-                // on `result`. Drop the closure here by calling
-                // `append_mode_line_rendered_segment` directly with
-                // the pre-computed dash string.
-                let dash_string: String = match pctx.target {
-                    ModeLineTarget::String => "--".to_string(),
-                    ModeLineTarget::Display { columns } => {
-                        let current = result.char_len();
-                        if columns > current {
-                            "-".repeat(columns - current)
-                        } else {
-                            "--".to_string()
-                        }
-                    }
-                };
-                let mut segment = ModeLineRendered::plain(&dash_string);
-                segment.overlay_property_map(props_at_percent.clone());
-                append_mode_line_rendered_segment(result, &segment, field_width, 0);
-                index += 1;
-            }
-            Some('%') => {
-                append_mode_line_percent_string_spec(result, "%", &props_at_percent, field_width);
-                index += 1;
-            }
-            Some('n') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    if buf.is_some_and(|b| b.is_narrowed()) {
-                        " Narrow"
-                    } else {
-                        ""
-                    },
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('s') => {
-                append_mode_line_percent_string_spec(
-                    result,
-                    mode_line_process_status_in_state(buffers, processes),
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('l') => {
+            PointFieldPolicy::Live => {
                 append_mode_line_percent_string_spec(
                     result,
                     &point_field(mode_line_point::Field::Line).to_string(),
-                    &props_at_percent,
+                    props_at_percent(),
                     field_width,
                 );
-                index += 1;
             }
-            Some('c') => {
+        },
+        Some('c') => match pctx.target.point_fields() {
+            PointFieldPolicy::Suppressed => {
+                append_mode_line_percent_string_spec(result, "", props_at_percent(), field_width);
+            }
+            PointFieldPolicy::Live => {
                 note_column_spec_consumed();
                 append_mode_line_percent_string_spec(
                     result,
                     &point_field(mode_line_point::Field::Column).to_string(),
-                    &props_at_percent,
+                    props_at_percent(),
                     field_width,
                 );
-                index += 1;
             }
-            Some('C') => {
-                // GNU: 1-indexed column number at point.
-                note_column_spec_consumed();
-                append_mode_line_percent_string_spec(
-                    result,
-                    &(point_field(mode_line_point::Field::Column) + 1).to_string(),
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('m') => {
-                // GNU: major mode name from buffer-local `mode-name`.
-                if let Some(mode_name) =
-                    mode_line_fixed_symbol_value_in_state(vars, buffers, ModeLineSymbol::ModeName)
-                        .filter(|value| value.is_string())
-                {
-                    append_mode_line_percent_lisp_text_spec(
-                        result,
-                        &mode_name,
-                        &props_at_percent,
-                        field_width,
-                    );
-                } else {
+        },
+        Some('C') => {
+            match pctx.target.point_fields() {
+                PointFieldPolicy::Suppressed => {
                     append_mode_line_percent_string_spec(
                         result,
                         "",
-                        &props_at_percent,
+                        props_at_percent(),
                         field_width,
                     );
                 }
-                index += 1;
-            }
-            Some('p') => {
-                // GNU xdisp.c:29406 — percentage of buffer above window top.
-                // pos = marker_position(w->start), checks window_end_pos.
-                let text = if let Some(b) = buf {
-                    let pos = pctx.window_start;
-                    let botpos = pctx.window_end;
-                    let begv = b.point_min_char_pos().get();
-                    let zv = b
-                        .point_max_char_pos()
-                        .get()
-                        .max(b.point_min_char_pos().get());
-                    if botpos >= zv {
-                        if pos <= begv {
-                            "All".to_owned()
-                        } else {
-                            "Bottom".to_owned()
-                        }
-                    } else if pos <= begv {
-                        "Top".to_owned()
-                    } else {
-                        format!("{}%", percent99(pos - begv, zv - begv))
-                    }
-                } else {
-                    String::new()
-                };
-                append_mode_line_percent_string_spec(result, &text, &props_at_percent, field_width);
-                index += 1;
-            }
-            Some('P') => {
-                // GNU xdisp.c:29425 — percentage of buffer above window bottom.
-                let text = if let Some(b) = buf {
-                    let toppos = pctx.window_start;
-                    let botpos = pctx.window_end;
-                    let begv = b.point_min_char_pos().get();
-                    let zv = b
-                        .point_max_char_pos()
-                        .get()
-                        .max(b.point_min_char_pos().get());
-                    if botpos >= zv {
-                        if toppos <= begv {
-                            "All".to_owned()
-                        } else {
-                            "Bottom".to_owned()
-                        }
-                    } else {
-                        let pct = percent99(botpos.saturating_sub(begv), zv.saturating_sub(begv));
-                        if toppos <= begv {
-                            format!("{}%", pct)
-                        } else {
-                            format!("Top{}%", pct)
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-                append_mode_line_percent_string_spec(result, &text, &props_at_percent, field_width);
-                index += 1;
-            }
-            Some('o') => {
-                // GNU xdisp.c:29386 — degree of travel of window through buffer.
-                let text = if let Some(b) = buf {
-                    let toppos = pctx.window_start;
-                    let botpos = pctx.window_end;
-                    let begv = b.point_min_char_pos().get();
-                    let zv = b
-                        .point_max_char_pos()
-                        .get()
-                        .max(b.point_min_char_pos().get());
-                    if botpos >= zv {
-                        if toppos <= begv {
-                            "All".to_owned()
-                        } else {
-                            "Bottom".to_owned()
-                        }
-                    } else if toppos <= begv {
-                        "Top".to_owned()
-                    } else {
-                        let top_dist = toppos - begv;
-                        let bot_dist = zv - botpos;
-                        format!("{}%", percent99(top_dist, top_dist + bot_dist))
-                    }
-                } else {
-                    String::new()
-                };
-                append_mode_line_percent_string_spec(result, &text, &props_at_percent, field_width);
-                index += 1;
-            }
-            Some('q') => {
-                // GNU xdisp.c:29445 — percentage offsets of top and bottom of window.
-                let text = if let Some(b) = buf {
-                    let toppos = pctx.window_start;
-                    let botpos = pctx.window_end;
-                    let begv = b.point_min_char_pos().get();
-                    let zv = b
-                        .point_max_char_pos()
-                        .get()
-                        .max(b.point_min_char_pos().get());
-                    if toppos <= begv && botpos >= zv {
-                        "All   ".to_owned()
-                    } else {
-                        let range = zv.saturating_sub(begv);
-                        let top_pct = if toppos <= begv {
-                            0
-                        } else {
-                            percent99(toppos - begv, range)
-                        };
-                        let bot_pct = if botpos >= zv {
-                            100
-                        } else {
-                            percent99(botpos.saturating_sub(begv), range)
-                        };
-                        if top_pct == bot_pct {
-                            format!("{}%", top_pct)
-                        } else {
-                            format!("{}-{}%", top_pct, bot_pct)
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-                append_mode_line_percent_string_spec(result, &text, &props_at_percent, field_width);
-                index += 1;
-            }
-            Some('z') => {
-                // GNU xdisp.c:29494 — coding system mnemonic without EOL indicator.
-                // On TTY frames GNU includes terminal + keyboard + buffer coding
-                // mnemonics, regardless of MODE_LINE_STRING vs MODE_LINE_DISPLAY.
-                append_mode_line_percent_string_spec(
-                    result,
-                    &pctx.buffer_coding.with_frame(pctx.frame_coding_mnemonics),
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('@') => {
-                // GNU xdisp.c:29477 — "@" if default-directory is remote, "-" otherwise.
-                let remote = mode_line_fixed_symbol_value_in_state(
-                    vars,
-                    buffers,
-                    ModeLineSymbol::DefaultDirectory,
-                )
-                .and_then(|v| mode_line_runtime_string(&v))
-                .map(|dir| is_remote_directory(&dir))
-                .unwrap_or(false);
-                append_mode_line_percent_string_spec(
-                    result,
-                    if remote { "@" } else { "-" },
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('Z') => {
-                // GNU xdisp.c:29496 — coding system mnemonic WITH EOL indicator.
-                let mut segment = ModeLineRendered::plain(
-                    pctx.buffer_coding.with_frame(pctx.frame_coding_mnemonics),
-                );
-                if let Some(eol_indicator) = pctx.eol_indicator {
-                    segment.append_decoded_string_or_char_value_preserving_props(&eol_indicator);
-                } else {
-                    segment.push_plain_char(':');
+                PointFieldPolicy::Live => {
+                    // GNU: 1-indexed column number at point.
+                    note_column_spec_consumed();
+                    append_mode_line_percent_string_spec(
+                        result,
+                        &(point_field(mode_line_point::Field::Column) + 1).to_string(),
+                        props_at_percent(),
+                        field_width,
+                    );
                 }
-                segment.overlay_property_map(props_at_percent.clone());
-                append_mode_line_rendered_segment(result, &segment, field_width, 0);
-                index += 1;
-            }
-            Some(c @ ('[' | ']')) => {
-                let repeated = match (c, command_loop_depth) {
-                    ('[', depth) if depth > 5 => "[[[... ".to_string(),
-                    (']', depth) if depth > 5 => " ...]]]".to_string(),
-                    (bracket, depth) => std::iter::repeat_n(bracket, depth).collect(),
-                };
-                append_mode_line_percent_string_spec(
-                    result,
-                    &repeated,
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            Some('e') => {
-                append_mode_line_percent_string_spec(result, "", &props_at_percent, field_width);
-                index += 1;
-            }
-            Some(' ') => {
-                append_mode_line_percent_string_spec(result, " ", &props_at_percent, field_width);
-                index += 1;
-            }
-            Some(c) => {
-                let mut unknown = String::from("%");
-                unknown.push(c);
-                append_mode_line_percent_string_spec(
-                    result,
-                    &unknown,
-                    &props_at_percent,
-                    field_width,
-                );
-                index += 1;
-            }
-            None => {
-                append_mode_line_percent_string_spec(result, "%", &props_at_percent, field_width)
             }
         }
-
-        literal_start = index;
+        Some('m') => {
+            // GNU: major mode name from buffer-local `mode-name`.
+            if let Some(mode_name) =
+                mode_line_fixed_symbol_value_in_state(vars, buffers, ModeLineSymbol::ModeName)
+                    .filter(|value| value.is_string())
+            {
+                append_mode_line_percent_lisp_text_spec(
+                    result,
+                    &mode_name,
+                    props_at_percent(),
+                    field_width,
+                );
+            } else {
+                append_mode_line_percent_string_spec(result, "", props_at_percent(), field_width);
+            }
+        }
+        Some('p') => {
+            // GNU xdisp.c:29406 — percentage of buffer above window top.
+            // pos = marker_position(w->start), checks window_end_pos.
+            let text = if let Some(b) = buf {
+                let pos = pctx.window_start;
+                let botpos = pctx.window_end;
+                let begv = b.point_min_char_pos().get();
+                let zv = b
+                    .point_max_char_pos()
+                    .get()
+                    .max(b.point_min_char_pos().get());
+                if botpos >= zv {
+                    if pos <= begv {
+                        "All".to_owned()
+                    } else {
+                        "Bottom".to_owned()
+                    }
+                } else if pos <= begv {
+                    "Top".to_owned()
+                } else {
+                    format!("{}%", percent99(pos - begv, zv - begv))
+                }
+            } else {
+                String::new()
+            };
+            append_mode_line_percent_string_spec(result, &text, props_at_percent(), field_width);
+        }
+        Some('P') => {
+            // GNU xdisp.c:29425 — percentage of buffer above window bottom.
+            let text = if let Some(b) = buf {
+                let toppos = pctx.window_start;
+                let botpos = pctx.window_end;
+                let begv = b.point_min_char_pos().get();
+                let zv = b
+                    .point_max_char_pos()
+                    .get()
+                    .max(b.point_min_char_pos().get());
+                if botpos >= zv {
+                    if toppos <= begv {
+                        "All".to_owned()
+                    } else {
+                        "Bottom".to_owned()
+                    }
+                } else {
+                    let pct = percent99(botpos.saturating_sub(begv), zv.saturating_sub(begv));
+                    if toppos <= begv {
+                        format!("{}%", pct)
+                    } else {
+                        format!("Top{}%", pct)
+                    }
+                }
+            } else {
+                String::new()
+            };
+            append_mode_line_percent_string_spec(result, &text, props_at_percent(), field_width);
+        }
+        Some('o') => {
+            // GNU xdisp.c:29386 — degree of travel of window through buffer.
+            let text = if let Some(b) = buf {
+                let toppos = pctx.window_start;
+                let botpos = pctx.window_end;
+                let begv = b.point_min_char_pos().get();
+                let zv = b
+                    .point_max_char_pos()
+                    .get()
+                    .max(b.point_min_char_pos().get());
+                if botpos >= zv {
+                    if toppos <= begv {
+                        "All".to_owned()
+                    } else {
+                        "Bottom".to_owned()
+                    }
+                } else if toppos <= begv {
+                    "Top".to_owned()
+                } else {
+                    let top_dist = toppos - begv;
+                    let bot_dist = zv - botpos;
+                    format!("{}%", percent99(top_dist, top_dist + bot_dist))
+                }
+            } else {
+                String::new()
+            };
+            append_mode_line_percent_string_spec(result, &text, props_at_percent(), field_width);
+        }
+        Some('q') => {
+            // GNU xdisp.c:29445 — percentage offsets of top and bottom of window.
+            let text = if let Some(b) = buf {
+                let toppos = pctx.window_start;
+                let botpos = pctx.window_end;
+                let begv = b.point_min_char_pos().get();
+                let zv = b
+                    .point_max_char_pos()
+                    .get()
+                    .max(b.point_min_char_pos().get());
+                if toppos <= begv && botpos >= zv {
+                    "All   ".to_owned()
+                } else {
+                    let range = zv.saturating_sub(begv);
+                    let top_pct = if toppos <= begv {
+                        0
+                    } else {
+                        percent99(toppos - begv, range)
+                    };
+                    let bot_pct = if botpos >= zv {
+                        100
+                    } else {
+                        percent99(botpos.saturating_sub(begv), range)
+                    };
+                    if top_pct == bot_pct {
+                        format!("{}%", top_pct)
+                    } else {
+                        format!("{}-{}%", top_pct, bot_pct)
+                    }
+                }
+            } else {
+                String::new()
+            };
+            append_mode_line_percent_string_spec(result, &text, props_at_percent(), field_width);
+        }
+        Some('z') => coding.append_field(
+            mode_line_coding::CodingDetail::Mnemonic,
+            pctx.coding_frame,
+            vars,
+            buffers,
+            result,
+            props_at_percent(),
+            stored_width,
+        ),
+        Some('@') => {
+            // GNU xdisp.c:29477 — "@" if default-directory is remote, "-" otherwise.
+            let remote = mode_line_fixed_symbol_value_in_state(
+                vars,
+                buffers,
+                ModeLineSymbol::DefaultDirectory,
+            )
+            .and_then(|v| mode_line_runtime_string(&v))
+            .map(|dir| is_remote_directory(&dir))
+            .unwrap_or(false);
+            append_mode_line_percent_string_spec(
+                result,
+                if remote { "@" } else { "-" },
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('Z') => coding.append_field(
+            mode_line_coding::CodingDetail::WithEndOfLine,
+            pctx.coding_frame,
+            vars,
+            buffers,
+            result,
+            props_at_percent(),
+            stored_width,
+        ),
+        Some(c @ ('[' | ']')) => {
+            let repeated = match (c, command_loop_depth.get()) {
+                ('[', depth) if depth > 5 => "[[[... ".to_string(),
+                (']', depth) if depth > 5 => " ...]]]".to_string(),
+                (bracket, depth) => std::iter::repeat_n(bracket, depth).collect(),
+            };
+            append_mode_line_percent_string_spec(
+                result,
+                &repeated,
+                props_at_percent(),
+                field_width,
+            );
+        }
+        Some('e') => {
+            append_mode_line_percent_string_spec(result, "", props_at_percent(), field_width);
+        }
+        Some(' ') => {
+            append_mode_line_percent_string_spec(result, " ", props_at_percent(), field_width);
+        }
+        Some(c) => {
+            append_unknown_mode_line_percent_spec(result, c, props_at_percent(), stored_width)
+        }
+        None => append_mode_line_percent_string_spec(result, "%", props_at_percent(), field_width),
     }
+    NativeSpecAction::Emitted
+}
 
-    if literal_start < chars.len() {
-        result.append_string_char_slice_preserving_props(value, literal_start, chars.len());
+struct NativeAppendDriver<'input, 'dynamic, 'point, T: TargetPolicy, L> {
+    vars: VariableView<'input>,
+    coding: CodingAccess<'input>,
+    dynamic: &'dynamic [OrderedRuntimeBindingMap],
+    buffers: &'input crate::buffer::BufferManager,
+    processes: &'input crate::emacs_core::process::ProcessManager,
+    command_loop_depth: ModeLineCommandDepth,
+    pctx: &'input ModeLinePercentContext<T>,
+    value: &'input Value,
+    result: &'input mut ModeLineRendered,
+    point_access: &'input mut mode_line_point::Access<'point>,
+    limit: L,
+    chars: Vec<char>,
+    cache: NativeSpecCache,
+}
+
+impl PercentWidth for ModeLineNativeFieldWidth {
+    type Error = std::convert::Infallible;
+    const ZERO: Self = Self::ZERO;
+    fn decimal_digit(self, digit: DecimalDigit) -> Result<Self, Self::Error> {
+        Ok(self.append_decimal_digit(digit))
+    }
+}
+
+impl<T: TargetPolicy, L: ModeLineNativeFieldLimit> PercentAppendDriver
+    for NativeAppendDriver<'_, '_, '_, T, L>
+{
+    type Error = std::convert::Infallible;
+    type Width = ModeLineNativeFieldWidth;
+    const ZERO: ZeroTerminator = ZeroTerminator::Literal;
+    const TRAILING: TrailingPercent = TrailingPercent::Emit;
+
+    fn code_at(&self, position: CharPos0) -> Option<EmacsChar> {
+        self.chars
+            .get(position.get())
+            .copied()
+            .map(EmacsChar::from_char)
+    }
+    fn admit(&mut self) -> Result<AppendAdmission, Self::Error> {
+        Ok(AppendAdmission::Continue)
+    }
+    fn literal(&mut self, range: CharRange) -> Result<(), Self::Error> {
+        self.result.append_string_char_slice_preserving_props(
+            self.value,
+            range.start().get(),
+            range.end().get(),
+        );
+        Ok(())
+    }
+    fn field(
+        &mut self,
+        range: CharRange,
+        spec: Option<EmacsChar>,
+        width: Self::Width,
+    ) -> Result<(), Self::Error> {
+        match decode_one_native_spec::<T, LiteralGlobal>(
+            NativeSpecInputs {
+                vars: self.vars,
+                coding: self.coding,
+                dynamic: self.dynamic,
+                buffers: self.buffers,
+                processes: self.processes,
+                command_loop_depth: self.command_loop_depth,
+                pctx: self.pctx,
+                point_access: &mut *self.point_access,
+                cache: &mut self.cache,
+            },
+            NativePercentField {
+                value: self.value,
+                position: range.start(),
+                spec: spec.and_then(EmacsChar::as_rust_char),
+                width,
+            },
+            self.result,
+            &self.limit,
+        ) {
+            NativeSpecAction::Emitted => {}
+            NativeSpecAction::RecurseGlobal(never) => match never {},
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_mode_line_percent_in_state<T: TargetPolicy>(
+    vars: VariableView<'_>,
+    coding: CodingAccess<'_>,
+    dynamic: &[OrderedRuntimeBindingMap],
+    buffers: &crate::buffer::BufferManager,
+    processes: &crate::emacs_core::process::ProcessManager,
+    command_loop_depth: usize,
+    pctx: &ModeLinePercentContext<T>,
+    value: &Value,
+    result: &mut ModeLineRendered,
+    point_access: &mut mode_line_point::Access<'_>,
+    limit: impl ModeLineNativeFieldLimit,
+) {
+    let fmt_storage = if let Some(string) = value.as_lisp_string() {
+        crate::emacs_core::emacs_char::to_utf8_lossy(string.as_bytes())
+    } else if let Some(text) = value.as_utf8_str() {
+        text.to_owned()
+    } else {
+        return;
+    };
+    let mut driver = NativeAppendDriver {
+        vars,
+        coding,
+        dynamic,
+        buffers,
+        processes,
+        command_loop_depth: command_loop_depth.into(),
+        pctx,
+        value,
+        result,
+        point_access,
+        limit,
+        chars: fmt_storage.chars().collect(),
+        cache: NativeSpecCache::default(),
+    };
+    let result = mode_line_append::append_percent_stops(&mut driver);
+    match result {
+        Ok(()) => {}
+        Err(never) => match never {},
     }
 }
 
@@ -5575,7 +5686,7 @@ pub(crate) fn builtin_invisible_p(eval: &mut super::eval::Context, args: Vec<Val
 /// (line-pixel-height) -> integer
 ///
 /// Batch-compatible behavior returns 1.
-pub(crate) fn builtin_line_pixel_height(args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_line_pixel_height(args: &[Value]) -> EvalResult {
     expect_args("line-pixel-height", &args, 0)?;
     Ok(Value::fixnum(1))
 }
@@ -6508,7 +6619,7 @@ pub(crate) fn builtin_fringe_bitmaps_at_pos(
 /// `simple.el` can reason about visual line movement without batch fallbacks.
 pub(crate) fn builtin_window_line_height(
     eval: &mut super::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     let noninteractive = eval.noninteractive();
     window_line_height_impl(&mut eval.frames, &mut eval.buffers, noninteractive, args)
@@ -6518,7 +6629,7 @@ fn window_line_height_impl(
     frames: &mut crate::window::FrameManager,
     buffers: &mut crate::buffer::BufferManager,
     noninteractive: bool,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_args_range("window-line-height", &args, 0, 2)?;
     validate_optional_window_designator_in_state(
@@ -6971,12 +7082,11 @@ pub(crate) fn builtin_move_to_window_line(
 
     // GNU `displayed_window_lines (w)`.
     let window_value = Value::make_window(wid.0);
-    let lines =
-        super::window_cmds::builtin_window_body_height(eval, vec![window_value, Value::NIL])
-            .ok()
-            .and_then(|value| value.as_fixnum())
-            .unwrap_or(1)
-            .max(1);
+    let lines = super::window_cmds::builtin_window_body_height(eval, &[window_value, Value::NIL])
+        .ok()
+        .and_then(|value| value.as_fixnum())
+        .unwrap_or(1)
+        .max(1);
 
     let accessible = match eval.buffers.get(buf_id) {
         Some(buf) => buf.accessible_emacs_byte_region(),
@@ -7005,7 +7115,7 @@ pub(crate) fn builtin_move_to_window_line(
             let _ = eval.buffers.goto_buffer_emacs_byte_pos(current_id, byte);
         }
         None => {
-            super::indent::vertical_motion(eval, vec![Value::fixnum(-(lines / 2))])?;
+            super::indent::vertical_motion(eval, &[Value::fixnum(-(lines / 2))])?;
             let point = eval
                 .buffers
                 .get(current_id)
@@ -7024,7 +7134,7 @@ pub(crate) fn builtin_move_to_window_line(
         arg += 1;
     }
 
-    super::indent::vertical_motion(eval, vec![Value::fixnum(arg), window_value])
+    super::indent::vertical_motion(eval, &[Value::fixnum(arg), window_value])
 }
 
 /// (tool-bar-height &optional FRAME PIXELWISE) -> integer
@@ -7150,7 +7260,7 @@ pub(crate) fn line_number_gutter_cols(
     char_height: f32,
 ) -> i64 {
     let enabled = buffer
-        .buffer_local_value("display-line-numbers")
+        .buffer_local_value_id(WellKnown::DisplayLineNumbers.id())
         .is_some_and(|value| value.is_truthy());
     if !enabled {
         return 0;
@@ -8013,6 +8123,27 @@ impl PositionVisibility {
     }
 }
 
+/// Take a deferred chrome exit before a Position query is mapped to a layout
+/// error. GNU's redisplay handler propagates throws and non-error signals to
+/// the enclosing Lisp `catch`; leaving the exit pending would turn it into
+/// `DidNotConverge` and leak it into the next redisplay.
+fn take_position_query_flow(
+    eval: &mut super::eval::Context,
+    scope: crate::window::WindowLayoutQueryScope,
+    query_failed: bool,
+) -> Result<(), Flow> {
+    if query_failed
+        && matches!(
+            scope,
+            crate::window::WindowLayoutQueryScope::Position { .. }
+        )
+        && let Some(flow) = eval.take_mode_line_display_flow()
+    {
+        return Err(flow);
+    }
+    Ok(())
+}
+
 fn live_position_visibility(
     eval: &mut super::eval::Context,
     window: Option<&Value>,
@@ -8115,7 +8246,13 @@ fn live_position_visibility(
     let scope = pos.map_or(crate::window::WindowLayoutQueryScope::Viewport, |target| {
         crate::window::WindowLayoutQueryScope::Position { target }
     });
-    match eval.query_window_layout_scope(fid, wid, scope) {
+    let outcome = eval.query_window_layout_scope(fid, wid, scope);
+    take_position_query_flow(
+        eval,
+        scope,
+        matches!(&outcome, crate::window::WindowLayoutQueryOutcome::Failed(_)),
+    )?;
+    match outcome {
         crate::window::WindowLayoutQueryOutcome::Ready(query) => {
             Ok(query.into_geometry().as_ref().map(measure))
         }
@@ -8514,13 +8651,11 @@ fn resolve_exact_visible_metrics_with_layout(
 
 /// Whether the retained row map for WINDOW still describes the live window.
 ///
-/// This is `vertical-motion`'s predicate, not a second one:
-/// `Context::fresh_window_display_snapshot` compares the whole
-/// [`crate::window::WindowDisplaySnapshotFreshness`] token, whose fields are
-/// deliberately opaque so that "individual snapshot consumers [cannot] invent
-/// partial freshness checks that drift apart". This includes graphical
-/// windows: a renderer acknowledgement does not make old scroll coordinates
-/// suitable for a new Lisp motion query.
+/// Prefer the canonical freshness comparison used by `vertical-motion`. The
+/// point-only exception additionally rejects row inputs whose geometry can
+/// depend on point without changing their format or face definitions. This also
+/// applies to graphical windows: renderer acknowledgement alone does not make
+/// old coordinates suitable for a live Lisp motion query.
 fn retained_rows_answer_for_live_window(
     eval: &super::eval::Context,
     window: Option<&Value>,
@@ -8534,9 +8669,135 @@ fn retained_rows_answer_for_live_window(
     let Some(buffer_id) = frame.find_window(wid).and_then(|window| window.buffer_id()) else {
         return Ok(true);
     };
-    Ok(eval
+    if eval
         .fresh_window_display_snapshot(fid, wid, buffer_id)
-        .is_some())
+        .is_some()
+    {
+        return Ok(true);
+    }
+    // Stable format/face definitions do not prove stable geometry after point
+    // moves: chrome can evaluate Lisp, and the current line-number face can
+    // change row metrics even with absolute numbering.
+    if !line_numbers_are_point_independent(eval, fid, buffer_id)
+        || !chrome_is_point_independent(eval, fid, wid, buffer_id)
+    {
+        return Ok(false);
+    }
+    let Some(current) = eval.window_display_snapshot_freshness(fid, wid, buffer_id) else {
+        return Ok(false);
+    };
+    Ok(eval
+        .frames
+        .get(fid)
+        .and_then(|frame| frame.redisplay_snapshot(wid))
+        .and_then(|snapshot| snapshot.layout_freshness.as_ref())
+        .is_some_and(|recorded| recorded.same_position_rows_ignoring_point(&current)))
+}
+
+/// Whether line numbering is proven not to change geometry when point moves.
+///
+/// Absolute numbering still selects `line-number-current-line` for the current
+/// row, so moving point can change that row's prefix metrics. GNU's
+/// `try_cursor_movement` accepts the shortcut only when the two faces' frame
+/// lface definitions are equal, tolerating their default direct `:inherit`
+/// relationship (src/xdisp.c:19912-19918); relative and visual numbering are
+/// rejected separately because they renumber every row (src/xdisp.c:19908-19911).
+fn line_numbers_are_point_independent(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    buffer_id: crate::buffer::BufferId,
+) -> bool {
+    let Some(buffer) = eval.buffers.get(buffer_id) else {
+        return true;
+    };
+    let Some(value) = eval.variable_value_in_buffer(
+        Some(buffer),
+        crate::emacs_core::intern::intern("display-line-numbers"),
+    ) else {
+        return true;
+    };
+    if value.is_nil() {
+        return true;
+    }
+    if matches!(
+        value.as_bare_symbol_name().as_deref(),
+        Some("relative" | "visual")
+    ) {
+        return false;
+    }
+    // Neomacs realizes buffer-local face remappings while also comparing the
+    // frame's lface definitions. Equal definitions can therefore still yield
+    // different row metrics when either face is remapped in this buffer.
+    if line_number_faces_are_remapped(eval, buffer) {
+        return false;
+    }
+    crate::emacs_core::xfaces::lisp_faces_equal_in_frame(
+        eval,
+        frame_id,
+        "line-number",
+        "line-number-current-line",
+        true,
+    )
+}
+
+fn line_number_faces_are_remapped(eval: &super::eval::Context, buffer: &Buffer) -> bool {
+    let Some(value) = eval.variable_value_in_buffer(
+        Some(buffer),
+        crate::emacs_core::intern::intern("face-remapping-alist"),
+    ) else {
+        return false;
+    };
+    if value.is_nil() {
+        return false;
+    }
+    let remapping = crate::face::FaceRemapping::from_lisp(&value);
+    remapping.get("line-number").is_some() || remapping.get("line-number-current-line").is_some()
+}
+
+/// Whether the chrome partition is proven not to change when point moves.
+///
+/// GNU `pos_visible_p` re-evaluates all three chrome formats and measures
+/// their rendered rows on *every* query (src/xdisp.c:1732-1770, 28216-28399),
+/// so a `:eval` that reads point is answered from fresh geometry. This port
+/// answers from retained rows whose measured chrome heights came from an
+/// earlier point. A position query remeasures chrome and retries the body if
+/// its partition changes, so point-only reuse requires that no chrome line is
+/// present. Presence, not the format value, is the
+/// question GNU asks here (`window_wants_mode_line` and friends,
+/// src/window.c:6037-6101): a format on a window too short to show it, or on
+/// the minibuffer, cannot affect the text area.
+///
+/// Any present chrome requires the canonical query and its chrome measurement.
+/// That is deliberately stronger than scanning
+/// the format for `:eval`: chrome percentages and `%M`/`%m` splice arbitrary
+/// propertized strings, and a static proof of row height would have to model
+/// every display spec and face metric those strings can introduce.
+fn chrome_is_point_independent(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    window_id: WindowId,
+    buffer_id: crate::buffer::BufferId,
+) -> bool {
+    let (Some(frame), Some(buffer)) = (eval.frames.get(frame_id), eval.buffers.get(buffer_id))
+    else {
+        return false;
+    };
+    let Some(window) = frame.find_window(window_id) else {
+        return false;
+    };
+    let presence = WindowChromePresence::resolve(
+        window,
+        buffer,
+        frame,
+        eval.frames.is_minibuffer_window_id(window_id),
+    );
+    ![
+        WindowChromeLine::ModeLine,
+        WindowChromeLine::HeaderLine,
+        WindowChromeLine::TabLine,
+    ]
+    .into_iter()
+    .any(|line| presence.contains(line))
 }
 
 fn resolve_exact_visible_metrics(
@@ -8741,7 +9002,7 @@ fn call_fontification_functions_at<O: FontificationDemandObserver>(
     pos: i64,
     observer: &mut O,
 ) {
-    let hook_sym = intern("fontification-functions");
+    let hook_sym = FONTIFICATION_FUNCTIONS.id();
     let functions = hook_runtime::collect_hook_functions_in_state(ctx, hook_sym, hook_value, true);
     if functions.is_empty() {
         return;
@@ -8757,7 +9018,7 @@ fn call_fontification_functions_at<O: FontificationDemandObserver>(
 
     let binding_count = ctx.specpdl.len();
     if let Err(flow) = ctx.try_specbind_or_unwind_to(binding_count, hook_sym, Value::NIL) {
-        let rendered = super::error::format_flow_with_eval(ctx, &flow);
+        let rendered = crate::emacs_core::print::format_flow_with_eval(ctx, &flow);
         tracing::warn!(
             "error binding redisplay fontification hook at {}: {}",
             pos,
@@ -8778,7 +9039,7 @@ fn call_fontification_functions_at<O: FontificationDemandObserver>(
             ModeLineSymbol::InhibitRedisplay.id(),
             Value::T,
         ) {
-            let rendered = super::error::format_flow_with_eval(ctx, &flow);
+            let rendered = crate::emacs_core::print::format_flow_with_eval(ctx, &flow);
             tracing::warn!(
                 "error binding redisplay inhibition at {}: {}",
                 pos,
@@ -8790,7 +9051,7 @@ fn call_fontification_functions_at<O: FontificationDemandObserver>(
         let result = ctx.apply(function, vec![arg]);
         let result = ctx.unbind_to_with_result(call_count, result);
         if let Err(flow) = result {
-            let rendered = super::error::format_flow_with_eval(ctx, &flow);
+            let rendered = crate::emacs_core::print::format_flow_with_eval(ctx, &flow);
             tracing::warn!(
                 "error during redisplay fontification at {}: {}",
                 pos,
@@ -8800,7 +9061,7 @@ fn call_fontification_functions_at<O: FontificationDemandObserver>(
     }
 
     if let Err(flow) = ctx.unbind_to_with_result(binding_count, Ok(Value::NIL)) {
-        let rendered = super::error::format_flow_with_eval(ctx, &flow);
+        let rendered = crate::emacs_core::print::format_flow_with_eval(ctx, &flow);
         tracing::warn!(
             "error restoring redisplay fontification bindings at {}: {}",
             pos,
@@ -8954,7 +9215,7 @@ fn ensure_fontified_for_redisplay_inner<O: FontificationDemandObserver>(
 
     let result = (|| -> Result<RedisplayFontificationOutcome, Flow> {
         if ctx
-            .eval_symbol("memory-full")
+            .eval_symbol_by_id(WellKnown::MemoryFull.id())
             .unwrap_or(Value::NIL)
             .is_truthy()
         {
@@ -8962,7 +9223,7 @@ fn ensure_fontified_for_redisplay_inner<O: FontificationDemandObserver>(
             return Ok(RedisplayFontificationOutcome::Unchanged);
         }
 
-        let hook_sym = intern("fontification-functions");
+        let hook_sym = FONTIFICATION_FUNCTIONS.id();
         let hook_value = hook_runtime::hook_value_by_id(ctx, hook_sym).unwrap_or(Value::NIL);
         if hook_value.is_nil() {
             observer.unknown();
@@ -9259,7 +9520,13 @@ fn compute_live_window_geometry_scope(
     {
         return Ok(None);
     }
-    match eval.query_window_layout_scope(fid, wid, scope) {
+    let outcome = eval.query_window_layout_scope(fid, wid, scope);
+    take_position_query_flow(
+        eval,
+        scope,
+        matches!(&outcome, crate::window::WindowLayoutQueryOutcome::Failed(_)),
+    )?;
+    match outcome {
         crate::window::WindowLayoutQueryOutcome::Ready(query) => Ok(query.into_geometry()),
         crate::window::WindowLayoutQueryOutcome::Unavailable => Ok(None),
         crate::window::WindowLayoutQueryOutcome::LayoutBusy => Err(signal(
@@ -10458,8 +10725,16 @@ pub(crate) fn builtin_buffer_text_pixel_size(
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/text_measurement_invisible_test.rs"]
+mod text_measurement_invisible_tests;
+
+#[cfg(test)]
 #[path = "tests/mode_line_gc_roots_test.rs"]
 mod mode_line_gc_roots;
+
+#[cfg(test)]
+#[path = "tests/mode_line_element_attribution_test.rs"]
+mod mode_line_element_attribution_tests;
 
 #[cfg(test)]
 #[path = "tests/mode_line_multibyte_identity_test.rs"]
@@ -10500,3 +10775,14 @@ mod mode_line_point_test;
 #[cfg(test)]
 #[path = "tests/mode_line_nested_point_test.rs"]
 mod mode_line_nested_point_test;
+
+/// Carrier park: clear the column-spec consumption latch.
+pub(crate) fn reset_carrier_tls() {
+    COLUMN_SPEC_CONSUMED.with(|slot| slot.set(false));
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(h, COLUMN_SPEC_CONSUMED.with(|slot| slot.get() as u64));
+}

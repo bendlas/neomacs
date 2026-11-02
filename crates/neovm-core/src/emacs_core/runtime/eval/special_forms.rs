@@ -7,8 +7,8 @@ use super::*;
 
 /// Temporary root visibility owned by one mutator during a special form.
 ///
-/// The mutable Context borrow is confined to this scope. Drop preserves the same
-/// enclosing-sequence residue as the normal return path; it only compacts
+/// The mutable Context borrow is confined to this scope. Drop applies the same
+/// enclosing-sequence retention as the normal return path; it only compacts
 /// existing arena entries and does not allocate, run Lisp, or perform I/O.
 #[must_use = "dropping the guard restores temporary roots to the enclosing sequence"]
 pub(super) struct EvalTempRootsToSequenceGuard<'a> {
@@ -51,6 +51,66 @@ impl Drop for EvalTempRootsToSequenceGuard<'_> {
         // Restoring arena visibility clamps ranges to their current length;
         // Values are Copy and their removal does not execute destructors.
         self.context.restore_eval_temp_roots_to_sequence(self.scope);
+    }
+}
+
+/// The root group owned by one explicit evaluation: a hard boundary for
+/// temporary-root visibility.
+///
+/// A body sequence keeps a returned form's temps visible to the rest of the
+/// sequence (Neo's deterministic conservative retention rule; see
+/// `Context::restore_eval_temp_roots_to_sequence`), but an explicit
+/// evaluation is a frame of its own (GNU `Feval` is such a frame): when
+/// `(eval FORM)` returns, the caller's body sequence must not inherit the
+/// evaluation's temps or its last call's evaluated arguments.  Drop releases
+/// exactly the roots appended since `enter`; the enclosing sequence's older
+/// run (at or below the base) is untouched, and its stale
+/// `let_floor`/`let_len` are clamped by the next sequence restore.
+#[must_use = "dropping the guard releases the evaluation's temporary roots"]
+pub(super) struct EvalBoundaryRoots<'a> {
+    context: &'a mut Context,
+    eval_base: usize,
+    call_base: usize,
+    _mutator: std::marker::PhantomData<*const ()>,
+}
+
+static_assertions::assert_not_impl_any!(EvalBoundaryRoots<'static>: Send, Sync);
+
+impl std::fmt::Debug for EvalBoundaryRoots<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EvalBoundaryRoots")
+            .field("eval_base", &self.eval_base)
+            .field("call_base", &self.call_base)
+            .finish()
+    }
+}
+
+impl<'a> EvalBoundaryRoots<'a> {
+    #[inline]
+    pub(super) fn enter(context: &'a mut Context) -> Self {
+        let eval_base = context.eval_temp_roots.len();
+        let call_base = context.eval_call_roots.len();
+        Self {
+            context,
+            eval_base,
+            call_base,
+            _mutator: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub(super) fn context(&mut self) -> &mut Context {
+        self.context
+    }
+}
+
+impl Drop for EvalBoundaryRoots<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // Values are Copy and their removal does not execute destructors.
+        self.context.eval_temp_roots.truncate(self.eval_base);
+        self.context.eval_call_roots.truncate(self.call_base);
     }
 }
 
@@ -111,6 +171,17 @@ impl Context {
     /// inline here stay out of the dispatcher that calls it; the evaluation
     /// depth is restored afterwards, as every special form's own frame
     /// unwinds in GNU.
+    ///
+    /// Every handler is out of line for the same reason.  Inlining them all
+    /// here made this one function 21 KB of code whose executed cache lines
+    /// were spread over the whole span (a magit-status edit loop touched 172
+    /// I-cache lines across 19 KB, and the callgrind I1 simulation charged
+    /// this function 142K misses, the largest evaluator-core owner): a hot
+    /// `if` evaluation fetched its own handful of lines from three clusters
+    /// separated by other forms' code.  GNU keeps each special form in its
+    /// own C function; this dispatch keeps only the handler selection and
+    /// the depth save/restore, and each handler's hot and rare paths are
+    /// laid out together inside its own function.
     #[inline(never)]
     pub(super) fn run_special_form(
         &mut self,
@@ -201,6 +272,7 @@ impl Context {
         self.sf_quote_value_named(quote_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_quote_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         self.one_unevalled_arg(call_name, tail)
     }
@@ -210,6 +282,7 @@ impl Context {
         self.sf_function_value_named(function_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_function_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         let arg = self.one_unevalled_arg(call_name, tail)?;
         if cons_head_symbol_id(&arg, self.symbol_mode()) == Some(lambda_symbol()) {
@@ -227,6 +300,7 @@ impl Context {
         self.sf_let_value_named(let_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_let_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -350,9 +424,21 @@ impl Context {
         }
 
         // The init values leave the operand stack here, before anything is
-        // pushed on the specpdl.  From here to the install and the temp-root
-        // pushes below nothing can collect: only conses are allocated, and
-        // `alloc_cons` never collects (`tagged/gc/allocation.rs`).
+        // pushed on the specpdl.  GNU Flet keeps its evaluated `temps[]`
+        // (eval.c:1151-1186, SAFE_ALLOCA_LISP) live for the whole body
+        // independently of the lexenv binding: `(setq obj nil)` in the body
+        // drops the binding's reference but not the temp, so a weak table
+        // keyed on the value must still see it.  The operand-stack slice is
+        // exactly that temps array at this point, so take the whole span as
+        // ONE contiguous root run -- one reserve and one copy per `let`,
+        // never a root push per binding.  The enclosing
+        // `EvalTempRootsToSequenceGuard` owns the run; its sequence restore
+        // decides how long it stays visible.  From here to the install
+        // nothing can collect: only conses are allocated, and `alloc_cons`
+        // never collects (`tagged/gc/allocation.rs`).
+        let temps = temps_base..context.bc_buf.len();
+        let (bc_buf, eval_temp_roots) = (&context.bc_buf, &mut context.eval_temp_roots);
+        eval_temp_roots.extend_from_slice(&bc_buf[temps]);
         context.bc_buf.truncate(temps_base);
 
         // Save lexenv AFTER init forms run (matches GNU eval.c:1167:
@@ -387,9 +473,10 @@ impl Context {
         // Install the new lexenv atomically.
         context.lexenv = new_lexenv;
 
-        for (_, value) in lexical_bindings.iter().chain(dynamic_sym_ids.iter()) {
-            context.push_eval_temp_root(*value);
-        }
+        // The initializer values are already rooted for the whole body by the
+        // temps run appended above; a dynamic value would otherwise be
+        // unreachable until `try_specbind`, and a specbind watcher may run
+        // Lisp before the binding exists.
         for (sym_id, value) in &dynamic_sym_ids {
             if let Err(flow) = context.try_specbind(*sym_id, *value) {
                 return context.unbind_to_with_result(specpdl_count, Err(flow));
@@ -407,6 +494,7 @@ impl Context {
         self.sf_let_star_value_named(let_star_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_let_star_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -527,6 +615,7 @@ impl Context {
         self.sf_setq_value_named(setq_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_setq_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Ok(Value::NIL);
@@ -584,7 +673,14 @@ impl Context {
                         .unwrap_or_default(),
                 );
             }
-            self.assign_setq_by_id(sym_id, value)?;
+            // GNU Fsetq's one assignment protocol (eval.c:491-502): mutate
+            // the exact lexical binding first, otherwise take the runtime
+            // variable model. This is `assign_setq_by_id` inlined at its
+            // hot caller -- the lexical stage is the common case, so the
+            // call boundary was pure overhead on every pair.
+            if !self.try_assign_lexical_binding_by_id(sym_id, value) {
+                self.assign_setq_dynamic_by_id(sym_id, value)?;
+            }
             last = value;
         }
         if !cursor.is_nil() {
@@ -598,6 +694,7 @@ impl Context {
         self.sf_if_value_named(if_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_if_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -628,6 +725,7 @@ impl Context {
         }
     }
 
+    #[inline(never)]
     pub(super) fn sf_and_value(&mut self, tail: Value) -> EvalResult {
         let mut cursor = tail;
         let mut last = Value::T;
@@ -644,6 +742,7 @@ impl Context {
         Ok(last)
     }
 
+    #[inline(never)]
     pub(super) fn sf_or_value(&mut self, tail: Value) -> EvalResult {
         let mut cursor = tail;
         while cursor.is_cons() {
@@ -659,6 +758,7 @@ impl Context {
         Ok(Value::NIL)
     }
 
+    #[inline(never)]
     pub(super) fn sf_cond_value(&mut self, tail: Value) -> EvalResult {
         let mut clauses = tail;
         while clauses.is_cons() {
@@ -694,6 +794,7 @@ impl Context {
         self.sf_while_value_named(while_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_while_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -724,17 +825,32 @@ impl Context {
         }
     }
 
+    #[inline(never)]
     pub(super) fn sf_progn_value(&mut self, forms: Value) -> EvalResult {
         let temp_scope = self.save_sequence_temp_roots();
+        // GNU Fprogn's `body` local lives in the C frame and stays scanned
+        // for the whole iteration; the traced slot is that visibility for a
+        // precise GC, updated before every evaluation that may run Lisp,
+        // collect, or enter the debugger.
+        let continuation = self.push_saved_continuation(forms);
         let result = (|| {
             let mut cursor = forms;
             let mut last = Value::NIL;
             while cursor.is_cons() {
-                match self.eval_sub(cursor.cons_car()).kinded() {
+                // GNU Fprogn (eval.c:433-446) reads the rest of the list
+                // BEFORE evaluating the form: a form that mutates its own
+                // containing list cannot skip its later siblings.  An
+                // improper final tail just ends the loop; GNU does not
+                // validate it.
+                let form = cursor.cons_car();
+                let rest = cursor.cons_cdr();
+                self.set_saved_continuation(continuation, rest);
+                cursor = rest;
+                match self.eval_sub(form).kinded() {
                     Ok(value) => last = value,
                     Err(FlowKind::ThreadBlocked(blocked)) => {
                         let remaining_forms = if blocked.remaining_forms.is_nil() {
-                            cursor.cons_cdr()
+                            rest
                         } else {
                             blocked.remaining_forms
                         };
@@ -742,10 +858,6 @@ impl Context {
                     }
                     Err(flow) => return Err(Flow::from_kind(flow)),
                 }
-                cursor = cursor.cons_cdr();
-            }
-            if !cursor.is_nil() {
-                return Err(self.listp_error(forms));
             }
             Ok(last)
         })();
@@ -758,6 +870,7 @@ impl Context {
         self.sf_prog1_value_named(prog1_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_prog1_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -784,6 +897,7 @@ impl Context {
         self.sf_defvar_value_named(defvar_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_defvar_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -861,6 +975,7 @@ impl Context {
         self.sf_defconst_value_named(defconst_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_defconst_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -925,6 +1040,7 @@ impl Context {
         self.sf_catch_value_named(catch_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_catch_value_named(&mut self, call_name: SymId, tail: Value) -> EvalResult {
         if tail.is_nil() {
             return Err(signal(
@@ -968,6 +1084,7 @@ impl Context {
         self.sf_unwind_protect_value_named(unwind_protect_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_unwind_protect_value_named(
         &mut self,
         call_name: SymId,
@@ -1003,6 +1120,7 @@ impl Context {
         self.sf_condition_case_value_named(condition_case_symbol(), tail)
     }
 
+    #[inline(never)]
     pub(super) fn sf_condition_case_value_named(
         &mut self,
         call_name: SymId,
@@ -1231,18 +1349,21 @@ impl Context {
         self.unbind_to_with_result(specpdl_count, result)
     }
 
+    #[inline(never)]
     pub(super) fn sf_save_excursion_value(&mut self, tail: Value) -> EvalResult {
         let mut scope = ExcursionScope::enter(self);
         let result = scope.context().sf_progn_value(tail);
         scope.finish(result)
     }
 
+    #[inline(never)]
     pub(super) fn sf_save_current_buffer_value(&mut self, tail: Value) -> EvalResult {
         let mut scope = CurrentBufferScope::enter(self);
         let result = scope.context().sf_progn_value(tail);
         scope.finish(result)
     }
 
+    #[inline(never)]
     pub(super) fn sf_save_restriction_value(&mut self, tail: Value) -> EvalResult {
         let mut scope = RestrictionScope::enter(self);
         let result = scope.context().sf_progn_value(tail);
@@ -1600,7 +1721,7 @@ impl Context {
             symbol_mode,
         ) {
             Err(e) => {
-                let rendered = super::super::error::format_flow_with_eval(self, &e);
+                let rendered = crate::emacs_core::print::format_flow_with_eval(self, &e);
                 tracing::error!(
                     feature = ?feature_name,
                     filename = ?filename_str,
@@ -1661,7 +1782,7 @@ impl Context {
                             let noerror_val =
                                 noerror.as_ref().map(|v| !v.is_nil()).unwrap_or(false);
                             let path_str = path.display().to_string();
-                            let rendered = super::super::error::format_flow_with_eval(self, e);
+                            let rendered = crate::emacs_core::print::format_flow_with_eval(self, e);
                             tracing::error!(
                                 feature_name = ?feature_name,
                                 path = %path_str,

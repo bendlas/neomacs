@@ -13,6 +13,7 @@ use super::error::{EvalResult, Flow, signal};
 use super::value::*;
 use crate::buffer::buffer::UndoBoundaryOutcome;
 use crate::emacs_core::error::expect_args;
+use crate::emacs_core::intern::WellKnown;
 
 // ---------------------------------------------------------------------------
 // Bootstrap variables
@@ -204,10 +205,7 @@ fn compact_one_buffer_for_gc(ctx: &mut super::eval::Context, id: crate::buffer::
 ///
 /// Context-dependent variant used during normal execution: inserts an
 /// undo boundary into the current buffer's undo list.
-pub(crate) fn builtin_undo_boundary(
-    ctx: &mut super::eval::Context,
-    args: Vec<Value>,
-) -> EvalResult {
+pub(crate) fn builtin_undo_boundary(ctx: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     expect_args("undo-boundary", &args, 0)?;
     let Some(current_id) = ctx.buffers.current_buffer_id() else {
         return Err(signal("error", vec![Value::string("No current buffer")]));
@@ -234,10 +232,14 @@ pub(crate) fn builtin_undo_boundary(
 /// Delegating also picks up alias resolution, the constant check and variable
 /// watchers, all of which GNU gets for free from the same call.
 pub(crate) fn set_last_boundary_cause_explicit(ctx: &mut super::eval::Context) -> Result<(), Flow> {
+    // GNU's `Fset (Qundo_auto__last_boundary_cause, Qexplicit)` with both
+    // names fixed; each recorded command boundary previously interned both.
+    static UNDO_AUTO_LAST_BOUNDARY_CAUSE: WellKnown = WellKnown::UndoAutoLastBoundaryCause;
+    static EXPLICIT: WellKnown = WellKnown::Explicit;
     super::builtins::symbols::builtin_set_2(
         ctx,
-        Value::symbol("undo-auto--last-boundary-cause"),
-        Value::symbol("explicit"),
+        Value::symbol(&UNDO_AUTO_LAST_BOUNDARY_CAUSE),
+        Value::symbol(&EXPLICIT),
     )?;
     Ok(())
 }

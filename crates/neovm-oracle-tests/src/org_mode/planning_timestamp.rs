@@ -36,15 +36,17 @@ fn org_timestamp_change_toggle_repeater_delay_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_read_date_relative_default_time_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
+    let expect = expect_test::expect![[
+        r#""OK (\"2026-06-10\" \"2026-05-30\" \"2026-07-15 08:15\" ((\"<2026-05-27 Wed>\" \"2026-05-27 00:00\" nil) (\"[2026-05-27 Wed 09:30]\" \"2026-05-27 09:30\" 9) (\"<2026-05-27 Wed 09:30-10:45>\" \"2026-05-27 09:30\" 9)))""#
+    ]];
+    crate::common::assert_oracle_parity_frozen_time_expect(
         r##"(progn
   (require 'org)
+  (require 'org-element)
   (let* ((base (encode-time 0 15 8 27 5 2026))
          (org-read-date-popup-calendar nil)
          (org-overriding-default-time base))
@@ -64,7 +66,7 @@ fn org_read_date_relative_default_time_combo() {
                 (org-timestamp-has-time-p ts))))
       '("<2026-05-27 Wed>"
         "[2026-05-27 Wed 09:30]"
-        "<2026-05-27 Wed 09:30-10:45>"))))"##,
+        "<2026-05-27 Wed 09:30-10:45>")))))"##,
         expect,
     );
 }
@@ -132,12 +134,13 @@ fn org_timestamp_time_range_eval_parse_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_planning_repeater_warning_element_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((((\"<2026-05-27 Wed .+2d/4d>\" restart 2 day nil nil nil) (\"<2026-06-01 Mon +1w -3d>\" cumulate 1 week all 3 day)) t \"2026-05-27\" \"2026-06-01\"))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -171,92 +174,25 @@ fn org_planning_repeater_warning_element_combo() {
               (org-timestamp-to-time scheduled))
              (format-time-string
               "%Y-%m-%d"
-              (org-timestamp-to-time deadline))))))))"##,
+              (org-timestamp-to-time deadline)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_schedule_deadline_timestamp_range_shift_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (with-temp-buffer
-    (let ((org-log-reschedule nil)
-          (org-log-redeadline nil))
-      (org-mode)
-      (insert "* TODO Task\n")
-      (insert "Body with <2026-05-27 Wed 09:30-10:45> and ")
-      (insert "[2026-05-28 Thu].\n")
-      (goto-char (point-min))
-      (org-schedule nil "2026-06-03 08:15")
-      (org-deadline nil "2026-06-10 +1w -2d")
-      (let ((after-planning
-             (buffer-substring-no-properties (point-min) (point-max))))
-        (search-forward "09:30")
-        (let* ((range-ts (org-timestamp-at-point))
-               (split-start
-                (mapcar (lambda (ts)
-                          (and ts (org-element-property :raw-value ts)))
-                        (org-timestamp-split-range range-ts)))
-               (translated-start
-                (org-timestamp-translate range-ts 'start))
-               (translated-end
-                (org-timestamp-translate range-ts 'end)))
-          (org-timestamp-up-day 2)
-          (search-forward "[2026")
-          (org-timestamp-down-day 1)
-          (goto-char (point-max))
-          (insert "\n")
-          (org-timestamp nil nil)
-          (insert "\n")
-          (org-timestamp-inactive nil)
-          (let ((parsed
-                 (mapcar
-                  (lambda (s)
-                    (let ((ts (org-timestamp-from-string s)))
-                      (list s
-                            (org-element-property :raw-value ts)
-                            (org-timestamp-has-time-p ts)
-                            (format-time-string
-                             "%Y-%m-%d %H:%M"
-                             (org-timestamp-to-time ts))
-                            (format-time-string
-                             "%Y-%m-%d %H:%M"
-                             (org-timestamp-to-time ts 'end)))))
-                  '("<2026-05-27 Wed 09:30-10:45>"
-                    "<2026-06-03 Wed 08:15>"
-                    "[2026-05-28 Thu]"))))
-            (list after-planning
-                  split-start
-                  translated-start
-                  translated-end
-                  parsed
-                  (replace-regexp-in-string
-                   "\\[[0-9][^]\n]+\\]\\|<[0-9][^>\n]+>"
-                   "[stamp]"
-                   (buffer-substring-no-properties
-                    (point-min) (point-max))))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_todo_auto_repeat_planning_logbook_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
-    crate::common::assert_oracle_parity_expect(
+    let expect = expect_test::expect![[
+        r#""OK (#(\"NEXT\" 0 4 (org-todo-head \"TODO\")) \".+2d\" \"[2026-05-27 Wed 12:00]\" ((#(\"Repeating task\" 0 14 (org-todo-head \"TODO\")) #(\"NEXT\" 0 4 (org-todo-head \"TODO\")) \"<2026-06-17 Wed .+2d>\" \"<2026-05-27 Wed +1w -2d>\" \"[2026-05-27 Wed 12:00]\")) \"* NEXT Repeating task\\nSCHEDULED: <2026-06-17 Wed .+2d> DEADLINE: <2026-05-27 Wed +1w -2d>\\n:PROPERTIES:\\n:REPEAT_TO_STATE: NEXT\\n:LAST_REPEAT: [2026-05-27 Wed 12:00]\\n:END:\\nBody timestamp <2026-06-20 Sat +1m>\\n:LOGBOOK:\\nCLOCK: [2026-05-26 Tue 09:00]--[2026-05-26 Tue 10:15] =>  1:15\\n:END:\\n\" \"* NEXT Repeating task\\nSCHEDULED: <2026-06-17 Wed .+0d> DEADLINE: <2026-05-27 Wed +0w -2d>\\n:PROPERTIES:\\n:REPEAT_TO_STATE: NEXT\\n:LAST_REPEAT: [2026-05-27 Wed 12:00]\\n:END:\\nBody timestamp <2026-06-20 Sat +0m>\\n:LOGBOOK:\\nCLOCK: [2026-05-26 Tue 09:00]--[2026-05-26 Tue 10:15] =>  1:15\\n:END:\\n\" ((headline \"NEXT\" \"Repeating task\") (planning \"<2026-06-17 Wed .+0d>\" \"<2026-05-27 Wed +0w -2d>\") (property \"REPEAT_TO_STATE\" \"NEXT\") (property \"LAST_REPEAT\" \"[2026-05-27 Wed 12:00]\") (timestamp \"<2026-06-20 Sat +0m>\" cumulate 0 month nil nil)))""#
+    ]];
+    crate::common::assert_oracle_parity_frozen_time_expect(
         r##"(progn
   (require 'org)
   (require 'org-clock)
   (with-temp-buffer
-    (let ((org-todo-keywords '((sequence "TODO" "NEXT" "|" "DONE")))
+    (let* ((events nil)
+           (org-todo-keywords '((sequence "TODO" "NEXT" "|" "DONE")))
           (org-log-repeat 'time)
           (org-log-into-drawer t)
           (org-log-done nil)
@@ -267,15 +203,14 @@ fn org_todo_auto_repeat_planning_logbook_combo() {
                                (org-entry-get nil "SCHEDULED")
                                (org-entry-get nil "DEADLINE")
                                (org-entry-get nil "LAST_REPEAT"))
-                         events))))
-          events)
+                         events)))))
       (org-mode)
       (insert "* TODO Repeating task\n")
+      (insert "SCHEDULED: <2026-05-20 Wed .+2d> ")
+      (insert "DEADLINE: <2026-05-20 Wed +1w -2d>\n")
       (insert ":PROPERTIES:\n")
       (insert ":REPEAT_TO_STATE: NEXT\n")
       (insert ":END:\n")
-      (insert "SCHEDULED: <2026-05-20 Wed .+2d> ")
-      (insert "DEADLINE: <2026-05-20 Wed +1w -2d>\n")
       (insert "Body timestamp <2026-05-20 Wed +1m>\n")
       (insert ":LOGBOOK:\n")
       (insert "CLOCK: [2026-05-26 Tue 09:00]--[2026-05-26 Tue 10:15] =>  1:15\n")
@@ -283,6 +218,9 @@ fn org_todo_auto_repeat_planning_logbook_combo() {
       (goto-char (point-min))
       (cl-letf (((symbol-function 'org-current-time)
                  (lambda (&rest _)
+                   (encode-time 0 0 12 27 5 2026)))
+                ((symbol-function 'current-time)
+                 (lambda ()
                    (encode-time 0 0 12 27 5 2026))))
         (org-todo "DONE"))
       (let ((after-done
@@ -329,7 +267,78 @@ fn org_todo_auto_repeat_planning_logbook_combo() {
                     ('node-property
                      (list 'property
                            (org-element-property :key el)
-                           (org-element-property :value el))))))))))"##,
+                           (org-element-property :value el)))))))))))"##,
+        expect,
+    );
+}
+
+#[test]
+fn org_schedule_deadline_timestamp_range_shift_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r#""OK (\"* TODO Task\\nDEADLINE: <2026-06-10 Wed> SCHEDULED: <2026-06-03 Wed 08:15>\\nBody with <2026-05-27 Wed 09:30-10:45> and [2026-05-28 Thu].\\n\" (\"<2026-05-27 Wed 09:30> \" \"<2026-05-27 Wed 10:45> \") \"<2026-05-27 Wed 09:30-10:45> \" \"<2026-05-27 Wed 09:30-10:45> \" ((\"<2026-05-27 Wed 09:30-10:45>\" \"<2026-05-27 Wed 09:30-10:45>\" 9 \"2026-05-27 09:30\" \"2026-05-27 10:45\") (\"<2026-06-03 Wed 08:15>\" \"<2026-06-03 Wed 08:15>\" 8 \"2026-06-03 08:15\" \"2026-06-03 08:15\") (\"[2026-05-28 Thu]\" \"[2026-05-28 Thu]\" nil \"2026-05-28 00:00\" \"2026-05-28 00:00\")) \"* TODO Task\\nDEADLINE: [stamp] SCHEDULED: [stamp]\\nBody with [stamp] and [stamp].\\n\\n[stamp]\\n[stamp]\")""#
+    ]];
+    crate::common::assert_oracle_parity_expect(
+        r##"(progn
+  (require 'org)
+  (with-temp-buffer
+    (let ((org-log-reschedule nil)
+          (org-log-redeadline nil))
+      (org-mode)
+      (insert "* TODO Task\n")
+      (insert "Body with <2026-05-27 Wed 09:30-10:45> and ")
+      (insert "[2026-05-28 Thu].\n")
+      (goto-char (point-min))
+      (org-schedule nil "2026-06-03 08:15")
+      (org-deadline nil "2026-06-10 +1w -2d")
+      (let ((after-planning
+             (buffer-substring-no-properties (point-min) (point-max))))
+        (search-forward "09:30")
+        (let* ((range-ts (org-element-context))
+               (split-start
+                (mapcar (lambda (ts)
+                          (and ts (org-element-property :raw-value ts)))
+                        (list (org-timestamp-split-range range-ts)
+                              (org-timestamp-split-range range-ts t))))
+               (translated-start
+                (org-timestamp-translate range-ts 'start))
+               (translated-end
+                (org-timestamp-translate range-ts 'end)))
+          (org-timestamp-up-day 2)
+          (search-forward "[2026")
+          (org-timestamp-down-day 1)
+          (goto-char (point-max))
+          (insert "\n")
+          (org-timestamp '(16) nil)
+          (insert "\n")
+          (org-timestamp-inactive '(16))
+          (let ((parsed
+                 (mapcar
+                  (lambda (s)
+                    (let ((ts (org-timestamp-from-string s)))
+                      (list s
+                            (org-element-property :raw-value ts)
+                            (org-timestamp-has-time-p ts)
+                            (format-time-string
+                             "%Y-%m-%d %H:%M"
+                             (org-timestamp-to-time ts))
+                            (format-time-string
+                             "%Y-%m-%d %H:%M"
+                             (org-timestamp-to-time ts 'end)))))
+                  '("<2026-05-27 Wed 09:30-10:45>"
+                    "<2026-06-03 Wed 08:15>"
+                    "[2026-05-28 Thu]"))))
+            (list after-planning
+                  split-start
+                  translated-start
+                  translated-end
+                  parsed
+                  (replace-regexp-in-string
+                   "\\[[0-9][^]\n]+\\]\\|<[0-9][^>\n]+>"
+                   "[stamp]"
+                   (buffer-substring-no-properties
+                    (point-min) (point-max))))))))))"##,
         expect,
     );
 }
@@ -475,12 +484,13 @@ Body <2026-05-27 Wed 11:00-12:15>
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_timestamp_parse_shift_range_element_extract_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((headline \"Alpha\" \"TODO\") (planning \"<2026-05-27 Wed 10:00-11:30 +1w -3d>\" nil nil) (timestamp active \"<2026-05-29 Fri>\" 2026 5 29 nil nil nil nil nil nil nil nil nil) (timestamp inactive \"[2026-05-26 Mon 15:30]\" 2026 5 26 15 30 15 30 nil nil nil nil nil) (headline \"WAIT Beta\" \"\") (planning \"<2026-05-28 Thu .+2d/5d>\" nil nil) (timestamp active \"<2026-06-01 Mon 09:00>\" 2026 6 1 9 0 9 0 nil nil nil nil nil) (headline \"Meeting\" \"\") (timestamp active-range \"<2026-05-30 Fri 14:00-15:00>\" 2026 5 30 14 0 15 0 nil nil nil nil nil) (timestamp inactive \"[2026-05-27 Wed]\" 2026 5 27 nil nil nil nil nil nil nil nil nil)) \"* TODO Alpha\\nSCHEDULED: <2026-05-27 Wed 10:00-11:30 +1w -3d>\\nDEADLINE: <2026-05-29 Fri>\\nCLOSED: [2026-05-26 Mon 15:30]\\n\\n* WAIT Beta\\nSCHEDULED: <2026-05-28 Thu .+2d/5d>\\nDEADLINE: <2026-06-01 Mon 09:00>\\n\\n* Meeting\\n<2026-05-31 Sun 14:00-15:00>\\n[2026-05-27 Wed]\\n\" ((\"<2026-05-29 Fri>\" 29 5) (\"[2026-05-26 Mon 15:30]\" 26 5) (\"<2026-06-01 Mon 09:00>\" 1 6) (\"<2026-05-31 Sun 14:00-15:00>\" 31 5) (\"[2026-05-27 Wed]\" 27 5)))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -529,7 +539,7 @@ fn org_timestamp_parse_shift_range_element_extract_combo() {
                         (org-element-property :repeater-value el)
                         (org-element-property :repeater-unit el)
                         (org-element-property :warning-type el)
-                        (org-element-property :warning-value el)))))))
+                        (org-element-property :warning-value el))))))))
       ;; Shift timestamp
       (goto-char (point-min))
       (search-forward "Meeting")
@@ -553,7 +563,6 @@ fn org_timestamp_parse_shift_range_element_extract_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_planning_timestamp_shift_edit_recurring_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
@@ -611,7 +620,7 @@ fn org_planning_timestamp_shift_edit_recurring_deep() {
                     after-shift2
                     after-edit
                     (buffer-substring-no-properties
-                     (point-min) (point-max)))))))))))"##,
+                     (point-min) (point-max))))))))))"##,
         expect,
     );
 }

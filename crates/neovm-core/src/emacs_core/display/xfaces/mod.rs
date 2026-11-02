@@ -341,22 +341,25 @@ use std::sync::{Arc, OnceLock};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
-use super::error::{Flow, LispCondition, signal};
+use super::error::{Flow, LispCondition, signal, signal_error_with_arg};
 #[cfg(test)]
 use super::font::alternative_font_registry_alist;
 use super::font::{
-    FrameFontRealization, alternative_font_family_alist, default_face_font_attr_affects_frame_font,
-    face_remapping_for_current_buffer, font_name_value, font_string_text, font_value_fields,
-    font_value_text, font_vector_get_flexible, frame_device_designator_p, frame_id_from_designator,
-    frame_parameter_for_face_attribute, is_font, is_font_entity, is_font_spec,
-    live_frame_designator_in_state, live_frame_font_attribute_fallback,
+    FrameFontRealization, default_face_font_attr_affects_frame_font,
+    face_remapping_for_current_buffer, font_name_value, font_spec_from_name, font_string_text,
+    font_value_fields, font_value_text, font_vector_get_flexible, frame_device_designator_p,
+    frame_id_from_designator, frame_parameter_for_face_attribute, is_font, is_font_entity,
+    is_font_spec, live_frame_designator_in_state, live_frame_font_attribute_fallback,
     opened_font_from_resolved_match, publish_face_attribute_to_frame_parameter,
-    replace_alternative_font_registry_alist, resolve_font_match, resolve_live_frame_font_request,
-    sync_live_default_face_font_state, sync_live_frame_font_state,
+    replace_alternative_font_family_alist, replace_alternative_font_registry_alist,
+    resolve_font_match, resolve_live_frame_font_request, sync_live_default_face_font_state,
+    sync_live_frame_font_state,
 };
 
 use super::intern::intern;
 use crate::emacs_core::SymId;
+use crate::emacs_core::intern::WellKnown;
+use crate::face::realization::FrameFaceClass;
 use crate::face::{
     BoxStyle, Face as RuntimeFace, FontSlant, FontWeight, FontWidth, LFACE_ATTRS, UnderlineStyle,
 };
@@ -1189,8 +1192,8 @@ fn mark_selected_created_lisp_face_id(id: SymId) {
     });
 }
 
-fn face_exists_for_domain(name: &str, defaults_frame: bool) -> bool {
-    face_exists_for_domain_id(face_symbol_id(name), name, defaults_frame)
+fn face_exists_for_domain(name: ResolvedFaceName, defaults_frame: bool) -> bool {
+    face_exists_for_domain_id(name.0, name.name(), defaults_frame)
 }
 
 /// [`face_exists_for_domain`] for callers that already hold the face's
@@ -1370,7 +1373,11 @@ fn face_alias_target(
     if face.symbol().is_nil() {
         return None;
     }
-    let target = eval.obarray().get_property(face.name(), "face-alias")?;
+    // GNU reads the face symbol's own plist for `Qface_alias` (xfaces.c
+    // resolve_face_name); resolving the designator's identity shares one
+    // spelling set instead of re-interning both names per lookup.
+    static FACE_ALIAS: WellKnown = WellKnown::FaceAlias;
+    let target = eval.obarray().get_property_id(face.0, FACE_ALIAS.id())?;
     if target.is_nil() {
         return None;
     }
@@ -1466,7 +1473,7 @@ fn resolve_face_name_for_domain(
 ) -> Result<String, Flow> {
     match resolve_face_designator(eval, *face, FaceAliasCyclePolicy::Signal)? {
         ResolvedFaceDesignator::String(name) => {
-            if face_exists_for_domain(name.name(), defaults_frame) {
+            if face_exists_for_domain(name, defaults_frame) {
                 Err(signal(
                     LispCondition::WrongTypeArgument,
                     vec![Value::symbol("symbolp"), *face],
@@ -1479,7 +1486,7 @@ fn resolve_face_name_for_domain(
             }
         }
         ResolvedFaceDesignator::Symbol(name) => {
-            if face_exists_for_domain(name.name(), defaults_frame) {
+            if face_exists_for_domain(name, defaults_frame) {
                 Ok(name.name().to_owned())
             } else {
                 Err(invalid_face_error(*face))
@@ -1492,7 +1499,7 @@ fn resolve_face_name_for_domain(
 fn resolve_face_name_for_merge(eval: &super::eval::Context, face: &Value) -> Result<String, Flow> {
     match resolve_face_designator(eval, *face, FaceAliasCyclePolicy::Signal)? {
         ResolvedFaceDesignator::String(name) => {
-            if face_exists_for_domain(name.name(), true) {
+            if face_exists_for_domain(name, true) {
                 Ok(name.name().to_owned())
             } else {
                 Err(signal(
@@ -1502,7 +1509,7 @@ fn resolve_face_name_for_merge(eval: &super::eval::Context, face: &Value) -> Res
             }
         }
         ResolvedFaceDesignator::Symbol(name) => {
-            if face_exists_for_domain(name.name(), true) {
+            if face_exists_for_domain(name, true) {
                 Ok(name.name().to_owned())
             } else {
                 Err(invalid_face_error(*face))
@@ -2540,6 +2547,27 @@ fn is_reset_like_face_attr_value(value: &Value) -> bool {
     })
 }
 
+/// `internal-set-lisp-face-attribute`'s `:font` value check
+/// (GNU `src/xfaces.c:3635-3664`, QCfont arm).  GNU runs it on the
+/// new-frame-defaults pass (`FRAME` t, including the first half of
+/// `FRAME` 0) and on window-system frames; the caller mirrors that guard.
+/// A non-reset value must be a font-spec/entity/object or a name string
+/// that parses into one.  `nil` is a plain non-font value and signals
+/// "Invalid font or font-spec", not a reset.
+fn validate_font_face_attr_value(value: &Value) -> Result<(), Flow> {
+    if is_font(value) {
+        return Ok(());
+    }
+    if value.is_string() {
+        let name = font_string_text(value).unwrap_or_default();
+        if font_spec_from_name(&name).is_some() {
+            return Ok(());
+        }
+        return Err(signal_error_with_arg("Invalid font name", *value));
+    }
+    Err(signal_error_with_arg("Invalid font or font-spec", *value))
+}
+
 pub(crate) fn derived_face_attrs_from_font_value(value: &Value) -> Vec<(LFaceAttr, Value)> {
     if !is_font(value) {
         return Vec::new();
@@ -2653,7 +2681,7 @@ fn resolve_known_face_name_for_compare(
 ) -> Result<String, Flow> {
     match resolve_face_designator(eval, *face, FaceAliasCyclePolicy::Signal)? {
         ResolvedFaceDesignator::Symbol(name) | ResolvedFaceDesignator::String(name) => {
-            if face_exists_for_domain(name.name(), defaults_frame) {
+            if face_exists_for_domain(name, defaults_frame) {
                 Ok(name.name().to_owned())
             } else {
                 Err(signal(
@@ -3311,6 +3339,17 @@ pub(crate) fn builtin_internal_set_lisp_face_attribute(
                 }
             }
 
+            // GNU's QCfont arm validates whenever it runs: always on the
+            // new-frame-defaults pass (FRAME t, and the first half of FRAME
+            // 0), and on live frames only when they have a window system --
+            // terminal live frames returned above before touching their
+            // face vector.  This is also why `(set-face-font FACE nil)
+            // signals on a terminal in GNU despite the window-system guard.
+            if canonical_attr == LFaceAttr::Font && !is_reset_like_face_attr_value(&canonical_value)
+            {
+                validate_font_face_attr_value(&canonical_value)?;
+            }
+
             set_face_override_id(face_id, canonical_attr, canonical_value, defaults_frame);
             if defaults_frame {
                 if let Some(vector) = ensure_global_lisp_face_vector(eval, &face_name) {
@@ -3829,6 +3868,93 @@ pub(crate) fn builtin_internal_lisp_face_equal_p(
     Ok(Value::T)
 }
 
+/// Whether FACE_A and FACE_B have equal frame-local lface definitions.
+///
+/// This is GNU `Finternal_lisp_face_equal_p (A, B, FRAME, Qt)`, the predicate
+/// `try_cursor_movement` uses to decide whether a point-only move may reuse the
+/// window's glyph rows while line numbers are displayed (src/xdisp.c:19912-19918;
+/// equality in src/xfaces.c:4516-4594). Every `LFACE_ATTRS` slot must match.
+/// `inherit` additionally accepts exactly one level of direct, symbol-valued
+/// `:inherit`: the inheriting face's other slots must be unspecified or equal
+/// to the parent's. GNU deliberately ignores list-valued `:inherit` there.
+///
+/// Never signals. An unknown face, alias cycle, or malformed vector cannot be
+/// proven equal and returns false.
+pub(crate) fn lisp_faces_equal_in_frame(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    face_a: &str,
+    face_b: &str,
+    inherit: bool,
+) -> bool {
+    let Some((name_a, vector_a)) = resolved_lface_in_frame(eval, frame_id, face_a) else {
+        return false;
+    };
+    let Some((name_b, vector_b)) = resolved_lface_in_frame(eval, frame_id, face_b) else {
+        return false;
+    };
+    lface_vectors_equal(vector_a, vector_b, inherit.then_some((name_a, name_b)))
+}
+
+/// Resolve FACE_NAME through `face-alias` and return its lface vector.
+///
+/// Mirrors GNU `lface_from_face_name` (src/xfaces.c:2060-2100): the frame's
+/// face hash first, then the global `face--new-frame-defaults` table. Returns
+/// the canonical name beside the vector so the direct-`inherit` rule can
+/// compare against the symbol the face actually names.
+fn resolved_lface_in_frame(
+    eval: &super::eval::Context,
+    frame_id: FrameId,
+    face_name: &str,
+) -> Option<(Value, Value)> {
+    let resolved =
+        resolve_face_designator(eval, Value::symbol(face_name), FaceAliasCyclePolicy::Signal)
+            .ok()?
+            .name()?;
+    let name = resolved.symbol();
+    // Both tables store the lface vector as the hash value. A non-vector value
+    // cannot be compared slot-wise and is not proven equal.
+    let vector = lookup_frame_lisp_face_vector(eval, frame_id, resolved.name())
+        .or_else(|| lookup_face_new_frame_defaults_vector(eval, name))?;
+    if vector.as_vector_data().is_none() {
+        return None;
+    }
+    Some((name, vector))
+}
+
+fn lface_vectors_equal(a: Value, b: Value, inherit_names: Option<(Value, Value)>) -> bool {
+    let unspecified = unspecified_face_symbol();
+    let slot =
+        |vector: Value, attr: LFaceAttr| lisp_face_vector_attr(vector, attr).unwrap_or(unspecified);
+    let other_attrs: Vec<LFaceAttr> = LFACE_ATTRS
+        .iter()
+        .copied()
+        .filter(|attr| *attr != LFaceAttr::Inherit)
+        .collect();
+    // GNU compares every slot here, including `:inherit`; only the direct
+    // inheritance tolerance below ignores that one slot.
+    if LFACE_ATTRS
+        .iter()
+        .all(|attr| slot(a, *attr) == slot(b, *attr))
+    {
+        return true;
+    }
+    let Some((name_a, name_b)) = inherit_names else {
+        return false;
+    };
+    // GNU accepts only a direct, symbol-valued `:inherit` edge. The inheriting
+    // face may add no other attribute; inherited values are equal by identity
+    // of the parent definition.
+    let inherits = |child: Value, parent_name: Value, parent: Value| {
+        slot(child, LFaceAttr::Inherit) == parent_name
+            && other_attrs.iter().all(|attr| {
+                let value = slot(child, *attr);
+                value.is_bare_symbol_named("unspecified") || value == slot(parent, *attr)
+            })
+    };
+    inherits(a, name_b, b) || inherits(b, name_a, a)
+}
+
 /// `(internal-lisp-face-empty-p FACE &optional FRAME)` -- return t if FACE has
 /// only unspecified attributes in selected/default face definitions.
 pub(crate) fn builtin_internal_lisp_face_empty_p(
@@ -3885,17 +4011,28 @@ pub(crate) fn builtin_internal_merge_in_global_face(
             }
         }
         sync_face_overrides_from_lisp_face_vector(&face_name, local_vector, false);
-        if crate::face::realization::enabled()
-            && face_name == "default"
-            && eval.frame_is_tty_face_target(frame_id)
-        {
-            realization::realize_default_after_global_merge(
-                eval,
-                frame_id,
-                global_vector,
-                local_vector,
-            )?;
-            return Ok(Value::NIL);
+        if face_name == "default" {
+            match eval.frame_face_class(frame_id) {
+                Some(FrameFaceClass::Termcap) => {
+                    if crate::face::realization::enabled() {
+                        realization::realize_default_after_global_merge(
+                            eval,
+                            frame_id,
+                            global_vector,
+                            local_vector,
+                        )?;
+                        return Ok(Value::NIL);
+                    }
+                }
+                Some(FrameFaceClass::WindowSystem) => {
+                    // GNU xfaces.c publishes the global default face's string
+                    // colors to every window-system frame here, even without a
+                    // termcap realization cache to refresh. The parameter
+                    // handler derives background-mode from the new color.
+                    realization::publish_default_face_colors(eval, frame_id, global_vector)?;
+                }
+                Some(FrameFaceClass::Initial) | None => {}
+            }
         }
     }
 
@@ -4512,7 +4649,7 @@ pub(crate) fn builtin_face_id(args: Vec<Value>) -> EvalResult {
     ))
 }
 
-pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: &[Value]) -> EvalResult {
     let symbol_mode = eval.symbol_mode();
     expect_min_args("face-font", &args, 1)?;
     expect_max_args("face-font", &args, 3)?;
@@ -4565,7 +4702,7 @@ pub(crate) fn builtin_face_font(eval: &mut super::eval::Context, args: Vec<Value
         // bootstrap built-in table.
         return match resolve_face_designator(eval, args[0], FaceAliasCyclePolicy::Signal)? {
             ResolvedFaceDesignator::Symbol(name) | ResolvedFaceDesignator::String(name) => {
-                if face_exists_for_domain(name.name(), false) {
+                if face_exists_for_domain(name, false) {
                     Ok(Value::NIL)
                 } else if name.symbol().is_nil() {
                     Err(signal("error", vec![Value::string("Invalid face")]))
@@ -4715,10 +4852,7 @@ pub(crate) fn builtin_internal_set_alternative_font_family_alist(args: Vec<Value
         }
         normalized.push(Value::list(converted));
     }
-    if let Ok(mut state) = alternative_font_family_alist().write() {
-        *state = alist;
-    }
-    crate::emacs_core::fontset::invalidate_font_selection_policy();
+    replace_alternative_font_family_alist(alist);
     clear_font_cache_state();
     Ok(Value::list(normalized))
 }
@@ -4890,3 +5024,18 @@ mod font_remapping_test;
 #[cfg(test)]
 #[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;
+
+/// Carrier park: forget the installed face-attribute registry handle (a
+/// plain store). The next activation installs the new owner's handle.
+pub(crate) fn park_carrier_tls() {
+    FACE_ATTR_STATE.with(HeapRegistrySlot::park);
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        FACE_ATTR_STATE.with(|slot| slot.installed_heap_identity().unwrap_or(0) as u64),
+    );
+}

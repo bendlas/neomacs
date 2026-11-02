@@ -7,6 +7,11 @@ mod model;
 mod platform;
 mod registry;
 
+// The compiled-in backend's primitive names, re-exported from the private
+// selection module so tests can ask the build instead of naming an OS.
+#[cfg(test)]
+pub(crate) use platform::{BACKEND_SUBRS, REMOVE_WATCH_SEMANTICS, RemoveWatchSemantics};
+
 // Private to the subsystem: every caller is inside `file_notify`, and keeping
 // it here means minting a `file-notify-error` stays within the module that
 // owns `ErrorDetail`.  Descendants still reach it through `use super::*`.
@@ -67,6 +72,12 @@ type PlatformBackend = platform::Backend;
 
 pub(crate) fn reset_file_notify_thread_locals() {
     FILE_NOTIFY_STATE.with(|slot| slot.reset(FileNotifyState::default()));
+}
+
+/// Carrier park: forget the installed file-notify registry handle (a plain
+/// store). The World's registry stays alive through its Contexts.
+pub(crate) fn park_file_notify_thread_locals() {
+    FILE_NOTIFY_STATE.with(HeapRegistrySlot::park);
 }
 
 pub(crate) type FileNotifyRegistryHandle = HeapRegistryHandle<FileNotifyState>;
@@ -150,3 +161,12 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/gc_tls_ownership_test.rs"]
 mod gc_tls_ownership_tests;
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        FILE_NOTIFY_STATE.with(|slot| slot.installed_heap_identity().unwrap_or(0) as u64),
+    );
+}

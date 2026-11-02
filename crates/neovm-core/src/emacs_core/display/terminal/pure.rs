@@ -1348,7 +1348,7 @@ pub(crate) fn builtin_frame_terminal(
 /// by framep-on-display to determine the window system type.
 pub(crate) fn builtin_terminal_live_p(
     eval: &mut crate::emacs_core::eval::Context,
-    args: Vec<Value>,
+    args: &[Value],
 ) -> EvalResult {
     expect_args_range("terminal-live-p", &args, 1, 1)?;
     let Some(terminal_id) = decode_terminal_id_eval(eval, &args[0]) else {
@@ -1720,6 +1720,7 @@ pub(crate) fn delete_terminal_owned(
         )?;
     }
     delete_terminal_record(terminal_id);
+    eval.forget_window_system_keyboard(terminal_id);
     eval.command_loop
         .keyboard
         .delete_terminal_kboard(terminal_id);
@@ -1794,3 +1795,19 @@ pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
 #[cfg(test)]
 #[path = "tests/registry_reinstall_test.rs"]
 mod registry_reinstall_tests;
+
+/// Carrier park: forget the installed Lisp terminal registry handle (a plain
+/// store). `TERMINAL_MANAGER` is a World-carried swap slot and must not be
+/// touched.
+pub(crate) fn park_carrier_tls() {
+    TERMINAL_LISP_STATE.with(HeapRegistrySlot::park);
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        TERMINAL_LISP_STATE.with(|slot| slot.installed_heap_identity().unwrap_or(0) as u64),
+    );
+}

@@ -112,7 +112,7 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Sync`
            `NonNull<i64>: Sync`
            which is required by `neovm_core::Context: Sync`
-           `*mut builtins::collections::HashTestGcInhibitAccounting: Sync`
+           `*mut hashtab::HashTestGcInhibitAccounting: Sync`
            which is required by `neovm_core::Context: Sync`
            `NonNull<neovm_core::buffer::Buffer>: Sync`
            which is required by `neovm_core::Context: Sync`
@@ -142,7 +142,7 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Sync`
            `NonNull<eval::owner_bindings::OwnerSlab>: Sync`
            which is required by `neovm_core::Context: Sync`
-           `Cell<Option<eval::LexenvAssqCacheEntry>>: Sync`
+           `Cell<Option<eval::lexenv_cache::LexenvAssqCacheEntry>>: Sync`
            which is required by `neovm_core::Context: Sync`
            `Cell<Option<eval::LexenvSpecialCacheEntry>>: Sync`
            which is required by `neovm_core::Context: Sync`
@@ -166,7 +166,7 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Sync`
            `Cell<SymId>: Sync`
            which is required by `neovm_core::Context: Sync`
-           `Cell<eval::form_head_cache::FormHead>: Sync`
+           `Cell<eval::dispatch_class::FormHead>: Sync`
            which is required by `neovm_core::Context: Sync`
            `UnsafeCell<neovm_core::buffer::buffer::BufferStorage>: Sync`
            which is required by `neovm_core::Context: Sync`
@@ -244,6 +244,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Sync`
            `Rc<neomacs_display_protocol::tty_palette::TtyPalette>: Send`
            which is required by `neovm_core::Context: Sync`
+           `Rc<xdisp::mode_line_output::OutputState>: Send`
+           which is required by `neovm_core::Context: Sync`
            `NonNull<eval::owner_bindings::OwnerSlab>: Send`
            which is required by `neovm_core::Context: Sync`
            `Cell<CanonicalArm>: Sync`
@@ -268,7 +270,11 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Sync`
            `*const u8: Send`
            which is required by `neovm_core::Context: Sync`
+           `NonNull<MarkerObj>: Sync`
+           which is required by `neovm_core::Context: Sync`
            `(dyn FnMut() -> Result<(), std::string::String> + Send + 'static): Sync`
+           which is required by `neovm_core::Context: Sync`
+           `Rc<Cell<Vec<TaggedValue>>>: Send`
            which is required by `neovm_core::Context: Sync`
            `Rc<Cell<*const ()>>: Send`
            which is required by `neovm_core::Context: Sync`
@@ -324,6 +330,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `neovm_core::Context: Sync`
            `*const tree_sitter::ffi::TSTree: Send`
            which is required by `neovm_core::Context: Sync`
+           `Rc<Cell<Vec<TaggedValue>>>: Sync`
+           which is required by `neovm_core::Context: Sync`
            `Rc<Cell<*const ()>>: Sync`
            which is required by `neovm_core::Context: Sync`
            `Cell<NonNull<[Cell<usize>; 8192]>>: Sync`
@@ -363,6 +371,10 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            `*const LispSymbol: Sync`
            which is required by `neovm_core::Context: Sync`
            `*const Atomic<u32>: Sync`
+           which is required by `neovm_core::Context: Sync`
+           `NonNull<MarkerObj>: Send`
+           which is required by `neovm_core::Context: Sync`
+           `Rc<window::word_wrap::CachedWordWrapPolicy>: Send`
            which is required by `neovm_core::Context: Sync`
            `NonNull<()>: Send`
            which is required by `neovm_core::Context: Sync`

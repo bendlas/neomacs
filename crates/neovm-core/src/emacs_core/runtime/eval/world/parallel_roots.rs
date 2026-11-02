@@ -9,34 +9,12 @@ use crate::tagged::value::TaggedValue;
 
 #[path = "parallel_admission.rs"]
 mod parallel_admission;
+#[cfg(test)]
+pub(crate) use parallel_admission::OwnedProofProjection;
 pub(crate) use parallel_admission::{OwnedParallelError, OwnedParallelProjection};
 
-/// An immutable census of the original Context, whose execution is suspended
-/// for the entire era. Construction is sealed to that Context before the
-/// QuiescentCollector heap loan exists. Values never cross an owner thread.
-#[derive(Debug)]
-pub(crate) struct FrozenLegacyRoots {
-    heap: HeapIdentity,
-    words: Vec<TaggedValue>,
-    functions_quiescent: bool,
-}
-
-impl FrozenLegacyRoots {
-    pub(crate) fn permits_function_writes(&self) -> bool {
-        self.functions_quiescent
-    }
-    pub(crate) fn heap_identity(&self) -> HeapIdentity {
-        self.heap
-    }
-
-    /// Copies words only. The consumer must hold stopped collector authority
-    /// for this exact heap before decoding them or tracing the resulting set.
-    pub(crate) fn append_words(&self, out: &mut Vec<TaggedValue>) {
-        out.extend_from_slice(&self.words);
-    }
-}
-
-static_assertions::assert_not_impl_any!(FrozenLegacyRoots: Send, Sync, Clone, Copy);
+use crate::tagged::gc::FrozenFunctionRoots;
+pub(crate) use crate::tagged::gc::FrozenLegacyRoots;
 
 impl Context {
     /// C4 admits inactive compiled caches, but no suspended legacy Lisp/native
@@ -135,15 +113,46 @@ impl Context {
             &self.dynamic_module_registry,
             &mut words,
         );
-        Ok(FrozenLegacyRoots {
-            heap: keeper.parallel_heap_identity(),
-            words,
-            functions_quiescent: self.function_cells_quiescent(),
-        })
+        let functions = if self.function_cells_quiescent() {
+            FrozenFunctionRoots::Quiescent
+        } else {
+            FrozenFunctionRoots::MayBeActive
+        };
+        // SAFETY: the complete original Context census was captured above,
+        // while its retained keeper excludes execution. Admission consumes it
+        // before any Context resumes; the quiescence check covers activations
+        // and outstanding compiled jobs.
+        Ok(unsafe { FrozenLegacyRoots::new(keeper.parallel_heap_identity(), words, functions) })
     }
 }
 
 impl Baton {
+    /// Capture the original manager identities once while this keeper is held.
+    /// The returned proof cannot outlive this retained Baton or cross threads.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn keeper_designator(
+        &self,
+    ) -> Result<
+        crate::emacs_core::symbol::parallel::KeeperWorldDesignator<'_>,
+        crate::tagged::gc::RegistrationError,
+    > {
+        use crate::emacs_core::symbol::parallel::KeeperWorldDesignator;
+        use crate::tagged::gc::RegistrationError;
+        if !self.held_here() {
+            return Err(RegistrationError::WrongThread);
+        }
+        let obarray = std::ptr::NonNull::new(self.world.obarray.get())
+            .ok_or(RegistrationError::Publication)?;
+        let projections = std::ptr::NonNull::from(&self.world.thread_projections);
+        // SAFETY: these original manager allocations and the heap identity
+        // belong to this retained World. The return lifetime borrows this held
+        // Baton, and the proof is confined to this owner thread.
+        Ok(unsafe {
+            KeeperWorldDesignator::new(self.parallel_heap_identity(), obarray, projections)
+        })
+    }
+
     /// Enumerate frozen shared storage once, after all ACKs, with no Context
     /// view, heap borrow, owner-slab walk, lazy initialization or Lisp callback.
     /// Marker unlink slots are valid only for the caller's stopped phase.
@@ -151,7 +160,7 @@ impl Baton {
     #[inline(never)]
     pub(crate) fn collect_parallel_world_roots(
         &self,
-        stopped: &AllStopped<'_>,
+        stopped: &mut AllStopped<'_>,
         out: &mut Vec<TaggedValue>,
     ) -> Result<Vec<*mut *mut crate::tagged::header::MarkerObj>, RendezvousError> {
         if !self.held_here() {
@@ -167,11 +176,14 @@ impl Baton {
         {
             return Err(RendezvousError::Publication);
         }
-        let projections = self
-            .world
-            .thread_projections
-            .try_borrow()
-            .map_err(|_| RendezvousError::Busy)?;
+        // All symbol/projection access requires the same checked receiver.
+        // Drop it before any collector/table bridge can borrow the stop.
+        {
+            let keeper = self.keeper_designator()?;
+            let symbols = stopped.symbols()?;
+            symbols.append_current_symbol_roots(&keeper, out)?;
+            symbols.append_current_projection_roots(&keeper, out)?;
+        }
         // SAFETY: the unique keeper retains the World; AllStopped checked this
         // heap, keeper and every participant's publication. No participant can
         // access shared managers, no owner/reference loan survives, and only
@@ -181,11 +193,9 @@ impl Baton {
             let world = &self.world;
             let mut visit = |value| out.push(value);
             (&*world.owned_roots.get()).trace_roots(&mut visit);
-            projections.trace_roots(&mut visit);
             for value in (&*world.treesit.get()).roots() {
                 visit(value);
             }
-            (&*world.obarray.get()).trace_roots_with(&mut visit);
             (&*world.watchers.get()).trace_roots_with(&mut visit);
             (&*world.autoloads.get()).trace_roots_with(&mut visit);
             (&*world.frames.get()).trace_roots_with(&mut visit);
@@ -209,16 +219,21 @@ impl Baton {
                     visit(value);
                 }
             }
-            for value in global.gstring_shape_cache.values().copied() {
-                visit(value);
-            }
+            crate::emacs_core::font::trace_gstring_shape_cache(
+                &global.gstring_shape_cache,
+                &mut visit,
+            );
             global.processes.trace_roots_with(&mut visit);
             global.registers.trace_roots_with(&mut visit);
+            global.bookmarks.trace_roots_with(&mut visit);
+            global.minibuffers.trace_roots_with(&mut visit);
+            global.abbrevs.trace_roots_with(&mut visit);
             global.interactive.trace_roots_with(&mut visit);
             global.xwidgets.trace_roots_with(&mut visit);
             global.face_table.trace_roots_with(&mut visit);
             global.threads.trace_roots_with(&mut visit);
             global.kmacro.trace_roots_with(&mut visit);
+            global.rectangle.trace_roots_with(&mut visit);
             global.command_loop.trace_roots_with(&mut visit);
             global.modes.trace_roots_with(&mut visit);
             buffers.parallel_marker_chain_head_slots()
@@ -245,7 +260,7 @@ impl Context {
     #[cfg(test)]
     pub(crate) fn with_test_collection_era<S, R>(
         setup: impl FnOnce(&mut Context) -> S,
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, S) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, S) -> R,
     ) -> R {
         let mut context = collection_fixture_context();
         let input = setup(&mut context);
@@ -268,7 +283,7 @@ impl Context {
         // Compare only the root address while the exclusive collector loan
         // is retained. Synthetic participants cannot use the serial TLS view.
         crate::tagged::gc::clear_tagged_heap_root_if_installed(context.tagged_heap.heap_root());
-        let era = crate::tagged::gc::ParallelHeapEra::admit_rooted(collector, keeper, frozen)
+        let era = crate::tagged::gc::ProofEra::admit_rooted(collector, keeper, frozen)
             .unwrap_or_else(|failure| panic!("collection fixture admission: {:?}", failure.reason));
         body(era, input)
     }
@@ -280,7 +295,7 @@ impl Context {
     pub(crate) fn with_test_collection_era_then<S, R>(
         setup: impl FnOnce(&mut Context) -> S,
         body: impl for<'heap> FnOnce(
-            crate::tagged::gc::ParallelHeapEra<'heap>,
+            crate::tagged::gc::ProofEra<'heap>,
             S,
         )
             -> (crate::tagged::gc::QuiescentCollector<'heap>, Baton, R),
@@ -307,7 +322,7 @@ impl Context {
         // Compare only the root address while the exclusive collector loan
         // is retained. Synthetic participants cannot use the serial TLS view.
         crate::tagged::gc::clear_tagged_heap_root_if_installed(context.tagged_heap.heap_root());
-        let era = crate::tagged::gc::ParallelHeapEra::admit_rooted(collector, keeper, frozen)
+        let era = crate::tagged::gc::ProofEra::admit_rooted(collector, keeper, frozen)
             .unwrap_or_else(|failure| panic!("collection fixture admission: {:?}", failure.reason));
         let (collector, keeper, output) = body(era, input);
         assert_eq!(collector.heap_identity(), expected_heap);
@@ -340,3 +355,20 @@ mod function_boundary;
 #[cfg(all(test, not(feature = "gc-memory-telemetry")))]
 #[path = "tests/intern_boundary.rs"]
 mod intern_boundary;
+
+// SAFETY: Baton is the unique serial-execution authority of its retained
+// World. Era ownership holds the real token by value on its keeper thread;
+// keeper_designator checks held_here before lending original manager identities.
+unsafe impl crate::tagged::gc::EraKeeper for Baton {
+    fn keeper_designator(
+        &self,
+    ) -> Result<
+        crate::emacs_core::symbol::parallel::KeeperWorldDesignator<'_>,
+        crate::tagged::gc::RegistrationError,
+    > {
+        Baton::keeper_designator(self)
+    }
+    fn parallel_heap_identity(&self) -> HeapIdentity {
+        Baton::parallel_heap_identity(self)
+    }
+}

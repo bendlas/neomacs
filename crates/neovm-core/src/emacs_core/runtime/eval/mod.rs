@@ -31,13 +31,14 @@ pub use super::display_host::{
 use super::error::*;
 use super::interactive::InteractiveRegistry;
 use super::intern::{
-    SymId, format_symbol_name_for_diagnostic, intern, intern_uninterned, is_canonical_id,
-    is_keyword_id, resolve_sym, symbol_name_id,
+    SymId, WellKnown, format_symbol_name_for_diagnostic, intern, intern_uninterned,
+    is_canonical_id, is_keyword_id, resolve_sym, symbol_name_id,
 };
 use super::keymap::{list_keymap_define, list_keymap_set_parent, make_sparse_list_keymap};
 use super::kmacro::KmacroManager;
 use super::minibuffer::MinibufferManager;
 use super::mode::ModeRegistry;
+use super::print::map_flow;
 use super::process::ProcessManager;
 use super::rect::RectangleState;
 use super::regex::MatchData;
@@ -58,12 +59,19 @@ use crate::window::{
 };
 
 pub(crate) mod world;
-pub use world::{ContextShutdownError, ObarrayWriteAccess, OutstandingWorldViews};
+pub use world::{ContextShutdownError, ObarrayWriteAccess, OutstandingWorldViews, WorldEra};
 pub(crate) use world::{ObarrayView, OwnedRootRegistryView, WorldSlot, WorldView};
 
 mod callback;
+mod command_error;
+mod lexenv_cache;
 mod lexical_symbols;
+pub(crate) use self::lexenv_cache::LexenvAssqCache;
 pub(crate) use callback::{CheckedNativeCallback, native_callback_cache_enabled};
+pub(crate) mod parallel_entry;
+#[allow(dead_code)] // Dormant E4-S0 executor substrate; E4 stage 1 consumes it.
+pub(crate) mod parallel_exec;
+mod subr_layout;
 mod subrs;
 #[cfg(test)]
 pub(crate) use subrs::SUBRS;
@@ -108,7 +116,6 @@ const STACK_GROWTH_PROBE_INTERVAL: usize = 16;
 /// distinct functions called during batch-byte-compile so the cache
 /// never thrashes once warmed.
 const NAMED_CALL_CACHE_CAPACITY: usize = 4096;
-const LEXENV_ASSQ_CACHE_CAPACITY: usize = 16;
 const LEXENV_SPECIAL_CACHE_CAPACITY: usize = 16;
 const GC_DEFAULT_THRESHOLD_BYTES: usize = 100_000 * std::mem::size_of::<usize>();
 const GC_THRESHOLD_FLOOR_BYTES: usize = GC_DEFAULT_THRESHOLD_BYTES / 10;
@@ -1238,6 +1245,9 @@ impl SpecBinding {
             Self::Let { sym_id, .. }
             | Self::LetLocal { sym_id, .. }
             | Self::LetDefault { sym_id, .. } => Some(sym_id),
+            Self::NativeUnwind {
+                action: NativeUnwindAction::KeyboardBinding(ref binding),
+            } => Some(binding.sym_id),
             Self::LexicalEnv { .. }
             | Self::GcRoot { .. }
             | Self::Backtrace { .. }
@@ -1256,6 +1266,14 @@ impl SpecBinding {
     }
 }
 
+/// A dynamic binding owned by one selected keyboard lifetime.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyboardBinding {
+    sym_id: SymId,
+    owner: crate::emacs_core::forward::KeyboardBindingOwner,
+    old_value: Value,
+}
+
 /// Native cleanups that must participate in GNU's specpdl unwind ordering.
 ///
 /// Keep this closed and exhaustive: adding a lifecycle that can signal or
@@ -1263,6 +1281,9 @@ impl SpecBinding {
 /// an untyped callback whose captures the GC cannot see.
 #[derive(Clone, Debug)]
 pub(crate) enum NativeUnwindAction {
+    /// GNU SPECPDL_LET's where.kbd: restore the captured keyboard even
+    /// when the selected frame changed inside the dynamic extent.
+    KeyboardBinding(Box<KeyboardBinding>),
     /// Scalar reserve state owned by this Context's mutator; restored on its
     /// own specpdl, without sharing a limit or a reserve between Contexts.
     RestoreEvalDepth { old_limit: i64 },
@@ -1298,6 +1319,7 @@ impl NativeUnwindAction {
             Self::MinibufferBuffer { .. } => {}
             Self::BacktraceEvalRewind { .. } => {}
             Self::OwnerBinding(_) => {}
+            Self::KeyboardBinding(binding) => visit(binding.old_value),
         }
     }
 
@@ -1307,6 +1329,9 @@ impl NativeUnwindAction {
         let root_scope = context.save_vm_roots();
         self.trace_roots(&mut |value| context.push_vm_frame_root(value));
         let result = match self {
+            Self::KeyboardBinding(binding) => context
+                .restore_keyboard_binding(*binding, true)
+                .map(|()| Value::NIL),
             Self::RestoreEvalDepth { old_limit } => {
                 context.restore_lisp_eval_depth_room(old_limit);
                 Ok(Value::NIL)
@@ -1740,55 +1765,6 @@ enum NamedAutoloadCallStep {
 struct NamedCallCacheEntry {
     function_epoch: u64,
     target: NamedCallTarget,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LexenvAssqCacheEntry {
-    lexenv_bits: usize,
-    symbol: SymId,
-    /// The `(symbol . value)` cell this environment binds the symbol to, or
-    /// `nil` for "this environment binds it nowhere".  A binding cell is
-    /// always a cons, so `nil` cannot be confused for one.
-    cell: Value,
-}
-
-struct LexenvAssqCache {
-    entries: [Cell<Option<LexenvAssqCacheEntry>>; LEXENV_ASSQ_CACHE_CAPACITY],
-}
-
-impl Default for LexenvAssqCache {
-    fn default() -> Self {
-        Self {
-            entries: std::array::from_fn(|_| Cell::new(None)),
-        }
-    }
-}
-
-impl LexenvAssqCache {
-    #[inline]
-    fn slot(lexenv_bits: usize, sym_id: SymId) -> usize {
-        let mixed = lexenv_bits.rotate_left(7) ^ (sym_id.0 as usize).wrapping_mul(0x9E37_79B1);
-        mixed & (LEXENV_ASSQ_CACHE_CAPACITY - 1)
-    }
-
-    #[inline]
-    fn find(&self, lexenv_bits: usize, sym_id: SymId) -> Option<Value> {
-        let entry = self.entries[Self::slot(lexenv_bits, sym_id)].get()?;
-        (entry.lexenv_bits == lexenv_bits && entry.symbol == sym_id).then_some(entry.cell)
-    }
-
-    #[inline]
-    fn push(&self, entry: LexenvAssqCacheEntry) {
-        let index = Self::slot(entry.lexenv_bits, entry.symbol);
-        self.entries[index].set(Some(entry));
-    }
-
-    #[inline]
-    fn clear(&self) {
-        for entry in &self.entries {
-            entry.set(None);
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2307,12 +2283,35 @@ pub struct GuiFrameHostRequest {
     pub height: u32,
     pub title: crate::heap_types::LispString,
     pub geometry_hints: crate::window::GuiFrameGeometryHints,
+    pub visibility: crate::window::FrameVisibility,
+    pub decorated: bool,
     pub fullscreen: Option<FrameFullscreen>,
     /// GNU's `x-no-window-manager`: create a new top-level window
     /// override-redirect so a window manager never adopts Emacs's own frames
     /// (notably EXWM, which otherwise tiles its floating frames as clients).
     /// Ignored by resize requests.
     pub override_redirect: bool,
+}
+
+impl GuiFrameHostRequest {
+    /// Snapshot final frame parameters without transferring evaluator-owned
+    /// values to the native thread. Callers retain their creation guards.
+    pub fn for_frame(frame: &crate::window::Frame) -> Self {
+        Self {
+            frame_id: frame.id,
+            width: frame.width,
+            height: frame.height,
+            title: frame.host_title_lisp_string(),
+            geometry_hints: frame.gui_geometry_hints(),
+            visibility: frame.visibility,
+            decorated: frame
+                .known_parameter(crate::window::FrameParam::Undecorated)
+                .is_none_or(|value| value.is_nil()),
+            fullscreen: frame
+                .known_parameter(crate::window::FrameParam::Fullscreen)
+                .and_then(|value| FrameFullscreen::from_symbol_value(&value)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2745,37 +2744,6 @@ enum CommandLoopExit {
     Call(Value),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum ResumeTarget {
-    CommandLoopExit,
-    CommandLoopTopLevel,
-    InterpreterCatch,
-    InterpreterConditionCase {
-        handler_index: usize,
-        condition_stack_base: usize,
-    },
-    /// GNU safe_funcall's Qt barrier. The index identifies a live handler
-    /// on its owning Context's mutator; it is never shared across Contexts.
-    SafeFuncall {
-        condition_stack_base: usize,
-    },
-    VmCatch {
-        resume_id: u64,
-        target: u32,
-        stack_len: usize,
-        spec_depth: usize,
-        bind_stack_len: usize,
-    },
-    VmConditionCase {
-        resume_id: u64,
-        target: u32,
-        stack_len: usize,
-        spec_depth: usize,
-        bind_stack_len: usize,
-    },
-}
-
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) enum ConditionFrame {
@@ -2904,6 +2872,23 @@ impl LoadReadStreamToken {
     }
 }
 
+/// How a [`LoadReadCursor`] obtains `read-symbol-shorthands` for
+/// `(read STREAM=standard-input)`.
+///
+/// GNU's reader consults the variable at every symbol lookup
+/// (`src/lread.c:4956-5010`), so the binding visible at the `(read)` call is
+/// authoritative.  `load` derives a file's value from its Local Variables
+/// section without binding the variable, so it captures that value when the
+/// stream starts.  `eval-buffer` and `eval-region` read a buffer whose binding
+/// evaluated forms can change, so they resolve it at each `(read)`.
+#[derive(Clone, Debug)]
+pub(crate) enum LoadReadShorthands {
+    /// The value captured when a `load` stream started.
+    Snapshot(Option<super::value_reader::ReadSymbolShorthands>),
+    /// The current buffer-local or dynamic binding.
+    CurrentBinding,
+}
+
 /// One active load-read cursor: the heap `LispString` being read plus a byte
 /// offset into it that BOTH the readevalloop and `(read)` advance.  See
 /// [`LoadReadStreamToken`] and [`Context::load_read_cursors`].
@@ -2918,9 +2903,8 @@ pub(crate) struct LoadReadCursor {
     /// Shared byte offset into `source`, advanced by both the readevalloop and
     /// `(read STREAM=standard-input)`.
     pub(crate) pos: usize,
-    /// `read-symbol-shorthands` active for this source, if any — so `(read)`
-    /// applies the same shorthand rewrites the loader does.
-    pub(crate) shorthands: Option<super::value_reader::ReadSymbolShorthands>,
+    /// How `(read STREAM=standard-input)` resolves `read-symbol-shorthands`.
+    pub(crate) shorthands: LoadReadShorthands,
 }
 
 /// Result of reading a Lisp variable before choosing whether an unbound cell
@@ -2942,6 +2926,16 @@ pub(crate) struct DaemonState {
     pub(crate) initialized: bool,
     pub(crate) notify: Option<DaemonNotifier>,
 }
+
+// GNU DEFVAR_LISP spellings probed by the input and echo-area paths on every
+// command. Their by-name reads re-interned each spelling per probe; the
+// handles are compile-time ids and cache no value.
+static UNREAD_COMMAND_EVENTS: WellKnown = WellKnown::UnreadCommandEvents;
+static UNREAD_POST_INPUT_METHOD_EVENTS: WellKnown = WellKnown::UnreadPostInputMethodEvents;
+static UNREAD_INPUT_METHOD_EVENTS: WellKnown = WellKnown::UnreadInputMethodEvents;
+static INHIBIT_MESSAGE: WellKnown = WellKnown::InhibitMessage;
+static INHIBIT_EOL_CONVERSION: WellKnown = WellKnown::InhibitEolConversion;
+static CLEAR_MESSAGE_FUNCTION: WellKnown = WellKnown::ClearMessageFunction;
 
 /// The evaluator state owned by the mutator thread that constructs it.
 ///
@@ -3020,12 +3014,9 @@ pub struct Context {
     last_redisplay_signature: WorldSlot<Option<RedisplaySignature>>,
     /// Match data from the last successful search/match operation.
     pub(crate) match_data: Option<MatchData>,
-    /// Input event receiver from the display/render thread.
-    /// `None` in batch mode (tests, non-interactive evaluation).
-    /// When `Some`, `read_char()` drains this queue but normally blocks on the
-    /// unified process/input poller. Producers must enqueue first, then call
-    /// [`Context::wait_notifier`]'s notifier so input cannot miss that wait.
-    pub input_rx: Option<crossbeam_channel::Receiver<crate::keyboard::InputEvent>>,
+    /// Host-input receiving owner. Only HostInputPublisher can attach a queue
+    /// paired with this Context's process wait backend.
+    pub(crate) input_rx: crate::host_input::HostInputReceiver,
     /// Tasks queued from other threads (e.g. the diagnostics server) to run on
     /// the Lisp thread at a safe point. Drained in the `read_char` loop.
     eval_task_rx: Option<crossbeam_channel::Receiver<EvalThreadTask>>,
@@ -3585,16 +3576,24 @@ pub struct Context {
     macro_perf_enabled: bool,
     /// Custom variable manager — defcustom/defgroup system.
     pub(crate) custom: CustomManager,
+    /// Native construction state, never serialized. Unlike an ordinary
+    /// runtime redump, loadup must omit build-only environment derivatives.
+    /// Use trailing padding to preserve the pinned Context field offsets.
+    pub(crate) loadup_dump_mode: Option<super::load::LoadupDumpMode>,
+    /// GNU `dispnew.c`'s static `frame_and_buffer_state`: the internal state
+    /// vector used by `(frame-or-buffer-changed-p)` when VARIABLE is nil.
+    /// Appended after the pinned layout; only the Context size grows.
+    pub(crate) frame_and_buffer_state: Option<Value>,
 }
 
 // A mutex does not make the host hooks, Rc leases or TLS views transferable.
 static_assertions::assert_not_impl_any!(Context: Send, Sync);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShutdownRequest {
-    pub exit_code: i32,
-    pub restart: bool,
-}
+// Construction state must fit the single trailing byte without growing
+// Context or shifting its pinned native/JIT ABI.
+static_assertions::const_assert_eq!(
+    std::mem::size_of::<Option<super::load::LoadupDumpMode>>(),
+    1
+);
 
 /// Whether Lisp forms may still be evaluated in this session.
 ///
@@ -3670,13 +3669,15 @@ struct GcRuntimeSettingsCache {
 /// the runtime-settings cache's size and its word-sized discriminant niche.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
-struct HashTestGcAccountingSlot(*mut super::builtins::HashTestGcInhibitAccounting);
+struct HashTestGcAccountingSlot(*mut crate::emacs_core::hashtab::HashTestGcInhibitAccounting);
 
 impl HashTestGcAccountingSlot {
     const NEEDS_LIVE_SETTINGS: usize = 1;
 
     #[inline]
-    fn accounting(self) -> Option<std::ptr::NonNull<super::builtins::HashTestGcInhibitAccounting>> {
+    fn accounting(
+        self,
+    ) -> Option<std::ptr::NonNull<crate::emacs_core::hashtab::HashTestGcInhibitAccounting>> {
         std::ptr::NonNull::new(
             self.0
                 .map_addr(|address| address & !Self::NEEDS_LIVE_SETTINGS),
@@ -3686,8 +3687,8 @@ impl HashTestGcAccountingSlot {
     #[inline]
     fn replace_accounting(
         &mut self,
-        pointer: Option<std::ptr::NonNull<super::builtins::HashTestGcInhibitAccounting>>,
-    ) -> Option<std::ptr::NonNull<super::builtins::HashTestGcInhibitAccounting>> {
+        pointer: Option<std::ptr::NonNull<crate::emacs_core::hashtab::HashTestGcInhibitAccounting>>,
+    ) -> Option<std::ptr::NonNull<crate::emacs_core::hashtab::HashTestGcInhibitAccounting>> {
         let previous = self.accounting();
         let visibility = self.0.addr() & Self::NEEDS_LIVE_SETTINGS;
         self.0 = pointer
@@ -3716,7 +3717,7 @@ impl Default for HashTestGcAccountingSlot {
 }
 
 const _: () = {
-    assert!(std::mem::align_of::<super::builtins::HashTestGcInhibitAccounting>() >= 2);
+    assert!(std::mem::align_of::<crate::emacs_core::hashtab::HashTestGcInhibitAccounting>() >= 2);
     assert!(std::mem::size_of::<HashTestGcAccountingSlot>() == std::mem::size_of::<usize>());
 };
 
@@ -4067,9 +4068,11 @@ pub(crate) struct SequenceTempRootScopeState {
 struct SequenceTempRootFrame {
     /// `eval_temp_roots.len()` at push: the pop floor.
     eval_base: usize,
-    /// Floor of this frame's retained let/let* residue run.  A returned
-    /// special form's temps stay visible to the rest of the sequence, as
-    /// GNU's freed-but-still-scanned stack slots do.
+    /// Floor of this frame's retained let/let* temps run.  A returned
+    /// special form's temps stay visible to the rest of the sequence: Neo's
+    /// own deterministic, conservative retention rule (the enclosing
+    /// sequence owns the run until the sequence ends), not an emulation of
+    /// any particular GNU stack-slot state.
     let_floor: usize,
     /// Length of that run.
     let_len: usize,
@@ -4684,7 +4687,7 @@ impl Context {
     }
 
     pub(crate) fn has_input_receiver(&self) -> bool {
-        self.input_rx.is_some()
+        self.input_rx.as_ref().is_some()
     }
 
     pub(crate) fn pop_unread_command_event(&mut self) -> Option<Value> {
@@ -4704,7 +4707,7 @@ impl Context {
     pub(crate) fn take_unread_command_event(
         &mut self,
     ) -> Option<crate::keyboard::UnreadCommandEvent> {
-        let current = match self.eval_symbol("unread-command-events") {
+        let current = match self.eval_symbol_by_id(UNREAD_COMMAND_EVENTS.id()) {
             Ok(value) => value,
             Err(_) => Value::NIL,
         };
@@ -4712,7 +4715,7 @@ impl Context {
             ValueKind::Cons => {
                 let head = current.cons_car();
                 let tail = current.cons_cdr();
-                self.assign("unread-command-events", tail);
+                self.assign_by_id(UNREAD_COMMAND_EVENTS.id(), tail);
                 Some(crate::keyboard::UnreadCommandEvent::decode(head))
             }
             _ => None,
@@ -4720,7 +4723,7 @@ impl Context {
     }
 
     pub(crate) fn peek_unread_command_event(&self) -> Option<Value> {
-        let current = match self.eval_symbol("unread-command-events") {
+        let current = match self.eval_symbol_by_id(UNREAD_COMMAND_EVENTS.id()) {
             Ok(value) => value,
             Err(_) => Value::NIL,
         };
@@ -4738,15 +4741,15 @@ impl Context {
     /// macro must wait for ordinary command events and both input-method queues
     /// that were populated while consuming that macro.
     pub(crate) fn has_pending_requeued_events(&self) -> bool {
-        self.eval_symbol("unread-command-events")
+        self.eval_symbol_by_id(UNREAD_COMMAND_EVENTS.id())
             .is_ok_and(|value| value.is_cons())
             || [
-                "unread-post-input-method-events",
-                "unread-input-method-events",
+                &UNREAD_POST_INPUT_METHOD_EVENTS,
+                &UNREAD_INPUT_METHOD_EVENTS,
             ]
             .into_iter()
             .any(|symbol| {
-                self.eval_symbol(symbol)
+                self.eval_symbol_by_id(symbol.id())
                     .is_ok_and(|value| value.is_truthy())
             })
     }
@@ -4754,12 +4757,12 @@ impl Context {
     /// Prepend an event to the `unread-command-events` list so that the next
     /// `read_char` / `pop_unread_command_event` will consume it first.
     pub(crate) fn push_unread_command_event(&mut self, event: Value) {
-        let current = match self.eval_symbol("unread-command-events") {
+        let current = match self.eval_symbol_by_id(UNREAD_COMMAND_EVENTS.id()) {
             Ok(value) => value,
             Err(_) => Value::NIL,
         };
         let new_list = Value::cons(event, current);
-        self.assign("unread-command-events", new_list);
+        self.assign_by_id(UNREAD_COMMAND_EVENTS.id(), new_list);
     }
 
     /// Queue a low-level special event on the keyboard event path.
@@ -5024,6 +5027,17 @@ impl Context {
         self.variable_value_by_name(name)
     }
 
+    /// [`Self::buffer_default_value`] for a fixed GNU spelling.
+    ///
+    /// Identical two-level lookup, with the variable name resolved once per
+    /// registry epoch instead of at every layout probe.
+    pub fn buffer_default_value_fixed(&self, symbol: &WellKnown) -> Option<Value> {
+        if let Some(info) = crate::buffer::buffer::lookup_buffer_slot(symbol.name()) {
+            return Some(self.buffers.buffer_defaults[info.offset.index()]);
+        }
+        self.variable_value(symbol.id())
+    }
+
     /// Seed the 24 GNU standard built-in fringe bitmaps into the registry and
     /// set each bitmap symbol's `'fringe` plist property to its index.
     ///
@@ -5184,129 +5198,6 @@ impl Context {
             && self
                 .visible_variable_value_or_nil("cursor-in-echo-area")
                 .is_truthy()
-    }
-
-    pub fn minibuffer_is_active(&self) -> bool {
-        self.minibuffers.is_active()
-    }
-
-    pub fn active_minibuffer_window_id(&self) -> Option<WindowId> {
-        if let Some(wid) = *self.active_minibuffer_window {
-            return Some(wid);
-        }
-        let state = self.minibuffers.current()?;
-
-        for frame_id in self.frames.frame_list() {
-            let Some(frame) = self.frames.get(frame_id) else {
-                continue;
-            };
-            if let Some(minibuffer_wid) = frame.minibuffer_window
-                && let Some(window) = frame.find_window(minibuffer_wid)
-                && window.buffer_id() == Some(state.buffer_id)
-            {
-                return Some(minibuffer_wid);
-            }
-        }
-        None
-    }
-
-    pub fn minibuffer_window_is_active(&self, window_id: WindowId) -> bool {
-        self.active_minibuffer_window_id() == Some(window_id)
-    }
-
-    /// Window that invoked the currently active minibuffer.
-    ///
-    /// GNU keeps this window's mode/header line active while the minibuffer
-    /// owns input selection (`minibuffer-selected-window`).
-    pub fn minibuffer_selected_window_id(&self) -> Option<WindowId> {
-        // GNU window.c returns the saved caller only while a minibuffer is
-        // selected, at positive minibuffer depth, and the caller is live.
-        // Keep the saved identity for nested reads/window-configuration
-        // restoration; deletion invalidates the query, not the session.
-        if !self.minibuffer_is_active() {
-            return None;
-        }
-        let selected_frame = self.frames.selected_frame()?;
-        if selected_frame.minibuffer_window != Some(selected_frame.selected_window) {
-            return None;
-        }
-        let caller = (*self.minibuffer_selected_window)?;
-        super::window_cmds::WindowDomain::Live.frame_of(&self.frames, caller)?;
-        Some(caller)
-    }
-
-    pub fn activate_minibuffer_window_for_buffer(
-        &mut self,
-        minibuf_id: BufferId,
-        prompt: crate::heap_types::LispString,
-        initial_input: Option<crate::heap_types::LispString>,
-    ) -> Result<Option<WindowId>, Flow> {
-        let entry_level = {
-            let state = self.minibuffers.read_from_minibuffer_lisp(
-                minibuf_id,
-                &prompt,
-                initial_input.as_ref(),
-                None,
-            )?;
-            let depth = std::num::NonZeroUsize::new(state.depth)
-                .expect("an active minibuffer has nonzero depth");
-            super::minibuffer::MinibufferEntryLevel::from_depth(depth)
-        };
-
-        let frame_id = super::window_cmds::ensure_selected_frame_id_in_state(
-            &mut self.frames,
-            &mut self.buffers,
-        );
-        let Some(frame) = self.frames.get(frame_id) else {
-            self.buffers.switch_current(minibuf_id);
-            return Ok(None);
-        };
-        let Some(minibuffer_window_id) = frame.minibuffer_window else {
-            self.buffers.switch_current(minibuf_id);
-            return Ok(None);
-        };
-        let previous_selected_window = frame.selected_window;
-        if super::eval::gnu_redisplay_hooks_enabled()
-            && frame.find_window(minibuffer_window_id).is_some()
-        {
-            // GNU minibuf.c:828 publishes set_window_buffer before normal
-            // Fselect_window; no Lisp executes until this transition commits.
-            self.gnu_mark_window_mode_line(minibuffer_window_id);
-            if previous_selected_window != minibuffer_window_id {
-                self.gnu_mark_selection(Some(previous_selected_window), minibuffer_window_id, true);
-            }
-        }
-
-        super::window_cmds::remember_selected_window_point_in_state(
-            &mut self.frames,
-            &mut self.buffers,
-            frame_id,
-        );
-        if let Some(frame) = self.frames.get_mut(frame_id) {
-            if let Some(window) = frame.find_window_mut(minibuffer_window_id) {
-                window.set_buffer(minibuf_id);
-                if super::eval::gnu_redisplay_hooks_enabled() {
-                    if let crate::window::Window::Leaf { hscroll, .. } = window {
-                        *hscroll = 0;
-                    }
-                    window.set_suspend_auto_hscroll(false);
-                }
-                crate::window::window_markers::attach_window_position_markers(
-                    &mut self.buffers,
-                    window,
-                );
-            }
-            let _ = frame.select_window(minibuffer_window_id);
-        }
-        self.buffers.switch_current(minibuf_id);
-        super::reader::MinibufferSelectedWindowUpdate::for_entry(
-            entry_level,
-            previous_selected_window,
-            minibuffer_window_id,
-        )
-        .apply(&mut self.minibuffer_selected_window);
-        *self.active_minibuffer_window = Some(minibuffer_window_id);
-        Ok(Some(minibuffer_window_id))
     }
 
     pub fn current_message_value(&self) -> Option<Value> {
@@ -5520,7 +5411,7 @@ impl Context {
     ) -> EchoMessageClearResult {
         self.set_message_buf_print(false);
         if self
-            .visible_variable_value_or_nil("inhibit-message")
+            .visible_variable_value_or_nil_by_id(INHIBIT_MESSAGE.id())
             .is_truthy()
         {
             return EchoMessageClearResult::PreserveEchoArea;
@@ -5530,16 +5421,19 @@ impl Context {
         let mut called_clear_function = false;
         let mut clear_result = EchoMessageClearResult::ClearEchoArea;
 
-        let clear_message_function = self.visible_variable_value_or_nil("clear-message-function");
+        let clear_message_function =
+            self.visible_variable_value_or_nil_by_id(CLEAR_MESSAGE_FUNCTION.id());
         if !clear_message_function.is_nil()
             && self.gc_inhibit_depth == 0
             && self.function_value_is_callable(&clear_message_function)
         {
             called_clear_function = true;
             let specpdl_count = self.specpdl.len();
-            if let Err(err) =
-                self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-quit"), Value::T)
-            {
+            if let Err(err) = self.try_specbind_or_unwind_to(
+                specpdl_count,
+                crate::emacs_core::intern::WellKnown::InhibitQuit.id(),
+                Value::T,
+            ) {
                 tracing::warn!(
                     "inhibit-quit watcher signaled while clearing echo message: {:?}",
                     err
@@ -5638,15 +5532,6 @@ impl Context {
         &mut self.current_message
     }
 
-    pub(crate) fn sync_keyboard_terminal_owner(&mut self) {
-        let terminal_id = self
-            .frames
-            .selected_frame()
-            .map(|frame| frame.terminal_id)
-            .unwrap_or(crate::emacs_core::terminal::pure::TERMINAL_ID);
-        self.command_loop.keyboard.select_terminal(terminal_id);
-    }
-
     pub(crate) fn route_keyboard_input_to_frame(&mut self, emacs_frame_id: u64) {
         let frame_id = if emacs_frame_id == 0 {
             self.frames.selected_frame().map(|frame| frame.id)
@@ -5708,13 +5593,17 @@ impl Context {
             .kboard
             .set_internal_last_event_frame(frame_id);
 
+        // GNU's `Qlast_event_frame` / `Qswitch_frame`; every keyboard event
+        // observed updates the former and previously re-interned it.
+        static LAST_EVENT_FRAME: WellKnown = WellKnown::LastEventFrame;
+        static SWITCH_FRAME: WellKnown = WellKnown::SwitchFrame;
         let frame_value = Value::make_frame(frame_id.0);
-        self.store_variable_by_name("last-event-frame", frame_value);
+        self.store_variable(LAST_EVENT_FRAME.id(), frame_value);
         if switching || self.command_loop.keyboard.has_unread_selection_event() {
             self.command_loop
                 .keyboard
                 .set_unread_selection_event(Value::list(vec![
-                    Value::symbol("switch-frame"),
+                    Value::symbol(&SWITCH_FRAME),
                     frame_value,
                 ]));
         }
@@ -5792,7 +5681,12 @@ impl Context {
         let mut result = Value::NIL;
         let mut error = None;
         for form in &forms {
-            let eval_result = self.eval_sub(*form);
+            // Each form is one top-level evaluation: its root group ends
+            // when the form returns (GNU's Feval frame).
+            let eval_result = {
+                let mut boundary = special_forms::EvalBoundaryRoots::enter(self);
+                boundary.context().eval_sub(*form)
+            };
             match self.finalize_public_eval_result(eval_result) {
                 Ok(v) => result = v,
                 Err(e) => {
@@ -5812,7 +5706,10 @@ impl Context {
     /// Evaluate a single Value form, mapping Flow errors to EvalError.
     pub fn eval_form(&mut self, form: Value) -> Result<Value, EvalError> {
         self.setup_thread_locals();
-        let eval_result = self.eval_sub(form);
+        let eval_result = {
+            let mut boundary = special_forms::EvalBoundaryRoots::enter(self);
+            boundary.context().eval_sub(form)
+        };
         self.finalize_public_eval_result(eval_result)
     }
 
@@ -5827,12 +5724,14 @@ impl Context {
         }
     }
 
-    /// Legacy eval_value: delegates to eval_sub.
+    /// Legacy eval_value: delegates to eval_sub inside one evaluation
+    /// boundary (GNU `Feval`: the frame's temp roots die when it returns).
     pub fn eval_value(&mut self, value: &Value) -> EvalResult {
         if !crate::tagged::gc::tagged_heap_is_current(&self.tagged_heap) {
             self.setup_thread_locals();
         }
-        self.eval_sub(*value)
+        let mut boundary = special_forms::EvalBoundaryRoots::enter(self);
+        boundary.context().eval_sub(*value)
     }
 
     /// Evaluate all forms in a source string and return per-form results.
@@ -5858,7 +5757,13 @@ impl Context {
         }
         let mut results = Vec::with_capacity(forms.len());
         for form in &forms {
-            let result = self.eval_sub(*form).map_err(map_flow);
+            // Each form is one top-level evaluation: its root group ends when
+            // the form returns (GNU's Feval frame), even though the parsed
+            // forms keep living in `forms`.
+            let result = {
+                let mut boundary = special_forms::EvalBoundaryRoots::enter(self);
+                boundary.context().eval_sub(*form).map_err(map_flow)
+            };
             if let Ok(ref val) = result {
                 self.push_specpdl_root(*val);
             }
@@ -6522,6 +6427,9 @@ fn default_toplevel_binding(specpdl: &[SpecBinding], sym_id: SymId) -> Option<&S
             sym_id: binding_sym,
             ..
         } => *binding_sym == sym_id,
+        SpecBinding::NativeUnwind {
+            action: NativeUnwindAction::KeyboardBinding(binding),
+        } => binding.sym_id == sym_id,
         SpecBinding::LetLocal { .. }
         | SpecBinding::LexicalEnv { .. }
         | SpecBinding::GcRoot { .. }
@@ -6549,6 +6457,9 @@ pub(crate) fn default_toplevel_value_in_state(
     match default_toplevel_binding(specpdl, sym_id) {
         Some(SpecBinding::Let { old_value, .. })
         | Some(SpecBinding::LetDefault { old_value, .. }) => old_value.get(),
+        Some(SpecBinding::NativeUnwind {
+            action: NativeUnwindAction::KeyboardBinding(binding),
+        }) => Some(binding.old_value),
         Some(SpecBinding::LetLocal { .. })
         | Some(SpecBinding::LexicalEnv { .. })
         | Some(SpecBinding::GcRoot { .. })
@@ -6579,6 +6490,9 @@ pub(crate) fn default_toplevel_value(ctx: &mut Context, args: Vec<Value>) -> Eva
             SpecBinding::Let { old_value, .. } | SpecBinding::LetDefault { old_value, .. } => {
                 old_value.get()
             }
+            SpecBinding::NativeUnwind {
+                action: NativeUnwindAction::KeyboardBinding(binding),
+            } => Some(binding.old_value),
             _ => unreachable!("default_toplevel_binding returns only variable bindings"),
         };
         return value.ok_or_else(|| signal(LispCondition::VoidVariable, vec![args[0]]));
@@ -6641,6 +6555,13 @@ pub(crate) fn set_default_toplevel_value_in_state(
                 ..
             } if *binding_sym == sym_id => {
                 old_value.set(Some(value));
+                return true;
+            }
+            SpecBinding::NativeUnwind {
+                action: NativeUnwindAction::KeyboardBinding(binding),
+            } if binding.sym_id == sym_id => {
+                crate::tagged::gc::note_root_overwrite(binding.old_value);
+                binding.old_value = value;
                 return true;
             }
             SpecBinding::Let { .. }
@@ -7108,7 +7029,7 @@ impl Context {
     /// fully registered subr.
     pub fn dispatch_subr_value(&mut self, function: Value, args: Vec<Value>) -> Option<EvalResult> {
         let sym_id = function.as_subr_id()?;
-        let wrong_arity_callee = Value::symbol(resolve_sym(sym_id));
+        let wrong_arity_callee = Value::from_sym_id(sym_id);
         self.dispatch_subr_value_internal(function, &args, wrong_arity_callee)
     }
 
@@ -7135,40 +7056,6 @@ impl Context {
     }
 
     // -----------------------------------------------------------------------
-
-    pub(crate) fn lexenv_assq_cached_in(&self, lexenv: Value, sym_id: SymId) -> Option<Value> {
-        let lexenv_bits = lexenv.bits();
-        let cache = &self.lexenv_assq_cache;
-        if let Some(cell) = cache.find(lexenv_bits, sym_id) {
-            // `nil` is not a binding cell -- `lexenv_assq` only ever returns a
-            // cons -- so it is free to record the other answer: this
-            // environment has no binding for this symbol.  Absence is the
-            // common answer and used to be the one nobody remembered.  Every
-            // reference to a dynamically-bound variable in interpreted code
-            // walks the environment to its end and finds nothing, and then
-            // the next reference to the same variable walks it again; that
-            // walk was 130M of the 208M a magit-status run spent resolving
-            // symbols.
-            return (!cell.is_nil()).then_some(cell);
-        }
-
-        let cell = if self.symbols_with_pos_enabled {
-            lexical_symbols::assq(lexenv, sym_id)
-        } else {
-            lexenv_assq(lexenv, sym_id)
-        };
-        cache.push(LexenvAssqCacheEntry {
-            lexenv_bits,
-            symbol: sym_id,
-            cell: cell.unwrap_or(Value::NIL),
-        });
-        cell
-    }
-
-    pub(crate) fn lexenv_lookup_cached_in(&self, lexenv: Value, sym_id: SymId) -> Option<Value> {
-        self.lexenv_assq_cached_in(lexenv, sym_id)
-            .map(|cell| cell.cons_cdr())
-    }
 
     pub(crate) fn lexenv_declares_special_cached_in(&self, lexenv: Value, sym_id: SymId) -> bool {
         let lexenv_bits = lexenv.bits();
@@ -7410,7 +7297,7 @@ impl Context {
     /// measurement that pins the difference.
     pub(crate) fn eol_conversion(&self) -> crate::emacs_core::coding::EolConversion {
         crate::emacs_core::coding::EolConversion::from_lisp(
-            self.visible_runtime_variable_value_by_id(intern("inhibit-eol-conversion"))
+            self.visible_runtime_variable_value_by_id(INHIBIT_EOL_CONVERSION.id())
                 .ok()
                 .flatten()
                 .unwrap_or(Value::NIL),
@@ -7650,6 +7537,9 @@ use thread_local_roots::{collect_thread_local_gc_roots, for_each_thread_local_ro
 mod hash_test_gc_inhibit;
 
 mod attention;
+mod minibuffer_window;
+pub(crate) use super::value::flow_vocab::ResumeTarget;
+pub use super::value::flow_vocab::ShutdownRequest;
 pub use attention::QuitRequest;
 pub(crate) use attention::{ASYNC_ATTENTION, AsyncSource, AttentionMask};
 
@@ -7664,6 +7554,7 @@ mod global_state;
 mod green;
 pub(crate) use admission::ThreadingMode;
 pub(crate) use green::{SelectTurn, green_make_thread, green_world};
+mod keyboard_forwarding;
 mod owner_bindings;
 mod owner_mirrors;
 mod variable_access;
@@ -7684,8 +7575,11 @@ pub use native_stack::raise_main_stack_rlimit;
 mod var_fast;
 
 mod cconv_memo;
+
+pub use green::carrier_tls::{CarrierTlsReset, register_carrier_tls_reset};
 mod cconv_shape;
 mod cconv_trust;
+pub(crate) use apply::{CallableRoot, RootedCallable};
 pub(crate) use cconv_memo::note_function_epoch_move;
 mod tier_i;
 #[cfg(test)]
@@ -7718,7 +7612,7 @@ mod apply;
 pub(crate) mod assoc_predicate;
 mod sort_predicate;
 
-mod command_loop;
+pub(crate) mod command_loop;
 
 pub(crate) mod redisplay_hooks;
 #[cfg(any(test, feature = "redisplay-test-policy"))]
@@ -7731,13 +7625,16 @@ pub use redisplay_hooks::{
 mod vm_shared;
 
 mod signal_dispatch;
+pub(crate) mod signal_entry;
 mod signal_room;
 
+mod allocation_flow;
 mod construct;
+mod dispatch_class;
 mod form_head_cache;
 mod tree_walk;
+use dispatch_class::{CallTarget, EvalDispatch, FormHead};
 pub(crate) use form_head_cache::FormHeadCache;
-use form_head_cache::{FormHead, HeadClass};
 
 #[cfg(test)]
 #[path = "tests/eval_test.rs"]
@@ -7933,3 +7830,33 @@ mod issue554_function_policy;
 
 mod rows_observation;
 pub use rows_observation::{RowsDependencyMetadata, RowsObservationEpoch, RowsObservationRefusal};
+
+/// Carrier park: forget the owner's quit request. The next owner replaces it;
+/// leaving it would leak a request raised against the retired owner.
+pub(crate) fn park_carrier_tls() {
+    QUIT_REQUESTED_TLS.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Deferred carrier reset: drop the owner-installed subr tables and scratch GC
+/// roots. They are native containers of `Copy` `Value`s; clearing them never
+/// dereferences a heap object. The next owner's `install_native_tables`
+/// repopulates the tables.
+pub(crate) fn reset_carrier_tls() {
+    cconv_memo::reset_carrier_tls();
+    GLOBAL_SUBR_TABLE.with(|table| table.borrow_mut().clear());
+    INLINE_SUBR_TABLE.with(|table| table.borrow_mut().clear());
+    SCRATCH_GC_ROOTS.with(|roots| roots.borrow_mut().clear());
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    cconv_memo::carrier_tls_fingerprint(h);
+    crate::tls_fingerprint::mix(h, GLOBAL_SUBR_TABLE.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(h, INLINE_SUBR_TABLE.with(|slot| slot.borrow().len() as u64));
+    crate::tls_fingerprint::mix(
+        h,
+        QUIT_REQUESTED_TLS.with(|slot| slot.borrow().is_some() as u64),
+    );
+    crate::tls_fingerprint::mix(h, SCRATCH_GC_ROOTS.with(|slot| slot.borrow().len() as u64));
+}

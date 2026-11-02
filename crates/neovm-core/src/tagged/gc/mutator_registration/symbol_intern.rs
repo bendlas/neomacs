@@ -19,5 +19,14 @@ impl InternOpKind {
         }
     }
 }
+mod fixture;
+#[path = "symbol_intern/tests/publication.rs"]
+mod publication;
+#[path = "symbol_intern/tests/table_failures.rs"]
+mod table_failures;
 #[cfg(not(feature = "gc-memory-telemetry"))]
 mod tests;
+
+pub(super) fn nmjit_n3_retired_publication_manifest() -> Result<(), String> {
+    publication::manifest()
+}

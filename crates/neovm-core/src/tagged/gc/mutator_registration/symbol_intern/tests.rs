@@ -1,4 +1,4 @@
-//! Real small World, exact rooted string operands and independent teardown.
+//! C5 operators using the shared real-World fixture.
 use super::super::symbol_functions::retry::{self as contention, Deadline, Retry, retry_owned};
 use super::*;
 use crate::emacs_core::eval::Context;
@@ -10,215 +10,8 @@ use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-struct Homes<'era> {
-    name: OwnerRootSlot<'era>,
-    equal_name: OwnerRootSlot<'era>,
-    dst: OwnerRootSlot<'era>,
-    value: OwnerRootSlot<'era>,
-    target: Option<crate::emacs_core::intern::SymId>,
-    old_id: crate::emacs_core::intern::SymId,
-    old_handle: crate::tagged::gc::SymbolHandle,
-    equal_holder: crate::tagged::gc::SymbolHandle,
-}
-struct FixtureGuard<'era> {
-    owner: Option<Mutator<'era>>,
-    inputs: Option<[SharedRoot; 3]>,
-    homes: Option<Homes<'era>>,
-    cleanup: Rc<RefCell<Option<Result<(), String>>>>,
-}
-impl Drop for FixtureGuard<'_> {
-    fn drop(&mut self) {
-        let result = (|| {
-            drop(self.homes.take());
-            let mut owner = self.owner.take().ok_or("C5 owner absent")?;
-            owner
-                .run_access()
-                .map_err(|e| format!("C5 cleanup run: {e:?}"))?
-                .clear_root_slots()
-                .map_err(|e| format!("C5 cleanup clear: {e:?}"))?;
-            drop(self.inputs.take());
-            retry_owned(
-                Deadline::contention(),
-                owner,
-                |owner| owner.retire_rooted(&[]),
-                |failed| match contention::rendezvous(&failed.reason) {
-                    Retry::Busy => ControlFlow::Continue(failed.into_owner()),
-                    Retry::Refuse => ControlFlow::Break(failed),
-                },
-            )
-            .map_err(|failed| format!("C5 cleanup retirement: {failed:?}"))
-        })();
-        *self.cleanup.borrow_mut() = Some(result);
-    }
-}
-#[derive(Clone, Copy, Debug)]
-enum Query {
-    Fresh,
-    FreshBoundary,
-    FreshReusedAtom,
-    Existing,
-    RegistryOnly,
-    Boundary,
-    Nonmember,
-    Nil,
-    T,
-    Keyword,
-}
-fn fixture(
-    kind: PlainSymbolBacking,
-    query: Query,
-    body: impl for<'owner, 'era> FnOnce(&mut RunAccess<'owner, 'era>, &mut Homes<'era>),
-) -> std::thread::Result<()> {
-    fixture_owner(kind, query, |_, owner, homes| {
-        let mut run = owner.run_access().unwrap();
-        body(&mut run, homes);
-    })
-}
+use super::fixture::*;
 
-fn fixture_owner(
-    kind: PlainSymbolBacking,
-    query: Query,
-    body: impl for<'heap, 'era> FnOnce(
-        &crate::tagged::gc::ParallelHeapEra<'heap>,
-        &mut Mutator<'era>,
-        &mut Homes<'era>,
-    ),
-) -> std::thread::Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    // Existing input holders stay below a deliberately distant target ID.
-    // Seeding them after the target would pre-grow the World and invalidate
-    // the actual chunk-growth witness.
-    for spelling in ["p3sym-c2-global", "p3sym-c3-global-1", "p3sym-c3-global-2"] {
-        crate::emacs_core::intern::intern(spelling);
-    }
-    let spelling = match query {
-        Query::Fresh | Query::FreshBoundary | Query::FreshReusedAtom => {
-            let spelling = format!("p3sym-c5-new-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-            if matches!(query, Query::FreshBoundary) {
-                let mut id = crate::emacs_core::intern::intern_uninterned("p3sym-c5-gap");
-                let target = (u64::from(id.0) / 4096 + 2) * 4096 + 17;
-                while u64::from(id.0) + 1 < target {
-                    id = crate::emacs_core::intern::intern_uninterned("p3sym-c5-gap");
-                }
-            } else if matches!(query, Query::FreshReusedAtom) {
-                crate::emacs_core::intern::intern_uninterned(&spelling);
-            }
-            spelling
-        }
-        Query::Existing | Query::Nonmember => "p3sym-c2-global".to_owned(),
-        Query::RegistryOnly => {
-            let spelling = format!(
-                "p3sym-c5-registry-only-{}",
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            );
-            crate::emacs_core::intern::intern(&spelling);
-            spelling
-        }
-        Query::Boundary => {
-            let spelling = format!("p3sym-c5-boundary-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-            let mut id = crate::emacs_core::intern::intern_uninterned("p3sym-c5-gap");
-            let target = (u64::from(id.0) / 4096 + 2) * 4096 + 17;
-            while u64::from(id.0) + 1 < target {
-                id = crate::emacs_core::intern::intern_uninterned("p3sym-c5-gap");
-            }
-            crate::emacs_core::intern::intern(&spelling);
-            spelling
-        }
-        Query::Nil => "nil".to_owned(),
-        Query::T => "t".to_owned(),
-        Query::Keyword => ":p3sym-c5-excluded".to_owned(),
-    };
-    if matches!(
-        query,
-        Query::Fresh | Query::FreshBoundary | Query::FreshReusedAtom
-    ) {
-        assert!(crate::emacs_core::intern::lookup_interned(&spelling).is_none());
-    }
-    let target = crate::emacs_core::intern::lookup_interned(&spelling);
-    Context::with_test_symbol_name_inputs_init_era(
-        kind,
-        &spelling,
-        |obarray, ids| {
-            if matches!(query, Query::Existing | Query::Nonmember) {
-                obarray
-                    .prepare_initial_nonmember_for_test(ids[0], matches!(query, Query::Nonmember));
-            }
-        },
-        |era, ids| {
-            let handles = [
-                era.admit_plain_symbol(ids[1]).unwrap(),
-                era.admit_plain_symbol(ids[2]).unwrap(),
-            ];
-            let mut stopped = era.stop().unwrap();
-            let inputs = era
-                .with_stopped_heap_for_test(&stopped, |heap| unsafe {
-                    // SAFETY: immediate seed words on the actual matching heap.
-                    // Real string operands stay in serially initialized cells.
-                    [
-                        SharedRoot::new(heap, Value::NIL),
-                        SharedRoot::new(heap, Value::NIL),
-                        SharedRoot::new(heap, Value::fixnum(23)),
-                    ]
-                })
-                .unwrap();
-            stopped.trace(|_, _| Ok(())).unwrap();
-            stopped.complete().unwrap();
-            let owner = era
-                .register(1, 8)
-                .unwrap()
-                .activate(era.heap_identity(), 1)
-                .unwrap();
-            let cleanup = Rc::new(RefCell::new(None));
-            let receipt = Rc::clone(&cleanup);
-            let era_ref = &era;
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let mut guard = FixtureGuard {
-                    owner: Some(owner),
-                    inputs: Some(inputs),
-                    homes: None,
-                    cleanup: receipt,
-                };
-                {
-                    let mut run = guard.owner.as_mut().unwrap().run_access().unwrap();
-                    let inputs = guard.inputs.as_ref().unwrap();
-                    guard.homes = Some(Homes {
-                        name: run.root_slot(&inputs[0]).unwrap(),
-                        equal_name: run.root_slot(&inputs[1]).unwrap(),
-                        dst: run.root_slot(&inputs[2]).unwrap(),
-                        value: run.root_slot(&inputs[2]).unwrap(),
-                        target,
-                        old_id: ids[1],
-                        old_handle: handles[0],
-                        equal_holder: handles[1],
-                    });
-                    let homes = guard.homes.as_mut().unwrap();
-                    run.sym_value_into(&handles[0], &mut homes.name).unwrap();
-                    run.sym_value_into(&handles[1], &mut homes.equal_name)
-                        .unwrap();
-                    assert_ne!(
-                        homes.name.word_for_test(&run),
-                        homes.equal_name.word_for_test(&run)
-                    );
-                }
-                body(
-                    era_ref,
-                    guard.owner.as_mut().unwrap(),
-                    guard.homes.as_mut().unwrap(),
-                );
-            }));
-            assert_eq!(
-                cleanup.borrow().as_ref(),
-                Some(&Ok(())),
-                "C5 fixture teardown failed independently of operation outcome"
-            );
-            let (collector, keeper) = era.finish().expect("C5 era finish after clean teardown");
-            drop(collector);
-            drop(keeper);
-            eprintln!("P3SYM_C5_TEARDOWN_OK {kind:?} {query:?}");
-            outcome
-        },
-    )
-}
 fn fresh_intern(kind: PlainSymbolBacking, query: Query, exact_epoch: bool) {
     use crate::emacs_core::intern::parallel::{
         identity_census_for_test, name_publication_for_test,
@@ -302,23 +95,17 @@ fn fresh_intern(kind: PlainSymbolBacking, query: Query, exact_epoch: bool) {
     })
     .expect("C5 fresh intern and exact roots with independent clean teardown");
 }
-fn intern_retry<'era>(
-    run: &mut RunAccess<'_, 'era>,
-    name: &OwnerRootSlot<'era>,
-    dst: &mut OwnerRootSlot<'era>,
-) -> Result<(), crate::tagged::gc::InitialInternError> {
-    contention::retry(
-        Deadline::contention(),
-        || run.initial_intern_into(name, dst),
-        contention::initial_intern,
-    )
-}
+
 fn existing_intern(kind: PlainSymbolBacking, query: Query) {
     fixture(kind, query, |run, homes| {
         let id = homes
             .target
             .expect("existing canonical ID prepared serially");
         let before = run.initial_facts_for_test(id).unwrap();
+        let table_before = run
+            .initial_table_statistics_for_test()
+            .unwrap()
+            .retained_bytes;
         let charge = run.owner.local.as_ref().unwrap().hot.bytes_since_gc;
         intern_retry(run, &homes.name, &mut homes.dst).unwrap();
         assert_eq!(homes.dst.word_for_test(run), Value::from_sym_id(id).bits());
@@ -331,6 +118,12 @@ fn existing_intern(kind: PlainSymbolBacking, query: Query) {
         assert_eq!(
             run.owner.local.as_ref().unwrap().hot.bytes_since_gc - charge,
             after.bytes - before.bytes
+                + run
+                    .initial_table_statistics_for_test()
+                    .unwrap()
+                    .retained_bytes
+                    .get()
+                - table_before.get()
         );
         if before.present {
             assert_eq!(
@@ -401,24 +194,21 @@ fn existing_intern(kind: PlainSymbolBacking, query: Query) {
     })
     .expect("C5 existing intern completed with clean teardown");
 }
-fn soft_retry<'era>(
-    run: &mut RunAccess<'_, 'era>,
-    name: &OwnerRootSlot<'era>,
-    dst: &mut OwnerRootSlot<'era>,
-) -> Result<(), crate::tagged::gc::InitialInternError> {
-    // Refused acquisition is legal. Every Busy releases its loan before the
-    // shared elapsed-time retry yields; a refusal stays a typed error.
-    contention::retry(
-        Deadline::contention(),
-        || run.initial_intern_soft_into(name, dst),
-        contention::initial_intern,
-    )
-}
+
 fn soft(kind: PlainSymbolBacking, query: Query) {
     let expected = match query {
         Query::Existing => Value::from_sym_id(crate::emacs_core::intern::intern("p3sym-c2-global")),
         Query::T => Value::T,
-        _ => Value::NIL,
+        Query::Fresh
+        | Query::FreshBoundary
+        | Query::TableGrowth
+        | Query::FreshReusedAtom
+        | Query::RegistryOnly
+        | Query::SameChunk
+        | Query::Boundary
+        | Query::Nonmember
+        | Query::Nil
+        | Query::Keyword => Value::NIL,
     };
     fixture(kind, query, |run, homes| {
         let name = homes.name.word_for_test(run);
@@ -693,9 +483,17 @@ fn p3sym_c5_existing_intern_can_replace_its_name_home() {
     }
 }
 
+/// Marker for the fresh process the exact-census fixtures below spawn.
+///
+/// These tests assert exact process-global registry epoch/count values, so
+/// they only hold in a process no other test has written the registry in.
+const P3SYM_EXACT_CHILD_ENV: &str = "NEOVM_TEST_P3SYM_EXACT_CENSUS_CHILD";
+
 #[test]
-#[ignore = "exact process registry epoch/count fixture; run alone"]
-fn p3sym_c5_existing_id_preserves_registry_epoch_and_count() {
+fn p3sym_c5_existing_id_preserves_registry_epoch_and_count_child() {
+    if std::env::var_os(P3SYM_EXACT_CHILD_ENV).is_none() {
+        return;
+    }
     use crate::emacs_core::intern::parallel::identity_census_for_test;
     for kind in [
         PlainSymbolBacking::Unprojected,
@@ -710,6 +508,27 @@ fn p3sym_c5_existing_id_preserves_registry_epoch_and_count() {
             assert_eq!(identity_census_for_test(), before, "existing-name lookups never bump the registry epoch");
         }).unwrap();
     }
+}
+
+#[test]
+fn p3sym_c5_existing_id_preserves_registry_epoch_and_count() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "p3sym_c5_existing_id_preserves_registry_epoch_and_count_child",
+            "--test-threads",
+            "1",
+        ])
+        .env(P3SYM_EXACT_CHILD_ENV, "1")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run the exact-census child");
+    assert!(
+        output.status.success(),
+        "exact-census child failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]
@@ -733,8 +552,10 @@ fn p3sym_c5_fresh_id_reuses_an_existing_noncanonical_name_atom() {
 }
 
 #[test]
-#[ignore = "exact process registry epoch/count fixture; run alone"]
-fn p3sym_c5_fresh_id_advances_registry_epoch_once() {
+fn p3sym_c5_fresh_id_advances_registry_epoch_once_child() {
+    if std::env::var_os(P3SYM_EXACT_CHILD_ENV).is_none() {
+        return;
+    }
     for kind in [
         PlainSymbolBacking::Unprojected,
         PlainSymbolBacking::VoidProjection,
@@ -743,6 +564,27 @@ fn p3sym_c5_fresh_id_advances_registry_epoch_once() {
             fresh_intern(kind, query, true);
         }
     }
+}
+
+#[test]
+fn p3sym_c5_fresh_id_advances_registry_epoch_once() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "p3sym_c5_fresh_id_advances_registry_epoch_once_child",
+            "--test-threads",
+            "1",
+        ])
+        .env(P3SYM_EXACT_CHILD_ENV, "1")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run the exact-census child");
+    assert!(
+        output.status.success(),
+        "exact-census child failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 mod failures;

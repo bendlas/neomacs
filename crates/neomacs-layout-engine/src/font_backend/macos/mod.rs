@@ -6,6 +6,10 @@
 
 mod catalog;
 mod core_text_calls;
+#[cfg(test)]
+mod test_registration;
+#[cfg(test)]
+pub(crate) use test_registration::ProcessFontRegistration;
 
 use super::native_asset_cache::NativeFontAssetCache;
 use super::{
@@ -47,8 +51,71 @@ impl FontBackend for CoreTextBackend {
     }
 
     fn list_candidates(&self, query: &FontCandidateQuery) -> Vec<FontCandidate> {
+        self.candidates_for_identity(query, None)
+    }
+
+    fn list_candidates_for_identity(
+        &self,
+        query: &FontCandidateQuery,
+        identity: &ResolvedFontIdentity,
+    ) -> Vec<FontCandidate> {
+        self.candidates_for_identity(query, Some(identity))
+            .into_iter()
+            .filter(|candidate| candidate.matched.identity == *identity)
+            .collect()
+    }
+
+    fn finalize_match(&self, matched: PlatformFontCandidate) -> Option<PlatformFontMatch> {
+        if matches!(&matched.locator, PlatformFontCandidateLocator::File(_)) {
+            return matched.into_file_match();
+        }
+        let postscript_name = matched.identity.postscript_name.as_deref()?;
+        let asset = self
+            .native_assets
+            .get_or_materialize(&matched.identity, || {
+                core_text_calls::standalone_font_bytes(
+                    postscript_name,
+                    &matched.identity.variation_coords,
+                )
+            })?;
+        matched.into_memory_match(asset)
+    }
+
+    fn design_metrics(&self, matched: &PlatformFontMatch) -> Option<PlatformFontDesignMetrics> {
+        core_text_calls::design_metrics(
+            matched.identity.postscript_name.as_deref()?,
+            &matched.identity.variation_coords,
+        )
+    }
+
+    fn advance_catalog_generation(&mut self) {
+        self.native_assets.clear();
+        self.file_faces
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    fn poll_catalog_change(&mut self) -> crate::font::catalog::FontCatalogChange {
+        self.catalog.poll()
+    }
+}
+
+impl CoreTextBackend {
+    /// Enumerate candidates that can produce the requested stable key before
+    /// opening font files. PostScript metadata on the caller's identity is not
+    /// authoritative: fontdb and CoreText can name the same file differently.
+    fn candidates_for_identity(
+        &self,
+        query: &FontCandidateQuery,
+        identity: Option<&ResolvedFontIdentity>,
+    ) -> Vec<FontCandidate> {
         core_text_calls::candidates(query)
             .into_iter()
+            .filter(|candidate| {
+                identity
+                    .is_none_or(|identity| Self::candidate_may_match_identity(candidate, identity))
+            })
             .filter_map(|candidate| {
                 let metadata = PlatformFontMetadata {
                     foundry: None,
@@ -101,43 +168,37 @@ impl FontBackend for CoreTextBackend {
             .collect()
     }
 
-    fn finalize_match(&self, matched: PlatformFontCandidate) -> Option<PlatformFontMatch> {
-        if matches!(&matched.locator, PlatformFontCandidateLocator::File(_)) {
-            return matched.into_file_match();
+    /// Conservatively retain every candidate that could have the same stable
+    /// key. File keys begin with the exact path followed by '#'; the face and
+    /// variations are checked after reading that file. Even a URL-backed
+    /// candidate may fall back to a native key if its container is opaque.
+    fn candidate_may_match_identity(
+        candidate: &core_text_calls::Candidate,
+        identity: &ResolvedFontIdentity,
+    ) -> bool {
+        if candidate
+            .path
+            .as_deref()
+            .and_then(Path::to_str)
+            .is_some_and(|path| {
+                identity
+                    .stable_key
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('#'))
+            })
+        {
+            return true;
         }
-        let postscript_name = matched.identity.postscript_name.as_deref()?;
-        let asset = self
-            .native_assets
-            .get_or_materialize(&matched.identity, || {
-                core_text_calls::standalone_font_bytes(
-                    postscript_name,
-                    &matched.identity.variation_coords,
-                )
-            })?;
-        matched.into_memory_match(asset)
+        identity.stable_key.starts_with("coretext:")
+            && ResolvedFontIdentity::from_native_with_variations(
+                FontBackendKind::CoreText,
+                format!("coretext:{}#0", candidate.postscript_name),
+                0,
+                Some(candidate.postscript_name.clone()),
+                candidate.variation_coords.clone(),
+            ) == *identity
     }
 
-    fn design_metrics(&self, matched: &PlatformFontMatch) -> Option<PlatformFontDesignMetrics> {
-        core_text_calls::design_metrics(
-            matched.identity.postscript_name.as_deref()?,
-            &matched.identity.variation_coords,
-        )
-    }
-
-    fn advance_catalog_generation(&mut self) {
-        self.native_assets.clear();
-        self.file_faces
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-
-    fn poll_catalog_change(&mut self) -> crate::font::catalog::FontCatalogChange {
-        self.catalog.poll()
-    }
-}
-
-impl CoreTextBackend {
     fn file_face_index_for_postscript_name(
         &self,
         path: &Path,

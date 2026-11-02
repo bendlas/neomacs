@@ -3,16 +3,42 @@ use super::*;
 
 impl Context {
     pub(crate) fn with_test_symbol_era<R>(
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, SymId) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, SymId) -> R,
     ) -> R {
         Self::with_test_symbol_backing_era(crate::tagged::gc::PlainSymbolBacking::Unprojected, body)
+    }
+
+    /// Observe the real rooted-admission result without converting its typed
+    /// refusal to a setup panic. Refused ownership is released before return.
+    pub(crate) fn try_with_test_symbol_era<R>(
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, SymId) -> R,
+    ) -> Result<R, crate::tagged::gc::RegistrationError> {
+        Self::try_with_test_symbol_backings_init_era(
+            &[crate::tagged::gc::PlainSymbolBacking::Unprojected],
+            |_, _| {},
+            |era, ids| body(era, ids[0]),
+        )
+    }
+
+    /// Typed-refusal variant for one serially seeded Plain/projected symbol.
+    /// Initialization ends before the proof era; no mutable World escapes.
+    pub(crate) fn try_with_test_symbol_backing_init_era<R>(
+        kind: crate::tagged::gc::PlainSymbolBacking,
+        init: impl FnOnce(&mut Obarray, SymId),
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, SymId) -> R,
+    ) -> Result<R, crate::tagged::gc::RegistrationError> {
+        Self::try_with_test_symbol_backings_init_era(
+            &[kind],
+            |obarray, ids| init(obarray, ids[0]),
+            |era, ids| body(era, ids[0]),
+        )
     }
 
     /// C3 setup only: the same small World, optionally projected before the
     /// era exists. No production cell accessor changes and no setup collection.
     pub(crate) fn with_test_symbol_backing_era<R>(
         kind: crate::tagged::gc::PlainSymbolBacking,
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, SymId) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, SymId) -> R,
     ) -> R {
         Self::with_test_symbol_backings_era(&[kind], |era, ids| body(era, ids[0]))
     }
@@ -21,7 +47,7 @@ impl Context {
     /// the era exists. Running tests can only access these existing symbols.
     pub(crate) fn with_test_symbol_backings_era<R>(
         kinds: &[crate::tagged::gc::PlainSymbolBacking],
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
         Self::with_test_symbol_backings_init_era(kinds, |_, _| {}, body)
     }
@@ -31,7 +57,7 @@ impl Context {
     /// rooted input operands through the already-qualified C3 read API.
     pub(crate) fn with_test_symbol_functions_era<R>(
         kind: crate::tagged::gc::PlainSymbolBacking,
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
         Self::with_test_symbol_functions_init_era(kind, |_, _| {}, body)
     }
@@ -41,7 +67,7 @@ impl Context {
     pub(crate) fn with_test_symbol_functions_init_era<R>(
         kind: crate::tagged::gc::PlainSymbolBacking,
         init: impl FnOnce(&mut Obarray, &[SymId]),
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
         Self::with_test_symbol_backings_init_era(
             &[kind, kind],
@@ -66,7 +92,7 @@ impl Context {
     pub(crate) fn with_test_symbol_name_inputs_era<R>(
         kind: crate::tagged::gc::PlainSymbolBacking,
         spelling: &str,
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
         Self::with_test_symbol_name_inputs_init_era(kind, spelling, |_, _| {}, body)
     }
@@ -75,7 +101,7 @@ impl Context {
         kind: crate::tagged::gc::PlainSymbolBacking,
         spelling: &str,
         init: impl FnOnce(&mut Obarray, &[SymId]),
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
         use crate::tagged::gc::PlainSymbolBacking;
         Self::with_test_symbol_backings_init_era(
@@ -99,7 +125,7 @@ impl Context {
     pub(crate) fn with_test_symbol_intern_race_era<R>(
         kind: crate::tagged::gc::PlainSymbolBacking,
         spellings: &[String],
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
         let mut kinds =
             vec![crate::tagged::gc::PlainSymbolBacking::Unprojected; spellings.len() + 1];
@@ -123,9 +149,18 @@ impl Context {
     fn with_test_symbol_backings_init_era<R>(
         kinds: &[crate::tagged::gc::PlainSymbolBacking],
         init: impl FnOnce(&mut Obarray, &[SymId]),
-        body: impl for<'heap> FnOnce(crate::tagged::gc::ParallelHeapEra<'heap>, Vec<SymId>) -> R,
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
     ) -> R {
-        use crate::tagged::gc::{AliasableBox, ParallelHeapEra, TaggedHeap};
+        Self::try_with_test_symbol_backings_init_era(kinds, init, body)
+            .unwrap_or_else(|reason| panic!("minimal symbol fixture admission: {reason:?}"))
+    }
+
+    fn try_with_test_symbol_backings_init_era<R>(
+        kinds: &[crate::tagged::gc::PlainSymbolBacking],
+        init: impl FnOnce(&mut Obarray, &[SymId]),
+        body: impl for<'heap> FnOnce(crate::tagged::gc::ProofEra<'heap>, Vec<SymId>) -> R,
+    ) -> Result<R, crate::tagged::gc::RegistrationError> {
+        use crate::tagged::gc::{AliasableBox, ProofEra as ParallelHeapEra, TaggedHeap};
 
         let heap = AliasableBox::new(TaggedHeap::new());
         // Manager construction can allocate; install only the owning root.
@@ -194,15 +229,29 @@ impl Context {
         let collector = unsafe { (*heap).drain_to_quiescent(|_| {}) }.unwrap();
         // No Context exists in this fixture, hence no Context-private roots.
         // World storage is retained by the actual Baton, exactly as in C2.
-        let frozen = FrozenLegacyRoots {
-            heap: collector.heap_identity(),
-            words: Vec::new(),
-            // No Context or legacy activation exists in this minimal World.
-            functions_quiescent: true,
+        // SAFETY: this minimal World has no original Context or legacy
+        // activation, so its complete private census is empty and quiescent.
+        // The actual keeper retains all World storage for the admitted era.
+        let frozen = unsafe {
+            FrozenLegacyRoots::new(
+                collector.heap_identity(),
+                Vec::new(),
+                FrozenFunctionRoots::Quiescent,
+            )
         };
-        let era = ParallelHeapEra::admit_rooted(collector, keeper, frozen)
-            .unwrap_or_else(|e| panic!("minimal symbol fixture admission: {:?}", e.reason));
-        body(era, ids)
+        let era = match ParallelHeapEra::admit_rooted(collector, keeper, frozen) {
+            Ok(era) => era,
+            Err(failure) => {
+                let reason = failure.reason;
+                // Admission returned both exclusive authorities. Release the
+                // collector before its World keeper, then let ready tear down
+                // the retained World. No owner, root home or lease was issued.
+                drop(failure.collector);
+                drop(failure.keeper);
+                return Err(reason);
+            }
+        };
+        Ok(body(era, ids))
         // ready owns the same World until after the body and keeper teardown.
     }
 }
@@ -213,27 +262,22 @@ impl Baton {
     /// still enumerates the complete World through its production root path.
     pub(crate) fn symbol_root_ledger_for_test(
         &self,
-        stopped: &crate::tagged::gc::AllStopped<'_>,
+        stopped: &mut crate::tagged::gc::AllStopped<'_>,
     ) -> Result<(Vec<usize>, Vec<usize>), crate::tagged::gc::RendezvousError> {
-        use crate::gc_trace::GcTrace;
         use crate::tagged::gc::{RegistrationError, RendezvousError};
 
         if !self.held_here() {
             return Err(RegistrationError::WrongThread.into());
         }
         stopped.check_world_roots(self.parallel_heap_identity())?;
-        let table = self
-            .world
-            .thread_projections
-            .try_borrow()
-            .map_err(|_| RendezvousError::Busy)?;
+        let keeper = self.keeper_designator()?;
+        let authority = stopped.symbols()?;
         let mut projections = Vec::new();
-        table.trace_roots(&mut |value| projections.push(value.bits()));
+        authority.append_current_projection_roots(&keeper, &mut projections)?;
         let mut symbols = Vec::new();
-        // SAFETY: original retained World root, matching AllStopped, zero
-        // symbol authority, and no overlapping Context/owner/collector view.
-        unsafe { &*self.world.obarray.get() }
-            .trace_roots_with(&mut |value| symbols.push(value.bits()));
+        authority.append_current_symbol_roots(&keeper, &mut symbols)?;
+        let projections = projections.into_iter().map(TaggedValue::bits).collect();
+        let symbols = symbols.into_iter().map(TaggedValue::bits).collect();
         Ok((symbols, projections))
     }
 }

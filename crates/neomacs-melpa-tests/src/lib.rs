@@ -12,11 +12,13 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use neomacs_melpa_test_support::{CommandError, elisp_string, output_with_timeout, sanitize_label};
+use neomacs_melpa_test_support::{
+    CommandError, elisp_string, output_with_timeout_pinned, sanitize_label,
+};
 pub use neomacs_melpa_test_support::{
     EmacsRuntime, LockedPackageSource, MelpaSandbox, PackageActivation, PreparedPackageSet,
-    SHALLOW_GIT_FETCH_ARGS, SourceBuild, locked_melpa_install_plan, locked_melpa_source,
-    locked_melpa_sources, neomacs_binary, package_activation_elisp,
+    PreparedSourceInstall, SHALLOW_GIT_FETCH_ARGS, SourceBuild, locked_melpa_install_plan,
+    locked_melpa_source, locked_melpa_sources, neomacs_binary, package_activation_elisp,
     preflight_locked_melpa_packages, prepare_cached_locked_melpa_package,
     prepare_cached_tree_sitter_grammar, prepare_cached_tree_sitter_grammar_from_subdirectory,
     workspace_root,
@@ -30,7 +32,9 @@ use neomacs_test_oracle::{
 const RESULT_MARKER: &str = "NEOMACS-MELPA-RESULT:";
 const OUTCOME_MARKER: &str = "NEOMACS-MELPA-OUTCOME:";
 const BATCH_BEGIN_MARKER: &str = "NEOMACS-MELPA-BEGIN:";
-pub use neomacs_melpa_test_support::{GNU_ELPA_ARCHIVE, prepare_cached_gnu_elpa_package};
+pub use neomacs_melpa_test_support::{
+    GNU_ELPA_LABEL, GnuElpaPackage, prepare_cached_gnu_elpa_package,
+};
 
 const BATCH_COMPLETE_MARKER: &str = "NEOMACS-MELPA-COMPLETE:";
 const TRANSPORTED_FORM_FUNCTION: &str = "neomacs--melpa-oracle-transported-form";
@@ -39,7 +43,12 @@ const DEFAULT_PROCESS_TIMEOUT: Duration = neomacs_melpa_test_support::DEFAULT_PR
 
 /// The exact Async release selected from GNU ELPA by the comprehensive API
 /// parity corpus.
-pub const ASYNC_GNU_ELPA_PIN: (&str, &str) = ("async", "1.9.9");
+///
+/// The release tarball is vendored and checksummed
+/// (`crates/neomacs-infra/fixtures/gnu-elpa/async-2.0.tar`), so the bytes the
+/// expectations were pinned against cannot change behind the suite.  (The
+/// immutable sibling axis is [`ASYNC_MELPA_PIN`], built from a Git revision.)
+pub const ASYNC_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::ASYNC;
 
 /// The exact current MELPA Async package selected by the comprehensive
 /// serialization, process, byte-compilation, Dired, package, and mail workflow
@@ -105,7 +114,7 @@ pub const AUTO_COMPLETE_AUCTEX_MELPA_PIN: (&str, &str) = ("auto-complete-auctex"
 
 /// The exact AUCTeX release selected from GNU ELPA for the
 /// auto-complete-auctex integration parity corpus.
-pub const AUCTEX_GNU_ELPA_PIN: (&str, &str) = ("auctex", "14.2.0");
+pub const AUCTEX_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::AUCTEX;
 
 /// The exact auto-complete-c-headers package selected by the comprehensive
 /// include-path, filesystem-cache, documentation, candidate-source, and
@@ -472,7 +481,7 @@ pub const ERLANG_MELPA_PIN: (&str, &str) = ("erlang", "20260724.1508");
 
 /// The exact GNU ELPA let-alist dependency selected for the flycheck-rust and
 /// sage-shell-mode package graphs.
-pub const LET_ALIST_GNU_ELPA_PIN: (&str, &str) = ("let-alist", "1.0.6");
+pub const LET_ALIST_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::LET_ALIST;
 
 /// The exact audio-notes-mode package selected by the comprehensive
 /// filesystem, playback, process-control, mode-line, advice, and global-mode
@@ -568,7 +577,7 @@ pub const PYVENV_MELPA_PIN: (&str, &str) = ("pyvenv", "20211014.707");
 /// The exact Queue release selected from GNU ELPA by the practical scheduler,
 /// priority, copy, iterator, traversal, event-loop, and live-view parity
 /// corpus.
-pub const QUEUE_GNU_ELPA_PIN: (&str, &str) = ("queue", "0.2");
+pub const QUEUE_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::QUEUE;
 
 /// The exact Quelpa package selected for practical source checkout, package
 /// build/install, dependency, upgrade, cache, async, and failure-state parity.
@@ -3057,7 +3066,7 @@ pub const SMEARGLE_MELPA_PIN: (&str, &str) = ("smeargle", "20200323.533");
 
 /// The exact Bind-Key release selected from GNU ELPA by the comprehensive API
 /// parity corpus.
-pub const BIND_KEY_GNU_ELPA_PIN: (&str, &str) = ("bind-key", "2.4.1");
+pub const BIND_KEY_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::BIND_KEY;
 
 /// The exact BUI package selected by the practical service dashboard,
 /// marking, filtering, detail action, and history parity corpus, and as
@@ -3262,7 +3271,7 @@ pub const BERT_MELPA_PIN: (&str, &str) = ("bert", "20131117.1014");
 
 /// The exact Compat release selected from GNU ELPA by the comprehensive API
 /// parity corpus.
-pub const COMPAT_GNU_ELPA_PIN: (&str, &str) = ("compat", "31.1.0.0");
+pub const COMPAT_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::COMPAT;
 
 /// The exact Corfu package selected for practical in-buffer completion,
 /// candidate navigation, preview, insertion, cancellation, and extension-mode
@@ -4113,7 +4122,7 @@ pub const TSC_MELPA_PIN: (&str, &str) = ("tsc", "20260116.9");
 
 /// The exact Use-Package release selected from GNU ELPA by the comprehensive
 /// API parity corpus.
-pub const USE_PACKAGE_GNU_ELPA_PIN: (&str, &str) = ("use-package", "2.4.6");
+pub const USE_PACKAGE_GNU_ELPA_PIN: GnuElpaPackage = GnuElpaPackage::USE_PACKAGE;
 
 /// The exact Uuidgen package selected for practical deterministic and random
 /// UUID v1/v3/v4/v5 generation, namespace hashing, CID/URN serialization,
@@ -4461,6 +4470,11 @@ pub struct PhaseReport {
     pub phase: ScenarioPhase,
     pub duration: Duration,
     pub status_code: Option<i32>,
+    /// The full wait status (`exit status: N`, or `signal: N (SIG...)`).
+    /// `status_code` is None for a signal death, which is otherwise
+    /// indistinguishable from any other abnormal end in a CI log; this names
+    /// the signal so an externally killed editor is attributable.
+    pub status_text: String,
     pub stdout: String,
     pub stderr: String,
 }
@@ -4610,12 +4624,16 @@ impl CachedPackageOracle {
 
     /// Prepare one pinned GNU ELPA package and select its Elisp source file.
     pub fn new_from_gnu_elpa(
-        package: (&str, &str),
+        package: GnuElpaPackage,
         source_file_name: &str,
     ) -> Result<Self, String> {
-        validate_cached_source_file_name(GNU_ELPA_ARCHIVE.label, source_file_name)?;
+        validate_cached_source_file_name(GNU_ELPA_LABEL, source_file_name)?;
         let package_dir = prepare_cached_gnu_elpa_package(&EmacsRuntime::gnu_emacs(), package)?;
-        Self::from_package_dir(package, source_file_name, package_dir)
+        Self::from_package_dir(
+            (package.name(), package.version()),
+            source_file_name,
+            package_dir,
+        )
     }
 
     fn from_package_dir(
@@ -4657,14 +4675,14 @@ impl CachedPackageOracle {
     /// package directory while loading the package under test.
     pub fn with_melpa_dependency(self, package: (&str, &str)) -> Result<Self, String> {
         let package_dir = prepare_cached_locked_melpa_package(&EmacsRuntime::gnu_emacs(), package)?;
-        self.with_prepared_dependency(package, package_dir)
+        self.with_prepared_dependency(package, package_dir.into_package_dir())
     }
 
     /// Make another exact GNU ELPA package cache visible as a system-wide
     /// package directory while loading the package under test.
-    pub fn with_gnu_elpa_dependency(self, package: (&str, &str)) -> Result<Self, String> {
+    pub fn with_gnu_elpa_dependency(self, package: GnuElpaPackage) -> Result<Self, String> {
         let package_dir = prepare_cached_gnu_elpa_package(&EmacsRuntime::gnu_emacs(), package)?;
-        self.with_prepared_dependency(package, package_dir)
+        self.with_prepared_dependency((package.name(), package.version()), package_dir)
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -4906,8 +4924,7 @@ fn run_direct_editor_probe(
             stderr_path.display()
         )
     })?;
-    let mut command = runtime.command();
-    sandbox.configure(&mut command);
+    let mut command = sandbox.command(&runtime);
     command
         .arg("--quick")
         .arg("--batch")
@@ -5030,23 +5047,56 @@ struct DirectEditorChild {
     tree_armed: bool,
 }
 
-impl DirectEditorChild {
-    fn spawn(command: &mut Command) -> Result<Self, String> {
+/// The two command types the direct probes run: a canonically pinned editor
+/// and a plain helper fixture (`sh`, a test executable).
+trait DirectSpawnCommand {
+    fn enter_process_group(&mut self);
+    fn spawn_direct(&mut self) -> std::io::Result<Child>;
+}
+
+impl DirectSpawnCommand for Command {
+    fn enter_process_group(&mut self) {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            command.process_group(0);
+            self.process_group(0);
         }
         #[cfg(windows)]
-        let job = {
+        {
             use std::os::windows::process::CommandExt;
             use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+            self.creation_flags(CREATE_SUSPENDED);
+        }
+    }
 
-            command.creation_flags(CREATE_SUSPENDED);
-            DirectWindowsJob::new()?
-        };
+    fn spawn_direct(&mut self) -> std::io::Result<Child> {
+        self.spawn()
+    }
+}
+
+impl DirectSpawnCommand for neomacs_test_env::PinnedCommand {
+    fn enter_process_group(&mut self) {
+        #[cfg(unix)]
+        self.process_group(0);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+            self.creation_flags(CREATE_SUSPENDED);
+        }
+    }
+
+    fn spawn_direct(&mut self) -> std::io::Result<Child> {
+        self.spawn()
+    }
+}
+
+impl DirectEditorChild {
+    fn spawn<C: DirectSpawnCommand>(command: &mut C) -> Result<Self, String> {
+        command.enter_process_group();
+        #[cfg(windows)]
+        let job = DirectWindowsJob::new()?;
         let mut child = command
-            .spawn()
+            .spawn_direct()
             .map_err(|error| format!("failed to spawn editor: {error}"))?;
         #[cfg(unix)]
         {
@@ -5856,8 +5906,7 @@ pub fn run_ert_scenario(
         .parent()
         .expect("ERT test files have a parent directory");
     let eval = format!(r##"(ert-run-tests-batch {})"##, scenario.selector);
-    let mut command = runtime.command();
-    sandbox.configure(&mut command);
+    let mut command = sandbox.command(&runtime);
     command
         .env("NEOMACS_RUNTIME_ROOT", workspace_root())
         .args(["--batch", "--quick", "-L"])
@@ -5867,14 +5916,14 @@ pub fn run_ert_scenario(
         .args(["--eval", &eval]);
 
     let started = Instant::now();
-    let output = output_with_timeout(&mut command, runtime.timeout).map_err(|error| {
+    let output = output_with_timeout_pinned(&mut command, runtime.timeout).map_err(|error| {
         command_error_message(error, runtime, &sandbox, &scenario.name, ScenarioPhase::Ert)
     })?;
     let phase = phase_report(ScenarioPhase::Ert, started.elapsed(), output);
     if phase.status_code != Some(0) {
         return Err(format!(
-            "{} ERT scenario `{}` failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-            runtime.name, scenario.name, phase.status_code, phase.stdout, phase.stderr
+            "{} ERT scenario `{}` failed ({})\nstdout:\n{}\nstderr:\n{}",
+            runtime.name, scenario.name, phase.status_text, phase.stdout, phase.stderr
         ));
     }
     let summary = extract_ert_summary(&phase.stdout, &phase.stderr).ok_or_else(|| {
@@ -6363,7 +6412,11 @@ fn git<const N: usize>(
     args: [&str; N],
 ) -> Result<(), String> {
     let mut command = Command::new("git");
-    sandbox.configure(&mut command);
+    neomacs_infra::packages::configure_helper_process_environment(
+        &mut command,
+        sandbox.environment(),
+        sandbox.root(),
+    );
     let output = command
         .current_dir(repository)
         .args(args)
@@ -6552,8 +6605,7 @@ fn run_phase_with_validation(
             loader_file.path().display()
         )
     })?;
-    let mut command = runtime.command();
-    sandbox.configure(&mut command);
+    let mut command = sandbox.command(&runtime);
     command
         .env("NEOMACS_RUNTIME_ROOT", workspace_root())
         .env("NEOMACS_MELPA_ORACLE_FORM_FILE", form_file.path())
@@ -6561,13 +6613,13 @@ fn run_phase_with_validation(
         .arg(loader_file.path())
         .args(["--eval", &format!("({TRANSPORTED_FORM_FUNCTION})")]);
     let started = Instant::now();
-    let output = output_with_timeout(&mut command, runtime.timeout)
+    let output = output_with_timeout_pinned(&mut command, runtime.timeout)
         .map_err(|error| command_error_message(error, runtime, sandbox, scenario_name, phase))?;
     let report = phase_report(phase, started.elapsed(), output);
     if report.status_code != Some(0) {
         return Err(format!(
-            "{} scenario `{scenario_name}` failed during {phase:?} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-            runtime.name, report.status_code, report.stdout, report.stderr
+            "{} scenario `{scenario_name}` failed during {phase:?} ({})\nstdout:\n{}\nstderr:\n{}",
+            runtime.name, report.status_text, report.stdout, report.stderr
         ));
     }
     if check_editor_error_output {
@@ -6628,6 +6680,7 @@ fn phase_report(phase: ScenarioPhase, duration: Duration, output: Output) -> Pha
         phase,
         duration,
         status_code: output.status.code(),
+        status_text: output.status.to_string(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
@@ -6772,6 +6825,9 @@ mod parity_tests;
 
 #[cfg(test)]
 mod direct_adapter_tests;
+
+#[cfg(test)]
+mod install_cache_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod gui_parity_tests;

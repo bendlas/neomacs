@@ -350,12 +350,13 @@ fn org_capture_kill_finalize_goto_marker_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_capture_prompt_placeholders_history_tags_props_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (\"* TODO Beta                                                     :work:urgent:\\nSCHEDULED: <2026-05-27 Wed>\\n:PROPERTIES:\\n:Owner:    Bea\\n:END:\\nCLOSED: [2026-05-27 Wed 10:45]\\n:PROPERTIES:\\n:Owner: \\n:END:\\nRepeated: Beta\\nElisp: ok-Beta\\n\" ((string \"Title (default Default): \" (\"Alpha\" \"Beta\")) (tags \"Tags: \" nil) (date nil t nil \"When\") (date t t nil \"Closed\") (property \"Owner\" 1 \"Ada\") (string \"Title (default Default): \" (\"Alpha\" \"Beta\"))) nil \"#+TAGS: work urgent home\\n* Target\\n:PROPERTIES:\\n:Owner_ALL: Ada Bea Cy\\n:END:\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -396,6 +397,7 @@ fn org_capture_prompt_placeholders_history_tags_props_combo() {
                      '("work" "urgent")))
                   ((symbol-function 'org-read-date)
                    (lambda (with-time to-time from-string prompt &rest _)
+                     (setq org-time-was-given with-time)
                      (push (list 'date with-time to-time from-string prompt)
                            prompts)
                      (encode-time 0 45 10 27 5 2026)))
@@ -411,7 +413,7 @@ fn org_capture_prompt_placeholders_history_tags_props_combo() {
                 (nreverse prompts)
                 (gethash "Title" org-capture--prompt-history-table)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
@@ -867,12 +869,11 @@ fn org_capture_template_expand_body_placeholders_deep_state_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_capture_insert_todo_edit_clock_refile_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 51 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -924,7 +925,7 @@ fn org_capture_insert_todo_edit_clock_refile_deep() {
                 (list before-refile
                       target-after
                       refile-after))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }

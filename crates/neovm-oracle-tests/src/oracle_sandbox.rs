@@ -11,6 +11,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use neomacs_test_env::{
+    CanonicalEnvironment, CanonicalPin, CanonicalProfile, PinnedCommand, bounded_temp_dir,
+};
 use tempfile::{NamedTempFile, TempDir};
 
 #[path = "form_source.rs"]
@@ -18,41 +21,30 @@ mod form_source;
 
 use form_source::{FormSourceCheck, check_form_source};
 
-/// Locale used when recording the checked-in GNU Emacs expectations.
-///
-/// Collation is locale-sensitive, so inheriting the developer's locale would
-/// make snapshot mode non-deterministic. Per-case overrides are applied after
-/// this default and can still select another locale explicitly.
-const SNAPSHOT_LOCALE: &str = "en_US.UTF-8";
-
-/// Time zone used when recording the checked-in GNU Emacs expectations.
-///
-/// Date conversion, daylight-saving, and Org timestamp behavior all consult
-/// the process time zone. GitHub's Ubuntu runners default to UTC, while the
-/// snapshots were recorded in the America/New_York zone.
-const SNAPSHOT_TIME_ZONE: &str = "America/New_York";
-
-/// Stable process identity used by snapshot probes that inspect the
-/// environment. The home directory itself remains a fresh per-case directory.
-const SNAPSHOT_USER: &str = "exec";
-
-/// Stable host identity for forms and libraries that derive output from the
-/// machine name (for example TRAMP defaults, Org macros, and email addresses).
-const SNAPSHOT_HOST: &str = "oracle-host";
+// The snapshot pins themselves -- locale, time zone, login and full name,
+// host, mail address, home and a bounded temp root -- have one definition in
+// `neomacs_test_oracle::canonical_env` (`CanonicalProfile::Oracle`), shared
+// with every other harness.  This adapter owns only what is per case: the
+// form, the load root, the case directory and explicit overrides.
 
 pub(crate) struct OracleSandbox {
     case_root: TempDir,
     /// Private temporary-file root for this case.
     ///
-    /// This deliberately does not inherit the outer `TMPDIR`: when a suite
-    /// runs with `TMPDIR=/tmp`, inheriting it makes the snapshot normalizer
-    /// rewrite every literal `/tmp` in a form's output. A per-case root keeps
-    /// literal paths observable while still giving `temporary-file-directory`
-    /// a stable `[SESSION-TMPDIR]` token.
+    /// The default child `TMPDIR` and `temporary-file-directory`.  It is
+    /// created under `bounded_temp_base()` rather than the ambient temp dir:
+    /// cases bind unix-domain sockets here, and a deep workspace/nextest path
+    /// plus a socket name overflows `sun_path` (104 bytes on Darwin).  A
+    /// distinct per-case directory also keeps the snapshot normalizer from
+    /// replacing a bare `/tmp` a form prints.
     session_root: TempDir,
+    /// The canonical pins for this case (locale, TZ, identity, HOME, TMPDIR,
+    /// umask).  Built once; `configure` adds only per-case variables.
+    environment: CanonicalEnvironment,
     home_root: PathBuf,
     form_path: PathBuf,
     load_root: PathBuf,
+    load_root_owner: LoadRootOwner,
     load_files: Vec<PathBuf>,
     project_root: PathBuf,
     case_filesystem: CaseFilesystemPolicy,
@@ -81,6 +73,33 @@ impl ResultNormalization {
     }
 }
 
+/// Who owns the sandbox's load root.
+///
+/// The project `lisp/` tree is Neomacs's own runtime and a FOREIGN tree to
+/// GNU, which must keep its installed lisp; only the engine that owns the
+/// tree may have it prepended to `load-path`.  A root a probe supplied
+/// explicitly (a fixture or package checkout, via the `*_with_load_root`
+/// helpers) is a request that BOTH engines put it first, so `(require ...)`
+/// resolves the probe's files on GNU too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LoadRootOwner {
+    #[default]
+    Project,
+    Probe,
+}
+
+impl LoadRootOwner {
+    /// Environment variable carrying [`LoadRootOwner`] into the eval program.
+    const ENV: &'static str = "NEOVM_ORACLE_LOAD_ROOT_OWNER";
+
+    fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Probe => "probe",
+        }
+    }
+}
+
 /// How a child process may use the per-case directory.
 ///
 /// The working-directory variant deliberately includes `TMPDIR`: relative OS
@@ -99,7 +118,12 @@ impl OracleSandbox {
         validate_form_source(form)?;
         let project_root = project_root();
         let case_root = create_case_tempdir_in(&project_root)?;
-        let session_root = create_case_tempdir_in(&project_root)?;
+        // The child's default TMPDIR: a bounded path, because cases bind unix
+        // sockets in it (sun_path is 104 bytes on Darwin).  The case root
+        // above stays in the workspace; it is a path the form sees, not the
+        // socket namespace.
+        let session_root = bounded_temp_dir("nv-oracle-")
+            .map_err(|error| format!("failed to create bounded oracle session tempdir: {error}"))?;
         let home_root = case_root.path().join("home");
         fs::create_dir(&home_root).map_err(|error| {
             format!(
@@ -112,19 +136,35 @@ impl OracleSandbox {
             .iter()
             .map(|file| load_root.join(file))
             .collect::<Vec<_>>();
+        let environment = CanonicalEnvironment::new(
+            CanonicalProfile::Oracle,
+            &home_root,
+            session_root.path(),
+            &project_root,
+        )
+        .map_err(|error| format!("invalid canonical oracle environment: {error}"))?;
 
         Ok(Self {
             case_root,
             session_root,
+            environment,
             home_root,
             form_path,
             load_root: load_root.to_path_buf(),
+            load_root_owner: LoadRootOwner::Project,
             load_files,
             project_root,
             case_filesystem: CaseFilesystemPolicy::Private,
             result_normalization: ResultNormalization::Exact,
             extra_env: Vec::new(),
         })
+    }
+
+    /// Mark the load root as supplied by the probe itself (a fixture or
+    /// package checkout) rather than the project's `lisp/` tree.
+    pub(crate) fn with_probe_load_root(mut self) -> Self {
+        self.load_root_owner = LoadRootOwner::Probe;
+        self
     }
 
     pub(crate) fn expose_case_root_as_test_tmpdir(mut self) -> Self {
@@ -156,24 +196,32 @@ impl OracleSandbox {
         self
     }
 
-    pub(crate) fn configure(&self, command: &mut Command) {
-        command
-            .env("LANG", SNAPSHOT_LOCALE)
-            .env("LC_ALL", SNAPSHOT_LOCALE)
-            .env("TZ", SNAPSHOT_TIME_ZONE)
-            .env("HOME", &self.home_root)
-            .env("USER", SNAPSHOT_USER)
-            .env("LOGNAME", SNAPSHOT_USER)
-            .env("HOSTNAME", SNAPSHOT_HOST)
-            .env("EMAIL", format!("{SNAPSHOT_USER}@{SNAPSHOT_HOST}"))
-            .env("NEOVM_ORACLE_SYSTEM_NAME", SNAPSHOT_HOST)
-            .env("TERM", "dumb")
-            // Workspace-local scratch directories sit beneath the checkout.
-            // Prevent repository helpers from discovering the outer repo.
-            .env("GIT_CEILING_DIRECTORIES", &self.project_root);
+    /// A command for one engine, already carrying the canonical pins.
+    ///
+    /// The pins themselves (locale, time zone, login/full name, host, mail
+    /// address, HOME, TMPDIR, umask) come from
+    /// `CanonicalEnvironment::command`, which is the only way a `PinnedCommand`
+    /// can be built.  This method adds the case's own environment.
+    pub(crate) fn pinned_command(&self, program: impl AsRef<OsStr>) -> PinnedCommand {
+        self.environment.command(program)
+    }
 
+    /// Add the per-case variables to a command produced by
+    /// [`Self::pinned_command`].
+    ///
+    /// Per-case overrides are applied after the pins on purpose: a probe that
+    /// deliberately selects another locale/TMPDIR says so in its source, while
+    /// the default is the recorded one.
+    pub(crate) fn configure(&self, command: &mut PinnedCommand) {
         for (name, value) in &self.extra_env {
-            command.env(name, value);
+            match name.to_str().and_then(CanonicalPin::from_env_name) {
+                Some(pin) => {
+                    command.override_pin(pin, value);
+                }
+                None => {
+                    command.env(name, value);
+                }
+            }
         }
         // This is harness-owned typed state, not an arbitrary per-test
         // override.  Apply it after `extra_env' so callers cannot create a
@@ -182,6 +230,22 @@ impl OracleSandbox {
             "NEOVM_ORACLE_RESULT_NORMALIZATION",
             self.result_normalization.as_env_value(),
         );
+        // Every editor, and every child it spawns, sees one hermetic git
+        // environment: the host's system config and its default branch are
+        // inputs, not oracle facts.  `org-attach-git' reports the branch of a
+        // fresh repository, and `git init' names it from
+        // `init.defaultBranch' (Apple Git sets "main" in /etc/gitconfig,
+        // GNU/Linux distributions leave "master"), so an unpinned probe
+        // records the host's git configuration.  This is the same pinning the
+        // board's Magit fixture applies to its repository builder
+        // (`crates/neomacs-perf/src/harness/scenarios/editor_workload.rs'):
+        // ignore the system config and state the branch.  HOME is already the
+        // sandbox's empty home, so no global config is read either.
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "init.defaultBranch")
+            .env("GIT_CONFIG_VALUE_0", "master");
 
         let scratch_root = self.case_root.path();
         let explicit_tmpdir = self
@@ -192,13 +256,13 @@ impl OracleSandbox {
             .map(|(_, value)| value.clone());
         let session_tmpdir = match self.case_filesystem {
             CaseFilesystemPolicy::WorkingDirectoryAndTempDirectory => {
-                command.env("TMPDIR", scratch_root);
+                command.override_pin(CanonicalPin::TmpDir, scratch_root);
                 Some(scratch_root.as_os_str().to_os_string())
             }
             CaseFilesystemPolicy::Private | CaseFilesystemPolicy::ExposedAsTestTempDirectory => {
                 let tmpdir = explicit_tmpdir
                     .unwrap_or_else(|| self.session_root.path().as_os_str().to_os_string());
-                command.env("TMPDIR", &tmpdir);
+                command.override_pin(CanonicalPin::TmpDir, &tmpdir);
                 Some(tmpdir)
             }
         };
@@ -211,6 +275,7 @@ impl OracleSandbox {
         command
             .env("NEOVM_ORACLE_FORM_FILE", &self.form_path)
             .env("NEOVM_ORACLE_LOAD_ROOT", &self.load_root)
+            .env(LoadRootOwner::ENV, self.load_root_owner.as_env_value())
             .env("NEOVM_ORACLE_PROJECT_ROOT", &self.project_root)
             .env("NEOVM_ORACLE_SCRATCH_ROOT", scratch_root)
             .env("NEOVM_ORACLE_HOME", &self.home_root)

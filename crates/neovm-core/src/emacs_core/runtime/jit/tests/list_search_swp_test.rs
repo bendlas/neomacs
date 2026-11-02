@@ -8,7 +8,7 @@
 //! before.
 //!
 //! The expected matrix below is GNU 31.1's answers, produced with
-//!   tmp/v10x/sandbox-run.sh ~/.local/bin/emacs -Q --batch -l tmp/memq/swp-oracle.el
+//!   tmp/v10x/sandbox-run.sh $NEOVM_FORCE_ORACLE_PATH -Q --batch -l tmp/memq/swp-oracle.el
 //! inside `nix develop /home/exec/Projects/github.com/eval-exec/neomacs-main`
 //! (rows `OP swp=N TARGET ELEMENT INDEX`, the index of the matched cell).
 //! Each case is checked against GNU's expected value, against the builtin
@@ -87,9 +87,11 @@ fn native(
 /// One direct call of the dispatch shim, decoded like [`native`].
 fn shim(op: bool, ctx_ptr: *mut u8, target: Value, list: Value) -> Result<Value, Flow> {
     let word = if op {
-        neovm_jit_assq(ctx_ptr, target.bits() as i64, list.bits() as i64)
+        // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+        unsafe { neovm_jit_assq(ctx_ptr, target.bits() as i64, list.bits() as i64) }
     } else {
-        neovm_jit_memq(ctx_ptr, target.bits() as i64, list.bits() as i64)
+        // SAFETY: the test frame supplies the live `ctx` and argument words; the shim contract holds.
+        unsafe { neovm_jit_memq(ctx_ptr, target.bits() as i64, list.bits() as i64) }
     };
     if word == VALUE_SHIM_SIGNAL {
         Err(take_pending_flow().expect("flow stashed"))

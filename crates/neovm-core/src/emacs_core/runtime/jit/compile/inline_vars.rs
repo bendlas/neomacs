@@ -164,20 +164,6 @@ impl CompileEnvScope {
     }
 }
 
-/// Green's stable World choice predates the first make-thread. All cache entry,
-/// retier and OSR compiles lend this scope; the backend worker only sees CLIF.
-/// Frontend classification and lowering run without Lisp, a callback, GC or a
-/// Baton handoff, so the current epoch cannot change between the arithmetic
-/// binding proof and this guard emission. Sim and context-free/AOT compiles
-/// retain the original arithmetic emission.
-pub(super) fn green_function_epoch() -> Option<u64> {
-    let CompileEnvState::Green(env) = ENV.with(Cell::get) else {
-        return None;
-    };
-    // SAFETY: the scope retains the original dormant, unmoved obarray.
-    Some(unsafe { &*env.obarray }.function_epoch())
-}
-
 fn with_env<R>(f: impl FnOnce(&Obarray, &[u64]) -> Option<R>) -> Option<R> {
     let env = match ENV.with(Cell::get) {
         CompileEnvState::Absent => return None,
@@ -1999,4 +1985,20 @@ pub(crate) fn lower_unbind(
     fb.ins().brif(ok, cont, &[], signal, &[]);
     fb.switch_to_block(cont);
     fb.seal_block(cont);
+}
+
+/// Carrier park: fresh compile env and no unbind sites.
+pub(crate) fn reset_carrier_tls() {
+    ENV.with(|slot| slot.set(CompileEnvState::Absent));
+    UNBIND_SITES.with(|sites| sites.borrow_mut().clear());
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        matches!(ENV.with(|slot| slot.get()), CompileEnvState::Absent) as u64,
+    );
+    crate::tls_fingerprint::mix(h, UNBIND_SITES.with(|slot| slot.borrow().len() as u64));
 }

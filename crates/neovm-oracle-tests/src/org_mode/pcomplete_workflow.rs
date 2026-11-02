@@ -51,12 +51,13 @@ fn org_pcomplete_file_options_startup_tags_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_pcomplete_heading_todo_tag_property_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((\"TO\" (#(\"TODO\" 0 1 (completion--unquoted \"TODO\" face completions-common-part) 1 2 (face completions-common-part))) (\"todo\") \"todo\") (\"\" (#(\"blocked:\" 0 1 (completion--unquoted \"blocked:\")) #(\"work:\" 0 1 (completion--unquoted \"work:\"))) (\"tag\") \"tag\") (\"Eff\" nil (\"prop\") \"prop\"))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -78,6 +79,7 @@ fn org_pcomplete_heading_todo_tag_property_combo() {
             (needle)
             (goto-char (point-min))
             (search-forward needle)
+            (when (string-suffix-p "\n" needle) (backward-char 1))
             (let* ((capf (run-hook-with-args-until-success
                           'completion-at-point-functions))
                    (beg (nth 0 capf))
@@ -88,9 +90,9 @@ fn org_pcomplete_heading_todo_tag_property_combo() {
                     (sort (all-completions stub table) #'string<)
                     (org-thing-at-point)
                     (org-command-at-point)))))
-        (list (complete-at "* TO")
+        (list (complete-at "* TO\n")
               (complete-at ":ur")
-              (complete-at ":Eff")))))"##,
+              (complete-at ":Eff"))))))"##,
         expect,
     );
 }
@@ -139,76 +141,13 @@ fn org_pcomplete_link_drawer_src_block_option_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
-#[test]
-fn org_pcomplete_entities_searchhead_options_matrix_combo() {
-    return_if_neovm_enable_oracle_proptest_not_set!();
-
-    let expect = expect_test::expect![[r#""ERR (void-function complete-at)""#]];
-    crate::common::assert_oracle_parity_expect(
-        r##"(progn
-  (require 'org)
-  (require 'org-pcomplete)
-  (require 'ox)
-  (with-temp-buffer
-    (let ((org-file-tags '("filetag" "shared"))
-          (org-export-default-language "en")
-          (org-priority-highest ?A)
-          (org-priority-lowest ?D)
-          (org-priority-default ?B)
-          (org-babel-load-languages
-           '((emacs-lisp . t) (shell . t) (python . nil)))
-          (user-full-name "Ada Lovelace")
-          (user-mail-address "ada@example.invalid"))
-      (org-mode)
-      (insert "* Alpha Heading\n")
-      (insert "** Beta Child\n")
-      (insert "[[*Al\n")
-      (insert "\\alp\n")
-      (insert "#+DATE: \n")
-      (insert "#+EMAIL: \n")
-      (insert "#+LANGUAGE: \n")
-      (insert "#+PRIORITIES: \n")
-      (insert "#+FILETAGS: \n")
-      (insert "#+OPTIONS: to\n")
-      (cl-labels
-          ((complete-at
-            (needle)
-            (goto-char (point-min))
-            (search-forward needle)
-            (let* ((thing (org-thing-at-point))
-                   (command (org-command-at-point))
-                   (args (org-parse-arguments))
-                   (capf (run-hook-with-args-until-success
-                          'completion-at-point-functions))
-                   (beg (nth 0 capf))
-                   (end (nth 1 capf))
-                   (table (nth 2 capf))
-                   (stub (buffer-substring-no-properties beg end)))
-              (list needle
-                    thing
-                    command
-                    stub
-                    (sort (all-completions stub table) #'string<)
-                    args)))))
-        (list (complete-at "[[*Al")
-              (complete-at "\\alp")
-              (complete-at "#+DATE: ")
-              (complete-at "#+EMAIL: ")
-              (complete-at "#+LANGUAGE: ")
-              (complete-at "#+PRIORITIES: ")
-              (complete-at "#+FILETAGS: ")
-              (complete-at "to"))))))"##,
-        expect,
-    );
-}
-
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_pcomplete_keyword_tag_drawer_property_omission_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-function complete-at)""#]];
+    let expect = expect_test::expect![[
+        r##""OK ((\"#+TITLE: \" (\"file-option\" . \"TITLE\") \"file-option/title\" \"\" (#(\"oracle-title\" 0 1 (completion--unquoted \"oracle-title\"))) ((\"#+TITLE:\" \"\") 34 43)) (\"sample-bound\" (\"file-option\" . \"BIND\") \"file-option/bind\" \"sample-bound\" nil ((\"#+BIND:\" \"sample-bound\") 44 52)) (\"pa\" (\"file-option\" . \"INFOJS_OPT\") \"file-option/infojs_opt\" \"pa\" (#(\"path:\" 0 1 (completion--unquoted \"path:\" face completions-common-part) 1 2 (face completions-common-part))) ((\"#+INFOJS_OPT:\" \"pa\") 65 79)) (\":work:ur\" (\"tag\") \"tag\" \"ur\" (#(\"urgent:\" 0 1 (completion--unquoted \"urgent:\" face completions-common-part) 1 2 (face completions-common-part))) ((\"*\" \"TODO\" \"Alpha\" \":work:ur\") 82 84 89 95)) (\":Eff\" (\"prop\") \"prop\" \"Eff\" nil ((\":Eff\") 129)) (\":LO\\n\" (\"drawer\") \"drawer\" \"LO\" (#(\"LOGBOOK:\" 0 1 (completion--unquoted \"LOGBOOK:\" face completions-common-part) 1 2 (face completions-common-part))) ((\":LO\") 156)))""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -241,6 +180,7 @@ fn org_pcomplete_keyword_tag_drawer_property_omission_combo() {
             (needle)
             (goto-char (point-min))
             (search-forward needle)
+            (when (string-suffix-p "\n" needle) (backward-char 1))
             (let* ((thing (org-thing-at-point))
                    (command (org-command-at-point))
                    (args (org-parse-arguments))
@@ -255,13 +195,86 @@ fn org_pcomplete_keyword_tag_drawer_property_omission_combo() {
                     command
                     stub
                     (sort (all-completions stub table) #'string<)
-                    args)))))
+                    args))))
         (list (complete-at "#+TITLE: ")
               (complete-at "sample-bound")
               (complete-at "pa")
               (complete-at ":work:ur")
               (complete-at ":Eff")
-              (complete-at ":LO"))))))"##,
+              (complete-at ":LO\n"))))))"##,
+        expect,
+    );
+}
+
+#[test]
+fn org_pcomplete_entities_searchhead_options_matrix_combo() {
+    return_if_neovm_enable_oracle_proptest_not_set!();
+
+    let expect = expect_test::expect![[
+        r##""OK ((\"[[*Al\" (\"searchhead\") \"searchhead\" \"Al\" (#(\"Alpha Heading\" 0 1 (completion--unquoted \"Alpha Heading\" face completions-common-part) 1 2 (face completions-common-part))) ((\"Al\") 34)) (\"\\\\alp\" (\"tex\") \"tex\" \"alp\" (#(\"alpha\" 0 1 (completion--unquoted \"alpha\" face completions-common-part) 1 3 (face completions-common-part))) ((\"\\\\alp\") 37)) (\"#+DATE: \" (\"file-option\" . \"DATE\") \"file-option/date\" \"\" (#(\"<2026-06-15 Mon>\" 0 1 (completion--unquoted \"<2026-06-15 Mon>\"))) ((\"#+DATE:\" \"\") 42 50)) (\"#+EMAIL: \" (\"file-option\" . \"EMAIL\") \"file-option/email\" \"\" (#(\"ada@example.invalid\" 0 1 (completion--unquoted \"ada@example.invalid\"))) ((\"#+EMAIL:\" \"\") 51 60)) (\"#+LANGUAGE: \" (\"file-option\" . \"LANGUAGE\") \"file-option/language\" \"\" (#(\"en\" 0 1 (completion--unquoted \"en\"))) ((\"#+LANGUAGE:\" \"\") 61 73)) (\"#+PRIORITIES: \" (\"file-option\" . \"PRIORITIES\") \"file-option/priorities\" \"\" (#(\"A D B\" 0 1 (completion--unquoted \"A D B\"))) ((\"#+PRIORITIES:\" \"\") 74 88)) (filetags-invalid-completion-table) (\"to\" (\"file-option\" . \"OPTIONS\") \"file-option/options\" \"to\" (#(\"toc:\" 0 1 (completion--unquoted \"toc:\" face completions-common-part) 1 2 (face completions-common-part)) #(\"todo:\" 0 1 (completion--unquoted \"todo:\" face completions-common-part) 1 2 (face completions-common-part))) ((\"#+OPTIONS:\" \"to\") 102 113)))""##
+    ]];
+    crate::common::assert_oracle_parity_frozen_time_expect(
+        r##"(progn
+  (require 'org)
+  (require 'org-pcomplete)
+  (require 'ox)
+  (with-temp-buffer
+    (let ((org-file-tags '("filetag" "shared"))
+          (org-export-default-language "en")
+          (org-priority-highest ?A)
+          (org-priority-lowest ?D)
+          (org-priority-default ?B)
+          (org-babel-load-languages
+           '((emacs-lisp . t) (shell . t) (python . nil)))
+          (user-full-name "Ada Lovelace")
+          (user-mail-address "ada@example.invalid"))
+      (org-mode)
+      (setq-local org-file-tags '("filetag" "shared"))
+      (insert "* Alpha Heading\n")
+      (insert "** Beta Child\n")
+      (insert "[[*Al\n")
+      (insert "\\alp\n")
+      (insert "#+DATE: \n")
+      (insert "#+EMAIL: \n")
+      (insert "#+LANGUAGE: \n")
+      (insert "#+PRIORITIES: \n")
+      (insert "#+FILETAGS: \n")
+      (insert "#+OPTIONS: to\n")
+      (cl-labels
+          ((complete-at
+            (needle)
+            (goto-char (point-min))
+            (search-forward needle)
+            (let* ((thing (org-thing-at-point))
+                   (command (org-command-at-point))
+                   (args (org-parse-arguments))
+                   (capf (run-hook-with-args-until-success
+                          'completion-at-point-functions))
+                   (beg (nth 0 capf))
+                   (end (nth 1 capf))
+                   (table (nth 2 capf))
+                   (stub (buffer-substring-no-properties beg end)))
+              (list needle
+                    thing
+                    command
+                    stub
+                    (sort (all-completions stub table) #'string<)
+                    args))))
+        (list (complete-at "[[*Al")
+              (complete-at "\\alp")
+              (complete-at "#+DATE: ")
+              (complete-at "#+EMAIL: ")
+              (complete-at "#+LANGUAGE: ")
+              (complete-at "#+PRIORITIES: ")
+              (condition-case err
+                  (progn
+                    (complete-at "#+FILETAGS: ")
+                    (error "Expected FILETAGS invalid completion table"))
+                (invalid-function
+                 (if (equal (cadr err) "filetag shared")
+                     '(filetags-invalid-completion-table)
+                   (signal (car err) (cdr err)))))
+              (complete-at "to"))))))"##,
         expect,
     );
 }
@@ -280,8 +293,15 @@ fn org_pcomplete_repeated_options_babel_searchhead_combo() {
   (require 'ob-core)
   (require 'ob-shell)
   (require 'ox)
+  (require 'ispell)
+  ;; ispell.el's default dictionary is whatever the host has at
+  ;; /usr/share/dict/words: GNU/Linux CI has none, macOS does, so an unpinned
+  ;; run records the host's word lists.  Pin the plain word-list search to
+  ;; "none" so the ispell completion path answers the same on every host.
   (with-temp-buffer
-    (let ((buffer-file-name "/tmp/org-pcomplete-report.org")
+    (let ((ispell-complete-word-dict nil)
+          (ispell-alternate-dictionary nil)
+          (buffer-file-name "/tmp/org-pcomplete-report.org")
           (org-file-tags '("filetag" "shared"))
           (org-link-abbrev-alist-local
            '(("bug" . "https://bugs.example/%s")

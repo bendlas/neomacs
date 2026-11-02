@@ -27,9 +27,13 @@
 //! does NOT elide invisible text, expand tabs, or emit truncation marks; those
 //! are renderer-owned today (the invisible checkpoint at row_lifecycle.rs:694+,
 //! `DisplayTabPolicy::advance_from`, special_glyphs.rs). Corpus cases whose
-//! inventory expectation depends on
-//! producer-owned stop state are landed `#[ignore]` naming the rung that will
-//! un-ignore them, so the checklist lives in the code rather than a document.
+//! inventory expectation depends on producer-owned stop state (C6 cluster
+//! classes, C7 invisible elision) are acceptance criteria for the rung that
+//! moves those decisions into the producer, not behavior this architecture can
+//! satisfy; their exact assertions live in
+//! `docs/design/producer-stream-rung.md`. Writing them here would be a test
+//! that fails by design — the current renderer already reproduces GNU's
+//! visible grid for both cases (strict_cluster_invisible pair tests).
 
 use super::vocabulary::{
     BufferScanPos, ProducedElement, ProducedGlyphProvenance as GlyphProvenance,
@@ -524,7 +528,7 @@ impl Fixture {
                 let end =
                     buffer.char_pos_to_emacs_byte_pos_clamped(CharPos0::new(overlay.end_char));
                 let value = Value::make_overlay(OverlayDataInit {
-                    serial: 0,
+                    serial: neovm_core::heap_types::OverlaySerialSource::Mint,
                     plist: Value::NIL,
                     buffer: Some(buffer_id),
                     start: start.get(),
@@ -1013,16 +1017,6 @@ fn c6b_extender_at_a_face_seam_stays_in_one_stream() {
     assert_streams_agree(&case);
 }
 
-#[test]
-#[ignore = "un-ignored by the rung that gives ProducedChar its char class: Wide / ComposedExtender classification and the never-split-a-cluster run seam rule (design section 4.10)"]
-fn c6_cluster_classes_are_carried_on_the_element() {
-    let case = StreamCase::new("C6 classes", "ae\u{301}z\n");
-    let stream = producer_stream(&case);
-    // Expected once the class is carried: the extender is a zero-advance
-    // ComposedExtender and no run ever ends between a base and its extender.
-    assert_ne!(stream[2].class, ElementClass::PlainChar);
-}
-
 // ---------------------------------------------------------------------------
 // C7: invisible elision
 // ---------------------------------------------------------------------------
@@ -1038,16 +1032,6 @@ fn c7a_invisible_text_is_not_elided_by_the_producer_today() {
 
     let stream = producer_stream(&case);
     assert_eq!(CharObservation::chars(&stream), "abXXcd\n");
-}
-
-#[test]
-#[ignore = "un-ignored by P4.8: the invisible checkpoint (row_lifecycle.rs) moves into producer stop state, and the scan track then jumps the elided span"]
-fn c7a_invisible_span_jumps_the_scan_track() {
-    let case =
-        StreamCase::new("C7a invisible mid-line", "abXXcd\n").with(CaseProperty::invisible(2, 4));
-    let stream = producer_stream(&case);
-    assert_eq!(CharObservation::chars(&stream), "abcd\n");
-    assert_eq!(stream[2].scan_before.charpos(), 4);
 }
 
 #[test]

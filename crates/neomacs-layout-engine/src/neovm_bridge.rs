@@ -35,6 +35,10 @@ mod property_keys_canonical_tests;
 #[path = "neovm_bridge/tests/property_keys_alias_test.rs"]
 mod property_keys_alias_tests;
 
+#[cfg(test)]
+#[path = "neovm_bridge/tests/effective_extent_progress_test.rs"]
+mod effective_extent_progress_tests;
+
 mod property_keys;
 use property_keys::PropertyKeyOrder;
 
@@ -55,7 +59,6 @@ use neovm_core::emacs_core::effect_profile::{
     EffectScope, effect_name_from_lisp, effect_operation_from_lisp,
 };
 use neovm_core::emacs_core::image_catalog::image_scale_environment;
-use neovm_core::emacs_core::intern::EpochCachedSymbol;
 use neovm_core::emacs_core::invisibility::{Invisibility, text_prop_means_invisible};
 use neovm_core::emacs_core::plist::plist_get;
 use neovm_core::emacs_core::textprop::{DirectCharProperties, resolve_effective_char_property};
@@ -94,9 +97,15 @@ use strum::{EnumString, IntoStaticStr};
 
 // Lazy native key identities only. Every query checks the registry epoch;
 // concurrent mutators share no property values, overlay order or Lisp roots.
-static OVERLAY_FACE_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("face");
-static OVERLAY_PRIORITY_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("priority");
-static OVERLAY_CATEGORY_PROPERTY: EpochCachedSymbol = EpochCachedSymbol::new("category");
+use crate::fixed_symbols::{
+    BAR as BAR_CURSOR_TYPE, CATEGORY as OVERLAY_CATEGORY_PROPERTY,
+    DEFAULT_FACE as DEFAULT_FACE_NAME, DISPLAY as DISPLAY_TEXT_PROPERTY,
+    FACE as OVERLAY_FACE_PROPERTY, FRINGE_INDICATOR_ALIST, INVISIBLE as INVISIBLE_TEXT_PROPERTY,
+    MODE_LINE_IN_NON_SELECTED_WINDOWS, NEOMACS_CURSOR_EFFECT, NOBREAK_CHAR_ASCII_DISPLAY,
+    PRIORITY as OVERLAY_PRIORITY_PROPERTY, SCROLL_MINIBUFFER_CONSERVATIVELY, X_CURSOR_FORE_PIXEL,
+    X_STRETCH_CURSOR,
+};
+use neovm_core::emacs_core::intern::WellKnown;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
@@ -219,6 +228,32 @@ pub(crate) trait LayoutBufferView {
         pos: EmacsBytePos,
         name: Value,
     ) -> Option<EmacsBytePos>;
+    /// Next position after `pos` where any of `keys` changes presence or
+    /// value.  Explicit nil differs from absent; effective-property scans need
+    /// that so an explicit nil can start or stop shadowing a lower-priority
+    /// source.
+    fn layout_next_watched_text_prop_state_change_after_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos>;
+    /// Previous position before `pos` where any of `keys` changes presence or
+    /// value.  The active state is the one at `pos`.
+    fn layout_previous_watched_text_prop_state_change_before_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos>;
+    /// True when `name` may occur in any interval of this layout view.  A
+    /// false answer lets effective-value scans skip the boundary walk: the
+    /// only remaining source is the view-constant `default-text-properties`.
+    fn layout_text_prop_present_anywhere(&self, name: Value) -> bool;
+    /// End of the char run from `pos` over which `syntax-table`/`category`
+    /// are constant (see `TextPropertyTable::syntax_prop_free_run_end`).
+    fn layout_syntax_prop_free_run_end_char_pos(&self, pos: CharPos0, cap: CharPos0) -> CharPos0;
+    /// Start of the run containing `pos` over which `syntax-table`/`category`
+    /// are constant in presence and value (backward companion).
+    fn layout_previous_syntax_prop_state_run_start_char_pos(&self, pos: CharPos0) -> CharPos0;
     fn layout_overlays(&self) -> &OverlayList;
     /// Automatic-composition span whose first character is `pos`.
     ///
@@ -363,6 +398,7 @@ fn layout_var_info(var: LayoutVar) -> &'static LayoutVarInfo {
                             | LayoutVar::StandardDisplayTable
                             | LayoutVar::TabStopList
                             | LayoutVar::WrapPrefix
+                            | LayoutVar::WordWrapByCategory
                     ),
                 }
             })
@@ -461,6 +497,34 @@ impl LayoutBufferView for Buffer {
         self.text_props_previous_single_change_before_emacs_byte_pos(pos, name)
     }
 
+    fn layout_next_watched_text_prop_state_change_after_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos> {
+        self.next_watched_property_state_change_after_emacs_byte_pos(pos, keys)
+    }
+
+    fn layout_previous_watched_text_prop_state_change_before_emacs_byte_pos(
+        &self,
+        pos: EmacsBytePos,
+        keys: &[Value],
+    ) -> Option<EmacsBytePos> {
+        self.previous_watched_property_state_change_before_emacs_byte_pos(pos, keys)
+    }
+
+    fn layout_text_prop_present_anywhere(&self, name: Value) -> bool {
+        self.text_props_has_property_anywhere(name)
+    }
+
+    fn layout_syntax_prop_free_run_end_char_pos(&self, pos: CharPos0, cap: CharPos0) -> CharPos0 {
+        self.syntax_prop_free_run_end_at_char_pos(pos, cap)
+    }
+
+    fn layout_previous_syntax_prop_state_run_start_char_pos(&self, pos: CharPos0) -> CharPos0 {
+        self.previous_syntax_prop_state_run_start_at_char_pos(pos)
+    }
+
     fn layout_overlays(&self) -> &OverlayList {
         self.overlays()
     }
@@ -488,9 +552,13 @@ fn effective_buffer_value(
         .or_else(|| vars.value(var.sym_id()))
 }
 
-fn frame_parameter_int(frame: &Frame, name: &str, default: i64) -> i64 {
+fn frame_fixed_parameter_int(
+    frame: &Frame,
+    key: &neovm_core::emacs_core::intern::WellKnown,
+    default: i64,
+) -> i64 {
     frame
-        .parameter(name)
+        .parameter_symbol(key)
         .and_then(|v| v.as_int())
         .unwrap_or(default)
 }
@@ -528,7 +596,7 @@ pub fn frame_params_from_neovm(
     vars: VariableView<'_>,
 ) -> FrameParams {
     // Read default face background from face table
-    let default_face = face_table.get("default");
+    let default_face = face_table.get_fixed(&crate::fixed_symbols::DEFAULT_FACE);
     let bg = default_face
         .and_then(|f| f.background)
         .map(|c| (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32)
@@ -616,9 +684,8 @@ pub(crate) fn window_parameter_by_name(window: &Window, name: &str) -> Option<Va
         .map(|(_, value)| *value)
 }
 
-fn global_bool(vars: VariableView<'_>, name: &str) -> bool {
-    vars.value_by_name(name)
-        .is_some_and(|value| !value.is_nil())
+fn global_bool(vars: VariableView<'_>, symbol: &WellKnown) -> bool {
+    vars.value(symbol.id()).is_some_and(|value| !value.is_nil())
 }
 
 fn effective_nobreak_char_display(buffer: &Buffer, vars: VariableView<'_>) -> NobreakDisplayMode {
@@ -629,7 +696,7 @@ fn effective_nobreak_char_display(buffer: &Buffer, vars: VariableView<'_>) -> No
     match effective_buffer_value(buffer, vars, LayoutVar::NobreakCharDisplay) {
         Some(value) if value.is_nil() => NobreakDisplayMode::Literal,
         Some(value) if value.is_t() => {
-            if global_bool(vars, "nobreak-char-ascii-display") {
+            if global_bool(vars, &NOBREAK_CHAR_ASCII_DISPLAY) {
                 NobreakDisplayMode::HighlightAscii
             } else {
                 NobreakDisplayMode::HighlightOriginal
@@ -641,8 +708,11 @@ fn effective_nobreak_char_display(buffer: &Buffer, vars: VariableView<'_>) -> No
 }
 
 fn frame_total_cols(frame: &Frame) -> i64 {
+    // `width` is a GNU frame query parameter, not one of the 54 typed
+    // `frame_parms[]` entries; the fixed identity avoids re-interning it and
+    // keeps the string constructor's accounting.
     frame
-        .parameter("width")
+        .parameter_symbol(&crate::fixed_symbols::WIDTH_PARAM)
         .and_then(|value| value.as_int())
         .unwrap_or(frame.columns() as i64)
 }
@@ -827,7 +897,9 @@ pub(crate) fn resolve_fringe_indicator_bitmap_index<B: LayoutBufferView>(
     // 2. Global/default value (GNU `BVAR(&buffer_defaults, fringe_indicator_alist)`).
     // `fringe-indicator-alist` is a forwarded per-buffer slot, so its default
     // lives in `buffer_defaults` — the obarray value cell is always nil.
-    let global = ctx.buffer_default_value("fringe-indicator-alist");
+    // GNU reads the DEFVAR `Vfringe_indicator_alist`; the fringe resolver runs
+    // on every layout pass and previously re-interned the fixed spelling.
+    let global = ctx.buffer_default_value_fixed(&FRINGE_INDICATOR_ALIST);
 
     // Try the buffer-local binding first. GNU only falls through to the global
     // value when the local lookup yields no usable element (a `t` element or a
@@ -1158,7 +1230,7 @@ fn parse_cursor_spec(value: &Value) -> Option<CursorSpec> {
 
 fn frame_cursor_spec(frame: &Frame) -> CursorSpec {
     frame
-        .parameter("cursor-type")
+        .parameter_symbol(&crate::fixed_symbols::CURSOR_TYPE_PARAM)
         .and_then(|value| parse_cursor_spec(&value))
         .unwrap_or(CursorSpec::filled_box())
 }
@@ -1174,7 +1246,7 @@ fn default_cursor_color_pixel(face_table: &FaceTable) -> u32 {
 
 fn frame_background_color_pixel(frame: &Frame, face_table: &FaceTable) -> u32 {
     frame
-        .parameter("background-color")
+        .parameter_symbol(&crate::fixed_symbols::BACKGROUND_COLOR_PARAM)
         .and_then(|value| parse_color_pixel(&value))
         .or_else(|| {
             FixedFace::Default
@@ -1187,7 +1259,7 @@ fn frame_background_color_pixel(frame: &Frame, face_table: &FaceTable) -> u32 {
 
 fn frame_foreground_color_pixel(frame: &Frame, face_table: &FaceTable) -> u32 {
     frame
-        .parameter("foreground-color")
+        .parameter_symbol(&crate::fixed_symbols::FOREGROUND_COLOR_PARAM)
         .and_then(|value| parse_color_pixel(&value))
         .or_else(|| {
             FixedFace::Default
@@ -1200,14 +1272,14 @@ fn frame_foreground_color_pixel(frame: &Frame, face_table: &FaceTable) -> u32 {
 
 fn frame_mouse_color_pixel(frame: &Frame) -> u32 {
     frame
-        .parameter("mouse-color")
+        .parameter_symbol(&crate::fixed_symbols::MOUSE_COLOR_PARAM)
         .and_then(|value| parse_color_pixel(&value))
         .unwrap_or(0x000000)
 }
 
 fn frame_cursor_color_pixel(frame: &Frame, face_table: &FaceTable) -> u32 {
     let pixel = frame
-        .parameter("cursor-color")
+        .parameter_symbol(&crate::fixed_symbols::CURSOR_COLOR_PARAM)
         .and_then(|value| parse_color_pixel(&value))
         .unwrap_or_else(|| default_cursor_color_pixel(face_table));
 
@@ -1245,7 +1317,7 @@ fn frame_cursor_foreground_pixel(
 ) -> u32 {
     // GNU's Vx_cursor_fore_pixel is a color-name string when explicitly set;
     // otherwise x_set_cursor_color uses FRAME_BACKGROUND_PIXEL.
-    vars.value_by_name("x-cursor-fore-pixel")
+    vars.value(X_CURSOR_FORE_PIXEL.id())
         .and_then(|value| parse_color_pixel(&value))
         .unwrap_or_else(|| frame_background_color_pixel(frame, face_table))
 }
@@ -1302,7 +1374,7 @@ fn parse_visual_cursor_spec(
 ) -> Option<VisualCursorSpec> {
     let items = list_to_vec(&value)?;
     let mut charpos: Option<i64> = None;
-    let mut cursor_type = Value::symbol("bar");
+    let mut cursor_type = Value::symbol(&BAR_CURSOR_TYPE);
     let mut color = default_color;
     let mut effects = None;
 
@@ -1484,7 +1556,7 @@ pub fn window_params_from_neovm_with_font_sizing(
         || (neovm_core::face::realization::enabled()
             && neovm_core::face::realization::frame_is_tty_target(frame)
             && vars
-                .value_by_name("mode-line-in-non-selected-windows")
+                .value(MODE_LINE_IN_NON_SELECTED_WINDOWS.id())
                 .is_some_and(Value::is_nil));
     // Only leaf windows can be laid out.
     let effective_window_system = frame.effective_window_system();
@@ -1539,7 +1611,8 @@ pub fn window_params_from_neovm_with_font_sizing(
                 if display.left_fringe_width >= 0 {
                     display.left_fringe_width
                 } else {
-                    frame_parameter_int(frame, "left-fringe", 8) as i32
+                    frame_fixed_parameter_int(frame, &crate::fixed_symbols::LEFT_FRINGE_PARAM, 8)
+                        as i32
                 }
             } else {
                 0
@@ -1548,7 +1621,8 @@ pub fn window_params_from_neovm_with_font_sizing(
                 if display.right_fringe_width >= 0 {
                     display.right_fringe_width
                 } else {
-                    frame_parameter_int(frame, "right-fringe", 8) as i32
+                    frame_fixed_parameter_int(frame, &crate::fixed_symbols::RIGHT_FRINGE_PARAM, 8)
+                        as i32
                 }
             } else {
                 0
@@ -1616,6 +1690,14 @@ pub fn window_params_from_neovm_with_font_sizing(
     // Read buffer-local variables.
     let wrap_mode = effective_wrap_mode(window, buffer, frame, vars, hscroll);
     let word_wrap = effective_buffer_bool(buffer, vars, LayoutVar::WordWrap);
+    let word_wrap_policy = neovm_core::window::WordWrapPolicy::for_buffer(
+        buffer,
+        if word_wrap && effective_buffer_bool(buffer, vars, LayoutVar::WordWrapByCategory) {
+            neovm_core::window::WordWrapMode::Category
+        } else {
+            neovm_core::window::WordWrapMode::Whitespace
+        },
+    );
     let tab_width = effective_buffer_int(buffer, vars, LayoutVar::TabWidth, 8) as i32;
     let display_line_numbers = DisplayLineNumbersMode::from_lisp_value(effective_buffer_value(
         buffer,
@@ -1630,9 +1712,16 @@ pub fn window_params_from_neovm_with_font_sizing(
         effective_buffer_int(buffer, vars, LayoutVar::ScrollConservatively, 0);
     let scroll_step = effective_buffer_int(buffer, vars, LayoutVar::ScrollStep, 0);
     let scroll_minibuffer_conservatively = vars
-        .value_by_name("scroll-minibuffer-conservatively")
+        .value(SCROLL_MINIBUFFER_CONSERVATIVELY.id())
         .is_none_or(|value| !value.is_nil());
-    let scroll_margin = effective_buffer_int(buffer, vars, LayoutVar::ScrollMargin, 0);
+    // GNU `window_scroll_margin` (src/window.c:6207) caps `scroll-margin` by
+    // `maximum-scroll-margin`, which only counts when it is a float. Resolve
+    // both here so every layout consumer sees the same effective margin.
+    let scroll_margin = neovm_core::window::ScrollMargin::from_lisp_values(
+        effective_buffer_int(buffer, vars, LayoutVar::ScrollMargin, 0),
+        effective_buffer_value(buffer, vars, LayoutVar::MaximumScrollMargin)
+            .and_then(Value::as_float),
+    );
 
     // GNU window.c gates chrome reservation through window_wants_*:
     // a mode/header/tab line is shown only for leaf non-minibuffer
@@ -1691,7 +1780,7 @@ pub fn window_params_from_neovm_with_font_sizing(
             .and_then(parse_cursor_effect_profile)
     });
     let visual_cursors = parse_visual_cursors(buffer, cursor_color);
-    let x_stretch_cursor = global_bool(vars, "x-stretch-cursor");
+    let x_stretch_cursor = global_bool(vars, &X_STRETCH_CURSOR);
     let fill_column_indicator = buffer_fill_column_indicator(buffer, vars);
 
     let header_line_height = if wants_header_line {
@@ -1794,6 +1883,7 @@ pub fn window_params_from_neovm_with_font_sizing(
         vscroll,
         wrap_mode,
         word_wrap,
+        word_wrap_policy,
         tab_width,
         scroll_conservatively,
         scroll_step,
@@ -1992,7 +2082,7 @@ pub fn collect_layout_params_with_font_sizing(
         let window_cursor_type = evaluator.frame_manager().window_cursor_type(*win_id);
         let window_cursor_effect = evaluator
             .frame_manager()
-            .window_parameter(*win_id, &Value::symbol("neomacs-cursor-effect"))
+            .window_parameter(*win_id, &Value::symbol(&NEOMACS_CURSOR_EFFECT))
             .unwrap_or(Value::NIL);
         if let Some(wp) = window_params_from_neovm_with_font_sizing(
             window,
@@ -2045,7 +2135,7 @@ pub fn collect_layout_params_with_font_sizing(
             let window_cursor_type = evaluator.frame_manager().window_cursor_type(mini_leaf.id());
             let window_cursor_effect = evaluator
                 .frame_manager()
-                .window_parameter(mini_leaf.id(), &Value::symbol("neomacs-cursor-effect"))
+                .window_parameter(mini_leaf.id(), &Value::symbol(&NEOMACS_CURSOR_EFFECT))
                 .unwrap_or(Value::NIL);
             if let Some(wp) = window_params_from_neovm_with_font_sizing(
                 mini_leaf,
@@ -2261,8 +2351,11 @@ impl<'a, B: LayoutBufferView> RustBufferAccess<'a, B> {
         if n == 0 {
             return Some(bounds.start().get() as i64);
         }
-        let lookups = ["display", "invisible"]
-            .map(|name| LayoutCharPropertyLookup::new(self.buffer, Value::symbol(name)));
+        let lookups = [
+            &crate::fixed_symbols::DISPLAY,
+            &crate::fixed_symbols::INVISIBLE,
+        ]
+        .map(|symbol| LayoutCharPropertyLookup::new(self.buffer, Value::symbol(symbol)));
         let overlays = self.buffer.layout_overlays();
         let mut start = bounds.start();
         let mut remaining = n;
@@ -2484,8 +2577,8 @@ impl LayoutCharPropertyLookup {
     }
 
     /// Maximal text range over which this lookup resolves to the same effective
-    /// value.  The scan watches the canonical property, its aliases, and the
-    /// `category` indirection rather than only the canonical plist key.
+    /// value. Direct values can skip shadowed category/alias changes; fallback
+    /// runs resolve each plist boundary, including absent versus explicit nil.
     pub(crate) fn effective_text_extent_at<B: LayoutBufferView + ?Sized>(
         &self,
         buffer: &B,
@@ -2498,52 +2591,88 @@ impl LayoutCharPropertyLookup {
         let target = self
             .text_value_at(buffer, bytepos)
             .filter(|value| !value.is_nil())?;
-        let mut watched: Vec<_> = self.lookup_order.ordered().collect();
-        let category = Value::symbol("category");
+        let canonical = self.lookup_order.canonical_and_aliases().0;
+        // Every key that can supply the effective value. The presence-aware
+        // query is required: an explicit nil suppresses a lower-priority alias,
+        // category or default, while an absent key lets it through, and both
+        // read as nil to a value-only boundary query.
+        let category = Value::symbol(&OVERLAY_CATEGORY_PROPERTY);
+        let mut watched: Vec<Value> = self.lookup_order.ordered().collect();
         if !watched
             .iter()
             .any(|property| property.bits() == category.bits())
         {
             watched.push(category);
         }
-
+        // When the canonical key and every alias are absent from the whole
+        // view, only `category` can change the effective value. Walk the
+        // syntax/category runs instead of every plist boundary, so a default
+        // value spanning a long history with a few category-bearing spans
+        // neither reads unrelated plists nor exhausts the dependency budget.
+        if self
+            .lookup_order
+            .ordered()
+            .all(|key| !buffer.layout_text_prop_present_anywhere(key))
+        {
+            return self.effective_extent_from_syntax_runs(buffer, bytepos, bounds, &target);
+        }
+        // With no watched key present anywhere, only the view-constant
+        // default can supply the (non-nil) target.
+        if !watched
+            .iter()
+            .any(|key| buffer.layout_text_prop_present_anywhere(*key))
+        {
+            return Some(EmacsByteRange::new(bounds.start(), bounds.end()));
+        }
+        let has_direct_value = |cursor| {
+            buffer
+                .layout_text_prop_at_emacs_byte_pos(cursor, canonical)
+                .is_some_and(|value| !value.is_nil())
+        };
         let previous_change = |cursor| {
-            watched
-                .iter()
-                .filter_map(|property| {
-                    buffer.layout_previous_single_text_prop_change_before_emacs_byte_pos(
-                        cursor, *property,
-                    )
-                })
-                .max()
+            // A direct canonical value wins over category and every alias.
+            // Those keys cannot change the effective value until this direct
+            // run ends. Searching their (often distant) boundaries would scan
+            // an entire history for each short mouse-face button.
+            if has_direct_value(cursor) {
+                return buffer.layout_previous_single_text_prop_change_before_emacs_byte_pos(
+                    cursor, canonical,
+                );
+            }
+            buffer.layout_previous_watched_text_prop_state_change_before_emacs_byte_pos(
+                cursor, &watched,
+            )
         };
         let next_change = |cursor| {
-            watched
-                .iter()
-                .filter_map(|property| {
-                    buffer
-                        .layout_next_single_text_prop_change_after_emacs_byte_pos(cursor, *property)
-                })
-                .min()
+            if has_direct_value(cursor) {
+                return buffer
+                    .layout_next_single_text_prop_change_after_emacs_byte_pos(cursor, canonical);
+            }
+            buffer.layout_next_watched_text_prop_state_change_after_emacs_byte_pos(cursor, &watched)
         };
 
-        let mut start = bounds.start();
-        let mut cursor = bytepos;
-        while let Some(boundary) = previous_change(cursor) {
-            if boundary <= bounds.start() {
-                break;
-            }
-            let boundary_char = buffer.layout_emacs_byte_pos_to_char_pos(boundary);
-            let previous_char = CharPos0::new(boundary_char.get().saturating_sub(1));
+        let mut start = bytepos;
+        while start > bounds.start() {
+            let start_char = buffer.layout_emacs_byte_pos_to_char_pos(start);
+            let previous_char = CharPos0::new(start_char.get().saturating_sub(1));
             let probe = buffer.layout_char_pos_to_emacs_byte_pos(previous_char);
             if self
                 .text_value_at(buffer, probe)
                 .is_none_or(|value| !eq_value(&value, &target))
             {
-                start = boundary;
                 break;
             }
-            cursor = boundary;
+            // Resolve just BEFORE the boundary. If an alias/category supplies
+            // the same value across a direct-property transition, looking at
+            // the boundary again would rediscover it without making progress.
+            let next_start = previous_change(probe)
+                .unwrap_or(bounds.start())
+                .max(bounds.start());
+            debug_assert!(
+                next_start < start,
+                "extent walk must move backward: {next_start:?} >= {start:?}"
+            );
+            start = next_start;
         }
 
         let mut end = bounds.end();
@@ -2560,6 +2689,74 @@ impl LayoutCharPropertyLookup {
                 break;
             }
             cursor = boundary;
+        }
+
+        Some(EmacsByteRange::new(start, end))
+    }
+
+    /// Extent for the case where only `category` can vary: the canonical
+    /// property and every alias are provably absent from the whole view.
+    ///
+    /// Both directions walk out from the queried position over
+    /// syntax/category-constant runs. `syntax_prop_free_run_end_char_pos` and
+    /// its backward companion jump prop-free gaps through the syntax-range
+    /// index, so a query near the end of a long history does not touch every
+    /// unrelated plist, and a long default run stays O(number of category
+    /// spans), not O(buffer length).
+    fn effective_extent_from_syntax_runs<B: LayoutBufferView + ?Sized>(
+        &self,
+        buffer: &B,
+        bytepos: EmacsBytePos,
+        bounds: EmacsByteRange,
+        target: &Value,
+    ) -> Option<EmacsByteRange> {
+        let end_char = buffer.layout_emacs_byte_pos_to_char_pos(bounds.end());
+        let mut cursor = buffer.layout_emacs_byte_pos_to_char_pos(bytepos);
+        let mut end = bytepos;
+        loop {
+            let run_end = buffer
+                .layout_syntax_prop_free_run_end_char_pos(cursor, end_char)
+                .max(CharPos0::new(cursor.get().saturating_add(1)));
+            let run_end_byte = buffer.layout_char_pos_to_emacs_byte_pos(run_end);
+            if run_end >= end_char {
+                end = bounds.end();
+                break;
+            }
+            if self
+                .text_value_at(buffer, run_end_byte)
+                .is_some_and(|value| eq_value(&value, target))
+            {
+                end = run_end_byte;
+                cursor = run_end;
+            } else {
+                end = run_end_byte;
+                break;
+            }
+        }
+
+        let mut start = bytepos;
+        while start > bounds.start() {
+            let start_char = buffer.layout_emacs_byte_pos_to_char_pos(start);
+            let probe_char = CharPos0::new(start_char.get().saturating_sub(1));
+            let probe = buffer.layout_char_pos_to_emacs_byte_pos(probe_char);
+            if self
+                .text_value_at(buffer, probe)
+                .is_none_or(|value| !eq_value(&value, target))
+            {
+                break;
+            }
+            let run_start = buffer.layout_previous_syntax_prop_state_run_start_char_pos(probe_char);
+            let next_start = buffer
+                .layout_char_pos_to_emacs_byte_pos(run_start)
+                .max(bounds.start());
+            debug_assert!(
+                next_start < start,
+                "syntax-run walk must move backward: {next_start:?} >= {start:?}"
+            );
+            if next_start >= start {
+                break;
+            }
+            start = next_start;
         }
 
         Some(EmacsByteRange::new(start, end))
@@ -2594,7 +2791,7 @@ impl LayoutCharPropertyLookup {
         OverlayPropertyFilter::for_properties(
             self.lookup_order
                 .ordered()
-                .chain(std::iter::once(Value::symbol("category"))),
+                .chain(std::iter::once(Value::symbol(&OVERLAY_CATEGORY_PROPERTY))),
         )
     }
 
@@ -2996,12 +3193,14 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
             .layout_overlays()
             .highest_priority_overlay_property_value_at_emacs_byte_pos(
                 bytepos,
-                Value::symbol("display"),
+                Value::symbol(&DISPLAY_TEXT_PROPERTY),
                 self.window_id,
             )
             .or_else(|| {
-                self.buffer
-                    .layout_text_prop_at_emacs_byte_pos(bytepos, Value::symbol("display"))
+                self.buffer.layout_text_prop_at_emacs_byte_pos(
+                    bytepos,
+                    Value::symbol(&DISPLAY_TEXT_PROPERTY),
+                )
             })
             .is_some_and(|value| {
                 crate::display_property::classify_display_property_at(
@@ -3029,7 +3228,7 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
         let mut charpos = char_from.clamp(0, max);
         let end = char_to.clamp(charpos, max);
         let end_byte = buffer_i64_charpos_to_emacs_byte_pos(self.buffer, end);
-        let display = Value::symbol("display");
+        let display = Value::symbol(&DISPLAY_TEXT_PROPERTY);
 
         while charpos < end {
             if self.invisible_status_at(charpos).hidden() || self.replacing_display_at(charpos) {
@@ -3082,15 +3281,17 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
             .layout_overlays()
             .highest_priority_overlay_property_value_at_emacs_byte_pos(
                 bytepos,
-                Value::symbol("invisible"),
+                Value::symbol(&INVISIBLE_TEXT_PROPERTY),
                 self.window_id,
             );
         let (value, origin) = if let Some(value) = overlay_value {
             (Some(value), InvisiblePropertyOrigin::Overlay)
         } else {
             (
-                self.buffer
-                    .layout_text_prop_at_emacs_byte_pos(bytepos, Value::symbol("invisible")),
+                self.buffer.layout_text_prop_at_emacs_byte_pos(
+                    bytepos,
+                    Value::symbol(&INVISIBLE_TEXT_PROPERTY),
+                ),
                 InvisiblePropertyOrigin::TextProperty,
             )
         };
@@ -3117,7 +3318,7 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
             .buffer
             .layout_next_single_text_prop_change_after_emacs_byte_pos_bounded(
                 bytepos,
-                Value::symbol("invisible"),
+                Value::symbol(&INVISIBLE_TEXT_PROPERTY),
                 scan_limit,
             )
             .map(|next| buffer_emacs_byte_pos_to_charpos(self.buffer, next))
@@ -3271,7 +3472,7 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
         let Some(invisible) = self
             .buffer
             .layout_overlays()
-            .overlay_get_named(overlay_id, Value::symbol("invisible"))
+            .overlay_get_named(overlay_id, Value::symbol(&INVISIBLE_TEXT_PROPERTY))
         else {
             return false;
         };
@@ -3386,9 +3587,10 @@ fn overlay_string_priority(overlay: Value) -> i64 {
     let Some(data) = overlay.as_overlay_data() else {
         return 0;
     };
-    let Some(priority) =
-        neovm_core::emacs_core::plist::plist_get(data.plist, &Value::symbol("priority"))
-    else {
+    let Some(priority) = neovm_core::emacs_core::plist::plist_get(
+        data.plist,
+        &Value::symbol(&OVERLAY_PRIORITY_PROPERTY),
+    ) else {
         return 0;
     };
     match priority.kind() {
@@ -3497,7 +3699,7 @@ pub struct ResolvedFace {
     /// Use the terminal's default background instead of `bg`.
     pub use_default_background: bool,
     /// Font family name.
-    pub font_family: String,
+    pub font_family: neomacs_display_protocol::face::FaceString,
     /// Font weight (CSS 100-900).
     pub font_weight: u16,
     /// Italic flag.
@@ -3567,11 +3769,11 @@ pub struct ResolvedFace {
     /// Lisp face name this face was resolved from, when it came from a
     /// named face (GNU keeps the name reachable via `struct face::lface`).
     /// `None` for anonymous attribute-plist faces.
-    pub lisp_name: Option<String>,
+    pub lisp_name: Option<neomacs_display_protocol::face::FaceString>,
     /// Realized `:stipple` bitmap, if the face specified one. GNU realizes the
     /// `LFACE_STIPPLE_INDEX` spec to a pixmap id in `face->stipple`; neomacs
     /// realizes it directly to the XBM `StipplePattern` the renderer tiles.
-    pub stipple: Option<neomacs_display_protocol::StipplePattern>,
+    pub stipple: Option<std::sync::Arc<neomacs_display_protocol::StipplePattern>>,
 }
 
 impl Default for ResolvedFace {
@@ -3583,7 +3785,7 @@ impl Default for ResolvedFace {
             terminal_bg: None,
             use_default_foreground: false,
             use_default_background: false,
-            font_family: String::new(),
+            font_family: neomacs_display_protocol::face::empty_face_string(),
             font_weight: 400,
             italic: false,
             font_size: 14.0,
@@ -4467,6 +4669,37 @@ enum BufferBasicFaceLookup {
     WindowNamedOverFrameDefault(BasicFaceId),
 }
 
+/// The DEFSYM spelling of each GNU basic face. `BasicFaceId::name` is a
+/// fixed C-static name, so callers of the remapping interpreter resolve it
+/// through the table instead of re-interning the spelling per row.
+pub(crate) const fn basic_face_symbol(
+    face: neomacs_display_protocol::face::BasicFaceId,
+) -> WellKnown {
+    use neomacs_display_protocol::face::BasicFaceId;
+    match face {
+        BasicFaceId::Default => WellKnown::Default,
+        BasicFaceId::ModeLineActive => WellKnown::ModeLineActive,
+        BasicFaceId::ModeLineInactive => WellKnown::ModeLineInactive,
+        BasicFaceId::ToolBar => WellKnown::ToolBar,
+        BasicFaceId::Fringe => WellKnown::Fringe,
+        BasicFaceId::HeaderLineActive => WellKnown::HeaderLineActive,
+        BasicFaceId::HeaderLineInactive => WellKnown::HeaderLineInactive,
+        BasicFaceId::ScrollBar => WellKnown::ScrollBar,
+        BasicFaceId::Border => WellKnown::Border,
+        BasicFaceId::Cursor => WellKnown::Cursor,
+        BasicFaceId::Mouse => WellKnown::Mouse,
+        BasicFaceId::Menu => WellKnown::Menu,
+        BasicFaceId::VerticalBorder => WellKnown::VerticalBorder,
+        BasicFaceId::WindowDivider => WellKnown::WindowDivider,
+        BasicFaceId::WindowDividerFirstPixel => WellKnown::WindowDividerFirstPixel,
+        BasicFaceId::WindowDividerLastPixel => WellKnown::WindowDividerLastPixel,
+        BasicFaceId::InternalBorder => WellKnown::InternalBorder,
+        BasicFaceId::ChildFrameBorder => WellKnown::ChildFrameBorder,
+        BasicFaceId::TabBar => WellKnown::TabBar,
+        BasicFaceId::TabLine => WellKnown::TabLine,
+    }
+}
+
 impl FaceResolver {
     fn resolve_face_height(&self, height: &FaceHeight, inherited_size: f32) -> f32 {
         let candidate = match height {
@@ -4552,8 +4785,8 @@ impl FaceResolver {
             df.set_frame_default_background(default_bg);
         }
         df.font_family = neo_default
-            .family_runtime_string_owned()
-            .unwrap_or_default();
+            .family_runtime_string_shared()
+            .unwrap_or_else(neomacs_display_protocol::face::empty_face_string);
         df.font_weight = neo_default
             .weight
             .map(FontWeight::css_weight)
@@ -4681,7 +4914,7 @@ impl FaceResolver {
             generation: evaluator.face_change_count(),
         });
         let mut named_default = (*self.default_face).clone();
-        named_default.lisp_name = Some(BasicFace::Default.name().to_owned());
+        named_default.lisp_name = Some(std::sync::Arc::from(BasicFace::Default.name()));
         let mut basic_faces = Box::new(enum_map::EnumMap::default());
         basic_faces[BasicFace::Default] = Some(named_default);
         for name in neovm_core::face::realization::basic_face_names() {
@@ -4718,7 +4951,7 @@ impl FaceResolver {
             } else {
                 TtySpaceIdentity::OtherRealized
             };
-            resolved.lisp_name = Some(name.to_owned());
+            resolved.lisp_name = Some(std::sync::Arc::from(name));
             resolved.face_id =
                 BasicFaceId::from_name(name).map_or(BasicFaceId::SENTINEL, u32::from);
             basic_faces[role] = Some(resolved);
@@ -4968,6 +5201,31 @@ impl FaceResolver {
     /// Basic faces (see [`BasicFaceId`]) get their fixed enum value.
     /// Other faces get a dynamically allocated ID ≥
     /// [`BasicFaceId::SENTINEL`] (20).
+    /// Resolve a fixed DEFSYM face without a by-name lookup.
+    ///
+    /// Same basic-face fast path, same `FaceTable` key and the same realized
+    /// face as [`Self::resolve_named_face`]; only the lookup key comes from
+    /// the static identity instead of re-interning the printed spelling.
+    pub(crate) fn resolve_fixed_face(&self, handle: WellKnown) -> ResolvedFace {
+        use neomacs_display_protocol::face::BasicFaceId;
+        let name = handle.name();
+        if let Some(role) = BasicFace::from_name(name)
+            && let Some(faces) = &self.realized_basic_faces
+            && let Some(face) = &faces[role]
+        {
+            return face.clone();
+        }
+        let face = self.face_table.resolve_fixed_symbol(&handle);
+        let mut resolved = self.realize_face(&face);
+        resolved.lisp_name = Some(std::sync::Arc::from(name));
+        if let Some(basic) = BasicFaceId::from_name(name) {
+            resolved.face_id = basic.into();
+        } else {
+            resolved.face_id = BasicFaceId::SENTINEL;
+        }
+        resolved
+    }
+
     pub fn resolve_named_face(&self, name: &str) -> ResolvedFace {
         use neomacs_display_protocol::face::BasicFaceId;
         if let Some(role) = BasicFace::from_name(name)
@@ -4978,7 +5236,7 @@ impl FaceResolver {
         }
         let face = self.face_table.resolve(name);
         let mut resolved = self.realize_face(&face);
-        resolved.lisp_name = Some(name.to_string());
+        resolved.lisp_name = Some(std::sync::Arc::from(name));
         if let Some(basic) = BasicFaceId::from_name(name) {
             resolved.face_id = basic.into();
         } else {
@@ -5003,7 +5261,7 @@ impl FaceResolver {
         }
         let face = self.face_table.resolve_producer(value)?;
         let mut resolved = self.realize_face(&face);
-        resolved.lisp_name = Some(name.to_string());
+        resolved.lisp_name = Some(std::sync::Arc::from(name));
         resolved.face_id = BasicFaceId::from_name(name)
             .map(u32::from)
             .unwrap_or(BasicFaceId::SENTINEL);
@@ -5024,7 +5282,7 @@ impl FaceResolver {
         let mut face = self.face_table.resolve(name);
         face.inverse_video = Some(false);
         let mut resolved = self.realize_face(&face);
-        resolved.lisp_name = Some(name.to_string());
+        resolved.lisp_name = Some(std::sync::Arc::from(name));
         if let Some(basic) = BasicFaceId::from_name(name) {
             resolved.face_id = basic.into();
         } else {
@@ -5363,7 +5621,7 @@ impl FaceResolver {
             .realize()
             .install(&mut rf);
 
-        if let Some(family) = face.family_runtime_string_owned() {
+        if let Some(family) = face.family_runtime_string_shared() {
             rf.font_family = family;
         }
         if let Some(weight) = face.weight {
@@ -5443,7 +5701,7 @@ impl FaceResolver {
         // semantics). This is the path buffer-text (text-property / overlay /
         // font-lock) faces take, e.g. `indent-bars`.
         if let Some(pat) = self.realize_stipple(face) {
-            rf.stipple = Some(pat);
+            rf.stipple = Some(std::sync::Arc::new(pat));
         }
 
         rf
@@ -5739,7 +5997,7 @@ impl FaceResolver {
     ) -> ResolvedFace {
         match self.buffer_basic_face_lookup(remapping, face_id) {
             BufferBasicFaceLookup::Canonical(face_id) => {
-                let mut resolved = self.resolve_named_face(face_id.name());
+                let mut resolved = self.resolve_fixed_face(basic_face_symbol(face_id));
                 resolved.face_id = u32::from(face_id);
                 resolved
             }
@@ -5762,7 +6020,7 @@ impl FaceResolver {
                 resolved.face_id = 0;
                 resolved.canonical_tty_role = None;
                 resolved.tty_space_identity = TtySpaceIdentity::Unknown;
-                resolved.lisp_name = Some(face_id.name().to_string());
+                resolved.lisp_name = Some(face_id.name_shared());
                 resolved
             }
         }
@@ -6011,7 +6269,34 @@ impl FaceResolver {
         resolved.face_id = BasicFaceId::SENTINEL;
         resolved.canonical_tty_role = None;
         resolved.tty_space_identity = TtySpaceIdentity::Unknown;
-        resolved.lisp_name = Some(name.to_string());
+        resolved.lisp_name = Some(std::sync::Arc::from(name));
+        resolved
+    }
+
+    /// Resolve a fixed DEFSYM face in a captured displayed-window face
+    /// environment: the same remapping interpreter and basic fastpath as
+    /// [`Self::resolve_remapped_named_face`], with the identity supplied by
+    /// the caller instead of re-interned from the spelling.
+    pub(crate) fn resolve_remapped_fixed_face(
+        &self,
+        remapping: BufferFaceRemapping,
+        handle: WellKnown,
+    ) -> ResolvedFace {
+        let name = handle.name();
+        if let Some(face_id) = BasicFaceId::from_name(name) {
+            return self.resolve_remapped_basic_face(remapping, face_id);
+        }
+        if remapping.alist().is_none_or(Value::is_nil) {
+            return self.resolve_fixed_face(handle);
+        }
+        let base = (*self.default_face).clone();
+        let mut resolved = self
+            .resolve_remapped_face_value_over(remapping, &base, &Value::symbol(handle))
+            .unwrap_or(base);
+        resolved.face_id = BasicFaceId::SENTINEL;
+        resolved.canonical_tty_role = None;
+        resolved.tty_space_identity = TtySpaceIdentity::Unknown;
+        resolved.lisp_name = Some(std::sync::Arc::from(name));
         resolved
     }
 
@@ -6110,7 +6395,7 @@ impl FaceResolver {
         let mut remap_stack = Vec::new();
         self.resolve_buffer_face_value_overlay_spec_inner(
             remapping,
-            &Value::symbol("default"),
+            &Value::symbol(&DEFAULT_FACE_NAME),
             &mut remap_stack,
             0,
             FaceReferenceDiagnostics::Report,
@@ -6202,8 +6487,9 @@ impl FaceResolver {
         // GNU redisplay asks `Fget_text_property' for the effective `face':
         // direct value, category fallback, configured aliases such as
         // `font-lock-face', then `default-text-properties'.
-        let face_prop = LayoutCharPropertyLookup::new(buffer, Value::symbol("face"))
-            .text_value_at(buffer, bytepos);
+        let face_prop =
+            LayoutCharPropertyLookup::new(buffer, Value::symbol(&OVERLAY_FACE_PROPERTY))
+                .text_value_at(buffer, bytepos);
 
         // Update next_check from text property boundaries
         if let Some(nc) = buffer.layout_next_text_prop_change_after_emacs_byte_pos(bytepos) {
@@ -6252,8 +6538,9 @@ impl FaceResolver {
         let mut min_next = buffer.layout_point_max_char_pos().get();
         let remapping = BufferFaceRemapping::capture(buffer);
         let mut resolved = self.resolve_remapped_default_face(remapping);
-        let face_prop = LayoutCharPropertyLookup::new(buffer, Value::symbol("face"))
-            .text_value_at(buffer, bytepos);
+        let face_prop =
+            LayoutCharPropertyLookup::new(buffer, Value::symbol(&OVERLAY_FACE_PROPERTY))
+                .text_value_at(buffer, bytepos);
         let generic_lookup = face_prop.is_some_and(|value| !value.is_nil())
             || remapping.alist().is_some_and(|alist| !alist.is_nil());
         if let Some(face_prop) = face_prop
@@ -6312,7 +6599,9 @@ impl FaceResolver {
                 let buffer = buffer.expect("buffer-remapped basic face policy requires a buffer");
                 self.resolve_remapped_basic_face(BufferFaceRemapping::capture(buffer), face_id)
             }
-            BaseFacePolicy::FrameBasicFace(face_id) => self.resolve_named_face(face_id.name()),
+            BaseFacePolicy::FrameBasicFace(face_id) => {
+                self.resolve_fixed_face(basic_face_symbol(face_id))
+            }
         }
     }
 
@@ -6335,7 +6624,9 @@ impl FaceResolver {
         origin: &DisplayOrigin,
     ) -> ResolvedFace {
         match origin.default_base_face_policy() {
-            BaseFacePolicy::FrameBasicFace(face_id) => self.resolve_named_face(face_id.name()),
+            BaseFacePolicy::FrameBasicFace(face_id) => {
+                self.resolve_fixed_face(basic_face_symbol(face_id))
+            }
             BaseFacePolicy::BufferRemappedBasicFace(_) => {
                 panic!("display origin {origin:?} requires a buffer for basic-face remapping")
             }
@@ -6442,7 +6733,7 @@ impl FaceResolver {
             .install(&mut rf);
 
         // Font family
-        if let Some(family) = face.family_runtime_string_owned() {
+        if let Some(family) = face.family_runtime_string_shared() {
             rf.font_family = family;
         }
         // Font weight
@@ -6530,7 +6821,7 @@ impl FaceResolver {
         // tiles behind glyphs. GNU realizes `LFACE_STIPPLE_INDEX` to a pixmap
         // id in `face->stipple`; neomacs keeps the small bitmap on the face.
         if let Some(pat) = self.realize_stipple(face) {
-            rf.stipple = Some(pat);
+            rf.stipple = Some(std::sync::Arc::new(pat));
         }
 
         rf

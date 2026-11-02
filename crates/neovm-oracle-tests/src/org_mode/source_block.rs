@@ -1,12 +1,13 @@
 use crate::common::assert_oracle_parity;
 use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_src_edit_switches_indent_writeback_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"emacs-lisp\" \"(let ((x 1))\\n  (+ x 2))\" \"both\" emacs-lisp-mode \"(let ((x 1))\\n  (+ x 2))\\n\" \"-n -r\" \":results value :exports both\" \"* Code\\n#+begin_src emacs-lisp -n -r :results value :exports both\\n  (let ((x 1))\\n    (+ x 2))\\n  ;; tail\\n#+end_src\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -39,7 +40,7 @@ fn org_src_edit_switches_indent_writeback_combo() {
                 (org-element-property :switches element)
                 (org-element-property :parameters element)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
@@ -267,12 +268,11 @@ fn org_babel_inline_and_block_result_replace_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_src_preserve_indentation_save_abort_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""File to save in: OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -303,17 +303,18 @@ fn org_src_preserve_indentation_save_abort_combo() {
         (org-edit-src-abort)
         (list edit-before
               edit-after-save
-              (buffer-substring-no-properties (point-min) (point-max))))))"##,
+              (buffer-substring-no-properties (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_edit_special_example_and_src_modes_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (fundamental-mode \"example line\\n\" fundamental-mode \"fixed\\nwidth\" emacs-lisp-mode \"* Mixed\\n#+begin_example\\n  example line\\n  example added\\n#+end_example\\n\\n: fixed\\n: widththird\\n\\n#+begin_src emacs-lisp\\n(+ 1 2)\\n#+end_src\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -358,17 +359,18 @@ fn org_edit_special_example_and_src_modes_combo() {
               fixed-text
               src-mode
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_update_body_remove_result_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (\"(+ 1 2)\" \"#+NAME: calc\\n#+begin_src emacs-lisp :results value replace\\n  (let ((x 4))\\n    (+ x 6))\\n#+end_src\\n#+RESULTS: calc\\n: 3\\n\\nInline src_emacs-lisp[:results raw replace]{(+ 2 3)} {{{results(=5=)}}}.\\n\" \"#+NAME: calc\\n#+begin_src emacs-lisp :results value replace\\n  (let ((x 4))\\n    (+ x 6))\\n#+end_src\\n\\nInline src_emacs-lisp[:results raw replace]{(+ 2 3)}.\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -397,17 +399,18 @@ fn org_babel_update_body_remove_result_combo() {
         (list (nth 1 info-before)
               after-update
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_named_navigation_results_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK ((\"beta\" \"alpha\") (\"beta\" \"alpha\") 21 62 105 146 105 (62 \"#+RESULTS: alpha\") 105 \"#+begin_src emacs-lisp\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -451,24 +454,26 @@ fn org_babel_named_navigation_results_combo() {
               (funcall offset (point))
               (buffer-substring-no-properties
                (line-beginning-position)
-               (line-end-position))))))"##,
+               (line-end-position)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_subtree_execute_hooks_results_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((confirm \"emacs-lisp\" \"(+ base 1)\") (confirm \"emacs-lisp\" \"(+ base 1)\") (after 143 \"first\") (confirm \"emacs-lisp\" \"(+ base 2)\") (confirm \"emacs-lisp\" \"(+ base 2)\") (after 235 \"second\")) \"#+RESULTS: first\" \"#+RESULTS: second\" nil \"#+RESULTS: outside\" ((confirm \"emacs-lisp\" \"(+ 100 3)\") (confirm \"emacs-lisp\" \"(+ 100 3)\") (after 340 \"outside\") (confirm \"emacs-lisp\" \"(* base 3)\") (confirm \"emacs-lisp\" \"(* base 3)\") (after 143 \"first\") (confirm \"emacs-lisp\" \"(+ base 2)\") (confirm \"emacs-lisp\" \"(+ base 2)\") (after 235 \"second\") (confirm \"emacs-lisp\" \"(+ 100 3)\") (confirm \"emacs-lisp\" \"(+ 100 3)\") (after 340 \"outside\")) \"#+PROPERTY: header-args:emacs-lisp :results value replace drawer\\n* Run\\n:PROPERTIES:\\n:header-args:emacs-lisp: :var base=10\\n:END:\\n#+NAME: first\\n#+begin_src emacs-lisp\\n(+ base 1)\\n#+end_src\\n\\n#+RESULTS: first\\n: 11\\n\\n** Child\\n#+NAME: second\\n#+begin_src emacs-lisp :var base=20\\n(+ base 2)\\n#+end_src\\n\\n#+RESULTS: second\\n: 22\\n\\n* Skip\\n#+NAME: outside\\n#+begin_src emacs-lisp\\n(+ 100 3)\\n#+end_src\\n\" \"#+PROPERTY: header-args:emacs-lisp :results value replace drawer\\n* Run\\n:PROPERTIES:\\n:header-args:emacs-lisp: :var base=10\\n:END:\\n#+NAME: first\\n#+begin_src emacs-lisp\\n(* base 3)\\n#+end_src\\n\\n#+RESULTS: first\\n: 30\\n\\n** Child\\n#+NAME: second\\n#+begin_src emacs-lisp :var base=20\\n(+ base 2)\\n#+end_src\\n\\n#+RESULTS: second\\n: 22\\n\\n* Skip\\n#+NAME: outside\\n#+begin_src emacs-lisp\\n(+ 100 3)\\n#+end_src\\n\\n#+RESULTS: outside\\n: 103\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ob-core)
   (require 'ob-emacs-lisp)
   (with-temp-buffer
-    (let ((org-confirm-babel-evaluate
+    (let* (events
+           (org-confirm-babel-evaluate
            (lambda (lang body)
              (push (list 'confirm lang
                          (replace-regexp-in-string "[ \t\n]+" " " body))
@@ -482,8 +487,7 @@ fn org_babel_subtree_execute_hooks_results_combo() {
                                  (org-babel-goto-src-block-head)
                                  (org-element-property
                                   :name (org-element-at-point))))
-                         events))))
-          events)
+                         events)))))
       (org-mode)
       (insert "#+PROPERTY: header-args:emacs-lisp :results value replace drawer\n")
       (insert "* Run\n")
@@ -536,7 +540,7 @@ fn org_babel_subtree_execute_hooks_results_combo() {
                 (nreverse events)
                 after-subtree
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
@@ -814,12 +818,13 @@ fn org_babel_tangle_write_noweb_comments_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_src_fontify_coderef_escape_inline_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((\"(ref:%s)\" \"(ref:%s)\" \"\\\\([ \t]*\\\\((ref:\\\\([-a-zA-Z0-9_][-a-zA-Z0-9_ ]*\\\\))\\\\)[ \t]*\\\\)$\" \"\\\\([ \t]*\\\\((ref:let)\\\\)[ \t]*\\\\)$\" \"\\\\([ \t]*\\\\((ref:\\\\([-a-zA-Z0-9_][-a-zA-Z0-9_ ]*\\\\))\\\\)[ \t]*\\\\)$\") ((\"(defun demo (x)                         <def>\" nil nil nil nil) (\"  (let ((y (+ x 1)))                 <let>\" nil nil nil nil) (\",* escaped headline                  (ref:ex)\" 19 \"ex\" nil \"ex\")) ((\"emacs-lisp\" \"(+ 1 2)\" \":results raw\") (\"text\" \"plain\" nil)) ((\"defun\" (font-lock-keyword-face (:background \"gray10\") org-block) nil t nil) (\"comment line\" (font-lock-comment-face (:background \"gray10\") org-block) nil t nil) (\"(+ 1 2)\" ((:background \"gray10\") org-block) nil t nil) (\"src_text\" (shadow org-inline-src-block) nil nil nil) (\"escaped headline\" (org-block) nil t nil)) \",* H\\n,#+K: v\\n,,,* already\\nbody\" \"* H\\n#+K: v\\n,,* already\\nbody\" \"* escaped headline                  (ref:ex)\\n#+escaped keyword\" \"* Code\\n#+begin_src emacs-lisp -n -r :label-fmt \\\"<%s>\\\"\\n(defun demo (x)                         <def>\\n  ;; comment line\\n  (let ((y (+ x 1)))                 <let>\\n    y))\\n#+end_src\\nInline src_emacs-lisp[:results raw]{(+ 1 2)} and src_text{plain}.\\n#+begin_example -n -r\\n* escaped headline                  (ref:ex)\\n#+escaped keyword\\n#+end_example\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -901,17 +906,16 @@ fn org_src_fontify_coderef_escape_inline_combo() {
               unescaped-string
               region-after-unescape
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_src_edit_buffer_coordinates_multi_block_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""File to save in: OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1002,17 +1006,18 @@ fn org_src_edit_buffer_coordinates_multi_block_combo() {
                           (org-element-property :value block)))
                       (org-element-map
                           (org-element-parse-buffer)
-                          'src-block #'identity))))))"##,
+                          'src-block #'identity)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_hash_hide_mutate_reexecute_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (\"emacs-lisp\" \"(list \\\"value\\\" x (* x x))\" \"no\" \"85f1e7d1d8861210924a498b6277f996b68ff37a\" (\"value\" 4 16) 152 \"85f1e7d1d8861210924a498b6277f996b68ff37a\" nil \"alpha\\nbeta\" 315 nil ((\"value\" nil nil) (\"alpha\" nil nil) (\"beta\" nil nil)) \"efcd2ccc0cabf939d91bf0c2f9ff6b6fb7dd8cf8\" \"85f1e7d1d8861210924a498b6277f996b68ff37a\" (\"value\" 4 64) 154 nil ((\"value\" nil nil) (\"alpha\" nil nil) (\"beta\" nil nil)) \"#+PROPERTY: header-args:emacs-lisp :results value replace :cache yes\\n#+NAME: cached\\n#+begin_src emacs-lisp :var x=4\\n(list \\\"value\\\" x (* x x x))\\n#+end_src\\n\\n#+RESULTS[efcd2ccc0cabf939d91bf0c2f9ff6b6fb7dd8cf8]: cached\\n\\n#+NAME: output\\n#+begin_src emacs-lisp :results output drawer replace\\n(princ \\\"alpha\\\\nbeta\\\")\\n#+end_src\\n\\n#+RESULTS: output\\n:results:\\nalpha\\nbeta\\n:end:\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1115,24 +1120,32 @@ fn org_babel_hash_hide_mutate_reexecute_combo() {
                       read-after
                       shown
                       (buffer-substring-no-properties
-                       (point-min) (point-max))))))))))"##,
+                       (point-min) (point-max)))))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_insert_remove_file_example_result_matrix_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((initial ((src-block \"output-block\" nil \"(princ \\\"old\\\")\\n\" nil nil 11 104) (src-block \"drawer-block\" nil \"(list 1 2)\\n\" nil nil 104 200) (src-block \"file-block\" nil \"result-file\\n\" nil nil 200 313)) \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n\") (after-output ((src-block \"output-block\" nil \"(princ \\\"old\\\")\\n\" nil nil 11 104) (fixed-width nil nil \"alpha\\nbeta\" nil nil 104 144) (src-block \"drawer-block\" nil \"(list 1 2)\\n\" nil nil 144 240) (src-block \"file-block\" nil \"result-file\\n\" nil nil 240 353)) \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+RESULTS: output-block\\n: alpha\\n: beta\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n\") (after-drawer ((src-block \"output-block\" nil \"(princ \\\"old\\\")\\n\" nil nil 11 104) (fixed-width nil nil \"alpha\\nbeta\" nil nil 104 144) (src-block \"drawer-block\" nil \"(list 1 2)\\n\" nil nil 144 240) (drawer nil nil nil nil nil 240 301) (src-block \"file-block\" nil \"result-file\\n\" nil nil 301 414)) \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+RESULTS: output-block\\n: alpha\\n: beta\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+RESULTS: drawer-block\\n:results:\\n| 1 | 2 |\\n| 3 | 4 |\\n:end:\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n\") (after-file ((src-block \"output-block\" nil \"(princ \\\"old\\\")\\n\" nil nil 11 104) (fixed-width nil nil \"alpha\\nbeta\" nil nil 104 144) (src-block \"drawer-block\" nil \"(list 1 2)\\n\" nil nil 144 240) (drawer nil nil nil nil nil 240 301) (src-block \"file-block\" nil \"result-file\\n\" nil nil 301 414) (link nil nil nil \"file\" \"out data.txt\" 436 457)) \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+RESULTS: output-block\\n: alpha\\n: beta\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+RESULTS: drawer-block\\n:results:\\n| 1 | 2 |\\n| 3 | 4 |\\n:end:\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n#+RESULTS: file-block\\n[[file:out data.txt]]\\n\\n\")) \"alpha\\nbeta\" ((1 2) (3 4)) \"[[file:out data.txt][File Desc]]\" ((\"file\" \"out data.txt\" nil)) \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+RESULTS: output-block\\n: alpha\\n: beta\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+RESULTS: drawer-block\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n#+RESULTS: file-block\\n[[file:out data.txt]]\\n\\n\" \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+RESULTS: drawer-block\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n#+RESULTS: file-block\\n[[file:out data.txt]]\\n\\n\" \": one\\n\" \": one\\n: two\\n: three\\n\" \"* Results\\n#+NAME: output-block\\n#+begin_src emacs-lisp :results output replace\\n(princ \\\"old\\\")\\n#+end_src\\n\\n#+NAME: drawer-block\\n#+begin_src emacs-lisp :results value drawer replace\\n(list 1 2)\\n#+end_src\\n\\n#+RESULTS: drawer-block\\n\\n#+NAME: file-block\\n#+begin_src emacs-lisp :results file link replace :file \\\"out data.txt\\\"\\nresult-file\\n#+end_src\\n\\n#+RESULTS: file-block\\n[[file:out data.txt]]\\n\\n\")""#
+    ]];
+    // The file result is passed relative to `default-directory` (ROOT). With
+    // no buffer file, GNU `org-babel-result-to-file` (lisp/org/ob-core.el)
+    // keeps a relative RESULT as written, so the inserted link and every
+    // element position after it no longer depend on the length of the
+    // host's temporary-file-directory (CI's is 37 characters shorter).
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
   (require 'ob-core)
   (require 'ob-emacs-lisp)
-  (let* ((root (make-temp-file "org-babel-result" t))
-         (result-file (expand-file-name "out data.txt" root)))
+  (let* ((root (expand-file-name "org-babel-result" temporary-file-directory))
+         (result-name "out data.txt")
+         (result-file (expand-file-name result-name root)))
+    (make-directory root t)
     (unwind-protect
         (with-temp-buffer
           (setq default-directory root)
@@ -1205,8 +1218,8 @@ fn org_babel_insert_remove_file_example_result_matrix_combo() {
               (with-temp-file result-file
                 (insert "file body\n"))
               (setq file-result
-                    (org-babel-result-to-file result-file "File Desc"))
-              (org-babel-insert-result result-file
+                    (org-babel-result-to-file result-name "File Desc"))
+              (org-babel-insert-result result-name
                                        '("file" "link" "replace")
                                        info nil "emacs-lisp")
               (setq file-link
@@ -1256,7 +1269,7 @@ fn org_babel_insert_remove_file_example_result_matrix_combo() {
                    "<root>"
                    (buffer-substring-no-properties
                     (point-min) (point-max))))))
-      (when (file-directory-p root) (delete-directory root t))))"##,
+      (when (file-directory-p root) (delete-directory root t)))))"##,
         expect,
     );
 }
@@ -1328,12 +1341,11 @@ fn org_babel_tangle_noweb_header_deep_state_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_tangle_header_args_noweb_comments_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 57 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1391,17 +1403,18 @@ fn org_babel_tangle_header_args_noweb_comments_deep_state_combo() {
                            (string-match-p "shared-val" content-a))
                        (and content-a
                             (not (string-match-p "<<shared>>" content-a)))))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_src_edit_exit_writeback_preserve_structure_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable edit-mode)""#]];
+    let expect = expect_test::expect![[
+        r##""OK (emacs-lisp-mode \"(+ 1 2)\\n\" \"#+begin_src emacs-lisp\\n  (+ 10 20)\\n  (+ 30 40)\\n#+end_src\\n\\n#+begin_src python\\nprint('hello')\\n#+end_src\\n\\nBetween blocks.\\n\\n#+begin_src emacs-lisp\\n(message \\\"test\\\")\\n#+end_src\\n\" \"#+begin_src emacs-lisp\\n  (+ 10 20)\\n  (+ 30 40)\\n#+end_src\\n\\n#+begin_src python\\n  print('modified')\\n  print('extra')\\n#+end_src\\n\\nBetween blocks.\\n\\n#+begin_src emacs-lisp\\n(message \\\"test\\\")\\n#+end_src\\n\" ((\"emacs-lisp\" \"  (+ 10 20)\\n  (+ 30 40)\\n\") (\"python\" \"  print('modified')\\n  print('extra')\\n\") (\"emacs-lisp\" \"(message \\\"test\\\")\\n\")))""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -1420,7 +1433,7 @@ fn org_src_edit_exit_writeback_preserve_structure_deep_state_combo() {
                      (point-min) (point-max))))
       (erase-buffer)
       (insert "(+ 10 20)\n(+ 30 40)\n")
-      (org-edit-src-exit))
+      (org-edit-src-exit)
     (let ((after-first-edit (buffer-substring-no-properties
                              (point-min) (point-max))))
       (goto-char (point-min))

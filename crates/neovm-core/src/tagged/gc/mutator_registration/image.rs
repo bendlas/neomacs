@@ -19,6 +19,13 @@ use super::super::{HeapIdentity, MEMORY_USE_COUNT_LEN, TaggedHeap};
 use crate::emacs_core::intern::SymId;
 use rustc_hash::FxHashSet;
 
+/// Response-local pacing policy, distinct from the major/minor cycle kind.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ResponsePacing {
+    Preserve,
+    Reset,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(in crate::tagged::gc) enum ImageError {
     #[error("owner root scratch capacity cannot be reserved")]
@@ -355,6 +362,13 @@ impl OwnerGcState {
 }
 
 impl PublishedGcImage {
+    pub(super) fn charge_symbol_tables(
+        &mut self,
+        bytes: super::super::symbol_table::publication::RetainedTableBytes,
+    ) {
+        self.facts.bytes_since_gc = self.facts.bytes_since_gc.saturating_add(bytes.get());
+    }
+
     #[cfg(test)]
     pub(in crate::tagged::gc) fn seed_collection_words_for_test(
         &mut self,
@@ -435,7 +449,7 @@ impl PublishedGcImage {
         );
     }
 
-    pub(super) fn finish_major_response(&mut self, generational: bool) {
+    pub(super) fn finish_collection_response(&mut self, pacing: ResponsePacing) {
         // This is a charged live balance, not lifetime allocation history or
         // object ownership. Owner 0 retains the exact post-sweep aggregate;
         // peers start accruing new local credits after this response.
@@ -445,8 +459,9 @@ impl PublishedGcImage {
             .bytes_banked_at_resets
             .saturating_add(self.facts.bytes_since_gc as u64);
         self.facts.bytes_since_gc = 0;
-        if generational {
-            self.facts.pacing = GenerationPacingCounters::default();
+        match pacing {
+            ResponsePacing::Preserve => {}
+            ResponsePacing::Reset => self.facts.pacing = GenerationPacingCounters::default(),
         }
         self.facts.region_stats = RegionStats::default();
     }

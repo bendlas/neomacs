@@ -611,11 +611,11 @@ fn eval_terminal_parameter_accepts_live_frame_designator() {
 fn terminal_live_p_reflects_designator_shape() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::Context::new();
-    let live_nil = builtin_terminal_live_p(&mut eval, vec![Value::NIL]).unwrap();
-    let live_handle = builtin_terminal_live_p(&mut eval, vec![terminal_handle_value()]).unwrap();
+    let live_nil = builtin_terminal_live_p(&mut eval, &vec![Value::NIL]).unwrap();
+    let live_handle = builtin_terminal_live_p(&mut eval, &vec![terminal_handle_value()]).unwrap();
     let live_string =
-        builtin_terminal_live_p(&mut eval, vec![Value::string("initial_terminal")]).unwrap();
-    let live_int = builtin_terminal_live_p(&mut eval, vec![Value::fixnum(1)]).unwrap();
+        builtin_terminal_live_p(&mut eval, &vec![Value::string("initial_terminal")]).unwrap();
+    let live_int = builtin_terminal_live_p(&mut eval, &vec![Value::fixnum(1)]).unwrap();
     assert_eq!(live_nil, Value::T);
     assert_eq!(live_handle, Value::T);
     assert!(live_string.is_nil());
@@ -627,10 +627,10 @@ fn eval_terminal_live_p_accepts_live_frame_designator() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::Context::new();
     let frame_id = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval).0;
-    let live = builtin_terminal_live_p(&mut eval, vec![Value::make_frame(frame_id)]).unwrap();
+    let live = builtin_terminal_live_p(&mut eval, &vec![Value::make_frame(frame_id)]).unwrap();
     assert_eq!(live, Value::T);
 
-    let stale = builtin_terminal_live_p(&mut eval, vec![Value::fixnum(999_999)]).unwrap();
+    let stale = builtin_terminal_live_p(&mut eval, &vec![Value::fixnum(999_999)]).unwrap();
     assert!(stale.is_nil());
 }
 
@@ -680,7 +680,7 @@ fn frame_terminal_returns_live_terminal_handle() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::Context::new();
     let handle = builtin_frame_terminal(&mut eval, vec![Value::NIL]).unwrap();
-    let live = builtin_terminal_live_p(&mut eval, vec![handle]).unwrap();
+    let live = builtin_terminal_live_p(&mut eval, &vec![handle]).unwrap();
     assert_eq!(live, Value::T);
     assert_eq!(handle.type_name(), "terminal");
 }
@@ -690,7 +690,7 @@ fn selected_terminal_returns_live_terminal_handle() {
     crate::test_utils::init_test_tracing();
     let mut eval = crate::emacs_core::Context::new();
     let handle = builtin_selected_terminal(vec![]).unwrap();
-    let live = builtin_terminal_live_p(&mut eval, vec![handle]).unwrap();
+    let live = builtin_terminal_live_p(&mut eval, &vec![handle]).unwrap();
     assert_eq!(live, Value::T);
 }
 
@@ -722,7 +722,7 @@ fn eval_frame_terminal_accepts_live_frame_designator() {
     let mut eval = crate::emacs_core::Context::new();
     let frame_id = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval).0;
     let handle = builtin_frame_terminal(&mut eval, vec![Value::make_frame(frame_id)]).unwrap();
-    let live = builtin_terminal_live_p(&mut eval, vec![handle]).unwrap();
+    let live = builtin_terminal_live_p(&mut eval, &vec![handle]).unwrap();
     assert_eq!(live, Value::T);
 }
 
@@ -777,7 +777,7 @@ fn eval_frame_edges_live_window_designator_includes_buffer_context() {
     let mut eval = crate::emacs_core::Context::new();
     let _ = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
     let window =
-        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, vec![]).unwrap();
+        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, &vec![]).unwrap();
     let result = builtin_frame_edges(&mut eval, vec![window]);
     match result.kinded() {
         Err(FlowKind::Signal(sig)) => {
@@ -876,7 +876,7 @@ fn eval_internal_show_cursor_accepts_live_window_designator() {
     let mut eval = crate::emacs_core::Context::new();
     let _ = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
     let window =
-        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, vec![]).unwrap();
+        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, &vec![]).unwrap();
     let result = builtin_internal_show_cursor(&mut eval, vec![window, Value::T]).unwrap();
     assert!(result.is_nil());
 }
@@ -887,7 +887,7 @@ fn eval_internal_show_cursor_p_accepts_live_window_designator() {
     let mut eval = crate::emacs_core::Context::new();
     let _ = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
     let window =
-        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, vec![]).unwrap();
+        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, &vec![]).unwrap();
     let result = builtin_internal_show_cursor_p(&mut eval, vec![window]).unwrap();
     assert!((result.is_t() || result.is_nil()));
 }
@@ -899,7 +899,7 @@ fn eval_internal_show_cursor_tracks_per_window_state() {
     let mut eval = crate::emacs_core::Context::new();
     let _ = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
     let selected =
-        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, vec![]).unwrap();
+        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, &vec![]).unwrap();
     // GNU's `split-window` stages the old window's new size before calling
     // the primitive, which rejects an unstaged split.
     eval.eval_str("(set-window-new-pixel nil (- (window-pixel-height) 12))")
@@ -3475,7 +3475,7 @@ fn eval_monitor_attributes_include_bootstrapped_frame() {
         Value::T
     );
     assert_eq!(
-        crate::emacs_core::frame::builtin_frame_live_p(&mut eval, vec![frames[0]]).unwrap(),
+        crate::emacs_core::frame::builtin_frame_live_p(&mut eval, &vec![frames[0]]).unwrap(),
         Value::T
     );
 }
@@ -3772,7 +3772,7 @@ fn eval_display_monitor_errors_render_window_designators() {
     let mut eval = crate::emacs_core::Context::new();
     let _ = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
     let window =
-        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, vec![]).unwrap();
+        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, &vec![]).unwrap();
 
     let list_err = builtin_display_monitor_attributes_list(&mut eval, vec![window])
         .expect_err("window designator should be rejected");
@@ -3807,7 +3807,7 @@ fn get_device_terminal_formatter_keeps_integer_literals() {
     let mut eval = crate::emacs_core::Context::new();
     let _ = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
     let window =
-        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, vec![]).unwrap();
+        crate::emacs_core::window_cmds::builtin_selected_window(&mut eval, &vec![]).unwrap();
 
     let rendered_window = format_get_device_terminal_arg_eval(&eval, &window);
     assert!(rendered_window.contains("#<window"));
@@ -4196,8 +4196,8 @@ fn x_popup_menu_interactive_keymap_returns_selected_event() {
     let scratch = eval.buffers.create_buffer("*scratch*");
     let frame_id = eval.frames.create_frame("popup-owner", 800, 600, scratch);
     eval.frames.select_frame(frame_id);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     let host = RecordingPopupHost::default();
     let shown = Arc::clone(&host.shown);
     let hidden = Arc::clone(&host.hidden);
@@ -4266,8 +4266,8 @@ fn old_style_menu_help_keeps_the_real_submenu_definition() {
 #[test]
 fn x_popup_menu_publishes_selected_item_help_and_keeps_it_after_teardown() {
     let mut eval = crate::emacs_core::Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
     eval.eval_str(
         r##"(progn
@@ -4366,8 +4366,8 @@ fn x_popup_dialog_interactive_returns_selected_value() {
     let scratch = eval.buffers.create_buffer("*scratch*");
     let frame_id = eval.frames.create_frame("dialog-owner", 800, 600, scratch);
     eval.frames.select_frame(frame_id);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     let host = RecordingPopupHost::default();
     let shown = Arc::clone(&host.shown);
     let hidden = Arc::clone(&host.hidden);
@@ -4427,8 +4427,8 @@ fn x_popup_menu_interactive_keymap_collapses_submenu_on_tty() {
             .is_none(),
         "test fixture frame should be a TTY frame (no window system)"
     );
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     let host = RecordingPopupHost::default();
     let shown = Arc::clone(&host.shown);
     eval.set_display_host(Box::new(host));
@@ -4483,8 +4483,8 @@ fn x_popup_menu_interactive_submenu_selection_returns_full_event_path() {
         .get_mut(frame_id)
         .expect("selected frame")
         .set_window_system(Some(Value::symbol(gui_window_system_symbol())));
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
 
     let submenu = crate::emacs_core::keymap::make_sparse_list_keymap();
@@ -4527,8 +4527,8 @@ fn x_popup_menu_interactive_submenu_selection_returns_full_event_path() {
 #[test]
 fn x_popup_menu_interactive_ignores_tty_mouse_navigation() {
     let mut eval = crate::emacs_core::Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
 
     let tty_menu_navigation_map = crate::emacs_core::keymap::make_sparse_list_keymap();
@@ -4576,8 +4576,8 @@ fn x_popup_menu_interactive_ignores_tty_mouse_navigation() {
 #[test]
 fn x_popup_menu_interactive_keyboard_select_roots_selected_event() {
     let mut eval = crate::emacs_core::Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
 
     let menu = crate::emacs_core::keymap::make_sparse_list_keymap();
@@ -4617,8 +4617,8 @@ fn x_popup_menu_interactive_keyboard_select_roots_selected_event() {
 #[test]
 fn x_popup_menu_interactive_cancel_returns_nil() {
     let mut eval = crate::emacs_core::Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
 
     let menu = crate::emacs_core::keymap::make_sparse_list_keymap();
@@ -4654,8 +4654,8 @@ fn x_popup_menu_interactive_menu_bar_position_anchors_below_menu_bar() {
         .expect("frame")
         .menu_bar_height = 24;
     eval.frames.select_frame(frame_id);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     let host = RecordingPopupHost::default();
     let shown = Arc::clone(&host.shown);
     eval.set_display_host(Box::new(host));
@@ -4714,8 +4714,8 @@ fn x_popup_menu_interactive_menu_bar_position_uses_pending_native_anchor() {
         .expect("frame")
         .menu_bar_height = 24;
     eval.frames.select_frame(frame_id);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     let host = RecordingPopupHost::default();
     let shown = Arc::clone(&host.shown);
     eval.set_display_host(Box::new(host));
@@ -4775,8 +4775,8 @@ fn x_popup_menu_interactive_menu_bar_position_uses_pending_native_anchor() {
 #[test]
 fn x_popup_menu_interactive_menu_bar_right_returns_next_menu_position() {
     let mut eval = crate::emacs_core::Context::new();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
 
     let menu_bar = crate::emacs_core::keymap::make_sparse_list_keymap();
@@ -4846,8 +4846,8 @@ fn x_popup_menu_preserves_heading_click_queued_before_old_cancellation() {
     let frame = eval.frames.create_frame("menu-owner", 800, 600, buffer);
     eval.frames.select_frame(frame);
     eval.eval_str("(progn (setq global-map (make-sparse-keymap)) (use-global-map global-map) (define-key global-map [menu-bar mouse-1] 'ignore))").unwrap();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = crate::host_input::HostInputPublisher::install(&mut eval);
+
     eval.set_display_host(Box::new(RecordingPopupHost::default()));
     let menu = crate::emacs_core::keymap::make_sparse_list_keymap();
     crate::emacs_core::keymap::list_keymap_define(

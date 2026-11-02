@@ -220,12 +220,7 @@ Multiple lines, just like the bindings.el version."
     )
     .expect("write source");
     // Byte-compile via GNU Emacs.
-    let gnu_emacs = "/home/exec/.local/bin/emacs";
-    if !std::path::Path::new(gnu_emacs).exists() {
-        eprintln!("skipping: GNU Emacs not available at {gnu_emacs}");
-        return;
-    }
-    let status = std::process::Command::new(gnu_emacs)
+    let status = crate::test_utils::gnu_probe_command()
         .args(["--batch", "--eval"])
         .arg(format!("(byte-compile-file \"{}\")", src_path.display()))
         .status()
@@ -296,7 +291,7 @@ fn defcustom_quoted_symbol_default_followed_by_defun_using_var() {
                (list mode-line-test-edge (mode--line-test))"#,
         )
         .iter()
-        .map(crate::emacs_core::error::format_eval_result)
+        .map(crate::emacs_core::format_eval_result)
         .collect();
     // GNU verified via:
     //   emacs --batch --eval '(progn (defcustom ...) (defun ...) (list ...))'

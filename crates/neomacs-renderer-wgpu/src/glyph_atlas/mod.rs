@@ -4,6 +4,8 @@
 
 pub mod allocator;
 mod bitmap_fonts;
+#[cfg(target_os = "macos")]
+mod macos;
 pub mod pages;
 pub mod types;
 
@@ -567,6 +569,8 @@ pub struct WgpuGlyphAtlas {
     atlas_config: GlyphAtlasConfig,
     font_system: FontSystem,
     scale_context: ScaleContext,
+    #[cfg(target_os = "macos")]
+    native_rasterizer: macos::NativeRasterizer,
     bind_group_layout: wgpu::BindGroupLayout,
     linear_sampler: wgpu::Sampler,
     nearest_sampler: wgpu::Sampler,
@@ -712,6 +716,8 @@ impl WgpuGlyphAtlas {
                 fontdb::Database::new(),
             ),
             scale_context: ScaleContext::new(),
+            #[cfg(target_os = "macos")]
+            native_rasterizer: macos::NativeRasterizer::default(),
             bind_group_layout,
             linear_sampler,
             nearest_sampler,
@@ -785,7 +791,7 @@ impl WgpuGlyphAtlas {
         y_bin: SubpixelBin,
         enable_subpixel: bool,
     ) -> Option<RasterizeResult> {
-        let req_family = face.map(|f| f.font_family.as_str()).unwrap_or("monospace");
+        let req_family = face.map(|f| f.font_family.as_ref()).unwrap_or("monospace");
         let req_weight = face.map(|f| f.font_weight).unwrap_or(400);
         let req_italic = face
             .map(|f| {
@@ -905,7 +911,7 @@ impl WgpuGlyphAtlas {
                     let bearing_x = physical_glyph.x as f32 + image.left as f32;
                     let bearing_y = image.top as f32;
 
-                    let font_family_str = face.map(|f| f.font_family.as_str()).unwrap_or("(none)");
+                    let font_family_str = face.map(|f| f.font_family.as_ref()).unwrap_or("(none)");
                     tracing::debug!(
                         "rasterize_text: text='{}' glyph U+{:04X} font='{}' content={:?} size={}x{}",
                         text,
@@ -1394,6 +1400,19 @@ impl WgpuGlyphAtlas {
             .font_system
             .get_font(cache_key.font_id, cache_key.font_weight)?;
 
+        // The native macOS adapter publishes a grayscale coverage mask. Keep
+        // it on the Alpha path; a future subpixel mode must stay on Swash (or
+        // grow a subpixel mask of its own).
+        #[cfg(target_os = "macos")]
+        if render_mode == GlyphRenderMode::Alpha
+            && let Some(info) = self.font_system.db().face(cache_key.font_id)
+            && let Some(image) =
+                self.native_rasterizer
+                    .rasterize(&font, &info.post_script_name, cache_key)
+        {
+            return Some(image);
+        }
+
         let variable_width = font
             .as_swash()
             .variations()
@@ -1880,12 +1899,12 @@ impl WgpuGlyphAtlas {
                     .replay
                     .file_asset()
                     .map(|asset| asset.path().to_owned()),
-                None => f.font_file_path.clone(),
+                None => f.font_file_path.as_deref().map(str::to_owned),
             };
             if let Some(ref path) = prime_path {
                 let _ = self.font_file_cache.prime_file(&mut self.font_system, path);
             }
-            let mut effective_family = f.font_family.clone();
+            let mut effective_family = f.font_family.to_string();
             let mut effective_weight = f.font_weight;
             let mut effective_style = if requested_italic {
                 Some(Style::Italic)
@@ -2033,6 +2052,8 @@ impl WgpuGlyphAtlas {
         self.resolved_fonts_by_fontdb.clear();
         self.color_font_assets.clear();
         self.color_glyph_rasterizer.clear();
+        #[cfg(target_os = "macos")]
+        self.native_rasterizer.clear();
         self.color_font_ids.clear();
         // A missing/replaced platform font can become available after the
         // render-side generation reset. Keep successful fontdb registrations,

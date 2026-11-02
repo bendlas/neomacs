@@ -79,11 +79,11 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `BufferManager: Send`
            `Rc<neomacs_display_protocol::tty_palette::TtyPalette>: Send`
            which is required by `BufferManager: Send`
+           `Rc<xdisp::mode_line_output::OutputState>: Send`
+           which is required by `BufferManager: Send`
            `NonNull<eval::owner_bindings::OwnerSlab>: Send`
            which is required by `BufferManager: Send`
            `Cell<CanonicalArm>: Sync`
-           which is required by `BufferManager: Send`
-           `*mut MarkerObj: Send`
            which is required by `BufferManager: Send`
            `std::sync::mpsc::Receiver<gc::gc_thread::ConcurrentMarkResult>: Sync`
            which is required by `BufferManager: Send`
@@ -107,11 +107,17 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            which is required by `BufferManager: Send`
            `Rc<RefCell<shared::SharedUndoStateInner>>: Send`
            which is required by `BufferManager: Send`
+           `Rc<Cell<Vec<TaggedValue>>>: Send`
+           which is required by `BufferManager: Send`
            `Rc<Cell<*const ()>>: Send`
            which is required by `BufferManager: Send`
            `*mut TaggedHeap: Send`
            which is required by `BufferManager: Send`
            `*const (): Sync`
+           which is required by `BufferManager: Send`
+           `NonNull<MarkerObj>: Send`
+           which is required by `BufferManager: Send`
+           `Rc<window::word_wrap::CachedWordWrapPolicy>: Send`
            which is required by `BufferManager: Send`
            `*mut HashTableObj: Sync`
            which is required by `BufferManager: Send`
@@ -134,6 +140,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            `*mut RecordObj: Send`
            which is required by `BufferManager: Send`
            `*mut SymbolWithPosObj: Send`
+           which is required by `BufferManager: Send`
+           `*mut MarkerObj: Send`
            which is required by `BufferManager: Send`
            `*mut BignumObj: Send`
            which is required by `BufferManager: Send`
@@ -182,6 +190,8 @@ error[E0599]: the associated function or constant `transfer` exists for struct `
            `RefCell<Vec<Option<dynamic_module::GlobalRefEntry>>>: Sync`
            which is required by `BufferManager: Send`
            `Rc<OverlayList>: Send`
+           which is required by `BufferManager: Send`
+           `Rc<Cell<Vec<TaggedValue>>>: Sync`
            which is required by `BufferManager: Send`
            `Rc<Cell<*const ()>>: Sync`
            which is required by `BufferManager: Send`

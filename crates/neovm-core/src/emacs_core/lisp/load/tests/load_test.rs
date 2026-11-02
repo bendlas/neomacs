@@ -2,6 +2,7 @@ use super::*;
 use crate::emacs_core::error::{FlowRef, FlowResultExt as _};
 use crate::emacs_core::eval::VariableView;
 use crate::emacs_core::symbol::CanonicalAccess;
+use crate::host_input::HostInputPublisher;
 fn test_ob() -> crate::emacs_core::symbol::Obarray {
     crate::emacs_core::symbol::Obarray::new()
 }
@@ -57,7 +58,7 @@ fn simulate_active_top_level_command_loop(eval: &mut Context) {
 
 /// Queue the session-ending key bound by
 /// [`simulate_active_top_level_command_loop`]; must be the last queued event.
-fn queue_end_of_session_key(tx: &crossbeam_channel::Sender<crate::keyboard::InputEvent>) {
+fn queue_end_of_session_key(tx: &HostInputPublisher) {
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::named(crate::keyboard::NamedKey::Insert),
     ))
@@ -779,9 +780,8 @@ fn dump_emacs_portable_rejects_other_live_lisp_threads() {
     let mut eval = Context::new();
     eval.threads.create_thread(
         Value::NIL,
-        Some(crate::heap_types::LispString::from_unibyte(
-            b"worker".to_vec(),
-        )),
+        crate::emacs_core::threads::ThreadName::from_lisp(Value::string("worker"))
+            .expect("a string is a valid NAME"),
     );
 
     let err = crate::emacs_core::builtins::builtin_dump_emacs_portable(
@@ -3233,6 +3233,95 @@ fn bootstrap_runtime_cached_gui_surface_restores_window_system_surface() {
         eval.frames.frame_list().is_empty(),
         "display queries should not synthesize a fallback frame before host bootstrap"
     );
+    assert_gnu_runtime_window_sequence_after_preload(&mut eval);
+}
+
+fn assert_gnu_runtime_window_sequence_after_preload(eval: &mut Context) -> crate::window::WindowId {
+    use crate::window::{SplitDirection, SplitPlacement};
+    let frame_id = crate::emacs_core::window_cmds::seed_batch_startup_frame_in_state(
+        &mut eval.frames,
+        &mut eval.buffers,
+    );
+    let frame = eval.frames.get(frame_id).expect("initial runtime frame");
+    let root = frame.selected_window;
+    let mini = frame.minibuffer_window.expect("runtime minibuffer");
+    assert_eq!(eval.frames.window_sequence_number(root).to_string(), "1");
+    assert_eq!(eval.frames.window_sequence_number(mini).to_string(), "2");
+    let scratch = eval
+        .buffers
+        .find_buffer_by_name("*scratch*")
+        .expect("scratch");
+    let additional = eval.frames.create_frame("F2", 80, 25, scratch);
+    let second = eval.frames.get(additional).expect("additional frame");
+    assert_eq!(
+        eval.frames
+            .window_sequence_number(second.selected_window)
+            .to_string(),
+        "3"
+    );
+    assert_eq!(
+        eval.frames
+            .window_sequence_number(second.minibuffer_window.expect("additional minibuffer"))
+            .to_string(),
+        "4"
+    );
+    let split = eval
+        .frames
+        .split_window(
+            frame_id,
+            root,
+            SplitDirection::Vertical,
+            scratch,
+            None,
+            SplitPlacement::AfterTarget,
+        )
+        .expect("split runtime root");
+    assert_eq!(eval.frames.window_sequence_number(split).to_string(), "6");
+    root
+}
+
+#[test]
+fn bootstrap_runtime_source_preload_retires_window_sequences_without_reusing_identity() {
+    crate::test_utils::init_test_tracing();
+    let mut eval = create_bootstrap_evaluator_with_features(&["x", "neomacs"])
+        .expect("uncached source bootstrap");
+    activate_runtime_evaluator(&mut eval, RuntimeImageRole::Final)
+        .expect("activate source runtime");
+    assert!(
+        eval.frames.frame_list().is_empty(),
+        "source preload must leave host frame creation to startup"
+    );
+    // The source preloader's root was #1. Its escaped native handle remains
+    // dead after the runtime root is created, as GNU's nilled dump object does.
+    let retired = Value::make_window(1);
+    eval.set_variable("source-preload-retired-window", retired);
+    assert!(!eval.frames.is_live_window_id(crate::window::WindowId(1)));
+    let root = assert_gnu_runtime_window_sequence_after_preload(&mut eval);
+    assert_ne!(
+        retired.as_window_id(),
+        Some(root.0),
+        "preload identity must not alias the runtime root"
+    );
+    assert!(!eval.frames.is_live_window_id(crate::window::WindowId(1)));
+    assert_eq!(
+        eval_rendered(
+            &mut eval,
+            "(list (window-live-p source-preload-retired-window) (eq source-preload-retired-window (selected-window)))"
+        ),
+        "OK (nil nil)"
+    );
+    assert_eq!(
+        crate::emacs_core::print_value_with_eval(&eval, &retired),
+        "#<window 0>"
+    );
+    assert_eq!(
+        crate::emacs_core::print_value_with_eval(&eval, &Value::make_window(root.0)),
+        "#<window 1 on *scratch*>"
+    );
+    assert_eq!(
+        crate::emacs_core::print_value_bytes_with_eval(&eval, &retired),
+        b"#<window 0>"
+    );
 }
 
 #[test]
@@ -3619,7 +3708,7 @@ fn bootstrap_completing_read_multiple_accepts_exact_must_match_input() {
     assert!(eval.frames.select_frame(frame_id));
     eval.eval_str("(require 'crm)").expect("load crm");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "default".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -3632,7 +3721,6 @@ fn bootstrap_completing_read_multiple_accepts_exact_must_match_input() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let rendered = format_eval_result(&eval.eval_str(
@@ -3811,9 +3899,9 @@ fn bootstrap_runtime_execute_extended_command_exits_minibuffer_on_ret() {
     )
     .expect("eval execute-extended-command RET probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     for ch in "neo-ret-probe".chars() {
@@ -3868,7 +3956,7 @@ fn bootstrap_runtime_command_loop_executes_meta_x_command_on_ret() {
                (exit-recursive-edit)))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -3885,7 +3973,6 @@ fn bootstrap_runtime_command_loop_executes_meta_x_command_on_ret() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -3927,7 +4014,7 @@ fn bootstrap_runtime_rejected_nested_mx_leaves_outer_mx_usable() {
     )
     .expect("install nested M-x recovery probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     let send = |event| {
         tx.send(crate::keyboard::InputEvent::key_press(event))
             .map_err(Box::new)
@@ -3957,7 +4044,6 @@ fn bootstrap_runtime_rejected_nested_mx_leaves_outer_mx_usable() {
     send(crate::keyboard::KeyEvent::char('q')).expect("queue command-loop exit key");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
     let result = command_loop_end_value(
         eval.recursive_edit_inner(),
@@ -4001,13 +4087,13 @@ fn bootstrap_runtime_read_only_local_default_binding_handles_character_input() {
     )
     .expect("install read-only catch-all local binding");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char('a'),
     ))
     .expect("queue catch-all character");
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     let result = command_loop_end_value(
@@ -4082,7 +4168,7 @@ fn bootstrap_runtime_command_loop_executes_help_describe_function_on_ret() {
         }
     }
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -4103,7 +4189,6 @@ fn bootstrap_runtime_command_loop_executes_help_describe_function_on_ret() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let result = command_loop_end_value(
@@ -4158,7 +4243,7 @@ fn bootstrap_runtime_command_loop_meta_s_o_opens_clean_occur_prompt_from_input_r
     )
     .expect("define occur keyboard prompt probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('s', crate::keyboard::Modifiers::meta()),
     ))
@@ -4169,7 +4254,6 @@ fn bootstrap_runtime_command_loop_meta_s_o_opens_clean_occur_prompt_from_input_r
     .expect("queue o");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -4217,7 +4301,7 @@ fn bootstrap_runtime_command_loop_meta_x_ret_opens_clean_nested_grep_prompt_from
     )
     .expect("define grep keyboard prompt probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -4234,7 +4318,6 @@ fn bootstrap_runtime_command_loop_meta_x_ret_opens_clean_nested_grep_prompt_from
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -4304,15 +4387,11 @@ fn bootstrap_runtime_mx_eager_completion_services_printable_input_before_quit() 
         }
     }));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let notifier = eval.wait_notifier();
+    let tx = HostInputPublisher::install(&mut eval);
     let sender = std::thread::spawn(move || {
-        let send = |event, tx: &crossbeam_channel::Sender<crate::keyboard::InputEvent>| {
+        let send = |event, tx: &HostInputPublisher| {
             tx.send(crate::keyboard::InputEvent::key_press(event))
                 .expect("send M-x eager-completion test input");
-            if let Some(notifier) = &notifier {
-                notifier.notify().expect("wake M-x completion wait");
-            }
         };
 
         send(
@@ -4339,7 +4418,6 @@ fn bootstrap_runtime_mx_eager_completion_services_printable_input_before_quit() 
         observed_before_quit
     });
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
     let result = eval
         .recursive_edit_inner()
@@ -4392,7 +4470,7 @@ fn bootstrap_runtime_read_key_after_two_minibuffers_consumes_fresh_key() {
                  (exit-recursive-edit))))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -4433,7 +4511,6 @@ fn bootstrap_runtime_read_key_after_two_minibuffers_consumes_fresh_key() {
     .expect("queue fresh read-key input");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -4489,7 +4566,7 @@ fn bootstrap_runtime_minibuffer_read_restores_outer_this_command_keys() {
              (keymap-global-set "C-c t" #'neo-mb-tck-command))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     // C-c t -> invoke the command (this-command-keys becomes [C-c t]).
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('c', crate::keyboard::Modifiers::ctrl()),
@@ -4512,7 +4589,6 @@ fn bootstrap_runtime_minibuffer_read_restores_outer_this_command_keys() {
     .expect("queue minibuffer RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -4578,12 +4654,12 @@ fn bootstrap_runtime_window_close_routes_through_handle_delete_frame() {
         "new runtime frame should become selectable"
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::WindowClose {
         emacs_frame_id: frame_id.0,
     })
     .expect("queue window close");
-    eval.input_rx = Some(rx);
+
     eval.service_wait_request_special_input_events()
         .expect("window close should be handled as a GNU special event");
 
@@ -4816,8 +4892,8 @@ fn bootstrap_runtime_read_key_sequence_follows_escape_prefix_command() {
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = HostInputPublisher::install(&mut eval);
+
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
         b"\x1bx".to_vec(),
         0,
@@ -4831,26 +4907,28 @@ fn bootstrap_runtime_read_key_sequence_follows_escape_prefix_command() {
 
 #[test]
 fn bootstrap_runtime_read_key_sequence_prioritizes_timer_unread_command_events() {
+    use crate::test_utils::input_wait::{InputGateOwner, WaitWitness};
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
     eval.eval_str(r#"(run-at-time 0 nil (lambda () (setq unread-command-events (list ?\e))))"#)
         .expect("schedule unread ESC timer");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        tx.send(crate::keyboard::InputEvent::KeyPress {
-            key: crate::keyboard::KeyEvent::char('x'),
-            emacs_frame_id: 0,
-        })
-        .expect("queue x host input");
-    });
+    let input_owner = InputGateOwner::install(&mut eval);
+    let (gate, publication) = input_owner.gate(vec![crate::keyboard::InputEvent::key_press(
+        crate::keyboard::KeyEvent::char('x'),
+    )]);
+    gate.arm(&mut eval, WaitWitness::InputWaitEntered);
 
-    let (keys, binding) = eval
-        .read_key_sequence()
-        .expect("read timer-requeued ESC before host x");
+    let read = eval.read_key_sequence();
+    assert_eq!(
+        publication
+            .finish()
+            .expect("required observed wait publication")
+            .witness,
+        WaitWitness::InputWaitEntered
+    );
+    let (keys, binding) = read.expect("read timer-requeued ESC before host x");
     assert_eq!(keys, vec![Value::fixnum(27), Value::fixnum('x' as i64)]);
     assert_eq!(binding, Value::symbol("execute-extended-command"));
 }
@@ -4862,8 +4940,8 @@ fn bootstrap_runtime_escape_prefix_bypasses_input_method_function() {
     eval.eval_str("(setq input-method-function (lambda (_char) nil))")
         .expect("install dropping input method");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = HostInputPublisher::install(&mut eval);
+
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(
         b"\x1bx".to_vec(),
         0,
@@ -4918,8 +4996,8 @@ fn bootstrap_runtime_input_decode_menu_item_filter_translates_escape() {
     )
     .expect("install menu-item filtered ESC input decode entry");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
-    eval.input_rx = Some(rx);
+    let tx = HostInputPublisher::install(&mut eval);
+
     tx.send(crate::keyboard::InputEvent::raw_tty_bytes(vec![0x1b], 0))
         .expect("queue raw TTY escape");
 
@@ -5110,14 +5188,13 @@ fn bootstrap_runtime_read_char_from_input_rx_preserves_ctrl_h_help_char() {
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
     .expect("queue C-h");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let event = eval.read_char().expect("read queued C-h");
     assert_eq!(event, Value::fixnum(8));
 }
@@ -5128,7 +5205,7 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_help_describe_funct
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5139,7 +5216,6 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_help_describe_funct
     .expect("queue f");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let (keys, binding) = eval
         .read_key_sequence()
         .expect("read C-h f sequence from input_rx");
@@ -5153,7 +5229,7 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_help_describe_bindi
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5164,7 +5240,6 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_help_describe_bindi
     .expect("queue b");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let (keys, binding) = eval
         .read_key_sequence()
         .expect("read C-h b sequence from input_rx");
@@ -5178,7 +5253,7 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_help_info_binding()
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5189,7 +5264,6 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_help_info_binding()
     .expect("queue i");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let (keys, binding) = eval
         .read_key_sequence()
         .expect("read C-h i sequence from input_rx");
@@ -5203,7 +5277,7 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_repeat_complex_comm
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5218,7 +5292,6 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_follows_repeat_complex_comm
     .expect("queue second ESC");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let (keys, binding) = eval
         .read_key_sequence()
         .expect("read C-x ESC ESC sequence from input_rx");
@@ -5235,7 +5308,7 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_leaves_following_minibuffer
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5256,7 +5329,6 @@ fn bootstrap_runtime_read_key_sequence_from_input_rx_leaves_following_minibuffer
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let (keys, binding) = eval
         .read_key_sequence()
         .expect("read C-h f sequence from input_rx");
@@ -5287,14 +5359,13 @@ fn bootstrap_runtime_read_char_from_minibuffer_exits_after_first_self_insert() {
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char(' '),
     ))
     .expect("queue space");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     let result = eval
         .eval_str(
             r#"(condition-case err
@@ -5362,7 +5433,7 @@ fn bootstrap_runtime_save_some_buffers_space_saves_modified_file() {
     ))
     .expect("setup save-some-buffers probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -5383,7 +5454,6 @@ fn bootstrap_runtime_save_some_buffers_space_saves_modified_file() {
     .expect("queue SPC");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5439,7 +5509,7 @@ fn bootstrap_runtime_command_loop_sets_last_nonmenu_event_for_keyboard_invocatio
     )
     .expect("define last-nonmenu probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -5456,7 +5526,6 @@ fn bootstrap_runtime_command_loop_sets_last_nonmenu_event_for_keyboard_invocatio
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5503,7 +5572,7 @@ fn bootstrap_runtime_command_loop_disabled_command_consumes_space_reply_once() {
     )
     .expect("setup disabled-command probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5527,7 +5596,6 @@ fn bootstrap_runtime_command_loop_disabled_command_consumes_space_reply_once() {
     queue_end_of_session_key(&tx);
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5584,7 +5652,7 @@ fn bootstrap_runtime_gui_disabled_command_n_cancels_with_new_help_window() {
     )
     .expect("setup GUI disabled-command probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for event in [
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::ctrl()),
         crate::keyboard::KeyEvent::char_with_mods('l', crate::keyboard::Modifiers::ctrl()),
@@ -5596,7 +5664,6 @@ fn bootstrap_runtime_gui_disabled_command_n_cancels_with_new_help_window() {
     queue_end_of_session_key(&tx);
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5638,7 +5705,7 @@ fn bootstrap_runtime_disabled_narrow_to_region_uses_live_region_after_space_repl
     )
     .expect("setup disabled narrow-to-region probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for event in [
         crate::keyboard::KeyEvent::char_with_mods('n', crate::keyboard::Modifiers::ctrl()),
         crate::keyboard::KeyEvent::char_with_mods(' ', crate::keyboard::Modifiers::ctrl()),
@@ -5653,7 +5720,6 @@ fn bootstrap_runtime_disabled_narrow_to_region_uses_live_region_after_space_repl
     }
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5687,7 +5753,7 @@ fn bootstrap_runtime_command_loop_universal_argument_prefix_reaches_following_co
     )
     .expect("setup universal argument probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('u', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5702,7 +5768,6 @@ fn bootstrap_runtime_command_loop_universal_argument_prefix_reaches_following_co
     .expect("queue a");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5743,7 +5808,7 @@ fn bootstrap_runtime_command_loop_raw_universal_argument_reaches_form_interactiv
     )
     .expect("setup raw universal argument probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('u', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5758,7 +5823,6 @@ fn bootstrap_runtime_command_loop_raw_universal_argument_reaches_form_interactiv
     .expect("queue |");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5794,7 +5858,7 @@ fn bootstrap_runtime_minibuffer_restores_raw_universal_argument_for_form_interac
     )
     .expect("setup raw prefix minibuffer probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('u', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -5819,7 +5883,6 @@ fn bootstrap_runtime_minibuffer_restores_raw_universal_argument_for_form_interac
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5869,7 +5932,7 @@ fn bootstrap_runtime_read_from_minibuffer_binds_requested_history_variable_and_p
     )
     .expect("setup read-expression-history probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::named(crate::keyboard::NamedKey::Escape),
     ))
@@ -5890,7 +5953,6 @@ fn bootstrap_runtime_read_from_minibuffer_binds_requested_history_variable_and_p
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5936,7 +5998,7 @@ fn bootstrap_runtime_completing_read_persists_requested_history_variable() {
     )
     .expect("setup completing-read history probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::named(crate::keyboard::NamedKey::Escape),
     ))
@@ -5957,7 +6019,6 @@ fn bootstrap_runtime_completing_read_persists_requested_history_variable() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -5996,7 +6057,7 @@ fn bootstrap_runtime_read_extended_command_recall_uses_extended_command_history(
     )
     .expect("setup read-extended-command history probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::named(crate::keyboard::NamedKey::Escape),
     ))
@@ -6029,7 +6090,6 @@ fn bootstrap_runtime_read_extended_command_recall_uses_extended_command_history(
     .expect("queue second RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -6080,7 +6140,7 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_mx_history_with_numeric_positio
     )
     .expect("setup M-x history command-loop probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -6117,7 +6177,6 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_mx_history_with_numeric_positio
     .expect("queue fallback stop command");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -6187,7 +6246,7 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_calendar_after_quit() {
     )
     .expect("setup calendar M-x history probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::meta()),
     ))
@@ -6228,7 +6287,6 @@ fn bootstrap_runtime_command_loop_meta_p_recalls_calendar_after_quit() {
     .expect("queue fallback stop command");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -6264,9 +6322,9 @@ fn bootstrap_runtime_previous_history_element_recalls_read_expression_history_en
     let frame_id = eval.frames.create_frame("F1", 960, 640, scratch);
     assert!(eval.frames.select_frame(frame_id));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     let rendered = eval_rendered(
@@ -6321,7 +6379,7 @@ fn bootstrap_runtime_disabled_command_from_visited_file_restores_single_selected
     ))
     .expect("setup visited-file disabled-command probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('x', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -6345,7 +6403,6 @@ fn bootstrap_runtime_disabled_command_from_visited_file_restores_single_selected
     queue_end_of_session_key(&tx);
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -6471,7 +6528,7 @@ fn bootstrap_runtime_cx_s_space_saves_typed_edit_from_command_loop() {
     ))
     .expect("setup typed save-some probe");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "omega line\n".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -6506,7 +6563,6 @@ fn bootstrap_runtime_cx_s_space_saves_typed_edit_from_command_loop() {
     .expect("queue finish RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -6568,7 +6624,7 @@ fn bootstrap_runtime_command_loop_logs_help_route_for_ch_f() {
              (advice-add 'describe-function :before #'neo--capture-describe-function))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -6589,7 +6645,6 @@ fn bootstrap_runtime_command_loop_logs_help_route_for_ch_f() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let _ = eval.recursive_edit_inner();
@@ -6635,7 +6690,7 @@ fn bootstrap_runtime_command_loop_logs_help_route_for_ch_b() {
              (advice-add 'describe-bindings :before #'neo--capture-describe-bindings))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -6646,7 +6701,6 @@ fn bootstrap_runtime_command_loop_logs_help_route_for_ch_b() {
     .expect("queue b");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let _ = eval.recursive_edit_inner();
@@ -6691,7 +6745,7 @@ fn bootstrap_runtime_command_loop_traces_describe_function_body_for_ch_f() {
              (advice-add 'describe-function :around #'neo--trace-describe-function))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::char_with_mods('h', crate::keyboard::Modifiers::ctrl()),
     ))
@@ -6712,7 +6766,6 @@ fn bootstrap_runtime_command_loop_traces_describe_function_body_for_ch_f() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
     let result = command_loop_end_value(
         eval.recursive_edit_inner(),
@@ -7598,9 +7651,9 @@ fn bootstrap_runtime_call_interactively_autoloaded_describe_function_reads_promp
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     for ch in "find-file".chars() {
@@ -7648,9 +7701,9 @@ fn bootstrap_runtime_command_execute_autoloaded_describe_function_reads_prompt()
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     for ch in "find-file".chars() {
@@ -7698,9 +7751,9 @@ fn bootstrap_runtime_command_execute_rename_buffer_reads_gnu_interactive_form() 
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     for ch in "renamed-scratch".chars() {
@@ -7747,9 +7800,9 @@ fn bootstrap_runtime_command_execute_goto_line_records_command_history_for_repea
     );
     assert_eq!(setup, "OK \"goto-history\"");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     for ch in "2".chars() {
@@ -7800,9 +7853,9 @@ fn bootstrap_runtime_command_execute_goto_line_installs_gnu_prompt_text() {
     );
     assert_eq!(setup, "OK \"goto-prompt-probe\"");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     let rendered = eval_rendered(
@@ -7839,9 +7892,9 @@ fn bootstrap_runtime_repeat_complex_command_reads_gnu_redo_form_from_command_his
     );
     assert_eq!(setup, "OK \"repeat-complex-command-probe\"");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     let rendered = eval_rendered(
@@ -7879,9 +7932,9 @@ fn bootstrap_runtime_occur_installs_clean_gnu_prompt_text() {
     );
     assert_eq!(setup, "OK \"occur-prompt-probe\"");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     let rendered = eval_rendered(
@@ -7924,9 +7977,9 @@ fn bootstrap_runtime_grep_installs_clean_gnu_prompt_text_and_default_command() {
     );
     assert_eq!(setup, "OK \"grep-prompt-probe\"");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     let rendered = eval_rendered(
@@ -7964,14 +8017,13 @@ fn bootstrap_runtime_read_buffer_to_switch_ret_uses_other_buffer_default() {
     );
     assert_eq!(setup, "OK (\"*scratch*\" \"buffer-completion-target.txt\")");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     tx.send(crate::keyboard::InputEvent::key_press(
         crate::keyboard::KeyEvent::named(crate::keyboard::NamedKey::Return),
     ))
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let result = eval
@@ -8022,7 +8074,7 @@ fn bootstrap_runtime_read_buffer_to_switch_tab_completes_existing_buffer() {
     );
     assert_eq!(setup, "OK (\"*scratch*\" \"buffer-completion-target.txt\")");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "buffer-completion-tar".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -8039,7 +8091,6 @@ fn bootstrap_runtime_read_buffer_to_switch_tab_completes_existing_buffer() {
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let result = eval
@@ -8094,7 +8145,7 @@ fn call_interactively_switch_to_buffer_does_not_redisplay_between_argument_read_
         }
     }));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "buffer-completion-tar".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -8110,7 +8161,7 @@ fn call_interactively_switch_to_buffer_does_not_redisplay_between_argument_read_
     ))
     .expect("queue RET");
     drop(tx);
-    eval.input_rx = Some(rx);
+
     eval.command_loop.running = true;
 
     eval.apply(
@@ -8207,7 +8258,7 @@ fn bootstrap_runtime_command_loop_cx_b_uses_recent_file_buffer_as_second_default
              (advice-add 'switch-to-buffer :after #'neo--stop-after-second-switch))"#,
     );
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     let find_file =
         crate::keyboard::KeySequence::from_description("C-x C-f").expect("C-x C-f sequence");
     for event in find_file.events {
@@ -8252,7 +8303,6 @@ fn bootstrap_runtime_command_loop_cx_b_uses_recent_file_buffer_as_second_default
     .expect("queue RET for second switch-to-buffer");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     simulate_active_top_level_command_loop(&mut eval);
 
     let result = eval
@@ -8283,7 +8333,7 @@ fn bootstrap_runtime_call_interactively_autoloaded_describe_function_reads_promp
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "find-file".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -8296,7 +8346,6 @@ fn bootstrap_runtime_call_interactively_autoloaded_describe_function_reads_promp
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let result = eval
@@ -8333,7 +8382,7 @@ fn bootstrap_runtime_command_execute_autoloaded_describe_function_reads_prompt_f
     let mut eval = create_bootstrap_evaluator_cached().expect("bootstrap");
     apply_runtime_startup_state(&mut eval).expect("runtime startup state");
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "find-file".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -8346,7 +8395,6 @@ fn bootstrap_runtime_command_execute_autoloaded_describe_function_reads_prompt_f
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
 
     let result = eval
@@ -8390,7 +8438,7 @@ fn bootstrap_runtime_call_interactively_describe_function_with_outer_command_sta
     let frame_id = eval.frames.create_frame("F1", 960, 640, scratch);
     assert!(eval.frames.select_frame(frame_id));
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx = HostInputPublisher::install(&mut eval);
     for ch in "find-file".chars() {
         tx.send(crate::keyboard::InputEvent::key_press(
             crate::keyboard::KeyEvent::char(ch),
@@ -8403,7 +8451,6 @@ fn bootstrap_runtime_call_interactively_describe_function_with_outer_command_sta
     .expect("queue RET");
     drop(tx);
 
-    eval.input_rx = Some(rx);
     eval.command_loop.running = true;
     let help_keys = vec![Value::fixnum(8), Value::fixnum('f' as i64)];
     eval.set_command_key_sequences(help_keys.clone(), help_keys);
@@ -9031,6 +9078,32 @@ fn resolve_autoload_load_path_requires_load_suffix_like_gnu() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Assert GNU's `(file-missing "Cannot open load file" TEXT NAME)` shape.
+///
+/// GNU's `Fload` reports a failed `openp` through `report_file_error
+/// ("Cannot open load file", file)` (src/lread.c:1228), and
+/// `report_file_errno` maps ENOENT to the `file-missing` symbol
+/// (src/fileio.c:264-283).  On APFS, GNU's file-name encoding plus the failed
+/// lookup leave ENOENT behind — measured with GNU 31.1 on macOS, whose own
+/// `(load RAW)` answers exactly this shape ("No such file or directory", the
+/// expanded raw name) — so the expectation follows GNU on the host, not the
+/// glibc EILSEQ an in-memory byte-preserving open would get.
+#[cfg(unix)]
+fn assert_load_cannot_open(flow: crate::emacs_core::error::Flow, expected_name: &[u8]) {
+    let (symbol, data) = crate::test_utils::signal_data_bytes(flow);
+    assert_eq!(symbol, "file-missing");
+    assert_eq!(data[0], b"Cannot open load file");
+    assert_eq!(data[1], b"No such file or directory");
+    assert_eq!(data.len(), 3, "GNU includes the file name: {data:?}");
+    assert_eq!(data[2], expected_name);
+}
+
+#[cfg(unix)]
+fn raw_names_rejected() -> bool {
+    crate::emacs_core::platform_facts::RAW_BYTE_FILENAMES
+        == crate::emacs_core::platform_facts::RawByteFilenames::Rejected
+}
+
 #[cfg(unix)]
 #[test]
 fn builtin_load_accepts_raw_unibyte_absolute_filename_values() {
@@ -9047,6 +9120,21 @@ fn builtin_load_accepts_raw_unibyte_absolute_filename_values() {
     path_bytes.push(0xFF);
     path_bytes.extend_from_slice(b".el");
     let raw_path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes.clone()));
+
+    if raw_names_rejected() {
+        // APFS rejects the name inside the syscall; GNU's `load` reports the
+        // failed search (src/lread.c:1228) rather than creating a file under
+        // a substituted name.
+        let mut eval = super::super::eval::Context::new();
+        let value = Value::heap_string(crate::heap_types::LispString::from_unibyte(
+            path_bytes.clone(),
+        ));
+        let flow = crate::emacs_core::builtins::builtin_load(&mut eval, vec![value])
+            .expect_err("a filesystem that rejects raw-byte names cannot open this file");
+        assert_load_cannot_open(flow, &path_bytes);
+        return;
+    }
+
     fs::write(&raw_path, "(setq vm-load-absolute-raw-ran t)\n").expect("write fixture");
 
     let mut eval = super::super::eval::Context::new();
@@ -9078,6 +9166,23 @@ fn builtin_load_resolves_raw_unibyte_load_path_entries() {
     dir_bytes.extend_from_slice(b"/dir-");
     dir_bytes.push(0xFF);
     let raw_dir = PathBuf::from(std::ffi::OsString::from_vec(dir_bytes.clone()));
+
+    if raw_names_rejected() {
+        // The load-path entry cannot exist on this file system.  GNU's openp
+        // opens `DIR/probe' (+ suffixes) directly, so the failure is EILSEQ
+        // and the reported name is the argument the caller asked to load.
+        let mut eval = super::super::eval::Context::new();
+        eval.set_variable(
+            "load-path",
+            Value::list(vec![Value::heap_string(raw_path_entry(dir_bytes.clone()))]),
+        );
+        let flow =
+            crate::emacs_core::builtins::builtin_load(&mut eval, vec![Value::string("probe")])
+                .expect_err("a filesystem that rejects raw-byte names cannot open this entry");
+        assert_load_cannot_open(flow, b"probe");
+        return;
+    }
+
     fs::create_dir_all(&raw_dir).expect("create raw dir");
 
     let file = raw_dir.join("probe.el");
@@ -9116,15 +9221,31 @@ fn builtin_load_substitutes_environment_variables_before_search() {
     dir_bytes.extend_from_slice(b"/env-");
     dir_bytes.push(0xFF);
     let raw_dir = PathBuf::from(std::ffi::OsString::from_vec(dir_bytes.clone()));
-    fs::create_dir_all(&raw_dir).expect("create raw dir");
-
-    let file = raw_dir.join("probe.el");
-    fs::write(&file, "(setq vm-load-env-ran t)\n").expect("write fixture");
 
     let env_name = "NEOVM_LOAD_ENV_RAW";
     unsafe {
         std::env::set_var(env_name, std::ffi::OsString::from_vec(dir_bytes.clone()));
     }
+
+    if raw_names_rejected() {
+        // GNU substitutes `$NAME' before the search and reports that expanded
+        // name when the raw-byte path cannot be opened.
+        let mut expected = dir_bytes.clone();
+        expected.extend_from_slice(b"/probe");
+        let mut eval = super::super::eval::Context::new();
+        let flow = crate::emacs_core::builtins::builtin_load(
+            &mut eval,
+            vec![Value::string(format!("${env_name}/probe"))],
+        )
+        .expect_err("a filesystem that rejects raw-byte names cannot open this file");
+        assert_load_cannot_open(flow, &expected);
+        return;
+    }
+
+    fs::create_dir_all(&raw_dir).expect("create raw dir");
+
+    let file = raw_dir.join("probe.el");
+    fs::write(&file, "(setq vm-load-env-ran t)\n").expect("write fixture");
 
     let mut eval = super::super::eval::Context::new();
     let loaded = crate::emacs_core::builtins::builtin_load(
@@ -10585,7 +10706,7 @@ fn load_file_binds_load_true_file_name_and_current_load_list() {
 
 #[cfg(unix)]
 #[test]
-fn builtin_load_file_accepts_raw_unibyte_filename_values() {
+fn load_file_semantics_accept_raw_unibyte_filename_values() {
     crate::test_utils::init_test_tracing();
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10599,12 +10720,34 @@ fn builtin_load_file_accepts_raw_unibyte_filename_values() {
     path_bytes.push(0xFF);
     path_bytes.extend_from_slice(b".el");
     let raw_path = PathBuf::from(std::ffi::OsString::from_vec(path_bytes.clone()));
+
+    // GNU's `load-file' is `(load (expand-file-name FILE) nil nil t)'
+    // (lisp/files.el:1101-1109).  The name here is absolute, so
+    // expand-file-name is byte-identity and the call is exactly
+    // `(load FILE nil nil t)'; its observable behaviour is what this test
+    // pins, not a private Rust helper.
+    let load_file_args = |value: Value| vec![value, Value::NIL, Value::NIL, Value::T];
+
+    if raw_names_rejected() {
+        // On a file system that cannot store the raw-byte name, GNU's own
+        // `(load RAW ...)' answers (file-missing "Cannot open load file" ...);
+        // measured with GNU 31.1 on macOS.
+        let mut eval = super::super::eval::Context::new();
+        let value = Value::heap_string(crate::heap_types::LispString::from_unibyte(
+            path_bytes.clone(),
+        ));
+        let flow = crate::emacs_core::builtins::builtin_load(&mut eval, load_file_args(value))
+            .expect_err("a filesystem that rejects raw-byte names cannot open this file");
+        assert_load_cannot_open(flow, &path_bytes);
+        return;
+    }
+
     fs::write(&raw_path, "(setq vm-load-file-raw-ran t)\n").expect("write fixture");
 
     let mut eval = super::super::eval::Context::new();
     let value = Value::heap_string(crate::heap_types::LispString::from_unibyte(path_bytes));
-    let loaded = crate::emacs_core::builtins::builtin_load_file(&mut eval, vec![value])
-        .expect("load-file should accept raw unibyte filename values");
+    let loaded = crate::emacs_core::builtins::builtin_load(&mut eval, load_file_args(value))
+        .expect("load-file semantics should accept raw unibyte filename values");
     assert_eq!(loaded, Value::T);
     assert_eq!(
         eval.obarray().symbol_value_copied("vm-load-file-raw-ran"),
@@ -11583,7 +11726,7 @@ fn elc_loading_defines_defcustom_variables() {
 
     let result = eval
         .eval_sub(form0)
-        .map_err(crate::emacs_core::error::map_flow);
+        .map_err(crate::emacs_core::print::map_flow);
     eprintln!("Form 0 result: {:?}", result);
 
     let gds_bound = eval
@@ -15216,7 +15359,7 @@ fn exec_path_dirs_empty_when_path_unset() {
 ///   cargo nextest run -p neovm-core --release --run-ignored ignored-only \
 ///     --no-capture -E 'test(alloc_class_profile_replay_nadvice)'
 #[test]
-#[ignore = "profiling aid; run explicitly in release with --no-capture"]
+#[cfg(feature = "perf-probes")]
 fn alloc_class_profile_replay_nadvice() {
     use crate::tagged::gc::alloc_probe;
     crate::test_utils::init_test_tracing();

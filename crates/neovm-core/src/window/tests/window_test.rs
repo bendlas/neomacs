@@ -1360,6 +1360,22 @@ fn window_cursor_kind_codes_match_gnu_text_cursor_kinds() {
 }
 
 #[test]
+fn source_preload_window_sequence_retirement_refuses_live_frames() {
+    let mut frames = FrameManager::new();
+    let frame = frames.create_frame("preload", 80, 25, BufferId(1));
+    let root = frames.get(frame).expect("preload frame").selected_window;
+    assert_eq!(
+        frames.retire_source_preload_window_sequences(),
+        Err(SourcePreloadWindowRetirementRefusal::LiveFramesRemain),
+    );
+    assert_eq!(frames.window_sequence_number(root).to_string(), "1");
+    assert_eq!(
+        frames.window_sequence_number(WindowId(u64::MAX)),
+        WindowSequenceNumber::Unminted(WindowId(u64::MAX))
+    );
+}
+
+#[test]
 fn create_frame_and_window() {
     crate::test_utils::init_test_tracing();
     let mut mgr = FrameManager::new();
@@ -1385,8 +1401,11 @@ fn gui_default_parameters_seed_scroll_bar_and_fringe_chrome() {
     // though the layout already reserves and draws the scroll bar — the frame
     // parameter lied about what is on screen. Each seeded value equals the layout
     // fallback in window/display.rs, so this is a reporting fix, not a geometry
-    // change. scroll-bar-width stays unseeded on purpose: its fallback tracks the
-    // live char width, so a fixed seed would go stale across a font change.
+    // change. scroll-bar-width stays unseeded on purpose: GNU reports the
+    // configured thickness from `frame-parameter' even when the alist has no
+    // entry (src/frame.c:5437-5456), and Neomacs answers it from
+    // frame_config_scroll_bar_width's toolkit default (16) in the parameter
+    // getter, so a seed would only duplicate that source of truth.
     assert_eq!(
         frame.known_parameter(FrameParam::VerticalScrollBars),
         Some(Value::symbol("right"))
@@ -1556,6 +1575,41 @@ fn nil_internal_window_system_does_not_make_tty_frame_graphic() {
         *frame.root_window().bounds(),
         Rect::new(0.0, 0.0, 100.0, 64.0)
     );
+}
+
+#[test]
+fn window_system_parameter_fallback_follows_the_parameter() {
+    crate::test_utils::init_test_tracing();
+    let mut mgr = FrameManager::new();
+    let fid = mgr.create_frame("F1", 100, 80, BufferId(1));
+    let frame = mgr.get_mut(fid).expect("frame");
+    assert_eq!(frame.effective_window_system(), None);
+
+    // Frames no backend created (batch fixtures, tests) become window-system
+    // frames when Lisp says so, and stop being them when it says otherwise.
+    frame.set_parameter(Value::symbol("window-system"), Value::symbol("neo"));
+    assert_eq!(frame.effective_window_system(), Some(Value::symbol("neo")));
+    frame.set_parameter(Value::symbol("window-system"), Value::NIL);
+    assert_eq!(frame.effective_window_system(), None);
+    frame.set_parameter(Value::symbol("window-system"), Value::symbol("x"));
+    frame.remove_parameter(Value::symbol("window-system"));
+    assert_eq!(frame.effective_window_system(), None);
+}
+
+#[test]
+fn internal_window_system_kind_wins_over_the_parameter() {
+    crate::test_utils::init_test_tracing();
+    let mut mgr = FrameManager::new();
+    let fid = mgr.create_frame("F1", 100, 80, BufferId(1));
+    let frame = mgr.get_mut(fid).expect("frame");
+    frame.set_window_system(Some(Value::symbol("x")));
+
+    // GNU's FRAME_WINDOW_P follows the output method: the Lisp parameter
+    // cannot retract the internal kind, and removing it leaves the kind.
+    frame.set_parameter(Value::symbol("window-system"), Value::NIL);
+    assert_eq!(frame.effective_window_system(), Some(Value::symbol("x")));
+    frame.remove_parameter(Value::symbol("window-system"));
+    assert_eq!(frame.effective_window_system(), Some(Value::symbol("x")));
 }
 
 #[test]

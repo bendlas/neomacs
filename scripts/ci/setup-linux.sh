@@ -25,6 +25,9 @@ readonly -a build_packages=(
     fontconfig
     libfontconfig1-dev
     libfreetype-dev
+    # neomacs-layout-engine's GNU CJK metric test (linux only) links libcairo to
+    # reproduce GNU's ftcr backend (ftcrfont.c); the -dev package provides libcairo.so.
+    libcairo2-dev
     libncurses-dev
     libglib2.0-dev
     libunwind-dev
@@ -96,12 +99,21 @@ case "$profile" in
             gnupg
             libfaketime
             xvfb
+            # Rich 120 Hz software-Vulkan budgets require the fixed capacity proxy.
+            glmark2
             xauth
             x11-utils
             x11-xkb-utils
             xdotool
             wmctrl
             kwin-x11
+            # KWin's decoration plugin.  Without one KWin loads neither
+            # org.kde.breeze nor aurorae's Plastik fallback (org.kde.plasma.core
+            # is absent), so it never publishes _NET_FRAME_EXTENTS -- the
+            # property the issue-582 GNU fullscreen oracle reads to measure the
+            # GTK3 GNU window's decorated outer edge.  Neomacs's own windows
+            # are undecorated, which is why only the GNU arm failed.
+            kwin-style-breeze
             dbus
             imagemagick
             ripgrep
@@ -109,9 +121,15 @@ case "$profile" in
             sway
             wtype
             grim
+            # native_frame_focus::ime drives a real fcitx5 session through the
+            # XIM entry point; pinyin and the unicode addon are the two inputs
+            # it sends, and fcitx5-remote is how the test switches between them.
+            fcitx5
+            fcitx5-chinese-addons
+            fcitx5-modules
             "${font_packages[@]}"
         )
-        required_commands=(gpg rg Xvfb xauth xdpyinfo xprop xwininfo xkbcomp xdotool wmctrl kwin_x11 dbus-run-session fc-match import weston sway wtype grim)
+        required_commands=(glmark2 timeout xvfb-run gpg rg Xvfb xauth xdpyinfo xprop xwininfo xkbcomp xdotool wmctrl kwin_x11 dbus-run-session fc-match import weston sway wtype grim fcitx5)
         requires_libfaketime=true
         install_nerd_fonts=true
         ;;

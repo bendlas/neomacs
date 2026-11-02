@@ -1,12 +1,13 @@
 use crate::common::assert_oracle_parity;
 use crate::common::return_if_neovm_enable_oracle_proptest_not_set;
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_inlinetask_region_insert_promote_demote_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"* Parent\\nBefore text\\n***** TODO \\nBody line one\\nBody line two\\n\\n***** END\\n\\nAfter text\\n\" 22 73 nil 5 \"* Parent\\nBefore text\\n***** TODO \\nBody line one\\nBody line two\\n\\n***** END\\n\\nAfter text\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -43,7 +44,7 @@ fn org_inlinetask_region_insert_promote_demote_combo() {
               (org-inlinetask-at-task-p)
               (org-inlinetask-get-task-level)
               (buffer-substring-no-properties
-               (point-min) (point-max))))))"##,
+               (point-min) (point-max)))))))"##,
         expect,
     );
 }
@@ -95,12 +96,13 @@ fn org_inlinetask_element_export_archive_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_inlinetask_visibility_and_remove_end_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((t t 4) org-fold-outline nil \"* Parent\\n**** TODO Inline\\nHidden body\\n\\n** Child\\nBody\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -129,17 +131,18 @@ fn org_inlinetask_visibility_and_remove_end_combo() {
                 folded
                 (org-fold-folded-p (line-end-position) 'headline)
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_inlinetask_fontify_edit_export_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r##""OK (((\"Inline Alpha\" t org-inlinetask t) (\"Inline Beta\" t org-inlinetask t) (\"bold\" t org-warning t) (\"link\" t org-warning t)) (org-fold-outline 2) ((\"DONE\" \"Inline Alpha\" (\"new\") (timestamp (:standard-properties [128 nil nil nil 144 0 nil nil nil nil nil nil nil nil nil nil nil nil] :type active :range-type nil :raw-value \"<2026-05-27 Wed>\" :year-start 2026 :month-start 5 :day-start 27 :hour-start nil :minute-start nil :year-end 2026 :month-end 5 :day-end 27 :hour-end nil :minute-end nil))) (\"WAIT\" \"Inline Beta\" nil nil)) t t t \"<div id=\\\"outline-container-org-id\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"org-id\\\"><span class=\\\"section-number-2\\\">1.</span> Parent</h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<p>\\nBefore.\\n</p>\\n<div class=\\\"inlinetask\\\">\\n<b><span class=\\\"done DONE\\\">DONE</span> Inline Alpha&nbsp;&nbsp;&nbsp<span class=\\\"tag\\\"><span class=\\\"new\\\">new</span></span></b><br />\\n<p>\\nBody with <b>bold</b> and <a href=\\\"https://example.org\\\">link</a>.\\n</p>\\n</div>\\n<div class=\\\"inlinetask\\\">\\n<b><span class=\\\"todo WAIT\\\">WAIT</span> Inline Beta</b><br />\\n<p>\\nBeta body.\\n</p>\\n</div>\\n</div>\\n</div>\\n\" \"#+TITLE: Inline Font\\n* Parent\\nBefore.\\n**** DONE Inline Alpha                                                  :new:\\nSCHEDULED: <2026-05-27 Wed>\\nBody with *bold* and [[https://example.org][link]].\\n**** END\\n**** WAIT Inline Beta\\n:PROPERTIES:\\n:Effort: 0:10\\n:END:\\nBeta body.\\n**** END\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -209,17 +212,16 @@ fn org_inlinetask_fontify_edit_export_combo() {
                   (not (null (string-match-p "new" html)))
                   html
                   (buffer-substring-no-properties
-                   (point-min) (point-max))))))))"##,
+                   (point-min) (point-max)))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_inlinetask_cycle_hook_odd_levels_error_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""ERR (user-error \"Not in an inline task\")""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -295,17 +297,18 @@ fn org_inlinetask_cycle_hook_odd_levels_error_combo() {
                 after-demote
                 after-promote
                 (buffer-substring-no-properties
-                 (point-min) (point-max)))))))"##,
+                 (point-min) (point-max))))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_inlinetask_adjacent_boundary_cut_paste_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[
+        r#""OK ((user-error \"Cannot nest inline tasks\") 3 ((initial ((\"First inline\" 3 \"**** TODO First inline\" t t 4 3 6 org-hide) (\"First body\" 4 \"First body\" nil t 4 3 6 nil) (\"Second inline\" 6 \"**** WAIT Second inline\" t t 4 6 9 org-hide) (\"Second body\" 7 \"Second body\" nil t 4 6 9 nil) (\"Third no end\" 9 \"**** TODO Third no end\" t t 4 9 10 org-hide) (\"Third body\" 10 \"Third body\" nil nil 4 9 11 nil) (\"After\" 11 \"** After\" nil nil 4 9 12 org-level-2)) 5 \"* Parent\\nIntro\\n**** TODO First inline\\nFirst body\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\nThird body\\n** After\\nAfter body\\n\") (after-boundary-insert ((\"First inline\" 3 \"**** TODO First inline\" t t 4 3 6 org-hide) (\"First body\" 4 \"First body\" nil t 4 3 6 nil) (\"Second inline\" 9 \"**** WAIT Second inline\" t t 4 9 12 org-hide) (\"Second body\" 10 \"Second body\" nil t 4 9 12 nil) (\"Third no end\" 12 \"**** TODO Third no end\" t t 4 12 13 org-hide) (\"Third body\" 13 \"Third body\" nil nil 4 12 14 nil) (\"After\" 14 \"** After\" nil nil 4 12 15 org-level-2)) 7 \"* Parent\\nIntro\\n**** TODO First inline\\nFirst body\\n**** END\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\nThird body\\n** After\\nAfter body\\n\") (after-no-end-goto-end ((\"First inline\" 3 \"**** TODO First inline\" t t 4 3 6 org-hide) (\"First body\" 4 \"First body\" nil t 4 3 6 nil) (\"Second inline\" 9 \"**** WAIT Second inline\" t t 4 9 12 org-hide) (\"Second body\" 10 \"Second body\" nil t 4 9 12 nil) (\"Third no end\" 12 \"**** TODO Third no end\" t t 4 12 13 org-hide) (\"Third body\" 14 \"Third body\" nil nil 4 12 15 nil) (\"After\" 13 \"Line after third end calc\" nil nil 4 12 14 nil)) 7 \"* Parent\\nIntro\\n**** TODO First inline\\nFirst body\\n**** END\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\nLine after third end calc\\nThird body\\n** After\\nAfter body\\n\") (after-demote-first ((\"First inline\" 3 \"***** TODO First inline\" t t 5 3 6 nil) (\"First body\" 4 \" First body\" nil t 5 3 6 nil) (\"Second inline\" 9 \"**** WAIT Second inline\" t t 4 9 12 org-hide) (\"Second body\" 10 \"Second body\" nil t 4 9 12 nil) (\"Third no end\" 12 \"**** TODO Third no end\" t t 4 12 13 org-hide) (\"Third body\" 14 \"Third body\" nil nil 4 12 15 nil) (\"After\" 13 \"Line after third end calc\" nil nil 4 12 14 nil)) 7 \"* Parent\\nIntro\\n***** TODO First inline\\n First body\\n***** END\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\nLine after third end calc\\nThird body\\n** After\\nAfter body\\n\") (after-promote-first ((\"First inline\" 3 \"**** TODO First inline\" t t 4 3 6 nil) (\"First body\" 4 \"First body\" nil t 4 3 6 nil) (\"Second inline\" 9 \"**** WAIT Second inline\" t t 4 9 12 org-hide) (\"Second body\" 10 \"Second body\" nil t 4 9 12 nil) (\"Third no end\" 12 \"**** TODO Third no end\" t t 4 12 13 org-hide) (\"Third body\" 14 \"Third body\" nil nil 4 12 15 nil) (\"After\" 13 \"Line after third end calc\" nil nil 4 12 14 nil)) 7 \"* Parent\\nIntro\\n**** TODO First inline\\nFirst body\\n**** END\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\nLine after third end calc\\nThird body\\n** After\\nAfter body\\n\") (after-cut-paste-first ((\"First inline\" 10 \"**** TODO First inline\" t t 4 10 13 nil) (\"First body\" 11 \"First body\" nil t 4 10 13 nil) (\"Second inline\" 6 \"**** WAIT Second inline\" t t 4 6 9 org-hide) (\"Second body\" 7 \"Second body\" nil t 4 6 9 nil) (\"Third no end\" 9 \"**** TODO Third no end\" t t 4 9 10 org-hide) (\"Third body\" 14 \"Third body\" nil nil 4 10 15 nil) (\"After\" 13 \"Line after third end calc\" nil nil 4 10 14 nil)) 7 \"* Parent\\nIntro\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\n**** TODO First inline\\nFirst body\\n**** END\\nLine after third end calc\\nThird body\\n** After\\nAfter body\\n\") (after-region-no-state ((\"First inline\" 10 \"**** TODO First inline\" t t 4 10 13 nil) (\"First body\" 11 \"First body\" nil t 4 10 13 nil) (\"Second inline\" 6 \"**** WAIT Second inline\" t t 4 6 9 org-hide) (\"Second body\" 7 \"Second body\" nil t 4 6 9 nil) (\"Third no end\" 9 \"**** TODO Third no end\" t t 4 9 10 org-hide) (\"Third body\" 14 \"Third body\" nil nil 4 10 17 nil) (\"After\" 13 \"Line after third end calc\" nil nil 4 10 17 nil)) 9 \"* Parent\\nIntro\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\n**** TODO First inline\\nFirst body\\n**** END\\nLine after third end calc\\nThird body\\n** After\\n**** \\nAfter body\\n\\n**** END\\n\\n\")) \"* Parent\\nIntro\\n**** NEXT Inserted before second\\n\\n**** END\\n**** WAIT Second inline\\nSecond body\\n**** END\\n**** TODO Third no end\\n**** TODO First inline\\nFirst body\\n**** END\\nLine after third end calc\\nThird body\\n** After\\n**** \\nAfter body\\n\\n**** END\\n\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -400,11 +403,14 @@ fn org_inlinetask_adjacent_boundary_cut_paste_combo() {
             (search-forward "First inline")
             (beginning-of-line)
             (let ((cut-start (line-number-at-pos)))
-              (org-cut-subtree)
+              (kill-region (point)
+                           (save-excursion
+                             (org-inlinetask-goto-end)
+                             (point)))
               (goto-char (point-min))
               (search-forward "After")
               (beginning-of-line)
-              (org-paste-subtree 2)
+              (yank)
               (push (snapshot 'after-cut-paste-first) states)
               (goto-char (point-min))
               (search-forward "After body")
@@ -416,7 +422,7 @@ fn org_inlinetask_adjacent_boundary_cut_paste_combo() {
                     cut-start
                     (nreverse states)
                     (buffer-substring-no-properties
-                     (point-min) (point-max))))))))"##,
+                     (point-min) (point-max))))))))))"##,
         expect,
     );
 }

@@ -191,6 +191,22 @@ fn category_set_bits(category_set: &Value) -> Option<u128> {
     }
 }
 
+pub(crate) fn category_bit_runs_in_table(table: Value) -> Option<Vec<(u32, u32, u128)>> {
+    Some(
+        super::chartable::char_table_atomic_runs_in_range(&table, 0, i64::MAX)
+            .ok()?
+            .into_iter()
+            .map(|(set, start, end)| {
+                (
+                    start as u32,
+                    end as u32,
+                    category_set_bits(&set).unwrap_or(0),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn make_category_set_from_bits(bits: u128) -> Value {
     boolvec::bool_vector_from_u128(128, bits)
 }
@@ -811,4 +827,17 @@ pub(crate) fn char_has_category_in_table_with_symbols(
 ) -> Result<bool, Flow> {
     let category_set = super::chartable::ct_lookup_with_symbols(&table, c as i64, mode)?;
     category_set_contains(&category_set, category as char)
+}
+
+/// Debug-only carrier TLS fingerprint for this module's classified records.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    crate::tls_fingerprint::mix(
+        h,
+        STANDARD_CATEGORY_TABLE_HEAP.with(|slot| slot.get() as u64),
+    );
+    crate::tls_fingerprint::mix(
+        h,
+        STANDARD_CATEGORY_TABLE_OBJECT.with(|slot| slot.borrow().is_some() as u64),
+    );
 }

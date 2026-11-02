@@ -199,28 +199,46 @@ impl Context {
         })
     }
 
-    /// `eval_lambda_body_forms`.
+    /// `eval_lambda_body_forms`: GNU `funcall_lambda` evaluates the body with
+    /// `Fprogn` (eval.c:3448-3455), so the body is a sequence owner: one
+    /// frame for its temps and a traced slot for the prefetched
+    /// continuation, released on success, error and thread-block returns.
     fn ti_body_forms(&mut self, act: &Act, body: Value, seq: &Seq) -> EvalResult {
-        let mut cursor = body;
-        let mut last = Value::NIL;
-        let mut index = 0;
-        while cursor.is_cons() {
-            match self.ti_nth(act, cursor.cons_car(), seq, index).kinded() {
-                Ok(value) => last = value,
-                Err(FlowKind::ThreadBlocked(blocked)) => {
-                    let remaining_forms = if blocked.remaining_forms.is_nil() {
-                        cursor.cons_cdr()
-                    } else {
-                        blocked.remaining_forms
-                    };
-                    return Err(Flow::thread_blocked(blocked.blocker, remaining_forms));
+        let temp_scope = self.save_sequence_temp_roots();
+        let continuation = self.push_saved_continuation(body);
+        let result = (|| {
+            let mut cursor = body;
+            let mut last = Value::NIL;
+            let mut index = 0;
+            while cursor.is_cons() {
+                // As `sf_progn_value`: GNU Fprogn reads the rest of the list
+                // before the form runs, so a form that mutates the list
+                // cannot skip its later siblings.  A stale compiled Seq node
+                // cannot override the actual form: `ti_nth` falls back to an
+                // island evaluation whenever the form is not the object the
+                // node was compiled from.
+                let form = cursor.cons_car();
+                let rest = cursor.cons_cdr();
+                self.set_saved_continuation(continuation, rest);
+                cursor = rest;
+                match self.ti_nth(act, form, seq, index).kinded() {
+                    Ok(value) => last = value,
+                    Err(FlowKind::ThreadBlocked(blocked)) => {
+                        let remaining_forms = if blocked.remaining_forms.is_nil() {
+                            rest
+                        } else {
+                            blocked.remaining_forms
+                        };
+                        return Err(Flow::thread_blocked(blocked.blocker, remaining_forms));
+                    }
+                    Err(flow) => return Err(Flow::from_kind(flow)),
                 }
-                Err(flow) => return Err(Flow::from_kind(flow)),
+                index += 1;
             }
-            cursor = cursor.cons_cdr();
-            index += 1;
-        }
-        Ok(last)
+            Ok(last)
+        })();
+        self.restore_sequence_temp_roots(temp_scope);
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -388,16 +406,8 @@ impl Context {
             return None;
         }
         let (head, leaf) = self.ti_head_leaf(f);
-        let (
-            true,
-            Some(func),
-            HeadClass::Subr {
-                function,
-                min_args,
-                max_args,
-            },
-            Op::Call(args),
-        ) = (leaf, head.func, head.class, &f.op)
+        let (true, Some(func), EvalDispatch::Call(CallTarget::Primitive(call)), Op::Call(args)) =
+            (leaf, head.func, head.dispatch, &f.op)
         else {
             return None;
         };
@@ -414,8 +424,8 @@ impl Context {
         let stack_base = self.bc_buf.len();
         let first_arg = stack_base + 1;
         if !cursor.is_nil()
-            || nargs < min_args as usize
-            || max_args.is_some_and(|m| nargs > m as usize)
+            || nargs < call.min_args as usize
+            || call.max_args.is_some_and(|m| nargs > m as usize)
             || BytecodeBacktraceSpan::try_new(first_arg, nargs).is_none()
         {
             return None;
@@ -438,7 +448,7 @@ impl Context {
             };
             self.bc_buf.push(value);
         }
-        match self.dispatch_subr_fn_from_bc_stack(function, first_arg, nargs) {
+        match self.dispatch_subr_fn_from_bc_stack(call.function, first_arg, nargs) {
             Ok(value) => {
                 // `retire_cons_frame`'s trivial arm for an EVALD
                 // operand-stack span.
@@ -563,13 +573,19 @@ impl Context {
             return (head, leaf);
         }
         let head = FormHead::classify(f.head_id, self.obarray.symbol_function_id(f.head_id));
-        let leaf = matches!(head.class, HeadClass::Subr { .. })
+        let leaf = matches!(head.dispatch, EvalDispatch::Call(CallTarget::Primitive(_)))
             && head.func.is_some_and(is_lazy_leaf_subr);
         f.head_cache.set((epoch, head, leaf));
         (head, leaf)
     }
 
-    /// The tree walker's dispatch of a form this node cannot run.
+    /// The tree walker's full resolution of a form this node cannot run.
+    ///
+    /// Every shape that reaches the island is one the classified fast arms
+    /// decline (an Escape shape, or a special-form handler that disagrees with
+    /// the compiled node), so the island takes the one slow entry directly
+    /// instead of re-classifying to reach it.  The frame, the debug arm and
+    /// the signal/retirement wrapper are `ti_form_cons`'s, exactly as before.
     #[inline(never)]
     fn ti_island(
         &mut self,
@@ -580,7 +596,15 @@ impl Context {
     ) -> EvalResult {
         self.tier_i.stats.note(TierIEvent::Island);
         let lexenv = self.lexenv;
-        let result = self.eval_sub_cons_dispatch(original_fun, original_args, outer_bt_count);
+        let symbol_mode = self.symbol_mode();
+        let result = self.eval_cons_slow(
+            original_fun,
+            original_args,
+            outer_bt_count,
+            symbol_mode,
+            original_fun.as_symbol_id(symbol_mode),
+            None,
+        );
         if self.lexenv.bits() != lexenv.bits() {
             act.markers.set(true);
         }
@@ -609,17 +633,14 @@ impl Context {
             return self.ti_island(act, original_fun, original_args, outer_bt_count);
         };
         match &f.op {
-            Op::Call(args) => match head.class {
-                HeadClass::Subr {
-                    function,
-                    min_args,
-                    max_args,
-                } => {
+            Op::Call(args) => match head.dispatch {
+                EvalDispatch::Call(CallTarget::Primitive(call)) => {
                     let numargs = match list_length(&original_args) {
                         Some(n) => n,
                         None => return Err(self.listp_error(original_args)),
                     };
-                    if numargs < min_args as usize || max_args.is_some_and(|m| numargs > m as usize)
+                    if numargs < call.min_args as usize
+                        || call.max_args.is_some_and(|m| numargs > m as usize)
                     {
                         return Err(signal(
                             LispCondition::WrongNumberOfArguments,
@@ -633,14 +654,20 @@ impl Context {
                     let (first_arg, nargs) =
                         self.ti_call_args_onto_stack(act, func, original_args, args)?;
                     self.set_backtrace_args_evalled_bc_span(outer_bt_count, first_arg, nargs);
-                    self.dispatch_subr_fn_from_bc_stack(function, first_arg, nargs)
+                    self.dispatch_subr_fn_from_bc_stack(call.function, first_arg, nargs)
                 }
-                HeadClass::ByteCode | HeadClass::Lambda => {
-                    let bc_data = match head.class {
-                        HeadClass::ByteCode => func.get_bytecode_data(),
+                EvalDispatch::Call(CallTarget::Bytecode)
+                | EvalDispatch::Call(CallTarget::InterpretedClosure) => {
+                    let bc_data = match head.dispatch {
+                        EvalDispatch::Call(CallTarget::Bytecode) => func.get_bytecode_data(),
                         _ => None,
                     };
-                    if bc_data.is_none() && !matches!(head.class, HeadClass::Lambda) {
+                    if bc_data.is_none()
+                        && !matches!(
+                            head.dispatch,
+                            EvalDispatch::Call(CallTarget::InterpretedClosure)
+                        )
+                    {
                         return self.ti_island(act, original_fun, original_args, outer_bt_count);
                     }
                     if list_length(&original_args).is_none() {
@@ -656,7 +683,7 @@ impl Context {
                         None => self.apply_closure_from_bc_stack(func, first_arg, nargs),
                     }
                 }
-                HeadClass::Slow => match self.ti_alias_target(f, func) {
+                EvalDispatch::Escape(_) => match self.ti_alias_target(f, func) {
                     AliasTarget::None => {
                         self.ti_island(act, original_fun, original_args, outer_bt_count)
                     }
@@ -669,12 +696,15 @@ impl Context {
                         args,
                     ),
                 },
-                HeadClass::SpecialForm(_) => {
+                EvalDispatch::Special(_)
+                | EvalDispatch::Atom
+                | EvalDispatch::Symbol(_)
+                | EvalDispatch::Literal(_) => {
                     self.ti_island(act, original_fun, original_args, outer_bt_count)
                 }
             },
-            op => match head.class {
-                HeadClass::SpecialForm(handler) if op.handler() == Some(handler) => {
+            op => match head.dispatch {
+                EvalDispatch::Special(kind) if op.handler() == Some(kind.0) => {
                     if list_length(&original_args).is_none() {
                         return Err(self.listp_error(original_args));
                     }
@@ -900,15 +930,26 @@ impl Context {
 
     /// The loop inside `sf_progn_value`'s temp-root scope.
     fn ti_progn_forms(&mut self, act: &Act, forms: Value, seq: &Seq) -> EvalResult {
+        // As `sf_progn_value`: the prefetched continuation is a traced slot
+        // in this progn's sequence scope, not an unrooted stack local.
+        let continuation = self.push_saved_continuation(forms);
         let mut cursor = forms;
         let mut last = Value::NIL;
         let mut index = 0;
         while cursor.is_cons() {
-            match self.ti_nth(act, cursor.cons_car(), seq, index).kinded() {
+            // As `sf_progn_value`: GNU Fprogn reads the rest of the list
+            // before the form runs, so a form that mutates the list cannot
+            // skip its later siblings.  An improper final tail ends the
+            // loop; GNU does not validate it.
+            let form = cursor.cons_car();
+            let rest = cursor.cons_cdr();
+            self.set_saved_continuation(continuation, rest);
+            cursor = rest;
+            match self.ti_nth(act, form, seq, index).kinded() {
                 Ok(value) => last = value,
                 Err(FlowKind::ThreadBlocked(blocked)) => {
                     let remaining_forms = if blocked.remaining_forms.is_nil() {
-                        cursor.cons_cdr()
+                        rest
                     } else {
                         blocked.remaining_forms
                     };
@@ -916,11 +957,7 @@ impl Context {
                 }
                 Err(flow) => return Err(Flow::from_kind(flow)),
             }
-            cursor = cursor.cons_cdr();
             index += 1;
-        }
-        if !cursor.is_nil() {
-            return Err(self.listp_error(forms));
         }
         Ok(last)
     }
@@ -1327,8 +1364,15 @@ impl Context {
             context.ti_untrust(act);
         }
 
-        // As `sf_let_value_named`: nothing below can collect until the
-        // environment is installed (only conses are allocated).
+        // As `sf_let_value_named`: the operand-stack slice is GNU Flet's
+        // `temps[]`, taken as ONE contiguous root run for the whole body
+        // (one reserve and one copy per `let`, never a root push per
+        // binding); the enclosing EvalTempRootsToSequenceGuard owns it.
+        // Nothing below can collect until the environment is installed
+        // (only conses are allocated).
+        let temps = temps_base..context.bc_buf.len();
+        let (bc_buf, eval_temp_roots) = (&context.bc_buf, &mut context.eval_temp_roots);
+        eval_temp_roots.extend_from_slice(&bc_buf[temps]);
         context.bc_buf.truncate(temps_base);
         let lexenv_at_entry = context.lexenv;
         let specpdl_count = context.specpdl.len();
@@ -1350,13 +1394,9 @@ impl Context {
         }
         context.lexenv = new_lexenv;
 
-        for value in lexical_bindings
-            .iter()
-            .map(|(_, value, _)| value)
-            .chain(dynamic_sym_ids.iter().map(|(_, value)| value))
-        {
-            context.push_eval_temp_root(*value);
-        }
+        // As `sf_let_value_named`: every evaluated initializer is already in
+        // the body-wide temps run appended above; a dynamic value only needs
+        // it before `try_specbind`'s watchers can run.
         for (sym_id, value) in &dynamic_sym_ids {
             if let Err(flow) = context.try_specbind(*sym_id, *value) {
                 return context.unbind_to_with_result(specpdl_count, Err(flow));

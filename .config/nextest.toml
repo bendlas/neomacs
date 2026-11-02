@@ -7,6 +7,11 @@ experimental = ["wrapper-scripts", "setup-scripts"]
 [scripts.wrapper.memory-limit]
 command = 'prlimit --as=8589934592 --'
 
+# Compile-contract drivers spawn compiler workers, not Lisp/VM test threads.
+# Keep the same address-space bound without reserving 128MiB for each worker.
+[scripts.wrapper.compiler-memory-limit]
+command = 'env -u RUST_MIN_STACK prlimit --as=8589934592 --'
+
 [scripts.setup.melpa-infra-preflight]
 command = { command-line = "scripts/melpa-infra-preflight.sh", relative-to = "workspace-root" }
 slow-timeout = { period = "60s", terminate-after = 1 }
@@ -14,6 +19,15 @@ capture-stdout = true
 capture-stderr = true
 
 [profile.default]
+# The P11 thread soak (tests/core.rs -> thread_soak.rs, test `thread_soak::soak`) is a driver: it
+# spawns a built editor on the tracked rows under crates/neovm-core/tests/soak/ through the tracked
+# portable launcher. Its default mode is a smoke (14 scenarios x Sim + green at 1 s, <= 2 min), so it
+# runs in default `cargo nextest run`; the editor is resolved from NEOVM_BINARY_PATH / NEOMACS_BIN
+# (both exported by CI for the runtime artifact) or the workspace's target/release/neomacs, and a
+# missing editor fails with the actionable build message rather than silently skipping.
+# The [[profile.default.scripts]] filter further down still excludes this test from the memory-limit
+# wrapper: the wrapper's RLIMIT_AS cap makes pthread_create fail with EAGAIN at a few hundred green
+# threads (SOAK-FINDING #1), and the launcher applies its own per-row sandbox budget instead.
 test-threads = 24
 
 # Many tests use the bootstrap evaluator (which loads 122 .el files)
@@ -33,13 +47,27 @@ slow-timeout = { period = "600s", terminate-after = 1, grace-period = "0s" }
 # not for constraining a spawned production GUI stack. Both files are now
 # modules of the gui binary, so match their module prefixes instead of the
 # former per-file binary IDs.
+#
+# The thread soak is the same case one level deeper: it drives a spawned
+# production editor with up to 300 Lisp threads, and their stacks are virtual
+# address-space reservations. Under the 8GB RLIMIT_AS the editor's baseline VA
+# plus 300 thread stacks crosses the cap and pthread_create fails with EAGAIN
+# (measured: RLIMIT_AS 8589934592, RLIMIT_NPROC 384632, child RSS ~7MB, cgroup
+# max/oom events 0 — P11 soak finding). The editor also needs the real
+# environment a shipped editor has, so the soak runs outside this guardrail;
+# its own per-scenario SANDBOX_MEM_GB budget bounds RSS instead.
 [[profile.default.scripts]]
-filter = 'not (package(neomacs-gui-tests) and (test(~real_gui_smoke::) or test(~child_frame_animation::)))'
+filter = 'not test(/compile_contracts$/) and not (package(neomacs-gui-tests) and (test(~real_gui_smoke::) or test(~child_frame_animation::))) and not (package(neovm-core) and test(=thread_soak::soak))'
 # `prlimit` is a Linux util-linux executable, not a generic Unix interface.
 # macOS is cfg(unix) too, but has no `prlimit`; selecting by the actual host OS
 # keeps hosted native tests executable instead of failing before test startup.
 platform = { host = "cfg(target_os = \"linux\")" }
 run-wrapper = 'memory-limit'
+
+[[profile.default.scripts]]
+filter = 'test(/compile_contracts$/)'
+platform = { host = "cfg(target_os = \"linux\")" }
+run-wrapper = 'compiler-memory-limit'
 
 # Start both editor adapters once before package parity cases are dispatched.
 # Harness contract tests use fake runtimes, and source-lock tests only parse
@@ -116,16 +144,31 @@ slow-timeout = { period = "120s", terminate-after = 1 }
 filter = 'package(neovm-core) and (test(expanded_cache_replay_preserves_nadvice_eval_and_compile_helpers) or test(expanded_cache_replay_preserves_oclosure_define_class_registration))'
 slow-timeout = { period = "1200s", terminate-after = 1 }
 
-# A couple of subprocess probes are timing sensitive rather than divergent:
-# `process_attributes_running_child` reads `process-running-child-p' while a
-# 0.2s child is alive, and `quit_process_sentinel_message' waits (a bounded
-# `accept-process-output' budget) for a SIGQUIT sentinel to fire. A fully
-# parallel run can steal enough scheduling latency to miss the window. Run them
-# isolated (adequate latency), like the heavy families, rather than reshaping
-# the probes (a longer-lived child would hold the process pipe open and block
-# the eval).
+# Each inlined_call_semantics test runs the full engine matrix: both GNU and
+# Neomacs evaluate every ~40 env row, so one test is ~80 subprocess runs.
+# Measured alone they take 17-23s; a fully parallel oracle run starves them
+# past the 60s single-form watchdog (four of them timed out in a 12-thread run
+# on a loaded machine, then all passed in isolation).  They are heavy, not
+# hung: run them without parallel contention and keep the 120s ceiling of the
+# other heavy oracle families.
 [[profile.default.overrides]]
-filter = 'package(neovm-oracle-tests) and (test(process_attributes_running_child) or test(quit_process_sentinel_message))'
+filter = 'package(neovm-oracle-tests) and test(inlined_call_semantics::)'
+threads-required = "num-test-threads"
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# A handful of subprocess probes are timing sensitive rather than divergent:
+# `process_attributes_running_child` reads `process-running-child-p' while a
+# 0.2s child is alive, `quit_process_sentinel_message' waits (a bounded
+# `accept-process-output' budget) for a SIGQUIT sentinel to fire, and the
+# process-filter/coding probes below read output a child writes immediately
+# after start (`accept-process-output` returns as soon as any bytes arrive, so
+# a starved run can observe a partial or empty buffer). A fully parallel run
+# can steal enough scheduling latency to miss the window. Run them isolated
+# (adequate latency), like the heavy families, rather than reshaping the
+# probes (a longer-lived child would hold the process pipe open and block the
+# eval).
+[[profile.default.overrides]]
+filter = 'package(neovm-oracle-tests) and (test(process_attributes_running_child) or test(quit_process_sentinel_message) or test(div_cx45_process_env_coding_narrow_output_filter_hash_mega) or test(div_cx428_process_filter_insert) or test(proc_decode_search_replace) or test(div_cx33_process_kill_query_off_then_kill_buffer) or test(div_core_divergence_surface_process_attributes_running_child_combo) or test(divergence_process_output_to_buffer))'
 threads-required = "num-test-threads"
 
 # The generative window-tree property replays whole operation SEQUENCES in both

@@ -25,11 +25,11 @@ impl GcTraceKind {
     }
 }
 
-/// Fixed command-loop identities. Each spelling is resolved once per registry
-/// epoch. A use after arbitrary Lisp
-/// must call `id` again: callbacks may unintern a symbol or replace the registry.
+/// Fixed command-loop identities: GNU DEFSYM statics with compile-time ids,
+/// no lock and no epoch. A caller may use `id` again after arbitrary Lisp;
+/// unintern or a dump restore cannot change the identity (GNU semantics).
 #[derive(Clone, Copy, Debug, strum::EnumIter)]
-enum CommandLoopSymbol {
+pub(crate) enum CommandLoopSymbol {
     PrefixArg,
     LastPrefixArg,
     CurrentPrefixArg,
@@ -48,104 +48,164 @@ enum CommandLoopSymbol {
     MemoryFull,
     DelayedWarningsList,
     AutoSaveInterval,
-    CommandRemapping,
     Undefined,
     CommandExecute,
+    InhibitRedisplay,
+    PreRedisplayFunction,
+    RedisplaySkipInitialFrame,
+    ResizeMiniFrames,
 }
 
 impl CommandLoopSymbol {
     #[inline]
-    fn id(self) -> SymId {
-        use crate::emacs_core::intern::EpochCachedSymbol;
+    pub(crate) fn id(self) -> SymId {
+        use crate::emacs_core::intern::WellKnown;
 
         match self {
             Self::PrefixArg => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("prefix-arg");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::PrefixArg;
+                SYMBOL.id()
             }
             Self::LastPrefixArg => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("last-prefix-arg");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::LastPrefixArg;
+                SYMBOL.id()
             }
             Self::CurrentPrefixArg => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("current-prefix-arg");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::CurrentPrefixArg;
+                SYMBOL.id()
             }
             Self::ThisCommand => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("this-command");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::ThisCommand;
+                SYMBOL.id()
             }
             Self::RealThisCommand => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("real-this-command");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::RealThisCommand;
+                SYMBOL.id()
             }
             Self::ThisOriginalCommand => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("this-original-command");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::ThisOriginalCommand;
+                SYMBOL.id()
             }
             Self::LastCommandEvent => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("last-command-event");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::LastCommandEvent;
+                SYMBOL.id()
             }
             Self::DeactivateMark => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("deactivate-mark");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::DeactivateMark;
+                SYMBOL.id()
             }
             Self::DisablePointAdjustment => {
-                static SYMBOL: EpochCachedSymbol =
-                    EpochCachedSymbol::new("disable-point-adjustment");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::DisablePointAdjustment;
+                SYMBOL.id()
             }
             Self::GlobalDisablePointAdjustment => {
-                static SYMBOL: EpochCachedSymbol =
-                    EpochCachedSymbol::new("global-disable-point-adjustment");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::GlobalDisablePointAdjustment;
+                SYMBOL.id()
             }
             Self::LastCommand => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("last-command");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::LastCommand;
+                SYMBOL.id()
             }
             Self::RealLastCommand => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("real-last-command");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::RealLastCommand;
+                SYMBOL.id()
             }
             Self::LastRepeatableCommand => {
-                static SYMBOL: EpochCachedSymbol =
-                    EpochCachedSymbol::new("last-repeatable-command");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::LastRepeatableCommand;
+                SYMBOL.id()
             }
             Self::InhibitQuit => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("inhibit-quit");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::InhibitQuit;
+                SYMBOL.id()
             }
             Self::UndoAutoAddBoundary => {
-                static SYMBOL: EpochCachedSymbol =
-                    EpochCachedSymbol::new("undo-auto--add-boundary");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::UndoAutoAddBoundary;
+                SYMBOL.id()
             }
             Self::MemoryFull => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("memory-full");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::MemoryFull;
+                SYMBOL.id()
             }
             Self::DelayedWarningsList => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("delayed-warnings-list");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::DelayedWarningsList;
+                SYMBOL.id()
             }
             Self::AutoSaveInterval => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("auto-save-interval");
-                SYMBOL.get()
-            }
-            Self::CommandRemapping => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("command-remapping");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::AutoSaveInterval;
+                SYMBOL.id()
             }
             Self::Undefined => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("undefined");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::Undefined;
+                SYMBOL.id()
             }
             Self::CommandExecute => {
-                static SYMBOL: EpochCachedSymbol = EpochCachedSymbol::new("command-execute");
-                SYMBOL.get()
+                static SYMBOL: WellKnown = WellKnown::CommandExecute;
+                SYMBOL.id()
+            }
+            Self::InhibitRedisplay => {
+                static SYMBOL: WellKnown = WellKnown::InhibitRedisplay;
+                SYMBOL.id()
+            }
+            Self::PreRedisplayFunction => {
+                static SYMBOL: WellKnown = WellKnown::PreRedisplayFunction;
+                SYMBOL.id()
+            }
+            Self::RedisplaySkipInitialFrame => {
+                static SYMBOL: WellKnown = WellKnown::RedisplaySkipInitialFrame;
+                SYMBOL.id()
+            }
+            Self::ResizeMiniFrames => {
+                static SYMBOL: WellKnown = WellKnown::ResizeMiniFrames;
+                SYMBOL.id()
+            }
+        }
+    }
+}
+
+/// Fixed tags and variables the command loop reads on every command. GNU holds
+// them as staticpro'd or DEFVAR_LISP statics (`Qtop_level`, `Qexit`,
+// `Qidentity`, `Qonly`, `Vtransient_mark_mode`, `Vinput_pending_p_filter_events`).
+static TOP_LEVEL_SYMBOL: WellKnown = WellKnown::TopLevel;
+static EXIT_TAG: WellKnown = WellKnown::Exit;
+static IDENTITY_SYMBOL: WellKnown = WellKnown::Identity;
+static ONLY_SYMBOL: WellKnown = WellKnown::Only;
+static TRANSIENT_MARK_MODE: WellKnown = WellKnown::TransientMarkMode;
+static INPUT_PENDING_FILTER_EVENTS: WellKnown = WellKnown::InputPendingPFilterEvents;
+static DEBUG_ON_EVENT: WellKnown = WellKnown::DebugOnEvent;
+static UNDO_AUTO_UNDOABLY_CHANGED_BUFFERS: WellKnown = WellKnown::UndoAutoUndoablyChangedBuffers;
+static DO_AUTO_SAVE: WellKnown = WellKnown::DoAutoSave;
+static NEOVM_STARTUP_LAST_PHASE: WellKnown = WellKnown::NeomacsStartupLastPhase;
+static NEOVM_STARTUP_LAST_CALL: WellKnown = WellKnown::NeomacsStartupLastCall;
+
+// Hooks the command loop runs itself, pre-resolved to fixed DEFSYM ids.
+///
+/// GNU names them with DEFSYM statics (`Qpre_command_hook`,
+/// `Qpost_command_hook`, `Qdelayed_warnings_hook`); the loop previously
+/// re-interned each spelling on every command.
+#[derive(Clone, Copy, Debug)]
+enum CommandLoopHook {
+    PreCommand,
+    PostCommand,
+    DelayedWarnings,
+}
+
+impl CommandLoopHook {
+    #[inline]
+    fn id(self) -> SymId {
+        use crate::emacs_core::intern::WellKnown;
+
+        match self {
+            Self::PreCommand => {
+                static SYMBOL: WellKnown = WellKnown::PreCommandHook;
+                SYMBOL.id()
+            }
+            Self::PostCommand => {
+                static SYMBOL: WellKnown = WellKnown::PostCommandHook;
+                SYMBOL.id()
+            }
+            Self::DelayedWarnings => {
+                static SYMBOL: WellKnown = WellKnown::DelayedWarningsHook;
+                SYMBOL.id()
             }
         }
     }
@@ -208,7 +268,7 @@ impl Context {
             // kill-emacs unwinds the recursive edit; the pending shutdown
             // request carries the exit code to the caller.
             Err(flow) if flow.is_shutdown() => Ok(()),
-            Err(flow) => Err(super::super::error::format_flow_with_eval(self, &flow)),
+            Err(flow) => Err(crate::emacs_core::print::format_flow_with_eval(self, &flow)),
         }
     }
 
@@ -250,12 +310,12 @@ impl Context {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(depth = self.command_loop.recursive_depth, has_input = self.input_rx.is_some()))]
+    #[tracing::instrument(skip_all, fields(depth = self.command_loop.recursive_depth, has_input = self.input_rx.as_ref().is_some()))]
     pub(crate) fn recursive_edit_inner(&mut self) -> EvalResult {
         self.run_exit_wrapped_command_loop(true)
     }
 
-    #[tracing::instrument(skip_all, fields(depth = self.command_loop.recursive_depth, has_input = self.input_rx.is_some()))]
+    #[tracing::instrument(skip_all, fields(depth = self.command_loop.recursive_depth, has_input = self.input_rx.as_ref().is_some()))]
     pub(crate) fn minibuffer_command_loop_inner(&mut self) -> EvalResult {
         self.run_exit_wrapped_command_loop(false)
     }
@@ -286,7 +346,7 @@ impl Context {
         // different: GNU still runs `top-level`/`normal-top-level` and lets
         // `read_char` terminate the loop via noninteractive EOF, even when
         // there is no input channel at all.
-        if self.input_rx.is_none() && !self.command_loop_noninteractive() {
+        if self.input_rx.as_ref().is_none() && !self.command_loop_noninteractive() {
             tracing::info!("recursive_edit_inner: no input receiver, returning immediately");
             return Ok(Value::NIL);
         }
@@ -313,10 +373,14 @@ impl Context {
         // caller's dynamic environment, as GNU macros.c does.
         let specpdl_count = self.specpdl.len();
         let result = (|| -> EvalResult {
-            self.try_specbind_or_unwind_to(specpdl_count, intern("inhibit-redisplay"), Value::NIL)?;
             self.try_specbind_or_unwind_to(
                 specpdl_count,
-                intern("undo-auto--undoably-changed-buffers"),
+                CommandLoopSymbol::InhibitRedisplay.id(),
+                Value::NIL,
+            )?;
+            self.try_specbind_or_unwind_to(
+                specpdl_count,
+                UNDO_AUTO_UNDOABLY_CHANGED_BUFFERS.id(),
                 Value::NIL,
             )?;
 
@@ -328,7 +392,7 @@ impl Context {
                 self.recursive_command_loop_depth() > 0 || self.minibuffers.depth() > 0;
             if catches_exit {
                 self.push_condition_frame(ConditionFrame::Catch {
-                    tag: Value::symbol("exit"),
+                    tag: Value::symbol(&EXIT_TAG),
                     resume: ResumeTarget::CommandLoopExit,
                 });
             }
@@ -345,7 +409,7 @@ impl Context {
                 Err(ref flow)
                     if let Some(thrown) = flow.as_throw()
                         && catches_exit
-                        && thrown.matches_tag(Value::symbol("exit")) =>
+                        && thrown.matches_tag(Value::symbol(&EXIT_TAG)) =>
                 {
                     let value = thrown.value;
                     match self.classify_command_loop_exit(value)? {
@@ -394,7 +458,7 @@ impl Context {
         loop {
             if outermost_command_loop {
                 // Catch 'top-level throws (from (top-level) function).
-                let top_level_tag = Value::symbol("top-level");
+                let top_level_tag = Value::symbol(&TOP_LEVEL_SYMBOL);
                 self.push_condition_frame(ConditionFrame::Catch {
                     tag: top_level_tag,
                     resume: ResumeTarget::CommandLoopTopLevel,
@@ -420,7 +484,7 @@ impl Context {
                     Ok(_) => self.command_loop_2(),
                     Err(ref flow)
                         if let Some(thrown) = flow.as_throw()
-                            && thrown.matches_tag(Value::symbol("top-level")) =>
+                            && thrown.matches_tag(Value::symbol(&TOP_LEVEL_SYMBOL)) =>
                     {
                         // top-level throw inside top_level_1 — fall through
                         // to command_loop_2 just like GNU's two-catch flow.
@@ -441,7 +505,7 @@ impl Context {
                 Err(ref flow)
                     if let Some(thrown) = flow.as_throw()
                         && outermost_command_loop
-                        && thrown.matches_tag(Value::symbol("top-level")) =>
+                        && thrown.matches_tag(Value::symbol(&TOP_LEVEL_SYMBOL)) =>
                 {
                     tracing::debug!("command_loop_inner: top-level throw, restarting loop");
                     continue;
@@ -475,7 +539,7 @@ impl Context {
 
     pub(super) fn command_loop_top_level_1(&mut self) -> EvalResult {
         let top_level = self
-            .variable_value_by_name("top-level")
+            .variable_value(TOP_LEVEL_SYMBOL.id())
             .unwrap_or(Value::NIL);
 
         tracing::debug!("command_loop_top_level_1: top-level={}", top_level);
@@ -495,8 +559,19 @@ impl Context {
                 Ok(Value::NIL)
             }
             Err(FlowKind::Signal(sig)) => {
-                let rendered = super::super::error::format_signal_data_with_eval(self, &sig);
+                let rendered = crate::emacs_core::print::format_signal_data_with_eval(self, &sig);
                 tracing::warn!("command_loop_top_level_1: top-level SIGNALED: {}", rendered);
+                if self
+                    .display_host
+                    .as_mut()
+                    .is_some_and(|host| host.fail_pending_gui_startup(rendered.clone()))
+                {
+                    eprintln!("Error during GUI startup: {rendered}");
+                    return self.shutdown_with_hooks(ShutdownRequest {
+                        exit_code: 1,
+                        restart: false,
+                    });
+                }
                 if self
                     .daemon
                     .as_ref()
@@ -516,11 +591,11 @@ impl Context {
                 self.report_command_error(data, "")?;
                 if cfg!(test) {
                     let last_phase = self
-                        .variable_value_by_name("neomacs--startup-last-phase")
+                        .variable_value(NEOVM_STARTUP_LAST_PHASE.id())
                         .map(|value| crate::emacs_core::print_value_with_eval(self, &value))
                         .unwrap_or_else(|| "nil".to_string());
                     let last_call = self
-                        .variable_value_by_name("neomacs--startup-last-call")
+                        .variable_value(NEOVM_STARTUP_LAST_CALL.id())
                         .map(|value| crate::emacs_core::print_value_with_eval(self, &value))
                         .unwrap_or_else(|| "nil".to_string());
                     eprintln!(
@@ -675,7 +750,7 @@ impl Context {
     /// dispatches through Lisp's buffer-local `command-error-function'.
     pub(super) fn command_error_message(&mut self, sig: &SignalData) -> String {
         let error_data = make_signal_binding_value(sig);
-        crate::emacs_core::errors::builtin_error_message_string(self, vec![error_data])
+        crate::emacs_core::print::builtin_error_message_string(self, vec![error_data])
             .ok()
             .and_then(|value| {
                 value
@@ -699,7 +774,7 @@ impl Context {
             severity: self.command_error_severity(sig),
             condition: format_symbol_name_for_diagnostic(sig.symbol),
             message: self.command_error_message(sig),
-            signal: super::super::error::format_signal_data_with_eval(self, sig),
+            signal: crate::emacs_core::print::format_signal_data_with_eval(self, sig),
             backtrace: self
                 .last_uncaught_signal_backtrace
                 .take()
@@ -798,7 +873,8 @@ impl Context {
                 for key in keys.iter().copied() {
                     self.push_vm_frame_root(key);
                 }
-                self.push_vm_frame_root(*binding);
+                self.push_vm_frame_root(binding.original());
+                self.push_vm_frame_root(binding.executed());
             }
             let unwind_result = match read_result.as_ref() {
                 Ok(_) => self.unbind_to_with_result(read_specpdl_count, Ok(Value::NIL)),
@@ -807,13 +883,11 @@ impl Context {
             self.restore_vm_roots(read_root_scope);
             unwind_result?;
 
-            let (keys, binding, input_end) = match read_result? {
+            let (keys, binding) = match read_result? {
                 crate::keyboard::CommandKeySequenceRead::Command { keys, binding } => {
-                    (keys, binding, None)
+                    (keys, Some(binding))
                 }
-                crate::keyboard::CommandKeySequenceRead::End(end) => {
-                    (Vec::new(), Value::NIL, Some(end))
-                }
+                crate::keyboard::CommandKeySequenceRead::End(_) => (Vec::new(), None),
             };
 
             // Reconcile a quit that became pending DURING the command-loop read.
@@ -883,14 +957,17 @@ impl Context {
 
             self.sync_current_buffer_to_selected_window();
 
-            if input_end.is_some() {
+            let Some(binding) = binding else {
+                // The read reached a typed input boundary: GNU's
+                // `i == 0` return from `read_key_sequence`.
                 self.assign_by_id(CommandLoopSymbol::ThisCommand.id(), Value::NIL);
                 return Ok(Value::NIL);
-            }
+            };
 
             // Start only after the complete key sequence has arrived.  This
             // excludes the user's inter-key think time while retaining the
-            // command-loop work below, including command remapping.
+            // command-loop work below.  Command remapping already happened
+            // inside read_key_sequence, where GNU does it.
             let command_observation_start = UserCommandObservationStart::capture_if_enabled();
 
             // A non-empty key sequence with a nil binding is a truly-unbound
@@ -906,23 +983,21 @@ impl Context {
             // the user-visible "is undefined" feedback. Keyboard/command-loop
             // audit Finding 1. (The `undefined` command itself sets
             // `prefix-arg`, so we no longer reset it here.)
-            if binding.is_nil() {
+            if binding.executed().is_nil() {
                 let desc: Vec<String> = keys.iter().map(|v| format!("{:?}", v)).collect();
                 tracing::info!("Undefined key sequence: {}", desc.join(" "));
             }
 
-            // The unmapped command (real-this-command) is the binding
-            // we read from the keymap, before any remapping is applied.
-            // Do not touch `real-last-command` here: GNU updates it only after
-            // the preceding command's `post-command-hook` and leaves that
-            // value visible to the next `pre-command-hook` (keyboard.c's
+            // GNU `keyboard.c:1464-1507`: `read_key_sequence` already applied
+            // the one level of command remapping, so `this-command` and
+            // `real-this-command` are the command it produced; asking again
+            // would remap a remapped command. Do not touch
+            // `real-last-command` here: GNU updates it only after the
+            // preceding command's `post-command-hook` and leaves that value
+            // visible to the next `pre-command-hook` (keyboard.c's
             // `kset_real_last_command` near the command-loop finalize tail).
-            self.assign_by_id(CommandLoopSymbol::RealThisCommand.id(), binding);
-
-            // Apply command remapping per GNU
-            // `keyboard.c:1340-1343`. The remapped command becomes
-            // this-command for execution. Finding 4.
-            let remapped = self.command_remapping_for_loop(binding);
+            let remapped = binding.executed();
+            self.assign_by_id(CommandLoopSymbol::RealThisCommand.id(), remapped);
             self.assign_by_id(CommandLoopSymbol::ThisCommand.id(), remapped);
             let mut command_observation = command_observation_start.map(|start| {
                 UserCommandObservation::begin(
@@ -931,7 +1006,7 @@ impl Context {
                         self.context_instance_id(),
                         self.command_loop.recursive_depth,
                         Self::command_keys_for_log(&keys),
-                        Self::command_value_for_log(binding),
+                        Self::command_value_for_log(binding.original()),
                         Self::command_value_for_log(remapped),
                         self.frames.selected_frame().map(|frame| frame.id),
                         self.buffers.current_buffer_id(),
@@ -949,7 +1024,10 @@ impl Context {
                 .unwrap_or(Value::NIL)
                 .is_nil()
             {
-                self.assign_by_id(CommandLoopSymbol::ThisOriginalCommand.id(), binding);
+                self.assign_by_id(
+                    CommandLoopSymbol::ThisOriginalCommand.id(),
+                    binding.original(),
+                );
             }
 
             if let Some(last) = keys.last() {
@@ -981,7 +1059,7 @@ impl Context {
             // hook function is removed instead of re-firing on every
             // command. Finding 7 — GNU `keyboard.c:1510`
             // (`safe_run_hooks_maybe_narrowed (Qpre_command_hook, ...)`).
-            self.safe_run_hook_if_bound("pre-command-hook")?;
+            self.safe_run_hook_if_bound(CommandLoopHook::PreCommand.id())?;
 
             // GNU `keyboard.c:1530-1534` adds undo boundaries here, after
             // `pre-command-hook` and before command execution, so the
@@ -1043,7 +1121,7 @@ impl Context {
             // Run post-command-hook via safe-run-hooks (Finding 7).
             // GNU `command_loop_1` calls `safe_run_hooks (Qpost_command_hook)`
             // at keyboard.c:1563.
-            self.safe_run_hook_if_bound("post-command-hook")?;
+            self.safe_run_hook_if_bound(CommandLoopHook::PostCommand.id())?;
             input_measurement.complete(|frame| self.input_latency_viewport(frame));
 
             // GNU `command_loop_1` (src/keyboard.c:1342-1345): "If displaying a
@@ -1201,14 +1279,14 @@ impl Context {
             .unwrap_or(Value::NIL)
             .is_nil()
         {
-            self.safe_run_hook_if_bound("post-command-hook")?;
+            self.safe_run_hook_if_bound(CommandLoopHook::PostCommand.id())?;
 
             if self
                 .eval_symbol_by_id(CommandLoopSymbol::DelayedWarningsList.id())
                 .unwrap_or(Value::NIL)
                 .is_truthy()
             {
-                self.safe_run_hook_if_bound("delayed-warnings-hook")?;
+                self.safe_run_hook_if_bound(CommandLoopHook::DelayedWarnings.id())?;
             }
         }
 
@@ -1270,7 +1348,7 @@ impl Context {
     pub(crate) fn run_command_loop_auto_save(&mut self, trigger: &'static str) {
         self.command_loop.last_auto_save_input_events = self.num_nonmacro_input_events();
         let no_message = if self
-            .eval_symbol("auto-save-no-message")
+            .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::AutoSaveNoMessage.id())
             .unwrap_or(Value::NIL)
             .is_truthy()
         {
@@ -1278,8 +1356,8 @@ impl Context {
         } else {
             Value::NIL
         };
-        if let Err(flow) = self.apply(Value::symbol("do-auto-save"), vec![no_message, Value::NIL]) {
-            let rendered = super::super::error::format_flow_with_eval(self, &flow);
+        if let Err(flow) = self.apply(Value::symbol(&DO_AUTO_SAVE), vec![no_message, Value::NIL]) {
+            let rendered = crate::emacs_core::print::format_flow_with_eval(self, &flow);
             tracing::warn!("auto-save from {trigger} failed: {rendered}");
         }
     }
@@ -1294,23 +1372,6 @@ impl Context {
             return true;
         }
         self.has_pending_frontend_input_with_configured_filter()
-    }
-
-    /// Apply `command-remapping` for the command-loop dispatch
-    /// path. Mirrors GNU `keyboard.c:1340-1343` calling
-    /// `Fcommand_remapping (cmd, Qnil, Qnil)` and substituting the
-    /// result when non-nil. Keyboard audit Finding 4.
-    pub(super) fn command_remapping_for_loop(&mut self, command: Value) -> Value {
-        if command.is_nil() {
-            return command;
-        }
-        match self.apply(
-            Value::from_sym_id(CommandLoopSymbol::CommandRemapping.id()),
-            vec![command],
-        ) {
-            Ok(remapped) if !remapped.is_nil() => remapped,
-            _ => command,
-        }
     }
 
     /// Dispatch the current `this-command` via GNU's
@@ -1354,7 +1415,7 @@ impl Context {
     /// `safe_run_hooks (Qhook_name)` at
     /// `src/keyboard.c:1361,1485` and `src/eval.c:2779-2830`.
     /// Keyboard audit Finding 7.
-    pub(crate) fn safe_run_hook_if_bound(&mut self, hook_name: &str) -> EvalResult {
+    pub(crate) fn safe_run_hook_if_bound(&mut self, hook_sym: SymId) -> EvalResult {
         // GNU `keyboard.c:1970-1978` (`safe_run_hooks`):
         //
         //   void safe_run_hooks (Lisp_Object hook) {
@@ -1376,7 +1437,6 @@ impl Context {
         // function, and swallows Signal errors. This never goes
         // through Lisp — matching GNU's keyboard.c which calls the
         // C function, not the Lisp wrapper.
-        let hook_sym = super::super::intern::intern(hook_name);
         // `safe_run_hook_funcall` only swallows ordinary `error`
         // signals.  Nonlocal exits like `throw`/`quit` still escape
         // the command loop, and `read-char-from-minibuffer` relies on
@@ -1485,7 +1545,7 @@ impl Context {
 
     pub(super) fn update_active_region_selection_after_command(&mut self) -> EvalResult {
         if self
-            .eval_symbol("mark-active")
+            .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::MarkActive.id())
             .unwrap_or(Value::NIL)
             .is_nil()
         {
@@ -1493,12 +1553,12 @@ impl Context {
         }
 
         let transient_mark_mode = self
-            .eval_symbol("transient-mark-mode")
+            .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::TransientMarkMode.id())
             .unwrap_or(Value::NIL);
-        if transient_mark_mode == Value::symbol("identity") {
+        if transient_mark_mode == Value::symbol(&IDENTITY_SYMBOL) {
             self.assign("transient-mark-mode", Value::NIL);
-        } else if transient_mark_mode == Value::symbol("only") {
-            self.assign("transient-mark-mode", Value::symbol("identity"));
+        } else if transient_mark_mode == Value::symbol(&ONLY_SYMBOL) {
+            self.assign_by_id(TRANSIENT_MARK_MODE.id(), Value::symbol(&IDENTITY_SYMBOL));
         }
 
         if !self
@@ -1523,7 +1583,7 @@ impl Context {
         }
 
         if self
-            .eval_symbol("select-active-regions")
+            .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::SelectActiveRegions.id())
             .unwrap_or(Value::NIL)
             .is_nil()
         {
@@ -1543,7 +1603,9 @@ impl Context {
             .eval_symbol_by_id(CommandLoopSymbol::ThisCommand.id())
             .unwrap_or(Value::NIL);
         let inhibited_commands = self
-            .eval_symbol("selection-inhibit-update-commands")
+            .eval_symbol_by_id(
+                crate::emacs_core::intern::WellKnown::SelectionInhibitUpdateCommands.id(),
+            )
             .unwrap_or(Value::NIL);
         if self
             .apply(
@@ -1557,7 +1619,7 @@ impl Context {
         }
 
         let region_extract = self
-            .eval_symbol("region-extract-function")
+            .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::RegionExtractFunction.id())
             .unwrap_or(Value::symbol("buffer-substring"));
         let text = self.apply(region_extract, vec![Value::NIL])?;
         let text_len = match self.apply(Value::symbol("length"), vec![text])?.kind() {
@@ -1605,7 +1667,7 @@ impl Context {
             .selected_frame()
             .is_some_and(|frame| frame.initial)
             && self
-                .variable_value_by_name("redisplay-skip-initial-frame")
+                .variable_value(CommandLoopSymbol::RedisplaySkipInitialFrame.id())
                 .is_some_and(|value| value.is_truthy()))
     }
 
@@ -1895,7 +1957,7 @@ impl Context {
         // (window.c:4116) specbinds this to t so any nested redisplay
         // triggered by a window-change hook is a no-op. Without this check
         // a hook that indirectly calls `redisplay` infinitely recurses.
-        let inhibit_redisplay = self.variable_value_by_name("inhibit-redisplay");
+        let inhibit_redisplay = self.variable_value(CommandLoopSymbol::InhibitRedisplay.id());
         if inhibit_redisplay.as_ref().is_some_and(|v| v.is_truthy())
             && (!force
                 || crate::emacs_core::xdisp::mode_line_flow_enabled()
@@ -2069,7 +2131,8 @@ impl Context {
     /// hook is demoted (GNU calls via `dsafe_calln`, and the lisp driver wraps
     /// each hook in `with-demoted-errors`).
     pub(super) fn run_pre_redisplay_function(&mut self, windows: Value) {
-        let Some(function) = self.variable_value_by_name("pre-redisplay-function") else {
+        let Some(function) = self.variable_value(CommandLoopSymbol::PreRedisplayFunction.id())
+        else {
             return;
         };
         if function.is_nil() {
@@ -2078,7 +2141,7 @@ impl Context {
         let specpdl_count = self.specpdl.len();
         if let Err(flow) = self.try_specbind_or_unwind_to(
             specpdl_count,
-            crate::emacs_core::intern::intern("inhibit-redisplay"),
+            CommandLoopSymbol::InhibitRedisplay.id(),
             Value::T,
         ) {
             tracing::debug!("pre-redisplay binding signalled (ignored): {flow:?}");
@@ -2096,7 +2159,7 @@ impl Context {
 
     pub(super) fn resize_minibuffer_only_frames(&mut self) {
         if !self
-            .variable_value_by_name("resize-mini-frames")
+            .variable_value(CommandLoopSymbol::ResizeMiniFrames.id())
             .is_some_and(|value| value.is_truthy())
         {
             return;
@@ -2114,7 +2177,9 @@ impl Context {
             })
             .collect();
         for frame in frames {
-            let _ = self.safe_funcall(Value::symbol("window--resize-mini-frame"), vec![frame]);
+            // GNU's fixed `Qwindow_resize_mini_frame` command symbol.
+            static WINDOW_RESIZE_MINI_FRAME: WellKnown = WellKnown::WindowResizeMiniFrame;
+            let _ = self.safe_funcall(Value::symbol(&WINDOW_RESIZE_MINI_FRAME), vec![frame]);
         }
     }
 
@@ -2692,8 +2757,11 @@ impl Context {
         // Share the count with the group recorder, but capture the stable heap
         // pointer by value so each root does not reload it through a reference.
         let root_count = &cur_count;
+        // SAFETY: this function runs only in the stopped seeding window. The
+        // independent loan drops (including on unwind) before returning.
+        let mut thread_local_roots = unsafe { (*heap_ptr).root_seed_scratch() };
         let heap_identity = unsafe { (*heap_ptr).identity() };
-        self.trace_roots(
+        self.trace_roots_reusing(
             heap_identity,
             |roots| {
                 // SAFETY: borrow only from the live collector loan, and end
@@ -2726,10 +2794,10 @@ impl Context {
                     }
                 }
             },
+            thread_local_roots.roots(),
         );
         close_group();
         let mut groups = groups.into_inner();
-        let mut thread_local_roots = Vec::new();
         // A JIT leaf may keep addresses inside the obarray it was compiled
         // against; drop the cache before its roots are walked if this
         // Context's obarray is not that one (P1.4 §3.6).
@@ -2741,25 +2809,31 @@ impl Context {
         // STW begin does not arm mark_in_progress. This call certifies actual
         // seeding, independently of that flag; snapshots never certify it.
         debug_assert!(!unsafe { (*heap_ptr).sweep_in_progress() });
-        collect_thread_local_gc_roots(
-            &mut thread_local_roots,
+        let mut tl_seed_us = 0;
+        let mut tl_seed_count = 0;
+        for_each_thread_local_root_source(
             heap_identity,
             collection_epoch,
             crate::tagged::gc::CacheRootScan::Collection,
-            &mut groups,
+            |origin, collect| {
+                let roots = thread_local_roots.roots();
+                debug_assert!(roots.is_empty());
+                let collect_t0 = std::time::Instant::now();
+                collect(roots);
+                groups.push((origin, collect_t0.elapsed().as_micros() as u64, roots.len()));
+                let seed_t0 = std::time::Instant::now();
+                tl_seed_count += roots.len();
+                for root in roots.drain(..) {
+                    // SAFETY: same stopped collector loan as the Context walk.
+                    unsafe {
+                        (*heap_ptr).seed_root_with_origin(root, origin);
+                    }
+                }
+                tl_seed_us += seed_t0.elapsed().as_micros() as u64;
+            },
         );
-        let tl_seed_t0 = std::time::Instant::now();
-        let tl_seed_count = thread_local_roots.len();
-        for (root, origin) in thread_local_roots {
-            unsafe {
-                (*heap_ptr).seed_root_with_origin(root, origin);
-            }
-        }
-        groups.push((
-            "tl_seed",
-            tl_seed_t0.elapsed().as_micros() as u64,
-            tl_seed_count,
-        ));
+        drop(thread_local_roots);
+        groups.push(("tl_seed", tl_seed_us, tl_seed_count));
         // Install per-buffer marker-chain head slots so `unchain_dead_markers`
         // can splice unmarked markers out of every live chain before sweep.
         // Mirrors GNU `sweep_buffer → unchain_dead_markers` (alloc.c).
@@ -3468,7 +3542,7 @@ impl Context {
     /// on the printed name and a non-symbol really does select no arm.
     pub(crate) fn debug_on_event_signal_name(&self) -> Option<String> {
         let symbol_mode = self.symbol_mode();
-        let value = self.variable_value_by_name("debug-on-event")?;
+        let value = self.variable_value(DEBUG_ON_EVENT.id())?;
         let name = value.as_symbol_lisp_string(symbol_mode)?;
         Some(crate::emacs_core::emacs_char::to_utf8_lossy(
             name.as_bytes(),
@@ -3573,7 +3647,7 @@ impl Context {
 
     pub(super) fn input_pending_filter(&self) -> crate::keyboard::InputPendingFilter {
         let configured = self
-            .variable_value_by_name("input-pending-p-filter-events")
+            .variable_value(INPUT_PENDING_FILTER_EVENTS.id())
             .unwrap_or(Value::T)
             .is_truthy();
         crate::keyboard::InputPendingFilter::from_filter_events_variable(configured)
@@ -3587,16 +3661,22 @@ impl Context {
     /// buffer has localised it (dframe, dictionary and gud all do), so the read
     /// names the buffer. Ledger 196.
     pub(crate) fn track_mouse_enabled(&self) -> bool {
+        // GNU DEFVAR_LISP `track-mouse`. Every pending-input query reads it;
+        // the by-name spelling re-interned it at each probe.
+        static TRACK_MOUSE: WellKnown = WellKnown::TrackMouse;
         self.variables()
-            .value_in_buffer_by_name(self.buffers.current_buffer(), "track-mouse")
+            .value_in_buffer(self.buffers.current_buffer(), TRACK_MOUSE.id())
             .unwrap_or(Value::NIL)
             .is_truthy()
     }
 
     pub(super) fn should_ignore_while_no_input_symbol(&self, ignore_symbol: &str) -> bool {
+        // GNU DEFVAR_LISP `while-no-input-ignore-events`, read per queried
+        // event; see `track_mouse_enabled` for the fixed-spelling rationale.
+        static WHILE_NO_INPUT_IGNORE_EVENTS: WellKnown = WellKnown::WhileNoInputIgnoreEvents;
         let symbol_mode = self.symbol_mode();
         let ignore_list = self
-            .variable_value_by_name("while-no-input-ignore-events")
+            .variable_value(WHILE_NO_INPUT_IGNORE_EVENTS.id())
             .unwrap_or(Value::NIL);
         super::super::value::list_to_vec(&ignore_list)
             .into_iter()
@@ -3643,7 +3723,7 @@ impl Context {
         // input path sets `quit-flag` when real keyboard input is available.
         // Neomacs has to poll the host channel for `throw-on-input`, but only
         // when such a channel exists or the command loop is interactive.
-        self.input_rx.is_some() || !self.command_loop_noninteractive()
+        self.input_rx.as_ref().is_some() || !self.command_loop_noninteractive()
     }
 
     pub(super) fn poll_pending_input_for_throw_on_input(&mut self) -> Result<(), Flow> {

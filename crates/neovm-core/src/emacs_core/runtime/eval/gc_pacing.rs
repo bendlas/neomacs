@@ -71,7 +71,22 @@ impl Context {
         group: &mut dyn FnMut(&'static str),
         visit: &mut dyn FnMut(Value),
     ) {
-        self.trace_root_groups::<true>(heap_id, collect_shared_roots, group, visit);
+        self.trace_roots_reusing(heap_id, collect_shared_roots, group, visit, &mut Vec::new());
+    }
+
+    /// Collector seeding retains this empty scratch's high-water capacity.
+    #[inline(always)]
+    pub(super) fn trace_roots_reusing(
+        &self,
+        heap_id: usize,
+        collect_shared_roots: impl FnOnce(&mut Vec<Value>),
+        group: &mut dyn FnMut(&'static str),
+        visit: &mut dyn FnMut(Value),
+        scratch: &mut Vec<Value>,
+    ) {
+        debug_assert!(scratch.is_empty());
+        self.trace_root_groups::<true>(heap_id, collect_shared_roots, group, visit, scratch);
+        debug_assert!(scratch.is_empty());
     }
 
     /// Only this owner's execution roots. World cells are traced by the
@@ -90,9 +105,13 @@ impl Context {
         called: &mut Vec<SymId>,
     ) {
         let heap_id = self.tagged_heap.identity();
-        self.trace_root_groups::<false>(heap_id, |_| {}, &mut |_| {}, &mut |value| {
-            roots.push(value)
-        });
+        self.trace_root_groups::<false>(
+            heap_id,
+            |_| {},
+            &mut |_| {},
+            &mut |value| roots.push(value),
+            &mut Vec::new(),
+        );
         #[cfg(feature = "jit")]
         self.trace_jit_redefined_functions(heap_id, &mut |value| roots.push(value), called);
         #[cfg(not(feature = "jit"))]
@@ -121,6 +140,7 @@ impl Context {
             |_| {},
             &mut |name| names.push(name),
             &mut |_| {},
+            &mut Vec::new(),
         );
         names
     }
@@ -134,6 +154,7 @@ impl Context {
         collect_shared_roots: impl FnOnce(&mut Vec<Value>),
         group: &mut dyn FnMut(&'static str),
         visit: &mut dyn FnMut(Value),
+        scratch: &mut Vec<Value>,
     ) {
         group("vm_frames");
         for frame in &self.vm_root_frames {
@@ -319,6 +340,9 @@ impl Context {
             text.trace_roots_with(visit);
         }
         group("misc");
+        if WORLD {
+            crate::emacs_core::font::trace_gstring_shape_cache(&self.gstring_shape_cache, visit);
+        }
         visit(self.lexenv);
         visit(self.quit_flag);
         visit(self.inhibit_quit);
@@ -371,11 +395,17 @@ impl Context {
         if let Some(table) = self.cached_standard_case_table {
             visit(table);
         }
+        // GNU dispnew.c's frame_and_buffer_state lives for the whole session,
+        // so the internal state vector must survive every collection even
+        // while no Lisp variable refers to it.
+        if let Some(state) = self.frame_and_buffer_state {
+            visit(state);
+        }
         // The Flow registry is private even though the full walk uses the
         // same temporary buffer for it and the following World registries.
         group("in_flight_registry");
         if WORLD {
-            let mut registry_roots = Vec::new();
+            let mut registry_roots = &mut *scratch;
             // Rust-held signals, throws and yields stay rooted when this Context moves.
             self.collect_in_flight_roots(heap_id, &mut registry_roots);
             for root in registry_roots.drain(..) {
@@ -443,27 +473,37 @@ impl Context {
             for root in registry_roots.drain(..) {
                 visit(root);
             }
-            // Registry values are already seeded. Release their scratch storage
-            // before the larger root walks so it does not stay live across them.
-            drop(registry_roots);
+            // Every registry has been drained; its capacity is available to
+            // the larger owner walk below without retaining any Values.
         }
         if WORLD {
             // Full ~all-interned-symbols walk on STW collections; only the
             // BLV-pool residual under `ObarraySymbolCellSkipGuard` (both
             // concurrent handshakes).
             group("obarray");
-            self.obarray.trace_roots_with(visit);
+            // Use the canonical owner enumerator directly: the trait's default
+            // visitor would allocate a fresh vector for this large owner.
+            self.obarray.trace_roots(scratch);
+            for root in scratch.drain(..) {
+                visit(root);
+            }
             group("proc_timer");
             self.processes.trace_roots_with(visit);
             self.watchers.trace_roots_with(visit);
             group("registers");
             self.registers.trace_roots_with(visit);
+            group("bookmarks");
+            self.bookmarks.trace_roots_with(visit);
+            group("minibuffers");
+            self.minibuffers.trace_roots_with(visit);
         }
         group("custom");
         self.custom.trace_roots_with(visit);
         if WORLD {
             group("autoloads");
             self.autoloads.trace_roots_with(visit);
+            group("abbrevs");
+            self.abbrevs.trace_roots_with(visit);
             group("interactive");
             self.interactive.trace_roots_with(visit);
             group("buffers");
@@ -476,6 +516,8 @@ impl Context {
             self.threads.trace_roots_with(visit);
             group("kmacro");
             self.kmacro.trace_roots_with(visit);
+            group("rectangle");
+            self.rectangle.trace_roots_with(visit);
             group("command_loop");
             crate::gc_trace::GcTrace::trace_roots_with(&*self.command_loop, visit);
             group("modes");
@@ -538,6 +580,41 @@ impl Context {
         // SAFETY: this method's caller establishes live same-evaluator input
         // provenance, and the identity check establishes its installed heap.
         unsafe { crate::tagged::transport::SharedRoot::batch_from_current_heap(values) }
+    }
+
+    /// Share exactly `N` live values through one private vector lease,
+    /// returning one root per input in order.
+    ///
+    /// [`Self::share_values`] with a fixed-size result: the caller gets a
+    /// `[SharedRoot; N]` by construction, so no later length check can fail.
+    ///
+    /// # Safety
+    /// Every value must satisfy [`Self::share_value`]'s admission and lifetime
+    /// requirements. This evaluator must be the installed active mutator;
+    /// raw values stay reachable until the batch has been admitted.
+    ///
+    /// # Errors
+    /// A missing installed heap or an installed heap from another evaluator.
+    pub unsafe fn share_values_array<const N: usize>(
+        &self,
+        values: [Value; N],
+    ) -> Result<[crate::tagged::transport::SharedRoot; N], crate::tagged::transport::SharedRootError>
+    {
+        use crate::tagged::gc::{HeapIdentity, current_tagged_heap_identity};
+        use crate::tagged::transport::SharedRootError;
+        let installed = current_tagged_heap_identity()
+            .and_then(HeapIdentity::from_legacy_word)
+            .ok_or(SharedRootError::NoInstalledHeap)?;
+        let owner = self.tagged_heap.heap_identity();
+        if installed != owner {
+            return Err(SharedRootError::ForeignHeap {
+                owner,
+                mutator: installed,
+            });
+        }
+        // SAFETY: this method's caller establishes live same-evaluator input
+        // provenance, and the identity check establishes its installed heap.
+        unsafe { crate::tagged::transport::SharedRoot::batch_from_current_heap_array(values) }
     }
 
     /// The local value of `root` on this evaluator's thread.
@@ -931,21 +1008,10 @@ impl Context {
         }
     }
 
-    /// Connect the input system for interactive mode.
-    ///
-    /// This mirrors GNU Emacs's `init_keyboard()` — it connects the evaluator
-    /// to the render thread's input channel so that `read_char()` can block
-    /// waiting for user input instead of returning immediately (batch mode).
-    /// Producers must send the event before notifying [`Context::wait_notifier`];
-    /// a channel send alone does not wake the unified process/input poller.
-    ///
-    /// # Arguments
-    /// * `input_rx` — Receiver end of the crossbeam channel from the render thread
-    pub fn init_input_system(
-        &mut self,
-        input_rx: crossbeam_channel::Receiver<crate::keyboard::InputEvent>,
-    ) {
-        self.input_rx = Some(input_rx);
+    /// Start the command loop after installing a HostInputPublisher.
+    /// Receiver attachment is owned by that publisher's installer, so a caller
+    /// cannot connect an independent raw channel without its wake capability.
+    pub fn init_input_system(&mut self) {
         self.command_loop.running = true;
     }
 
@@ -985,3 +1051,7 @@ impl Context {
         self.tty_frame_host_factory = Some(factory);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/root_seed_capacity_test.rs"]
+mod root_seed_capacity_tests;

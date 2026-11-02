@@ -1308,15 +1308,6 @@ fn render_command_set_extra_spacing() {
 }
 
 #[test]
-fn render_command_set_ligatures_enabled() {
-    let cmd = RenderCommand::Config(ConfigCommand::SetLigaturesEnabled { enabled: true });
-    match cmd {
-        RenderCommand::Config(ConfigCommand::SetLigaturesEnabled { enabled }) => assert!(enabled),
-        other => panic!("Expected SetLigaturesEnabled, got {:?}", other),
-    }
-}
-
-#[test]
 fn render_command_remove_child_frame() {
     let cmd = RenderCommand::Window(WindowCommand::RemoveChildFrame { frame_id: 0xDEAD });
     match cmd {
@@ -1355,6 +1346,7 @@ fn render_command_create_window() {
         title: "New Frame".to_string(),
         geometry_hints,
         override_redirect: false,
+        visibility: WindowVisibility::Invisible,
     });
     match cmd {
         RenderCommand::Window(WindowCommand::CreateWindow {
@@ -1364,6 +1356,7 @@ fn render_command_create_window() {
             title,
             geometry_hints: actual_hints,
             override_redirect,
+            visibility,
         }) => {
             assert_eq!(frame.raw_id(), 99);
             assert_eq!(width, 1024);
@@ -1371,6 +1364,7 @@ fn render_command_create_window() {
             assert_eq!(title, "New Frame");
             assert_eq!(actual_hints, geometry_hints);
             assert!(!override_redirect);
+            assert_eq!(visibility, WindowVisibility::Invisible);
         }
         other => panic!("Expected CreateWindow, got {:?}", other),
     }

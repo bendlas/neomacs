@@ -510,11 +510,12 @@ fn div_core_inhibit_modification_hooks_boundary_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_core_overlay_modification_hooks_order_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 23 59)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (\"aXYd\" ((front nil 2 2 nil) (front t 2 3 0) (behind nil 5 5 nil) (behind t 5 6 0) (mod nil 3 5 nil) (mod t 3 3 2)) (2 3))""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((log nil))
@@ -538,8 +539,7 @@ fn div_core_overlay_modification_hooks_order_combo() {
       (delete-region 3 5)
       (list (buffer-string)
             (nreverse log)
-            (list (overlay-start ov) (overlay-end ov)))))))
-"##,
+            (list (overlay-start ov) (overlay-end ov))))))"##,
         expect,
     );
 }
@@ -1198,10 +1198,21 @@ fn div_core_timer_absolute_and_idle_shape_combo() {
 #[test]
 fn div_core_divergence_surface_relative_timer_microseconds() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK (t t t t t nil)""#]];
-    // Divergence surfaced 2026-06-24:
-    // GNU Emacs: relative run-at-time retains a nonzero microsecond component.
-    // Neomacs:   relative run-at-time reports zero microseconds.
+    let expect = expect_test::expect![[
+        r#""OK (t t t t t t t t (27365 25001 123456 789000) (0 1000 123456 789000) nil)""#
+    ]];
+    // `nth 3` is the PICOSECOND field, not the microsecond field. GNU
+    // make_lisp_time sets USEC = ns / 1000 and PSEC = ns % 1000 * 1000
+    // (src/timefns.c:822-830), and Neomacs builds the same pair from
+    // SystemTime::now()'s nanosecond remainder (system/timefns/mod.rs). A
+    // nonzero psec is therefore a 1-in-1000 coincidence on a real ns clock in
+    // both engines (measured: 3 zeros in 1000 GNU runs) -- the old
+    // `(not (zerop (nth 3 tt)))` was a coin flip, and libfaketime cannot pin
+    // it (it freezes the seconds but leaves tv_nsec from the real clock).
+    // Assert the deterministic representation invariants instead, and check
+    // subsecond preservation through the same `timer-relative-time` path
+    // run-at-time uses (lisp/emacs-lisp/timer.el:357 -> :128), with an
+    // explicit base so no ambient clock reaches the output.
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((tm (run-at-time 1000 nil (lambda () 'never))))
@@ -1211,7 +1222,12 @@ fn div_core_divergence_surface_relative_timer_microseconds() {
               (integerp (nth 0 tt))
               (integerp (nth 1 tt))
               (integerp (nth 2 tt))
-              (not (zerop (nth 3 tt)))
+              (integerp (nth 3 tt))
+              (<= 0 (nth 2 tt) 999999)
+              (<= 0 (nth 3 tt) 999999)
+              (zerop (% (nth 3 tt) 1000))
+              (timer-relative-time '(27365 24001 123456 789000) 1000)
+              (time-add '(0 0 123456 789000) 1000)
               (timer--repeat-delay tm)))
     (cancel-timer tm)))
 "##,
@@ -1222,10 +1238,16 @@ fn div_core_divergence_surface_relative_timer_microseconds() {
 #[test]
 fn div_core_divergence_surface_repeating_timer_microseconds() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK (t t t t t 5)""#]];
-    // Divergence surfaced 2026-06-24:
-    // GNU Emacs: repeating run-at-time keeps a nonzero microsecond component.
-    // Neomacs:   repeating run-at-time reports zero microseconds.
+    let expect = expect_test::expect![[
+        r#""OK (t t t t t t t t (27365 24011 123456 789000) (0 10 123456 789000) 5)""#
+    ]];
+    // Same psec coin flip as the relative probe above: `nth 3` is
+    // ns % 1000 * 1000 (GNU src/timefns.c:822-830; Neomacs
+    // system/timefns/mod.rs), zero once in 1000 GNU and Neomacs runs on a real
+    // clock, and the frozen-clock harness leaves tv_nsec real. Deterministic
+    // checks only: the four integer fields, their ranges, psec's 1000-step
+    // granularity, and the exact +10 s arithmetic through
+    // `timer-relative-time` (lisp/emacs-lisp/timer.el:128) with a fixed base.
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((tm (run-at-time 10 5 (lambda () 'never))))
@@ -1235,7 +1257,12 @@ fn div_core_divergence_surface_repeating_timer_microseconds() {
               (integerp (nth 0 tt))
               (integerp (nth 1 tt))
               (integerp (nth 2 tt))
-              (not (zerop (nth 3 tt)))
+              (integerp (nth 3 tt))
+              (<= 0 (nth 2 tt) 999999)
+              (<= 0 (nth 3 tt) 999999)
+              (zerop (% (nth 3 tt) 1000))
+              (timer-relative-time '(27365 24001 123456 789000) 10)
+              (time-add '(0 0 123456 789000) 10)
               (timer--repeat-delay tm)))
     (cancel-timer tm)))
 "##,
@@ -2045,9 +2072,14 @@ fn div_core_divergence_surface_kill_buffer_live_process_hangup() {
       (unwind-protect
           (progn
             (kill-buffer buf)
+            ;; Wait for the sentinel itself (the observable event), not for
+            ;; `process-live-p': on a loaded machine the child can be reaped and
+            ;; the raw status flipped before the sentinel is delivered, and the
+            ;; old loop then exited with an empty log.  The neighbouring
+            ;; delete-process probe uses the same nil + event form.
             (let ((i 0))
-              (while (and (process-live-p proc) (< i 20))
-                (accept-process-output proc 0.05)
+              (while (and (null log) (< i 100))
+                (accept-process-output nil 0.05)
                 (setq i (1+ i))))
             (setq result
                   (list (process-status proc)
@@ -3011,30 +3043,50 @@ fn div_core_divergence_surface_case_table_word_casing_combo() {
 #[test]
 fn div_core_divergence_surface_process_attributes_running_child_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK (t \"/bin/sh -c sleep\\\\ 0.2\" \"\")""#]];
+    // The sampled facts are OS facts: GNU/Darwin answers a fixnum 0 from
+    // process-running-child-p where GNU/Linux answers t (src/process.c:
+    // 7049-7057: TIOCGPGRP reports process group 0 for a pipe on Darwin and
+    // `make_fixnum' returns it, while the Linux ioctl fails and the function
+    // falls through to t), and Darwin reports an unescaped argv and a nil
+    // ttname where Linux escapes spaces and reports "".  The probe already
+    // normalizes a pipe ttname; the rest must come from the local GNU at run
+    // time, not from a GNU/Linux transcript.
+    //
     // Divergence surfaced 2026-06-24:
     // GNU Emacs: OK (t "/bin/sh -c sleep\\ 0.2" "")
     // Neomacs:   OK (nil "/bin/sh -c sleep 0.2" "pipe:[...]")
-    crate::common::assert_oracle_parity_expect(
+    //
+    // The child reports "ready" and then blocks in `read', so the attributes
+    // are sampled after its exec and before it can exec anything else. With
+    // `sh -c "sleep 0.2"' the sample raced the child's own exec: a loaded
+    // host saw the not-yet-exec'd "[sh]" (empty cmdline) in both editors, and
+    // bash's single-command exec turns the child into "sleep 0.2" later on.
+    crate::common::assert_oracle_parity(
         r##"
-(let ((proc (make-process
-             :name "probe-attrs-child"
-             :command '("/bin/sh" "-c" "sleep 0.2")
-             :connection-type 'pipe)))
+(let* ((ready nil)
+       (proc (make-process
+              :name "probe-attrs-child"
+              :command '("/bin/sh" "-c" "echo ready; read line")
+              :connection-type 'pipe
+              :filter (lambda (_proc out)
+                        (when (string-match-p "ready" out) (setq ready t))))))
   (unwind-protect
-      (let* ((attrs (process-attributes (process-id proc)))
-             (args (cdr (assq 'args attrs)))
-             (ttname (cdr (assq 'ttname attrs))))
-        (list (process-running-child-p proc)
-              args
-              (if (and (stringp ttname)
-                       (string-match-p "\\`pipe:" ttname))
-                  "pipe:[...]"
-                ttname)))
+      (let ((deadline (+ (float-time) 10)))
+        (while (and (not ready) (< (float-time) deadline))
+          (accept-process-output proc 0.05))
+        (let* ((attrs (process-attributes (process-id proc)))
+               (args (cdr (assq 'args attrs)))
+               (ttname (cdr (assq 'ttname attrs))))
+          (list ready
+                (process-running-child-p proc)
+                args
+                (if (and (stringp ttname)
+                         (string-match-p "\\`pipe:" ttname))
+                    "pipe:[...]"
+                  ttname))))
     (when (process-live-p proc)
       (delete-process proc))))
 "##,
-        expect,
     );
 }
 

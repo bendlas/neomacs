@@ -276,12 +276,13 @@ fn org_babel_tangle_noweb_comments_collect_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_export_inline_result_html_deep_state_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (wrong-type-argument consp nil)""#]];
+    let expect = expect_test::expect![[
+        r##""OK (\"#+TITLE: Babel Export\\n\\n* Section\\n#+begin_src emacs-lisp :results value replace :exports both\\n(+ 3 4)\\n#+end_src\\n\\n#+RESULTS:\\n: 7\\n\\nCall: call_adder[:results raw](a=2,b=3)\\n\\n#+NAME: adder\\n#+begin_src emacs-lisp :var a=1 b=2 :results value replace\\n(list :sum (+ a b) :product (* a b))\\n#+end_src\\n\\n#+RESULTS: adder\\n| :sum | 3 | :product | 2 |\\n\\n\" (\"7\") t t \"<div id=\\\"table-of-contents\\\" role=\\\"doc-toc\\\">\\n<h2>Table of Contents</h2>\\n<div id=\\\"text-table-of-contents\\\" role=\\\"doc-toc\\\">\\n<ul>\\n<li><a href=\\\"#orgHASH\\\">1. Section</a></li>\\n</ul>\\n</div>\\n</div>\\n<div id=\\\"outline-container-orgHASH\\\" class=\\\"outline-2\\\">\\n<h2 id=\\\"orgHASH\\\"><span class=\\\"section-number-2\\\">1.</span> Section</h2>\\n<div class=\\\"outline-text-2\\\" id=\\\"text-1\\\">\\n<div class=\\\"orgHASH\\\">\\n<pre class=\\\"src src-emacs-lisp\\\"><code>(+ 3 4)\\n</code></pre>\\n</div>\\n\\n<pre class=\\\"example\\\">\\n7\\n</pre>\\n\\n<p>\\nCall: (:sum 5 :product 6)\\n</p>\\n\\n<div class=\\\"orgHASH\\\">\\n<pre class=\\\"src src-emacs-lisp\\\" id=\\\"orgHASH\\\"><code>(list :sum (+ a b) :product (* a b))\\n</code></pre>\\n</div>\\n</div>\\n</div>\\n\")""##
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -292,7 +293,7 @@ fn org_babel_export_inline_result_html_deep_state_combo() {
       (org-mode)
       (insert "#+TITLE: Babel Export\n\n")
       (insert "* Section\n")
-      (insert "#+begin_src emacs-lisp :results value replace\n(+ 3 4)\n#+end_src\n\n")
+      (insert "#+begin_src emacs-lisp :results value replace :exports both\n(+ 3 4)\n#+end_src\n\n")
       (insert "Call: call_adder[:results raw](a=2,b=3)\n\n")
       (insert "#+NAME: adder\n")
       (insert "#+begin_src emacs-lisp :var a=1 b=2 :results value replace\n")
@@ -303,9 +304,10 @@ fn org_babel_export_inline_result_html_deep_state_combo() {
       (search-forward "(+ 3 4)")
       (org-babel-execute-src-block)
       (goto-char (point-min))
-      (search-forward "adder")
+      (search-forward "#+NAME: adder")
+      (forward-line 1)
       (org-babel-execute-src-block)
-      (let ((after-exec (buffer-substring-no-properties
+      (let* ((after-exec (buffer-substring-no-properties
                          (point-min) (point-max)))
             ;; Parse results
             (results
@@ -314,26 +316,25 @@ fn org_babel_export_inline_result_html_deep_state_combo() {
                  (org-element-property :value el))))
             ;; Export
             (html (org-export-as 'html nil nil t nil))
-            (has-7 (string-match-p "7" html))
-            (has-sum (string-match-p "sum" html)))
+            (has-7 (not (null (string-match-p "7" html))))
+            (has-sum (not (null (string-match-p "sum" html)))))
         (list after-exec
               results
               has-7
               has-sum
               (replace-regexp-in-string
-               "org[[:alnum:]-]\\{8,\\}" "orgHASH"
+               "org[[:alnum:]-]\\{7,\\}" "orgHASH"
                (replace-regexp-in-string
-                "sec:org[[:alnum:]-]+" "sec:org-id" html))))))))"##,
+                "sec:org[[:alnum:]-]+" "sec:org-id" html)))))))"##,
         expect,
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_babel_tangle_edit_retangle_multi_block_deep() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (invalid-read-syntax \")\" 42 34)""#]];
+    let expect = expect_test::expect![[r#""OK nil""#]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -376,7 +377,7 @@ fn org_babel_tangle_edit_retangle_multi_block_deep() {
                 (list tangled1 tangled2
                       (buffer-substring-no-properties
                        (point-min) (point-max))))))))
-      (delete-directory root t))))"##,
+      (delete-directory root t)))"##,
         expect,
     );
 }

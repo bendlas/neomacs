@@ -15,6 +15,13 @@
 mod api;
 mod bootstrap;
 mod carried;
+mod carrier;
+pub(crate) mod carrier_tls;
+#[allow(
+    dead_code,
+    reason = "S2 control service stays dormant until owned host adapters activate"
+)]
+mod host_service;
 mod owner_carried;
 mod root_registry;
 mod scheduler;
@@ -24,7 +31,7 @@ pub(crate) use api::{green_make_thread, green_world};
 pub(crate) use bootstrap::GreenBootstrap;
 #[cfg(debug_assertions)]
 pub(crate) use bootstrap::debug_assert_native_tables_open;
-pub(crate) use scheduler::{ThreadKey, Wait};
+pub(crate) use scheduler::{ConditionId, MutexId, ThreadKey, Wait};
 pub(crate) use switch::{GreenSeat, SelectTurn};
 
 use super::admission::AdmissionError;
@@ -38,9 +45,7 @@ pub(crate) struct GreenRuntime {
     pub(super) bootstrap: GreenBootstrap,
     pub(super) control: std::sync::Arc<scheduler::Control>,
     /// Each parked thread's private roots (plan-3d §4).
-    pub(super) parked: std::cell::RefCell<
-        rustc_hash::FxHashMap<ThreadKey, crate::tagged::transport::RootBatchLease>,
-    >,
+    pub(super) parked: std::cell::RefCell<host_service::WorldRootRegistry>,
     /// A started thread's function until its OS thread runs it.
     pub(super) pending_starts:
         std::cell::RefCell<rustc_hash::FxHashMap<ThreadKey, crate::emacs_core::value::Value>>,
@@ -57,6 +62,10 @@ pub(crate) struct GreenRuntime {
     /// roots. A same-owner reacquire consumes the marker without signalling.
     pub(super) outgoing_constant_error:
         std::cell::Cell<Option<(ThreadKey, crate::emacs_core::intern::SymId)>>,
+    /// The bounded carrier OS-thread pool (S-track). Carriers share its
+    /// `Arc` while idle; it owns every carrier's join handle. Visible to the
+    /// Green module and its children only, matching `CarrierPool`.
+    carriers: carrier::CarrierPool,
 
     /// The standard case table, one for every thread as in GNU:
     /// `set-standard-case-table` sets it here, and each thread installs it
@@ -129,6 +138,25 @@ impl GreenRuntime {
     }
 }
 
+/// Cold scheduling selection, not a Lisp-visible error. A refused World uses
+/// the existing ordinary thread implementation and never issues a Baton.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GreenAdmissionRefusal {
+    NativeReadinessUnavailable {
+        cause: crate::host_effect::wake::NativeReadinessCause,
+    },
+}
+
+/// Thread startup additionally requires native readiness. The lower keeper
+/// constructor's errors remain unchanged for serial collection/parallel owners.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GreenThreadStartError {
+    #[error("green native readiness is unavailable: {0:?}")]
+    Admission(GreenAdmissionRefusal),
+    #[error(transparent)]
+    Runtime(#[from] GreenStartError),
+}
+
 /// Why the Green runtime could not start, or a Green operation refused.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GreenStartError {
@@ -147,6 +175,18 @@ pub(crate) enum GreenStartError {
 }
 
 impl Context {
+    #[cold]
+    pub(crate) fn green_admission_readiness(&self) -> Result<(), GreenAdmissionRefusal> {
+        self.processes.green_native_readiness().map_err(|cause| {
+            self.processes.observe_green_admission_refusal(|cause| {
+                let refusal = GreenAdmissionRefusal::NativeReadinessUnavailable { cause };
+                tracing::warn!(target: "neovm::green::admission", ?refusal,
+                    "Green admission refused; retaining ordinary Lisp threads");
+            });
+            GreenAdmissionRefusal::NativeReadinessUnavailable { cause }
+        })
+    }
+
     /// Start this World's Green runtime from its first owner: admit
     /// threads, capture the bootstrap further owners are built from, and
     /// issue the World's Baton to this thread. Refused unless the World is
@@ -158,7 +198,7 @@ impl Context {
         if self.threading_mode() != ThreadingMode::Green {
             return Err(GreenStartError::NotGreen);
         }
-        if self.display_host.is_some() || self.input_rx.is_some() {
+        if self.display_host.is_some() || self.input_rx.as_ref().is_some() {
             return Err(GreenStartError::ThreadAffineHost);
         }
         if self.gc_inhibit_depth != 0 {
@@ -172,7 +212,9 @@ impl Context {
         self.install_green_runtime(Box::new(GreenRuntime {
             bootstrap,
             control: Default::default(),
-            parked: Default::default(),
+            parked: std::cell::RefCell::new(host_service::WorldRootRegistry::new(
+                self.tagged_heap.heap_identity(),
+            )),
             pending_starts: Default::default(),
             exit: Default::default(),
             carried: std::cell::RefCell::new(carried::CarriedState::placeholders()),
@@ -180,6 +222,7 @@ impl Context {
             standard_case_table: std::cell::Cell::new(self.cached_standard_case_table),
             outgoing_constant_error: std::cell::Cell::new(None),
             deferred_errors: Default::default(),
+            carriers: carrier::CarrierPool::new(),
         }));
         Ok(baton)
     }
@@ -191,6 +234,12 @@ impl Context {
     #[cold]
     #[inline(never)]
     pub(crate) fn new_green_owner(baton: &super::world::Baton) -> Context {
+        // The job prologue restored the World's carried state before this
+        // call (the carrier reset and `unstow_carried_state` run in
+        // `run_carrier_job`). This owner is about to run on this OS thread;
+        // reserve the dense SymId cache once instead of regrowing it from
+        // empty.
+        crate::emacs_core::intern::prepare_thread_symbol_caches();
         let (seed, current, case_table) = {
             let runtime = baton.green_runtime();
             let bootstrap = &runtime
@@ -237,6 +286,28 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/green_switch_test.rs"]
 mod switch_tests;
+
+#[cfg(test)]
+#[path = "../tests/carrier_pool_test.rs"]
+mod carrier_pool_tests;
+
+// This child bounds its virtual address space through Linux /proc and
+// setrlimit; portable refusal injection lives in the GC unit-test family.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/collector_spawn_failure_test.rs"]
+mod collector_spawn_failure_tests;
+
+#[cfg(test)]
+#[path = "../tests/green_spawn_refusal_test.rs"]
+mod spawn_refusal_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/green_spawn_failure_test.rs"]
+mod spawn_failure_tests;
+
+#[cfg(test)]
+#[path = "../tests/green_thread_retirement_test.rs"]
+mod thread_retirement_tests;
 
 #[cfg(test)]
 #[path = "../tests/green_parked_root_equivalence_test.rs"]

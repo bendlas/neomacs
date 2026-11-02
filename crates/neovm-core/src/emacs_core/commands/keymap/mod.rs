@@ -871,7 +871,10 @@ pub(crate) fn get_keyelt_runtime(eval: &mut Context, binding: Value, autoload: b
             let tail = pair_cdr.cons_cdr();
             object = nth_list_element(pair_cdr, 1).unwrap_or(Value::NIL);
             if autoload && let Some(filter) = menu_item_filter(tail, symbol_mode) {
-                object = eval.apply(filter, vec![object])?;
+                // GNU applies the filter through `menu_item_eval_property`
+                // (src/keyboard.c:8873-8884): `inhibit-redisplay` bound,
+                // `error` caught to nil, quit still nonlocal.
+                object = eval.eval_menu_item_property(filter, vec![object])?;
             }
             continue;
         }
@@ -1771,6 +1774,11 @@ pub fn list_keymap_define(keymap: Value, event: Value, def: Value, symbol_mode: 
 
 /// Remove a binding from a keymap, matching GNU `define-key` with REMOVE arg.
 pub fn list_keymap_remove(keymap: Value, event: Value, symbol_mode: SymbolMode) {
+    // GNU `store_in_keymap` flushes the reverse keymap cache on every store,
+    // including REMOVE (src/keymap.c:733-736). Filters can run arbitrary Lisp
+    // (and rebuild that cache) between the caller's epoch bump and this
+    // store, so the removal must invalidate it just like a definition does.
+    note_keymap_mutation();
     store_in_keymap(keymap, event, Value::NIL, true, symbol_mode);
 }
 
@@ -3505,6 +3513,29 @@ pub(crate) fn command_remapping_command_name(
     command.as_symbol_id(symbol_mode)
 }
 
+/// GNU `Fcommand_remapping (COMMAND, Qnil, Qnil)`: the one-level remapping of
+/// COMMAND in the currently active keymaps, or nil.
+///
+/// `read_key_sequence` asks this once for every command it returns
+/// (keyboard.c:11863-11868) and `command_loop_1` reuses the answer
+/// (keyboard.c:1464-1495).  It is the raw active-map answer, without the
+/// menu-item resolution `key-binding` performs, because that is what GNU's
+/// `Fcommand_remapping` returns.
+pub(crate) fn command_remapping_in_active_maps(
+    ctx: &Context,
+    command: Value,
+) -> Result<Value, Flow> {
+    let symbol_mode = ctx.symbol_mode();
+    let Some(command_name) = command.as_symbol_id(symbol_mode) else {
+        return Ok(Value::NIL);
+    };
+    let active_maps = current_active_maps_for_position_read_only(ctx, true, None)?;
+    Ok(
+        command_remapping_lookup_in_keymaps(&active_maps, command_name, symbol_mode)
+            .unwrap_or(Value::NIL),
+    )
+}
+
 pub(crate) fn key_binding_apply_remap_in_active_maps(
     ctx: &mut Context,
     active_maps: &[Value],
@@ -3984,6 +4015,93 @@ pub fn list_keymap_define_seq_in_obarray_ex(
         }
     }
     Ok(())
+}
+
+/// Define a sequence with runtime prefix resolution and the REMOVE flag.
+/// Menu-item filters must run before deciding whether a binding is a prefix,
+/// just as in GNU `access_keymap(..., noinherit=true, autoload=true)`.
+pub(crate) fn list_keymap_define_seq_runtime_ex(
+    ctx: &mut Context,
+    keymap: Value,
+    events: &[Value],
+    def: Value,
+    remove: bool,
+) -> Result<(), Flow> {
+    let symbol_mode = ctx.symbol_mode();
+    note_keymap_mutation();
+    if events.is_empty() {
+        return Ok(());
+    }
+    if events.len() == 1 {
+        if remove {
+            list_keymap_remove(keymap, events[0], symbol_mode);
+        } else {
+            list_keymap_define(keymap, events[0], def, symbol_mode);
+        }
+        return Ok(());
+    }
+
+    // Filters can run arbitrary Lisp, including GC and replacing the original
+    // bindings. Keep resolved maps, the definition and heap events alive for
+    // the entire walk, including maps returned only by a filter.
+    let root_scope = ctx.save_specpdl_roots();
+    ctx.push_specpdl_root(keymap);
+    ctx.push_specpdl_root(def);
+    for event in events {
+        ctx.push_specpdl_root(*event);
+    }
+    let result = (|| {
+        let mut current_map = keymap;
+        for (i, event) in events.iter().enumerate() {
+            if i == events.len() - 1 {
+                if remove {
+                    list_keymap_remove(current_map, *event, symbol_mode);
+                } else {
+                    list_keymap_define(current_map, *event, def, symbol_mode);
+                }
+                return Ok(());
+            }
+            // Use noinherit: only look in current keymap level for prefix,
+            // matching GNU Emacs define-key which uses access_keymap(noinherit=1)
+            let binding = list_keymap_access_with_event(
+                &current_map,
+                KeymapLookupEvent::from_event(*event, symbol_mode),
+                true,
+                false,
+                true,
+                &mut &mut *ctx,
+                symbol_mode,
+            )?;
+            if let Some(prefix_map) =
+                resolve_prefix_keymap_binding_in_obarray(ctx.obarray(), &binding, symbol_mode)
+            {
+                current_map = prefix_map;
+            } else if binding.is_nil() {
+                // No binding, create a new prefix keymap.
+                // Matches GNU `define_as_prefix` (keymap.c:1446-1452).
+                let prefix_map = make_sparse_list_keymap();
+                list_keymap_define(current_map, *event, prefix_map, symbol_mode);
+                current_map = prefix_map;
+            } else {
+                // GNU `Fdefine_key` only calls `define_as_prefix` after
+                // `access_keymap` returns nil.  Existing non-prefix bindings are
+                // errors, even though a fresh undefined key is promoted to a new
+                // prefix keymap.
+                let full = describe_event_sequence(events, symbol_mode);
+                let prefix = describe_event_sequence(&events[..=i], symbol_mode);
+                return Err(signal(
+                    "error",
+                    vec![Value::string(format!(
+                        "Key sequence {full} starts with non-prefix key {prefix}"
+                    ))],
+                ));
+            }
+            ctx.push_specpdl_root(current_map);
+        }
+        Ok(())
+    })();
+    ctx.restore_specpdl_roots(root_scope);
+    result
 }
 
 /// Generate a human-readable description of an event sequence for error messages.

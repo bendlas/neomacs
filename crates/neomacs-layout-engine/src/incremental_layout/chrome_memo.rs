@@ -508,11 +508,11 @@ impl PlainEncoder {
             return Ok(());
         }
         let keys = MemoKeyScope::for_string(string);
-        let display = keys.capture(Value::symbol("display"));
+        let display = keys.capture(Value::symbol(&crate::fixed_symbols::DISPLAY));
         let name_only = [
-            keys.capture(Value::symbol("help-echo")),
-            keys.capture(Value::symbol("local-map")),
-            keys.capture(Value::symbol("keymap")),
+            keys.capture(Value::symbol(&crate::fixed_symbols::HELP_ECHO_PROPERTY)),
+            keys.capture(Value::symbol(&crate::fixed_symbols::LOCAL_MAP_PROPERTY)),
+            keys.capture(Value::symbol(&crate::fixed_symbols::KEYMAP_PROPERTY)),
         ];
         let runs = intervals.object_interval_plist_runs_for_char_len(
             neovm_core::buffer::CharLen::new(string.schars()),
@@ -688,3 +688,15 @@ pub(crate) fn recorded_fingerprints(window_id: i64) -> Option<Arc<[ChromeRowFing
 #[cfg(test)]
 #[path = "tests/chrome_memo_test.rs"]
 mod tests;
+
+/// Carrier park: drop the previous frame's chrome fingerprints.
+pub(crate) fn reset_carrier_tls() {
+    FINGERPRINT_RECORD.with(|record| record.borrow_mut().clear());
+}
+
+/// Debug-only carrier TLS fingerprint.
+#[cfg(debug_assertions)]
+pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
+    let len = FINGERPRINT_RECORD.with(|record| record.borrow().len()) as u64;
+    *h = (*h ^ len).wrapping_mul(0x0000_0100_0000_01b3);
+}

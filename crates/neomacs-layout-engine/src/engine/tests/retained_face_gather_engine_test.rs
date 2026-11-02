@@ -153,7 +153,7 @@ fn observed_sync(
     let text = source();
     let (mut eval, frame_id, _buffer, _window) = incr_editing_frame(&text, 800, 600);
     prepare_faces(&mut eval, &text);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
     eval.eval_str("(setq prove-first-mode-count 0 prove-first-font-count 0)")
@@ -196,7 +196,7 @@ fn observed_sync(
         .unwrap();
     // A fresh engine re-walks the same Context and source; it cannot borrow the
     // measured engine's matrices or frame-face arena. No fontifiers are installed.
-    let mut full = LayoutEngine::new();
+    let mut full = crate::font::metrics::test_catalog::layout_engine();
     full.layout_frame_rust(&mut eval, frame_id);
     let canonical = frame_observation(&eval, &full, frame_id);
     // A fresh renderer also publishes an unused default-face definition. It
@@ -269,7 +269,7 @@ fn warmed_plan() -> (
     let text = source();
     let (mut eval, frame_id, _buffer, window) = incr_editing_frame(&text, 800, 600);
     prepare_faces(&mut eval, &text);
-    let mut engine = LayoutEngine::new();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
     engine.layout_frame_rust(&mut eval, frame_id);
     activate_last_engine_presentation(&mut eval, &engine, frame_id);
     let retained = engine
@@ -303,9 +303,11 @@ fn prepared_face_replay_keeps_the_collector_and_source_namespace_validation() {
             cursor_only: Some(replay.clone()),
             scroll: None,
             is_edit: false,
+            retry_admitted_faces: None,
+            scroll_continuation_faces: None,
         };
         let mut attempt = arena.begin_attempt();
-        admit_retained_frame_faces(std::slice::from_ref(&plan), &mut attempt, arena).unwrap();
+        admit_retained_frame_faces(std::slice::from_mut(&mut plan), &mut attempt, arena).unwrap();
         assert_eq!(
             probes::counts().materializations,
             1,
@@ -316,7 +318,7 @@ fn prepared_face_replay_keeps_the_collector_and_source_namespace_validation() {
         plan.prepared_faces = Some(FrameFaceArena::default().prepared_snapshot());
         let mut foreign = arena.begin_attempt();
         assert_eq!(
-            admit_retained_frame_faces(std::slice::from_ref(&plan), &mut foreign, arena),
+            admit_retained_frame_faces(std::slice::from_mut(&mut plan), &mut foreign, arena),
             Err(FrameFaceReuseError::ForeignArena)
         );
         assert_eq!(probes::counts().materializations, 1);
@@ -334,17 +336,19 @@ fn stale_retained_generation_is_rejected_before_any_face_collection() {
     let arena = engine.frame_face_arenas.get(&frame_id).unwrap();
     assert_eq!(replay.face_generation, arena.generation());
     let stale = arena.invalidate();
-    let plan = IncrementalWindowPlan {
+    let mut plan = IncrementalWindowPlan {
         prepared_faces: None,
         cursor_only: Some(replay),
         scroll: None,
         is_edit: false,
+        retry_admitted_faces: None,
+        scroll_continuation_faces: None,
     };
     for enabled in [false, true] {
         let _gather = Guard::set(enabled);
         let mut attempt = stale.begin_attempt();
         assert_eq!(
-            admit_retained_frame_faces(std::slice::from_ref(&plan), &mut attempt, &stale),
+            admit_retained_frame_faces(std::slice::from_mut(&mut plan), &mut attempt, &stale),
             Err(FrameFaceReuseError::StaleGeneration {
                 retained: arena.generation(),
                 current: stale.generation(),

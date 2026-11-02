@@ -155,12 +155,13 @@ fn org_num_mode_toggle_clear_reenable_combo() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn org_num_narrow_mutate_promote_refresh_combo() {
     return_if_neovm_enable_oracle_proptest_not_set!();
 
-    let expect = expect_test::expect![[r#""ERR (void-variable states)""#]];
+    let expect = expect_test::expect![[
+        r#""OK (((initial nil nil ((\"* Root\" 1 nil \"<1> \" org-warning) (\"** A\" 2 nil \"<1-1> \" org-warning) (\"*** A1\" 3 nil \"<1-1-1> \" org-warning) (\"*** A2 :skip:\" 3 t \"\" nil) (\"**** A2 child\" 4 nil \"\" nil) (\"** B\" 2 t \"\" nil) (\"*** B child\" 3 nil \"\" nil) (\"* Tail\" 1 nil \"<2> \" org-warning))) (after-narrow-insert nil nil ((\"* Root\" 1 nil \"<1> \" org-warning) (\"** A\" 2 nil \"<1-1> \" org-warning) (\"*** A1\" 3 nil \"<1-1-1> \" org-warning) (\"*** A2 :skip:\" 3 t \"\" nil) (\"**** A2 child*** A3\" 4 nil \"\" nil) (\"**** A3 child\" 4 nil \"\" nil) (\"** B\" 2 t \"\" nil) (\"*** B child\" 3 nil \"\" nil) (\"* Tail\" 1 nil \"<2> \" org-warning))) (after-unskip nil nil ((\"* Root\" 1 nil \"<1> \" org-warning) (\"** A\" 2 nil \"<1-1> \" org-warning) (\"*** A1\" 3 nil \"<1-1-1> \" org-warning) (\"*** A2\" 3 nil \"<1-1-2> \" org-warning) (\"**** A2 child*** A3\" 4 nil \"<1-1-2-1> \" org-warning) (\"**** A3 child\" 4 nil \"<1-1-2-2> \" org-warning) (\"** B\" 2 t \"\" nil) (\"*** B child\" 3 nil \"\" nil) (\"* Tail\" 1 nil \"<2> \" org-warning))) (after-promote nil nil ((\"* Root\" 1 nil \"<1> \" org-warning) (\"** A\" 2 nil \"<1-1> \" org-warning) (\"*** A1\" 3 nil \"<1-1-1> \" org-warning) (\"*** A2\" 3 nil \"<1-1-2> \" org-warning) (\"**** A2 child*** A3\" 4 nil \"<1-1-2-1> \" org-warning) (\"*** A3 child\" 3 nil \"<1-1-3> \" org-warning) (\"** B\" 2 t \"\" nil) (\"*** B child\" 3 nil \"\" nil) (\"* Tail\" 1 nil \"<2> \" org-warning))) (after-delete nil nil ((\"* Root\" 1 nil \"<1> \" org-warning) (\"** A\" 2 nil \"<1-1> \" org-warning) (\"*** A2\" 3 nil \"<1-1-1> \" org-warning) (\"**** A2 child*** A3\" 4 nil \"<1-1-1-1> \" org-warning) (\"*** A3 child\" 3 nil \"<1-1-2> \" org-warning) (\"** B\" 2 t \"\" nil) (\"*** B child\" 3 nil \"\" nil) (\"* Tail\" 1 nil \"<2> \" org-warning))) (after-widen-update nil nil ((\"* Root\" 1 nil \"<1> \" org-warning) (\"** A\" 2 nil \"<1-1> \" org-warning) (\"*** A2\" 3 nil \"<1-1-1> \" org-warning) (\"**** A2 child*** A3\" 4 nil \"<1-1-1-1> \" org-warning) (\"*** A3 child\" 3 nil \"<1-1-2> \" org-warning) (\"** B\" 2 t \"\" nil) (\"*** B child\" 3 nil \"\" nil) (\"* Tail\" 1 nil \"<2> \" org-warning)))) \"* Root\\n** A\\n*** A2\\n**** A2 child*** A3\\n*** A3 child\\n\\n** B\\n:PROPERTIES:\\n:UNNUMBERED: t\\n:END:\\n*** B child\\n* Tail\\n\")""#
+    ]];
     crate::common::assert_oracle_parity_expect(
         r##"(progn
   (require 'org)
@@ -193,7 +194,9 @@ fn org_num_narrow_mutate_promote_refresh_combo() {
                      org-num--missing-overlay
                      (mapcar
                       (lambda (ov)
-                        (list (buffer-substring-no-properties
+                        (org-with-wide-buffer
+                         (goto-char (overlay-start ov))
+                         (list (buffer-substring-no-properties
                                (overlay-start ov)
                                (line-end-position))
                               (overlay-get ov 'level)
@@ -202,10 +205,10 @@ fn org_num_narrow_mutate_promote_refresh_combo() {
                                (or (overlay-get ov 'after-string) ""))
                               (get-text-property
                                0 'face
-                               (or (overlay-get ov 'after-string) ""))))
+                               (or (overlay-get ov 'after-string) "")))))
                       (sort (copy-sequence org-num--overlays)
                             (lambda (a b)
-                              (< (overlay-start a) (overlay-start b)))))))))
+                              (< (overlay-start a) (overlay-start b))))))))
             states)
         (push (funcall snapshot 'initial) states)
         (goto-char (point-min))

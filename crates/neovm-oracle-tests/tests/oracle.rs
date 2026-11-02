@@ -31,6 +31,9 @@ mod oracle_combination;
 #[path = "oracle_copy_lisp_face_defaults.rs"]
 mod oracle_copy_lisp_face_defaults;
 
+#[path = "oracle_default_threads.rs"]
+mod oracle_default_threads;
+
 #[path = "oracle_divergence.rs"]
 mod oracle_divergence;
 
@@ -135,3 +138,9 @@ mod tls_fixture_cleanup;
 
 #[path = "treesit_grammar_loading.rs"]
 mod treesit_grammar_loading;
+
+#[path = "oracle_startup_frame_lifecycle.rs"]
+mod oracle_startup_frame_lifecycle;
+
+#[path = "oracle_category_word_wrap.rs"]
+mod oracle_category_word_wrap;

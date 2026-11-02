@@ -2,6 +2,7 @@
 use super::tests::source;
 use super::*;
 use crate::tagged::gc::PlainSymbolBacking;
+use crate::tagged::gc::ProofEra as ParallelHeapEra;
 
 mod worker;
 use worker::{Actor, Command, Event, Snapshot};
@@ -72,7 +73,7 @@ struct Cycle {
 fn collect(era: &ParallelHeapEra<'_>, before: Vec<Snapshot>, phase: usize) -> Cycle {
     let mut stopped = era.stop().unwrap();
     era.return_cons_storage(&stopped).unwrap();
-    let roots = gc::ledger(era, &stopped);
+    let roots = gc::ledger(era, &mut stopped);
     let report = era.collect_stopped(&mut stopped).unwrap();
     let (live, printed) = era
         .with_stopped_heap_for_test(&stopped, |heap| {

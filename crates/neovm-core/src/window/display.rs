@@ -4,6 +4,7 @@ use super::{
     WindowDisplayState, WindowId, WindowLayoutInputState, WindowMargins,
 };
 use crate::buffer::{BufferId, LispCharPos1};
+use crate::emacs_core::intern::WellKnown;
 use crate::emacs_core::value::Value;
 use std::cell::Cell;
 
@@ -235,7 +236,7 @@ fn frame_default_right_fringe_width(frame: &Frame) -> i32 {
         .unwrap_or(8)
 }
 
-fn frame_vertical_scroll_bar_side(frame: &Frame) -> Option<Value> {
+pub(crate) fn frame_vertical_scroll_bar_side(frame: &Frame) -> Option<Value> {
     // GNU gates the scroll-bar type on FRAME_WINDOW_P /
     // FRAME_HAS_VERTICAL_SCROLL_BARS (src/window.c), so a terminal frame has
     // no scroll bar no matter what its parameter alist says:
@@ -256,7 +257,7 @@ fn frame_vertical_scroll_bar_side(frame: &Frame) -> Option<Value> {
     }
 }
 
-fn frame_has_horizontal_scroll_bar(frame: &Frame) -> bool {
+pub(crate) fn frame_has_horizontal_scroll_bar(frame: &Frame) -> bool {
     // Same FRAME_WINDOW_P gate as the vertical resolver: a tty frame has no
     // scroll bar, so its horizontal parameter is inert.
     if frame.effective_window_system().is_none() {
@@ -268,22 +269,43 @@ fn frame_has_horizontal_scroll_bar(frame: &Frame) -> bool {
     HorizontalScrollBarType::from_symbol_value(&raw).is_some() || raw.is_truthy()
 }
 
-fn frame_config_scroll_bar_width(frame: &Frame) -> i32 {
+/// Pixel thickness of a GUI frame's scroll bar when the frame names none.
+///
+/// GNU does not derive this from the character cell.  `x_set_scroll_bar_default_width`
+/// and `x_set_scroll_bar_default_height` (src/xfns.c:2393-2438) take the
+/// toolkit default: the GTK theme's `scrollbar-width`/`scrollbar-height`, or
+/// the constant 16 in a build without a toolkit.  The Adwaita theme the
+/// oracle runs under answers 16 as well, so a fresh GUI frame reserves a
+/// 16-pixel band on each side (COLUMNS = (16 + char width - 1) / char width,
+/// `x_set_scroll_bar_default_width`'s rounding at :2403).
+///
+/// Neomacs paints its own scroll bars, so its analogue of the toolkit default
+/// is GNU's toolkit-independent constant, not `char_width`: the two differ on
+/// every font whose cell is not 16 pixels wide.
+///
+/// Every place that reserves the default band must use THIS constant.  The
+/// initial GUI frame's size request (`startup_dimensions`, crates/neomacs)
+/// used to reserve one character cell, so with any other cell width the
+/// native window was a fraction of a column too narrow and the first frame
+/// came up one column short of the requested grid.
+pub const GUI_SCROLL_BAR_DEFAULT_WIDTH_PX: u32 = 16;
+
+pub(crate) fn frame_config_scroll_bar_width(frame: &Frame) -> i32 {
     frame
         .known_parameter(FrameParam::ScrollBarWidth)
         .and_then(|v| v.as_int())
         .and_then(|value| i32::try_from(value).ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| frame.char_width.max(1.0).round() as i32)
+        .unwrap_or(GUI_SCROLL_BAR_DEFAULT_WIDTH_PX as i32)
 }
 
-fn frame_config_scroll_bar_height(frame: &Frame) -> i32 {
+pub(crate) fn frame_config_scroll_bar_height(frame: &Frame) -> i32 {
     frame
         .known_parameter(FrameParam::ScrollBarHeight)
         .and_then(|v| v.as_int())
         .and_then(|value| i32::try_from(value).ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| frame.char_height.max(1.0).round() as i32)
+        .unwrap_or(GUI_SCROLL_BAR_DEFAULT_WIDTH_PX as i32)
 }
 
 fn effective_vertical_scroll_bar_type(
@@ -738,6 +760,17 @@ impl crate::emacs_core::eval::Context {
                 return crate::window::WindowLayoutQueryOutcome::Unavailable;
             }
             WindowLayoutQueryAdapter::Running => {
+                // A position query can measure chrome whose :eval asks for
+                // another position. The outer adapter owns the walk; let the
+                // nested consumer fall back to accepted geometry instead of
+                // turning an ordinary chrome expression into a layout error.
+                if matches!(
+                    scope,
+                    crate::window::WindowLayoutQueryScope::Position { .. }
+                ) && crate::emacs_core::xdisp::mode_line_display_active(self)
+                {
+                    return crate::window::WindowLayoutQueryOutcome::Unavailable;
+                }
                 return crate::window::WindowLayoutQueryOutcome::LayoutBusy;
             }
             WindowLayoutQueryAdapter::Ready(query) => query,
@@ -878,13 +911,14 @@ impl crate::emacs_core::eval::Context {
         &self,
         buffer_id: BufferId,
     ) -> Option<super::WindowBufferLayoutInputState> {
+        // GNU reads the DEFSYM `Qfontification_functions`; this projection
+        // runs for every layout attempt and previously re-interned the
+        // spelling at each call.
+        static FONTIFICATION_FUNCTIONS: WellKnown = WellKnown::FontificationFunctions;
         self.capture_buffer_layout_inputs(buffer_id, |buffer| {
             super::FontificationHookIdentity(
-                self.variable_value_in_buffer_inline(
-                    Some(buffer),
-                    crate::emacs_core::intern::intern("fontification-functions"),
-                )
-                .map(super::WindowLayoutValueIdentity::of),
+                self.variable_value_in_buffer_inline(Some(buffer), FONTIFICATION_FUNCTIONS.id())
+                    .map(super::WindowLayoutValueIdentity::of),
             )
         })
     }
@@ -922,7 +956,24 @@ impl crate::emacs_core::eval::Context {
             prefixes: self.layout_prefix_inputs(buffer_id)?,
             invisibility: self.layout_invisibility_input(buffer_id)?,
             display_table: self.layout_display_table_input(buffer_id)?,
+            word_wrap_policy: self.layout_word_wrap_policy(buffer_id)?,
         })
+    }
+
+    pub fn layout_word_wrap_policy(&self, buffer_id: BufferId) -> Option<super::WordWrapPolicy> {
+        let buffer = self.buffers.get(buffer_id)?;
+        let enabled = |variable: super::WindowLayoutVariable| {
+            self.variable_value_in_buffer(Some(buffer), variable.sym_id())
+                .is_some_and(|value| value.is_truthy())
+        };
+        let mode = if enabled(super::WindowLayoutVariable::WordWrap)
+            && enabled(super::WindowLayoutVariable::WordWrapByCategory)
+        {
+            super::WordWrapMode::Category
+        } else {
+            super::WordWrapMode::Whitespace
+        };
+        Some(super::WordWrapPolicy::for_buffer(buffer, mode))
     }
 
     /// Capture glyph-vector inputs for the effective buffer/standard table.
@@ -1002,6 +1053,10 @@ impl crate::emacs_core::eval::Context {
             media_generation: self.media_generation(),
             function_epoch: self.obarray().function_epoch(),
             symbol_property_revision: crate::emacs_core::symbol::SymbolPropertyRevision::current(),
+            overlays_face_only: self
+                .buffers
+                .get(buffer_id)
+                .is_some_and(|buffer| buffer.overlays_are_face_only()),
         })
     }
 

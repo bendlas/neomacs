@@ -1,5 +1,5 @@
 use super::*;
-use crate::buffer::{CharLen, CharPos0, CharRange, LispCharPos1};
+use crate::buffer::{CharLen, CharRange, LispCharPos1};
 use crate::emacs_core::error::{
     FlowKind, FlowResultExt, expect_args, expect_args_range, expect_fixnum, expect_max_args,
     expect_min_args,
@@ -9,6 +9,7 @@ use crate::emacs_core::eval::{
 };
 use crate::emacs_core::fontset;
 pub(crate) use crate::emacs_core::frame::{builtin_next_frame, builtin_previous_frame};
+use crate::emacs_core::intern::WellKnown;
 use crate::emacs_core::intern::{NIL_SYM_ID, T_SYM_ID, intern, is_canonical_id};
 use crate::emacs_core::minibuffer;
 use crate::emacs_core::symbol::CanonicalAccess;
@@ -24,9 +25,7 @@ pub(crate) const GNU_INITIAL_OBARRAY_SIZE: usize = 1 << 15;
 // Symbol operations (need evaluator for obarray access)
 // ===========================================================================
 
-pub(crate) fn symbol_id(value: &Value, mode: SymbolMode) -> Option<SymId> {
-    value.as_symbol_id(mode).filter(|_| !value.is_unbound())
-}
+pub(crate) use crate::emacs_core::value::symbol_id;
 
 pub(crate) fn symbol_id_checked(value: &Value, symbols_with_pos_enabled: bool) -> Option<SymId> {
     let mode = if symbols_with_pos_enabled {
@@ -1806,8 +1805,12 @@ pub(crate) fn is_global_obarray_proxy(eval: &super::eval::Context, value: &Value
 }
 
 fn current_lisp_obarray_value(eval: &super::eval::Context) -> Value {
-    eval.variable_value_by_name("obarray").unwrap_or_else(|| {
-        eval.variable_value_by_name("neovm--obarray-object")
+    // GNU's `Vobarray`; a Lisp `intern` call without an explicit obarray read
+    // it by name. The internal fallback name belongs to this port.
+    static OBARRAY: WellKnown = WellKnown::Obarray;
+    static NEOVM_OBARRAY_OBJECT: WellKnown = WellKnown::NeovmObarrayObject;
+    eval.variable_value(OBARRAY.id()).unwrap_or_else(|| {
+        eval.variable_value(NEOVM_OBARRAY_OBJECT.id())
             .unwrap_or(Value::NIL)
     })
 }
@@ -2377,7 +2380,7 @@ pub(crate) fn builtin_redisplay(
 ) -> EvalResult {
     expect_args_range("redisplay", &args, 0, 1)?;
     if eval
-        .eval_symbol("executing-kbd-macro")
+        .eval_symbol_by_id(crate::emacs_core::intern::WellKnown::ExecutingKbdMacro.id())
         .is_ok_and(|value| !value.is_nil())
     {
         return Ok(Value::NIL);
@@ -2624,8 +2627,8 @@ pub(crate) fn builtin_marker_last_position(args: Vec<Value>) -> EvalResult {
             // marker's last known position even after detach.  Neomacs
             // tracks this with `last_position_valid`, set the first time
             // the marker is positioned and preserved across detach.
-            let last = if marker.last_position_valid {
-                CharPos0::new(marker.charpos).to_lisp().as_i64()
+            let last = if marker.last_position_valid() {
+                marker.charpos.to_lisp().as_i64()
             } else {
                 0
             };
@@ -3183,8 +3186,17 @@ pub(crate) fn builtin_recordp_1(_eval: &mut super::eval::Context, arg: Value) ->
     Ok(Value::bool_val(arg.is_record()))
 }
 
-pub(crate) fn builtin_query_fontset(args: Vec<Value>) -> EvalResult {
+pub(crate) fn builtin_query_fontset(
+    eval: &mut super::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
     expect_args_range("query-fontset", &args, 1, 2)?;
+    // GNU `Fquery_fontset` calls `check_window_system (NULL)` before touching
+    // the pattern (src/fontset.c:1248), so a headless session signals instead
+    // of resolving the fontset registry.
+    if !crate::emacs_core::display::x_window_system_active(eval) {
+        return Err(crate::emacs_core::display::window_system_not_initialized_error());
+    }
     let pattern = expect_string_lossy(&args[0])?;
     if pattern.is_empty() {
         return Ok(Value::NIL);
@@ -3334,8 +3346,12 @@ pub(crate) fn builtin_resize_mini_window_internal(
 
     let old_total = root_height.saturating_add(mini_height);
     let new_total = root_new.saturating_add(mini_new);
-    if !crate::window::window_resize_check(frame.tree(), frame.tree().root_id(), false)
-        || mini_new <= 0
+    if !crate::window::window_resize_check(
+        frame.tree(),
+        frame.tree().root_id(),
+        crate::window::SplitDirection::Vertical,
+        crate::window::body::WindowBodyCellSize::new(frame.char_width, frame.char_height),
+    ) || mini_new <= 0
         || old_total != new_total
     {
         return Err(signal(
@@ -4074,7 +4090,7 @@ fn marker_live_buffer_for_value_lt(
     eval: &crate::emacs_core::eval::Context,
     value: &Value,
 ) -> Option<crate::buffer::BufferId> {
-    let buffer_id = value.as_marker_data()?.buffer?;
+    let buffer_id = value.as_marker_data()?.buffer_id()?;
     eval.buffers.get(buffer_id)?;
     Some(buffer_id)
 }
@@ -4471,8 +4487,13 @@ fn interactive_form_from_bytecode_value(function: Value) -> Option<Value> {
     if probe.slot_count <= 5 {
         return None;
     }
+    // GNU's `Qinteractive`; this form is reconstructed per command lookup.
+    static INTERACTIVE_FORM_SYMBOL: WellKnown = WellKnown::Interactive;
     let spec_val = stored_interactive_spec_value(probe.interactive.unwrap_or(Value::NIL));
-    Some(Value::list(vec![Value::symbol("interactive"), spec_val]))
+    Some(Value::list(vec![
+        Value::symbol(&INTERACTIVE_FORM_SYMBOL),
+        spec_val,
+    ]))
 }
 
 #[allow(dead_code)] // grandfathered when dead_code lint was enabled; delete or wire up
@@ -5804,7 +5825,23 @@ pub(crate) fn builtin_dump_emacs_portable(
     }
     ctx.set_variable("command-line-processed", Value::NIL);
     ctx.set_variable("process-environment", Value::NIL);
+    // This global is needed by loadup's build tools, but runtime startup
+    // reconstructs it. Save it only in native locals, after the last GC:
+    // Lisp bindings retaining the originals would also enter the image.
+    // Ordinary runtime redumps keep GNU's behavior, regardless of filename.
+    let saved_build_exec_path = ctx.loadup_dump_mode.map(|_| {
+        let exec_path = ctx
+            .obarray()
+            .canonical_value_without_buffer(CanonicalAccess::DUMP, "exec-path")
+            .any_arm()
+            .unwrap_or(Value::NIL);
+        ctx.set_variable("exec-path", Value::NIL);
+        exec_path
+    });
     let dump_result = crate::emacs_core::pdump::dump_to_file(ctx, dump_path);
+    if let Some(exec_path) = saved_build_exec_path {
+        ctx.set_variable("exec-path", exec_path);
+    }
     ctx.set_variable("post-gc-hook", saved_post_gc_hook);
     ctx.set_variable("command-line-processed", saved_command_line_processed);
     ctx.set_variable("process-environment", saved_process_environment);
@@ -6930,8 +6967,18 @@ pub(crate) fn builtin_make_finalizer(
     args: Vec<Value>,
 ) -> EvalResult {
     expect_args("make-finalizer", &args, 1)?;
-    // GNU `Fmake_finalizer` accepts any object as FUNCTION; it is only
-    // funcall'd (errors ignored) once the finalizer becomes unreachable.
+    // GNU `Fmake_finalizer` (src/alloc.c) starts with
+    // CHECK_TYPE (FUNCTIONP (function), Qfunctionp, function): the argument is
+    // checked at CREATION, before the object is allocated.  The later call is
+    // `internal_condition_case_1 (call0, ...)`, so a non-function never
+    // reaches it.  FUNCTIONP is GNU's full predicate (symbols with function
+    // definitions, subrs, closures, raw-nil-type autoloads).
+    if !super::types::value_is_function(ctx, args[0]) {
+        return Err(signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("functionp"), args[0]],
+        ));
+    }
     Ok(ctx.tagged_heap.alloc_finalizer(args[0]))
 }
 
@@ -6954,6 +7001,207 @@ pub(crate) fn world_state_placeholder() -> Box<dyn std::any::Any> {
 pub(crate) fn swap_world_state(slot: &mut dyn std::any::Any) {
     let slot = slot.downcast_mut::<i64>().expect("carried World state");
     LOSSAGE_SIZE.with(|size| std::mem::swap(&mut *size.borrow_mut(), slot));
+}
+
+// ---------------------------------------------------------------------------
+// Argument helpers
+// ---------------------------------------------------------------------------
+
+fn validate_optional_obarray_arg(args: &[Value]) -> Result<(), Flow> {
+    if let Some(obarray) = args.get(1)
+        && !obarray.is_nil()
+    {
+        check_obarray_value(*obarray)?;
+    }
+    Ok(())
+}
+
+fn is_global_obarray_proxy_in_state(
+    vars: crate::emacs_core::eval::VariableView<'_>,
+    value: &Value,
+) -> bool {
+    vars.value_by_name("obarray")
+        .is_some_and(|proxy| proxy == *value)
+}
+
+/// (mapatoms FUNCTION &optional OBARRAY) — call FUNCTION with each interned symbol.
+pub(crate) fn builtin_mapatoms(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+    let roots = eval.save_specpdl_roots();
+    for arg in &args {
+        eval.push_specpdl_root(*arg);
+    }
+    let (func, symbols) = collect_mapatoms_symbols(eval, args)?;
+    eval.push_specpdl_root(func);
+    // The snapshot contains only immediate `SymId` values. Symbols live in
+    // the process-global append-only registry, so they cannot be reclaimed by
+    // a callback-triggered GC and do not belong in the managed-object root
+    // stack. Rooting every symbol made one Doom startup permanently retain a
+    // multi-megabyte root-vector capacity after `mapatoms` returned.
+    let result = (|| -> EvalResult {
+        for sym in symbols {
+            eval.apply1(func, sym)?;
+        }
+        Ok(Value::NIL)
+    })();
+    eval.restore_specpdl_roots(roots);
+    result
+}
+
+fn effective_mapatoms_obarray_arg(eval: &super::eval::Context, args: &[Value]) -> Value {
+    args.get(1)
+        .copied()
+        .filter(|value| !value.is_nil())
+        .unwrap_or_else(|| current_lisp_obarray_value(eval))
+}
+
+pub(crate) fn collect_mapatoms_symbols(
+    eval: &super::eval::Context,
+    args: Vec<Value>,
+) -> Result<(Value, Vec<Value>), Flow> {
+    expect_min_args("mapatoms", &args, 1)?;
+    expect_max_args("mapatoms", &args, 2)?;
+    let func = args[0];
+    let effective_obarray = effective_mapatoms_obarray_arg(eval, &args);
+
+    if !is_global_obarray_proxy(eval, &effective_obarray) {
+        let custom_obarray = check_obarray_value(effective_obarray)?;
+        let all_slots = obarray_buckets(custom_obarray).unwrap_or_default();
+        let mut symbols = Vec::new();
+        for slot in &all_slots {
+            let mut current = *slot;
+            loop {
+                match current.kind() {
+                    ValueKind::Nil => break,
+                    ValueKind::Cons => {
+                        let car = current.cons_car();
+                        let cdr = current.cons_cdr();
+                        symbols.push(car);
+                        current = cdr;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        return Ok((func, symbols));
+    }
+
+    let symbols = global_obarray_symbols_in_bucket_order(eval.obarray(), effective_obarray);
+    Ok((func, symbols))
+}
+
+/// (unintern NAME OBARRAY) — remove symbol from obarray.
+pub(crate) fn builtin_unintern(eval: &mut super::eval::Context, args: Vec<Value>) -> EvalResult {
+    let symbol_mode = eval.symbol_mode();
+    // GNU `Sunintern` is `2, 2`: OBARRAY is mandatory (may be nil).
+    expect_min_args("unintern", &args, 2)?;
+    expect_max_args("unintern", &args, 2)?;
+    validate_optional_obarray_arg(&args)?;
+
+    // GNU tests SYMBOLP, which includes nil and t. Keep exact-symbol
+    // deletion distinct from name lookup; a namesake in another obarray
+    // must never be removed by a symbol argument.
+    enum UninternTarget<'a> {
+        Symbol(SymId),
+        Name(&'a crate::heap_types::LispString),
+    }
+
+    let target = if let Some(symbol) = args[0].as_symbol_id(eval.symbol_mode()) {
+        UninternTarget::Symbol(symbol)
+    } else if let Some(name) = args[0].as_lisp_string() {
+        UninternTarget::Name(name)
+    } else {
+        return Err(signal(
+            LispCondition::WrongTypeArgument,
+            vec![Value::symbol("stringp"), args[0]],
+        ));
+    };
+
+    let target_name = match &target {
+        UninternTarget::Symbol(id) => crate::emacs_core::intern::resolve_sym_lisp_string(*id),
+        UninternTarget::Name(name) => *name,
+    };
+
+    // Custom obarray path
+    if let Some(custom_obarray) = args
+        .get(1)
+        .filter(|v| !v.is_nil() && !is_global_obarray_proxy_in_state(eval.variables(), v))
+    {
+        let custom_obarray = check_obarray_value(*custom_obarray)?;
+        let vec_len = obarray_len(custom_obarray).unwrap_or(0);
+        if vec_len == 0 {
+            return Ok(Value::NIL);
+        }
+        let bucket_idx = obarray_hash_lisp_string(target_name, vec_len);
+        let bucket = obarray_bucket(custom_obarray, bucket_idx).unwrap_or(Value::NIL);
+
+        // GNU oblookup compares a name's character count and bytes and never
+        // its multibyte flag (lread.c:4945). The canonical name atom of an
+        // ASCII-only spelling is stored unibyte while the query can be
+        // multibyte, so LispString equality (which compares the flag) misses a
+        // symbol that `intern-soft` -- and GNU -- resolve. Compare the way
+        // lookup does.
+        let name_query = match &target {
+            UninternTarget::Name(name) => {
+                Some(crate::emacs_core::intern::SymbolNameQuery::from(*name))
+            }
+            UninternTarget::Symbol(_) => None,
+        };
+
+        // Walk the bucket chain and rebuild without the matching symbol
+        let mut items = Vec::new();
+        let mut found = false;
+        let mut current = bucket;
+        loop {
+            match current.kind() {
+                ValueKind::Nil => break,
+                ValueKind::Cons => {
+                    let car = current.cons_car();
+                    let cdr = current.cons_cdr();
+                    if !found {
+                        let should_remove = match &target {
+                            UninternTarget::Symbol(target_id) => {
+                                car.as_symbol_id(symbol_mode) == Some(*target_id)
+                            }
+                            UninternTarget::Name(_) => name_query.is_some_and(|query| {
+                                car.as_symbol_id(symbol_mode)
+                                    .map(
+                                        crate::emacs_core::intern::resolve_lisp_visible_symbol_name,
+                                    )
+                                    .is_some_and(|sym_name| query.matches(sym_name.text()))
+                            }),
+                        };
+                        if should_remove {
+                            found = true;
+                            current = cdr;
+                            continue;
+                        }
+                    }
+                    items.push(car);
+                    current = cdr;
+                }
+                _ => break,
+            }
+        }
+
+        if found {
+            // Rebuild the bucket chain
+            let new_bucket = items
+                .into_iter()
+                .rev()
+                .fold(Value::NIL, |acc, sym| Value::cons(sym, acc));
+            let _ = set_obarray_bucket(custom_obarray, bucket_idx, new_bucket);
+            note_obarray_symbol_removed(custom_obarray);
+            return Ok(Value::T);
+        }
+        return Ok(Value::NIL);
+    }
+
+    // Global obarray path
+    let removed = match target {
+        UninternTarget::Symbol(id) => eval.obarray.unintern_id(id),
+        UninternTarget::Name(name) => eval.obarray.unintern_lisp_string(name),
+    };
+    Ok(if removed { Value::T } else { Value::NIL })
 }
 
 #[cfg(test)]

@@ -135,11 +135,10 @@ fn div_cx43_overlay_stack_priority_get_char_property_5_deep() {
     );
 }
 
-#[ignore = "malformed embedded oracle form: the reader guard rejects this source until the probe is repaired"]
 #[test]
 fn div_cx43_window_start_end_hscroll_combined() {
     return_if_neovm_enable_oracle_proptest_not_set!();
-    let expect = expect_test::expect![[r#""OK nil""#]];
+    let expect = expect_test::expect![[r#""OK (5 1 61 0)""#]];
     crate::common::assert_oracle_parity_expect(
         r##"
 (let ((buf (get-buffer-create " *neo-cx43-ws*")))
@@ -152,7 +151,7 @@ fn div_cx43_window_start_end_hscroll_combined() {
     (prog1 (list hs ws we (window-hscroll))
       (set-window-buffer (selected-window) (get-buffer-create "*scratch*"))
       (kill-buffer buf)))
-"##,
+)"##,
         expect,
     );
 }
@@ -242,11 +241,19 @@ fn div_cx43_process_output_multibyte_narrowed_buffer_coding_mega() {
   (with-current-buffer buf
     (insert "HEADER\n")
     (narrow-to-region 1 4))
-  (let ((p (make-process :name "neo-cx43-pm" :command '("printf" "%s" "café世界")
-                         :buffer buf)))
+  (let* ((ready (make-temp-file "neo-cx43-pm-gate-"))
+         (p (make-process :name "neo-cx43-pm"
+                          :command (append (list "sh" "-c"
+                                                 "while [ -e \"$1\" ]; do sleep 0.01; done; shift; exec \"$@\""
+                                                 "sh" ready)
+                                           '("printf" "%s" "café世界"))
+                          :buffer buf)))
     (set-process-sentinel p #'ignore)
     (set-process-query-on-exit-flag p nil)
     (set-process-coding-system p 'utf-8-unix 'utf-8-unix)
+    ;; The child writes only after READY is deleted and the coding system is
+    ;; set, while this form is waiting.
+    (delete-file ready)
     (neovm--oracle-settle-process p 600))
   (prog1 (with-current-buffer buf
            (widen)

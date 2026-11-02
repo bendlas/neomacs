@@ -278,6 +278,14 @@ pub(super) fn parse_signal_number(value: &Value) -> Result<SignalNumber, Flow> {
 pub(super) enum ProcessSignalRecipient {
     ImmediateProcess,
     ProcessGroup,
+    /// The subr's CURRENT-GROUP argument is non-nil.  GNU then types the
+    /// terminal's control character down the pty for INT, QUIT and TSTP
+    /// (`src/process.c:7100-7138`), so the line discipline delivers the
+    /// signal to the terminal's current foreground process group -- the
+    /// subjob, not the shell -- and it keeps working for inferiors that
+    /// changed uid, where `kill` fails EPERM.  Without a pty (or with the
+    /// character disabled) GNU falls back to `kill (- p->pid, signo)`.
+    CurrentTerminalGroup,
 }
 
 /// GNU's `kill (p->pid, ...)` / `kill (- p->pid, ...)` for one of this port's
@@ -301,7 +309,7 @@ pub(super) enum ProcessSignalRecipient {
 /// the number `Fprocess_id` reports and GNU keeps after the reap; what goes
 /// away with the child is the number that authorises a syscall.
 pub(super) fn deliver_process_signal(
-    proc: &Process,
+    proc: &mut Process,
     signal_num: i32,
     recipient: ProcessSignalRecipient,
 ) -> i32 {
@@ -311,7 +319,90 @@ pub(super) fn deliver_process_signal(
     match recipient {
         ProcessSignalRecipient::ImmediateProcess => sys::send_signal(pid as i64, signal_num),
         ProcessSignalRecipient::ProcessGroup => sys::send_signal_to_group(pid as i64, signal_num),
+        ProcessSignalRecipient::CurrentTerminalGroup => {
+            if send_signal_via_terminal_character(proc, signal_num) {
+                0
+            } else {
+                sys::send_signal_to_group(pid as i64, signal_num)
+            }
+        }
     }
+}
+
+/// GNU `process_send_signal`'s `SIGNALS_VIA_CHARACTERS` arm
+/// (`src/process.c:7100-7138`): for INT, QUIT and TSTP, write the pty's
+/// control character (`VINTR`, `VQUIT`, `VSUSP`) to the master instead of
+/// calling `kill`.  `tcgetattr` reads the same line discipline a keystroke
+/// would go through, so whether the character becomes a signal is the
+/// terminal's decision, not ours -- `stty -isig` makes it ordinary input,
+/// and `stty -echo` never applies to input-only control bytes.
+///
+/// Returns true only when the byte was written; every other outcome (no
+/// pty, no writer, `tcgetattr` failure, a disabled character, a write
+/// error) returns false so the caller takes GNU's `kill (- p->pid, signo)`
+/// fallback.  GNU ignores `tcgetattr`'s result; reading uninitialised
+/// memory there is not something to reproduce.
+#[cfg(unix)]
+fn send_signal_via_terminal_character(proc: &mut Process, signal_num: i32) -> bool {
+    use std::io::Write;
+
+    let index = match signal_num {
+        libc::SIGINT => libc::VINTR,
+        libc::SIGQUIT => libc::VQUIT,
+        libc::SIGTSTP => libc::VSUSP,
+        _ => return false,
+    } as usize;
+    let Some(fd) = proc.live_io.pty_master.as_ref().and_then(|m| m.as_raw_fd()) else {
+        return false;
+    };
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `tcgetattr` initialises the whole struct on success and leaves
+    // it untouched on failure, which returns before the struct is read.
+    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `tcgetattr` returned 0, so the struct is initialised.
+    let termios = unsafe { termios.assume_init() };
+    let Some(&character) = termios.c_cc.get(index) else {
+        return false;
+    };
+    // GNU's CDISABLE (src/systty.h:50): a disabled control character means
+    // there is no byte to send.
+    if character == libc::_POSIX_VDISABLE as libc::cc_t {
+        return false;
+    }
+    let Some(writer) = proc.live_io.pty_writer.as_mut() else {
+        return false;
+    };
+    // The master fd is non-blocking (PTY registration sets O_NONBLOCK), so a
+    // full input queue reports EAGAIN instead of waiting.  GNU's
+    // `send_process` waits for writability and retries; one byte fits any
+    // empty pty queue, and the bounded poll below only matters when the
+    // child is not draining input.
+    let bytes = [character];
+    for _ in 0..100 {
+        match writer.write(&bytes) {
+            Ok(1) => return true,
+            Ok(_) => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut accessible = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one initialised `pollfd` for the duration of the
+                // call; the return value is not needed.
+                unsafe { libc::poll(&mut accessible, 1, 10) };
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn send_signal_via_terminal_character(_proc: &mut Process, _signal_num: i32) -> bool {
+    false
 }
 
 pub(super) fn process_has_subprocess_backing(proc: &Process) -> bool {
@@ -733,13 +824,15 @@ pub(super) fn socket_addr_to_lisp_value(addr: SocketAddr) -> Value {
     }
 }
 
+/// GNU's `conv_sockaddr_to_lisp` result for one end of a Unix-domain socket,
+/// as the unibyte string `make_unibyte_string` (src/process.c:2643) builds.
 #[cfg(unix)]
-pub(super) fn unix_socket_addr_to_runtime_string(addr: Option<UnixSocketAddr>) -> String {
-    addr.and_then(|addr| {
-        addr.as_pathname()
-            .map(|path| path.as_os_str().to_string_lossy().into_owned())
-    })
-    .unwrap_or_default()
+pub(super) fn unix_socket_endpoint_value(
+    fd: std::os::fd::RawFd,
+    end: sys::net::SocketEnd,
+) -> Option<Value> {
+    let name = sys::net::unix_socket_name(fd, end)?;
+    Some(Value::heap_string(LispString::from_unibyte(name)))
 }
 
 #[cfg(unix)]
@@ -930,42 +1023,6 @@ pub(super) fn int_vector(values: &[i64]) -> Value {
     Value::vector(values.iter().map(|v| Value::fixnum(*v)).collect())
 }
 
-pub(super) fn loopback_ipv4_address() -> Value {
-    int_vector(&[127, 0, 0, 1, 0])
-}
-
-pub(super) fn loopback_ipv4_broadcast() -> Value {
-    int_vector(&[0, 0, 0, 0, 0])
-}
-
-pub(super) fn loopback_ipv4_netmask() -> Value {
-    int_vector(&[255, 0, 0, 0, 0])
-}
-
-pub(super) fn loopback_ipv6_address() -> Value {
-    int_vector(&[0, 0, 0, 0, 0, 0, 0, 1, 0])
-}
-
-pub(super) fn loopback_ipv6_broadcast() -> Value {
-    int_vector(&[0, 0, 0, 0, 0, 0, 0, 1, 0])
-}
-
-pub(super) fn loopback_ipv6_netmask() -> Value {
-    int_vector(&[65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 0])
-}
-
-pub(super) fn loopback_hwaddr() -> Value {
-    Value::cons(Value::fixnum(772), int_vector(&[0, 0, 0, 0, 0, 0]))
-}
-
-pub(super) fn loopback_flags() -> Value {
-    Value::list(vec![
-        Value::symbol("running"),
-        Value::symbol("loopback"),
-        Value::symbol("up"),
-    ])
-}
-
 pub(super) fn zero_network_address(family: NetworkAddressFamily) -> Value {
     match family {
         NetworkAddressFamily::Ipv4 => int_vector(&[0, 0, 0, 0, 0]),
@@ -1099,21 +1156,6 @@ pub(super) fn resolve_network_lookup_addresses(
     }
 
     out
-}
-
-pub(super) fn interface_entry(name: &str, address: Value, full: bool) -> Value {
-    if !full {
-        return Value::cons(Value::string(name), address);
-    }
-
-    let (broadcast, netmask) = match address.kind() {
-        ValueKind::Veclike(VecLikeType::Vector) if address.as_vector_data().unwrap().len() == 9 => {
-            (loopback_ipv6_broadcast(), loopback_ipv6_netmask())
-        }
-        _ => (loopback_ipv4_broadcast(), loopback_ipv4_netmask()),
-    };
-
-    Value::list(vec![Value::string(name), address, broadcast, netmask])
 }
 
 pub(super) fn format_ipv4_network_address(items: &[i64], omit_port: bool) -> Option<String> {
