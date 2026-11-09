@@ -59,6 +59,7 @@ pub(crate) enum FunctionSourceIdentity {
 
 pub mod buffer_vocab;
 pub mod flow_vocab;
+pub(crate) mod jit_runtime;
 pub mod positions;
 pub(crate) mod scratch_bridge;
 pub mod text_props;
@@ -3241,7 +3242,7 @@ impl TaggedValue {
         width: i32,
         height: i32,
         xwidget_id: u32,
-        webview_id: neomacs_display_protocol::WebViewId,
+        webview_id: neovm_display_identity::WebViewId,
     ) -> Self {
         with_tagged_heap(|h| {
             h.alloc_xwidget(type_, title, buffer, width, height, xwidget_id, webview_id)
@@ -3271,7 +3272,7 @@ impl TaggedValue {
 
     /// Allocate a GC-managed video-session handle. The stable `VideoId` is
     /// destroyed through the display host when Lisp drops the final reference.
-    pub fn make_video_handle(video_id: neomacs_display_protocol::VideoId) -> Self {
+    pub fn make_video_handle(video_id: neovm_display_identity::VideoId) -> Self {
         with_tagged_heap(|h| h.alloc_video_handle(video_id))
     }
 
@@ -3286,7 +3287,7 @@ impl TaggedValue {
         unsafe {
             match (*header).type_tag {
                 VecLikeType::Thread => {
-                    Some((*(header as *const ThreadObj)).payload.id.native_key())
+                    Some((*(header as *const ThreadObj)).payload.id().native_key())
                 }
                 VecLikeType::Mutex => Some((*(header as *const MutexObj)).payload.id.native_key()),
                 VecLikeType::CondVar => {
@@ -3893,7 +3894,7 @@ impl TaggedValue {
     }
 
     /// Get the stable protocol id from a video-session handle.
-    pub fn as_video_handle(self) -> Option<neomacs_display_protocol::VideoId> {
+    pub fn as_video_handle(self) -> Option<neovm_display_identity::VideoId> {
         if self.is_video_handle() {
             let ptr = self.as_veclike_ptr().unwrap() as *const VideoObj;
             Some(unsafe { (*ptr).video_id })
@@ -5752,7 +5753,7 @@ use hash_index::{HashIndex, fx_hash_key, stored_hash};
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/bytecode_capture_test.rs"]
+#[path = "../../../../core_tests/emacs_core/runtime/value/tests/bytecode_capture_test.rs"]
 mod bytecode_capture_tests;
 
 #[cfg(test)]

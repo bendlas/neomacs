@@ -4,6 +4,7 @@
 //! the same view of `Context` and the parent's private items (`use super::*`).
 
 use super::*;
+use crate::emacs_core::eval::subr_abi::SubrValueExt;
 use crate::emacs_core::symbol::CanonicalAccess;
 
 /// Select raw constructor storage BEFORE the World is sealed or callable.
@@ -1499,7 +1500,10 @@ impl Context {
         // loaded GNU bytecode can capture `nil` for forward/runtime calls into
         // Builtin function cells are set by SubrSpec registration during init_builtins().
         for name in ["mark-marker", "region-beginning", "region-end"] {
-            obarray.set_symbol_function(name, Value::subr_from_sym_id(intern(name)));
+            obarray.set_symbol_function(
+                name,
+                <Value as SubrValueExt>::subr_from_sym_id(intern(name)),
+            );
         }
 
         // `word-at-point` is defined in GNU Emacs Lisp by `thingatpt.el`,
@@ -2352,6 +2356,12 @@ impl Context {
                 push: super::push_scratch_gc_root,
                 restore: super::restore_scratch_gc_roots,
             },
+        );
+        // The string position cache lives above heap_types, but heap payload
+        // mutations must invalidate it. Publish the cache's stamp at the same
+        // one-time seam; the cache refuses to fill until it is installed.
+        crate::heap_types::install_string_bytes_changed_hook(
+            crate::emacs_core::string_pos_cache::note_string_bytes_changed,
         );
         // The evaluator's observed-run log of function-epoch moves is plain
         // process state too; install it unconditionally so non-JIT builds

@@ -207,7 +207,7 @@ pub struct WindowScrollBarGeometry {
     pub horizontal_area_height: i64,
 }
 
-fn frame_line_height(frame: &Frame) -> i64 {
+pub(crate) fn frame_line_height(frame: &Frame) -> i64 {
     frame.char_height.max(1.0).round() as i64
 }
 
@@ -701,6 +701,15 @@ impl crate::emacs_core::eval::Context {
             + 'static,
     {
         self.window_layout_query_adapter = WindowLayoutQueryAdapter::Ready(Box::new(query));
+    }
+
+    /// Whether a layout query is running, so a nested one would be refused
+    /// as `LayoutBusy`.
+    pub(crate) fn window_layout_query_running(&self) -> bool {
+        matches!(
+            self.window_layout_query_adapter,
+            WindowLayoutQueryAdapter::Running
+        )
     }
 
     /// Refresh one window through the frontend's real layout engine and return

@@ -275,17 +275,52 @@ enum Upper {
     /// A top-level module. G0 is the first measured lower root that can sit
     /// under a top-level module, so both kinds are now nameable.
     Top(LowerRoot),
+    /// A workspace-sibling crate (for example `neomacs_display_protocol`)
+    /// named by a moving-set file. Registry dependencies belong to the value
+    /// crate's Cargo manifest, not to the layering ratchet; workspace
+    /// siblings would be a value -> core/UI edge and are counted.
+    Extern(String),
 }
 
 impl Upper {
     /// The ceilings-file spelling: an emacs_core submodule by name, a
-    /// top-level module as `top:<name>`. `:` cannot occur in an identifier,
-    /// so the two namespaces cannot collide.
+    /// top-level module as `top:<name>`, a workspace sibling crate as
+    /// `extern:<crate>`. `:` cannot occur in an identifier, so the
+    /// namespaces cannot collide.
     fn text(&self) -> String {
         match self {
             Self::Ec(sub) => sub.0.clone(),
             Self::Top(root) => format!("top:{}", root.name()),
+            Self::Extern(name) => format!("extern:{name}"),
         }
+    }
+}
+
+/// Workspace-sibling crates use the neomacs/neovm naming families. The
+/// current crate itself (`neovm_core`) is not a sibling reference.
+fn is_workspace_sibling(name: &str) -> bool {
+    (name.starts_with("neomacs_") || name.starts_with("neovm_")) && name != "neovm_core"
+}
+
+/// The lower crates of the extraction whose modules are already inside the
+/// moving set, so a moving file that reaches one of them through a core-root
+/// re-export stays internal and is not counted as an upward edge.
+const MOVING_CRATES: [&str; 2] = ["neovm_value", "neovm_display_identity"];
+
+fn is_moving_crate(name: &str) -> bool {
+    MOVING_CRATES.contains(&name)
+}
+
+/// A moving-set file is either a bottom-peer top-level module or a G0
+/// emacs_core member. The move manifest (`tmp/rehearsal/move.py` at the
+/// extraction tip) is generated from exactly these roots; `G0_MEMBERS` and
+/// `is_bottom_peer` are the single source of truth shared with the old
+/// ratchet, so the two cannot drift.
+fn moving_source(logical_path: &[String]) -> bool {
+    match logical_path {
+        [root] if root != "emacs_core" => is_bottom_peer(LowerRoot::parse(root)),
+        [root, member, ..] if root == "emacs_core" => is_g0_member(member),
+        _ => false,
     }
 }
 
@@ -326,6 +361,13 @@ struct ModuleIndex {
     /// `MenuBarPopupAnchor`, ...), which a `crate::emacs_core::Name` path can
     /// reach without naming a submodule.
     ec_root_items: BTreeSet<String>,
+    /// Items defined directly in `lib.rs`, reachable as `crate::name` without
+    /// naming a module. These are not layering edges.
+    crate_root_items: BTreeSet<String>,
+    /// Crate-root re-exports of modules that live in the moving crate (for
+    /// example `pub(crate) use neovm_value::tls_scope;`). A moving file that
+    /// names one through `crate::` still targets the moving set.
+    moving_crate_exports: BTreeMap<String, String>,
     crate_exports: BTreeMap<String, EcSub>,
     ec_exports: BTreeMap<String, EcSub>,
 }
@@ -434,12 +476,30 @@ impl ProductionWalker {
         if lower == "emacs_core" {
             return self.classify_from_emacs_core(segments, span);
         }
+        let source_root = LowerRoot::parse(lower);
+        let moving = is_bottom_peer(source_root);
         let Some(first) = segments.first() else {
             return Classification::NotUpward;
         };
+        if !matches!(first.as_str(), "crate" | "super") {
+            // `self::` stays inside the module. A bare path whose first
+            // segment is a workspace-sibling crate is an upper dependency
+            // only when the source moves (the value crate must not depend on
+            // a sibling workspace crate).
+            if moving && is_workspace_sibling(first) {
+                if is_moving_crate(first) {
+                    return Classification::NotUpward;
+                }
+                return Classification::Upward(Pair {
+                    lower: source_root,
+                    upper: Upper::Extern(first.clone()),
+                });
+            }
+            return Classification::NotUpward;
+        }
         let remainder = if first == "crate" {
             &segments[1..]
-        } else if first == "super" {
+        } else {
             let pops = segments.iter().take_while(|part| *part == "super").count();
             if pops > self.logical_path.len() {
                 return Classification::NotUpward;
@@ -451,17 +511,15 @@ impl ProductionWalker {
                 return Classification::NotUpward;
             }
             remainder
-        } else {
-            return Classification::NotUpward;
         };
         let Some(name) = remainder.first() else {
             return Classification::NotUpward;
         };
-        let upper = if name == "emacs_core" {
+        if name == "emacs_core" {
             let Some(name) = remainder.get(1) else {
                 return Classification::NotUpward;
             };
-            if self.index.ec_modules.contains(name) {
+            let upper = if self.index.ec_modules.contains(name) {
                 EcSub::validated(name, &self.index.ec_modules)
             } else if let Some(origin) = self.index.ec_exports.get(name) {
                 origin.clone()
@@ -473,16 +531,59 @@ impl ProductionWalker {
                     self.source.display(),
                     span.start().line
                 )
+            };
+            // A G0 emacs_core submodule moves with this source; references
+            // between moving-set files stay inside the extracted crate.
+            if moving && is_g0_member(&upper.0) {
+                return Classification::NotUpward;
             }
-        } else if let Some(origin) = self.index.crate_exports.get(name) {
-            origin.clone()
-        } else {
-            return Classification::NotUpward;
-        };
-        Classification::Upward(Pair {
-            lower: LowerRoot::parse(lower),
-            upper: Upper::Ec(upper),
-        })
+            return Classification::Upward(Pair {
+                lower: source_root,
+                upper: Upper::Ec(upper),
+            });
+        }
+        if let Some(origin) = self.index.crate_exports.get(name) {
+            if moving && is_g0_member(&origin.0) {
+                return Classification::NotUpward;
+            }
+            return Classification::Upward(Pair {
+                lower: source_root,
+                upper: Upper::Ec(origin.clone()),
+            });
+        }
+        if moving {
+            if self.index.crate_modules.contains(name) {
+                let root = LowerRoot::parse(name);
+                if is_bottom_peer(root) {
+                    return Classification::NotUpward;
+                }
+                return Classification::Upward(Pair {
+                    lower: source_root,
+                    upper: Upper::Top(root),
+                });
+            }
+            if self.index.moving_crate_exports.contains_key(name) || is_moving_crate(name) {
+                return Classification::NotUpward;
+            }
+            if is_workspace_sibling(name) {
+                return Classification::Upward(Pair {
+                    lower: source_root,
+                    upper: Upper::Extern(name.clone()),
+                });
+            }
+            if self.index.crate_root_items.contains(name) {
+                return Classification::NotUpward;
+            }
+            // A moving file's crate-root path that names no module, facade,
+            // moving-crate re-export or root item is an edge kind this guard
+            // cannot classify. Fail closed instead of silently skipping it.
+            panic!(
+                "{}:{}: unknown top-level production module {name}; teach the layering guard this edge",
+                self.source.display(),
+                span.start().line
+            );
+        }
+        Classification::NotUpward
     }
 
     /// Resolve a written path to crate-root-relative segments. `crate::`
@@ -525,6 +626,25 @@ impl ProductionWalker {
         if !is_g0_member(member) {
             return Classification::NotUpward;
         }
+        if !matches!(
+            segments.first().map(String::as_str),
+            Some("crate" | "super" | "self")
+        ) {
+            // A G0 member must not reference a sibling workspace crate; that
+            // would be a value -> core/UI dependency after extraction.
+            if let Some(first) = segments.first()
+                && is_workspace_sibling(first)
+            {
+                if is_moving_crate(first) {
+                    return Classification::NotUpward;
+                }
+                return Classification::Upward(Pair {
+                    lower: LowerRoot::G0,
+                    upper: Upper::Extern(first.clone()),
+                });
+            }
+            return Classification::NotUpward;
+        }
         let Some(absolute) = self.absolute_segments(segments) else {
             return Classification::NotUpward;
         };
@@ -563,6 +683,18 @@ impl ProductionWalker {
             return Classification::Upward(Pair {
                 lower: LowerRoot::G0,
                 upper: Upper::Ec(origin.clone()),
+            });
+        }
+        if self.index.moving_crate_exports.contains_key(first) || is_moving_crate(first) {
+            return Classification::NotUpward;
+        }
+        if self.index.crate_root_items.contains(first) {
+            return Classification::NotUpward;
+        }
+        if is_workspace_sibling(first) {
+            return Classification::Upward(Pair {
+                lower: LowerRoot::G0,
+                upper: Upper::Extern(first.clone()),
             });
         }
         assert!(
@@ -639,7 +771,9 @@ impl ProductionWalker {
 }
 
 // Macro bodies are token streams, not ordinary syn paths. Only literal
-// crate::emacs_core::<ident> sequences count; super is intentionally skipped.
+// crate:: paths count (three segments, enough for crate::<module>::<item>);
+// super is intentionally skipped. classify() decides whether the source
+// moves and whether the target leaves the moving set.
 fn macro_references(mut cursor: syn::buffer::Cursor<'_>, paths: &mut Vec<(Vec<String>, Span)>) {
     while !cursor.eof() {
         if let Some((ident, next)) = cursor.ident() {
@@ -668,7 +802,11 @@ fn macro_references(mut cursor: syn::buffer::Cursor<'_>, paths: &mut Vec<(Vec<St
                         break;
                     }
                 }
-                if segments.len() == 3 && segments[1] == "emacs_core" {
+                // `$crate::` and `crate::` paths can reach an emacs_core
+                // submodule, a top-level module or a workspace sibling;
+                // classify() decides whether the source moves and whether
+                // the target leaves the moving set.
+                if segments.len() >= 2 {
                     paths.push((segments, ident.span()));
                 }
             }
@@ -702,11 +840,15 @@ fn item_name(item: &Item) -> Option<String> {
 
 impl<'ast> Visit<'ast> for ProductionWalker {
     fn visit_item(&mut self, item: &'ast Item) {
-        if matches!(self.phase, ScanPhase::Discover)
-            && self.logical_path.as_slice() == ["emacs_core"]
-        {
-            if let Some(name) = item_name(item) {
-                self.index.ec_root_items.insert(name);
+        if matches!(self.phase, ScanPhase::Discover) {
+            if self.logical_path.as_slice() == ["emacs_core"] {
+                if let Some(name) = item_name(item) {
+                    self.index.ec_root_items.insert(name);
+                }
+            } else if self.logical_path.is_empty() {
+                if let Some(name) = item_name(item) {
+                    self.index.crate_root_items.insert(name);
+                }
             }
         }
         if !test_only(item_attributes(item)) {
@@ -773,11 +915,23 @@ impl<'ast> Visit<'ast> for ProductionWalker {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         match self.phase {
             ScanPhase::Discover => {
+                let mut leaves = Vec::new();
+                use_leaves(&item.tree, &mut Vec::new(), &mut leaves);
+                if self.logical_path.is_empty() {
+                    // Any root binding of a moving-crate module is the
+                    // crate:: facade a moving file can use, whatever its
+                    // visibility: descendants can see the root's private
+                    // imports.
+                    for (path, name) in &leaves {
+                        if path.first().is_some_and(|part| is_moving_crate(part)) {
+                            let module = path.get(1).cloned().unwrap_or_else(|| name.clone());
+                            self.index.moving_crate_exports.insert(name.clone(), module);
+                        }
+                    }
+                }
                 if matches!(item.vis, syn::Visibility::Public(_))
                     && (self.logical_path.is_empty() || self.logical_path == ["emacs_core"])
                 {
-                    let mut leaves = Vec::new();
-                    use_leaves(&item.tree, &mut Vec::new(), &mut leaves);
                     for (path, name) in leaves {
                         self.exports.push((self.logical_path.clone(), path, name));
                     }
@@ -911,6 +1065,13 @@ fn parse_ceilings(text: &str, index: &ModuleIndex) -> Ceilings {
             3,
             "expected <lower_root> <upper> <count>: {line}"
         );
+        assert!(
+            !columns[1].contains(':')
+                || columns[1].starts_with("top:")
+                || columns[1].starts_with("extern:"),
+            "unknown layering edge kind `{}`: {line}",
+            columns[1]
+        );
         let upper = if let Some(top) = columns[1].strip_prefix("top:") {
             let root = LowerRoot::parse(top);
             assert!(
@@ -918,6 +1079,12 @@ fn parse_ceilings(text: &str, index: &ModuleIndex) -> Ceilings {
                 "g0 is a lower-root group, not a top-level module: {line}"
             );
             Upper::Top(root)
+        } else if let Some(name) = columns[1].strip_prefix("extern:") {
+            assert!(
+                is_workspace_sibling(name),
+                "extern ceiling must name a workspace-sibling crate: {line}"
+            );
+            Upper::Extern(name.to_owned())
         } else {
             Upper::Ec(EcSub::validated(columns[1], &index.ec_modules))
         };
@@ -972,7 +1139,32 @@ fn assert_production_ceilings(root: &Path, sites: &Sites, ceilings: &Ceilings) {
                 .join("\n");
             failures.push(format!("{} {}: {current} production upward references exceed the ceiling {ceiling}. Remove upward dependencies; this ceiling may only decrease.\n{locations}", pair.lower.name(), pair.upper.text()));
         } else if current < ceiling {
-            failures.push(format!("{} {}: current {current} below ceiling {ceiling}; this ceiling may only decrease. Paste the FULL current table into layering_ceilings.list.", pair.lower.name(), pair.upper.text()));
+            let locations = sites.get(pair).map_or_else(String::new, |sites| {
+                let mut locations = sites
+                    .iter()
+                    .take(5)
+                    .map(|site| {
+                        format!(
+                            "{}:{}",
+                            site.source
+                                .strip_prefix(root)
+                                .unwrap_or(&site.source)
+                                .display(),
+                            site.line
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !locations.is_empty() {
+                    locations.insert(0, '\n');
+                }
+                locations
+            });
+            failures.push(format!(
+                "{} {}: current {current} below ceiling {ceiling}; this ceiling may only decrease. Attribute each removed reference to the moved item in the commit message and paste the FULL current table into layering_ceilings.list.{locations}",
+                pair.lower.name(),
+                pair.upper.text()
+            ));
         }
     }
     assert!(
@@ -1050,29 +1242,29 @@ fn layering_guard_skips_test_only_modules() {
 fn layering_guard_resolves_facades_and_super_chains() {
     let directory = fixture(
         r#"
-        mod emacs_core { pub mod value {} pub use value::{Value, ValueKind as Kind}; }
-        pub use emacs_core::value::{Value, ValueKind as Kind};
+        mod emacs_core { pub mod text {} pub use text::{Glyph, GlyphKind as Kind}; }
+        pub use emacs_core::text::{Glyph, GlyphKind as Kind};
         mod tagged {
-            use super::Value;
+            use super::Glyph;
             mod inner {
-                use crate::Value;
-                use super::super::Value;
-                use super::Value;
-                use super::emacs_core::value::Value;
+                use crate::Glyph;
+                use super::super::Glyph;
+                use super::Glyph;
+                use super::emacs_core::text::Glyph;
                 use crate::emacs_core::Kind;
                 use crate::Kind;
-                use self::Value;
+                use self::Glyph;
                 use super::gc;
             }
         }
     "#,
     );
     let (index, sites) = production_sites(directory.path());
-    assert_eq!(current_table(&sites), "tagged value 6\n");
+    assert_eq!(current_table(&sites), "tagged text 6\n");
     assert_production_ceilings(
         directory.path(),
         &sites,
-        &parse_ceilings("tagged value 6", &index),
+        &parse_ceilings("tagged text 6", &index),
     );
 }
 
@@ -1086,21 +1278,21 @@ fn layering_guard_rejects_unknown_lower_root() {
 #[test]
 fn layering_guard_requires_pasting_lowered_ceilings() {
     let directory = fixture(
-        "mod emacs_core { pub mod value {} pub mod text {} } mod tagged { use crate::emacs_core::value::Value; }",
+        "mod emacs_core { pub mod value {} pub mod text {} } mod tagged { use crate::emacs_core::text::Glyph; }",
     );
     let (index, sites) = production_sites(directory.path());
-    let ceilings = parse_ceilings("tagged value 2\ntagged text 1", &index);
+    let ceilings = parse_ceilings("tagged text 2", &index);
     let message = panic_message(|| assert_production_ceilings(directory.path(), &sites, &ceilings));
     assert!(
         message.contains("this ceiling may only decrease"),
         "{message}"
     );
     assert!(
-        message.contains("tagged text: current 0 below ceiling 1"),
+        message.contains("tagged text: current 1 below ceiling 2"),
         "{message}"
     );
     assert!(
-        message.contains("FULL CURRENT TABLE\ntagged value 1\nEND CURRENT TABLE"),
+        message.contains("FULL CURRENT TABLE\ntagged text 1\nEND CURRENT TABLE"),
         "{message}"
     );
 }
@@ -1122,7 +1314,7 @@ fn layering_guard_follows_paths_includes_and_macro_tokens() {
         include!(concat!("included", ".rs"));
         #[cfg(not(test))] fn run() { crate::emacs_core::text::run(); }
         #[cfg(any(test, feature = "fuzzing"))] fn mixed() { crate::emacs_core::text::run(); }
-        macro_rules! paths { () => { (crate::emacs_core::r#value::Value, super::Value) }; }
+        macro_rules! paths { () => { (crate::emacs_core::text::Glyph, super::Value) }; }
         macro_rules! strings { () => { r#"crate::emacs_core::text::Glyph"# }; }
     "###,
     )
@@ -1139,10 +1331,7 @@ fn layering_guard_follows_paths_includes_and_macro_tokens() {
     )
     .expect("write nested fixture");
     let (index, sites) = production_sites(root);
-    assert_eq!(
-        current_table(&sites),
-        "buffer text 1\ntagged text 3\ntagged value 1\n"
-    );
+    assert_eq!(current_table(&sites), "buffer text 1\ntagged text 4\n");
     assert_production_ceilings(
         root,
         &sites,
@@ -1183,23 +1372,23 @@ fn layering_guard_resolves_qualified_nested_exports() {
     let directory = fixture(
         r#"
         mod emacs_core {
-            pub mod value {}
+            pub mod alpha {}
             pub mod text {}
-            pub use crate::emacs_core::value::{Value, ValueKind as Kind};
+            pub use crate::emacs_core::alpha::{Alpha, AlphaKind as Kind};
             pub use self::text::Glyph;
         }
         pub use tagged::*;
-        pub use crate::emacs_core::{value::Value, text::Glyph as Shape};
+        pub use crate::emacs_core::{alpha::Alpha, text::Glyph as Shape};
         mod tagged {
-            use crate::{Value, Shape};
+            use crate::{Alpha, Shape};
             use crate::emacs_core::{Kind, Glyph};
             use crate::emacs_core::{self, self as ec};
-            use crate::emacs_core::value::{Value, ValueKind};
+            use crate::emacs_core::alpha::{Alpha, AlphaKind};
         }
     "#,
     );
     let (index, sites) = production_sites(directory.path());
-    assert_eq!(current_table(&sites), "tagged text 2\ntagged value 3\n");
+    assert_eq!(current_table(&sites), "tagged alpha 3\ntagged text 2\n");
     assert_production_ceilings(
         directory.path(),
         &sites,
@@ -1302,4 +1491,115 @@ fn layering_guard_rejects_unknown_g0_emacs_core_target() {
 fn layering_guard_rejects_unknown_g0_top_level_target() {
     let directory = fixture("mod emacs_core { pub mod value { use crate::surprise::Glyph; } }");
     production_sites(directory.path());
+}
+
+#[test]
+fn layering_guard_counts_moving_set_outside_edges() {
+    let directory = fixture(
+        r#"
+        mod emacs_core { pub mod value {} pub mod print {} }
+        mod tagged { use crate::buffer::BufferManager; use crate::tls_scope::TlsScope; }
+        mod heap_types { use crate::buffer::BufferId; }
+        mod gc_trace { use crate::emacs_core::value::Value; }
+        mod buffer {}
+        mod tls_scope {}
+    "#,
+    );
+    let root = directory.path();
+    let (index, sites) = production_sites(root);
+    assert_eq!(
+        current_table(&sites),
+        "heap_types top:buffer 1\ntagged top:buffer 1\ntagged top:tls_scope 1\n"
+    );
+    assert_production_ceilings(
+        root,
+        &sites,
+        &parse_ceilings(&current_table(&sites), &index),
+    );
+}
+
+#[test]
+fn layering_guard_counts_workspace_sibling_edges() {
+    let directory = fixture(
+        r#"
+        mod tagged { use neomacs_display_protocol::WebViewId; use serde::Serialize; }
+        mod emacs_core {
+            pub mod value { use neomacs_display_protocol::VideoId; }
+        }
+    "#,
+    );
+    let (index, sites) = production_sites(directory.path());
+    assert_eq!(
+        current_table(&sites),
+        "g0 extern:neomacs_display_protocol 1\ntagged extern:neomacs_display_protocol 1\n"
+    );
+    assert_production_ceilings(
+        directory.path(),
+        &sites,
+        &parse_ceilings(&current_table(&sites), &index),
+    );
+}
+
+#[test]
+fn layering_guard_moving_set_internal_references_are_not_counted() {
+    let directory = fixture(
+        r#"
+        mod emacs_core { pub mod value {} }
+        mod tagged { use crate::emacs_core::value::Value; use crate::heap_types::Payload; }
+        mod heap_types { pub struct Payload; }
+    "#,
+    );
+    let (index, sites) = production_sites(directory.path());
+    assert!(sites.is_empty(), "{:?}", current_table(&sites));
+    assert_production_ceilings(directory.path(), &sites, &parse_ceilings("", &index));
+}
+
+#[test]
+#[should_panic(expected = "unknown top-level production module missing")]
+fn layering_guard_rejects_unknown_moving_set_target() {
+    let directory = fixture("mod tagged { use crate::missing::Glyph; }");
+    production_sites(directory.path());
+}
+
+#[test]
+#[should_panic(expected = "unknown layering edge kind")]
+fn layering_guard_rejects_unknown_ceiling_edge_kind() {
+    let directory = fixture("mod tagged {}");
+    let (index, _) = production_sites(directory.path());
+    parse_ceilings("tagged mystery:x 1", &index);
+}
+
+#[test]
+fn layering_guard_treats_moving_crate_and_root_items_as_internal() {
+    let directory = fixture(
+        r#"
+        pub(crate) use neovm_value::tls_scope;
+        pub fn root_helper() {}
+        mod tagged {
+            use crate::root_helper;
+            use crate::tls_scope::TlsScope;
+            use neovm_value::heap_types::Payload;
+        }
+        mod emacs_core {
+            pub mod value { use crate::tls_scope::TlsScope; }
+        }
+    "#,
+    );
+    let (index, sites) = production_sites(directory.path());
+    assert!(sites.is_empty(), "{}", current_table(&sites));
+    assert_production_ceilings(directory.path(), &sites, &parse_ceilings("", &index));
+}
+
+#[test]
+fn layering_guard_moving_set_planted_tagged_buffer_reference_fails() {
+    let directory = fixture("mod tagged { use crate::buffer::BufferManager; } mod buffer {}");
+    let root = directory.path();
+    let (index, sites) = production_sites(root);
+    let message =
+        panic_message(|| assert_production_ceilings(root, &sites, &parse_ceilings("", &index)));
+    assert!(message.contains("lib.rs:1"), "{message}");
+    assert!(
+        message.contains("tagged top:buffer: 1 production upward references exceed the ceiling 0"),
+        "{message}"
+    );
 }

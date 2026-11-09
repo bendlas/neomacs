@@ -4647,6 +4647,32 @@ fn pdump_preserves_neo_term_generic_methods() {
 }
 
 #[test]
+fn neo_preload_binds_command_q_like_gnu_on_darwin() {
+    let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"])
+        .expect("cached bootstrap evaluator");
+
+    let rendered = eval
+        .eval_str(
+            r#"
+        ;; GNU's NS port installs this binding in the dump
+        ;; (lisp/term/ns-win.el:141). The AppKit Quit redirect feeds s-q
+        ;; into the input transport, so the darwin branch must bind it.
+        (let ((system-type 'darwin)
+              (original (lookup-key global-map [?\s-q])))
+          (unwind-protect
+              (progn
+                (load "term/neo-preload.el" nil t)
+                (list (eq (key-binding [?\s-q]) #'save-buffers-kill-emacs)))
+            (define-key global-map [?\s-q] original)))
+        "#,
+        )
+        .map(|value| print_value_with_eval(&eval, &value))
+        .unwrap_or_else(|err| format!("{err:?}"));
+
+    assert_eq!(rendered, "(t)");
+}
+
+#[test]
 fn neo_win_registers_neo_display_format() {
     let mut eval = create_bootstrap_evaluator_cached_with_features(&["neomacs"])
         .expect("cached bootstrap evaluator");

@@ -32,11 +32,11 @@
 
 use super::header::*;
 use super::value::TaggedValue;
-use crate::emacs_core::bytecode::Op;
-use crate::emacs_core::bytecode::chunk::GnuByteOffsetMapEntry;
 use crate::emacs_core::intern::SymId;
 use crate::emacs_core::value::HashTableWeakness;
 use crate::heap_types::LispStringStorageKind;
+use crate::tagged::bytecode::chunk::GnuByteOffsetMapEntry;
+use crate::tagged::bytecode::opcode::Op;
 use crate::tagged::symbol_marks::SymbolMarkBits;
 use malachite::integer::Integer;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -441,7 +441,7 @@ pub struct TaggedHeap {
     pending_surface_destroys: Vec<u32>,
     /// Stable video ids of `VideoObj` handles reclaimed by the sweep. The
     /// evaluator drains these after collection through `DisplayHost`.
-    pending_video_destroys: Vec<neomacs_display_protocol::VideoId>,
+    pending_video_destroys: Vec<neovm_display_identity::VideoId>,
     /// SIZE-CLASS OBJECT ARENAS (non-cons allocator modernization stage 3 +
     /// task 03/3a): every heap float/string/vector/bytecode lives in a
     /// 64KB-aligned `ObjectPage`
@@ -568,7 +568,7 @@ pub struct TaggedHeap {
     window_registry: FxHashMap<u64, TaggedValue>,
     frame_registry: FxHashMap<u64, TaggedValue>,
     timer_registry: FxHashMap<u64, TaggedValue>,
-    process_registry: FxHashMap<crate::emacs_core::process::ProcessId, TaggedValue>,
+    process_registry: FxHashMap<crate::heap_types::ProcessId, TaggedValue>,
     dirty_owner_bits: FxHashSet<usize>,
     /// Persistent remembered set: bits of dumped objects that have been
     /// mutated and may now hold heap children. Seeded as roots every cycle so
@@ -1503,11 +1503,18 @@ impl TaggedHeap {
         self.live_bytes
     }
 
-    pub fn buffer_value(&self, id: crate::buffer::BufferId) -> Option<TaggedValue> {
+    pub fn buffer_value(
+        &self,
+        id: crate::emacs_core::value::buffer_vocab::BufferId,
+    ) -> Option<TaggedValue> {
         self.buffer_registry.get(id.0 as usize).copied().flatten()
     }
 
-    pub fn register_buffer_value(&mut self, id: crate::buffer::BufferId, value: TaggedValue) {
+    pub fn register_buffer_value(
+        &mut self,
+        id: crate::emacs_core::value::buffer_vocab::BufferId,
+        value: TaggedValue,
+    ) {
         let idx = id.0 as usize;
         if self.buffer_registry.len() <= idx {
             self.buffer_registry.resize(idx + 1, None);
@@ -1539,15 +1546,11 @@ impl TaggedHeap {
         self.timer_registry.insert(id, value);
     }
 
-    pub fn process_value(&self, id: crate::emacs_core::process::ProcessId) -> Option<TaggedValue> {
+    pub fn process_value(&self, id: crate::heap_types::ProcessId) -> Option<TaggedValue> {
         self.process_registry.get(&id).copied()
     }
 
-    pub fn register_process_value(
-        &mut self,
-        id: crate::emacs_core::process::ProcessId,
-        value: TaggedValue,
-    ) {
+    pub fn register_process_value(&mut self, id: crate::heap_types::ProcessId, value: TaggedValue) {
         self.process_registry.insert(id, value);
     }
 
@@ -2042,9 +2045,7 @@ impl TaggedHeap {
                 identity
                     .variation_coords
                     .capacity()
-                    .saturating_mul(
-                        size_of::<neomacs_display_protocol::font::FontVariationCoord>(),
-                    ),
+                    .saturating_mul(size_of::<neovm_display_identity::font::FontVariationCoord>()),
             )
     }
 
@@ -2108,7 +2109,7 @@ impl TaggedHeap {
                             let obj = &*(ptr as *const BoolVectorObj);
                             size_of::<BoolVectorObj>().saturating_add(size_of_val(obj.words()))
                         }
-                        VecLikeType::Subr => size_of::<SubrObj>(),
+                        VecLikeType::Subr => size_of::<SubrStorageLayout>(),
                         VecLikeType::Bignum => size_of::<BignumObj>(),
                         VecLikeType::SymbolWithPos => size_of::<SymbolWithPosObj>(),
                         VecLikeType::Finalizer => size_of::<FinalizerObj>(),
@@ -2908,7 +2909,7 @@ mod generational_major_tests;
 mod generational_pacing_tests;
 
 #[cfg(test)]
-#[path = "gc/tests/bytecode_parameter_roots.rs"]
+#[path = "../../core_tests/tagged/gc/tests/bytecode_parameter_roots.rs"]
 mod bytecode_parameter_roots_tests;
 #[cfg(test)]
 #[path = "gc/tests/major_symbol_preimage_test.rs"]

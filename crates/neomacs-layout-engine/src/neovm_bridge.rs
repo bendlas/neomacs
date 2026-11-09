@@ -194,6 +194,11 @@ pub(crate) trait LayoutBufferView {
     fn layout_indexed_newline_count(&self, _range: EmacsByteRange) -> Option<usize> {
         None
     }
+    /// Prove the complete source has no text properties, including categories
+    /// and aliases. Projected/unknown views must conservatively return false.
+    fn layout_text_props_is_empty(&self) -> bool {
+        false
+    }
     fn layout_text_prop_at_emacs_byte_pos(&self, pos: EmacsBytePos, name: Value) -> Option<Value>;
     /// Return PROPERTY from CATEGORY's symbol plist as captured for this
     /// immutable layout view. Live-buffer test adapters have no evaluator
@@ -459,6 +464,10 @@ impl LayoutBufferView for Buffer {
         // The layout's counts are the line-number gutter's, repeated for
         // every redisplay: large enough ranges may build the index.
         self.indexed_newline_count(range, neovm_core::buffer::LineIndexBuild::IfLarge)
+    }
+
+    fn layout_text_props_is_empty(&self) -> bool {
+        self.text_props_is_empty()
     }
 
     fn layout_text_prop_at_emacs_byte_pos(&self, pos: EmacsBytePos, name: Value) -> Option<Value> {
@@ -3491,13 +3500,59 @@ impl<'a, B: LayoutBufferView + ?Sized> RustTextPropAccess<'a, B> {
     /// contribution is an empty string is not an anchor at all, and treating it
     /// as one costs a run boundary, a produced element and a route refusal for a
     /// string that will render nothing.
+    ///
+    /// Furthermore, if the entire string carries an `invisible` text property
+    /// that evaluates to invisible under `buffer-invisibility-spec` without an
+    /// ellipsis (GNU xdisp.c:5442-5452), the string is skipped.
     fn displayable_overlay_string(&self, overlay_id: Value, property: &str) -> Option<Value> {
         let value = self
             .buffer
             .layout_overlays()
             .overlay_get_named(overlay_id, Value::symbol(property))?;
         let string = value.as_lisp_string()?;
-        (!string.as_bytes().is_empty()).then_some(value)
+        if string.as_bytes().is_empty() {
+            return None;
+        }
+
+        if string.has_intervals()
+            && let Some(props) =
+                neovm_core::emacs_core::value::borrow_string_text_properties_table_for_value(value)
+        {
+            let spec = self
+                .buffer
+                .layout_buffer_local_value(LayoutVar::BufferInvisibilitySpec)
+                .unwrap_or(Value::T);
+            let invisible_sym = Value::symbol("invisible");
+            let len = string.schars();
+            let mut charpos = 0;
+            let mut all_invisible_without_ellipsis = true;
+
+            while charpos < len {
+                let prop = props
+                    .get_property_at_char_pos(CharPos0::new(charpos), invisible_sym)
+                    .unwrap_or(Value::NIL);
+                let invis = text_prop_means_invisible(prop, spec);
+                if invis != Invisibility::Hidden {
+                    all_invisible_without_ellipsis = false;
+                    break;
+                }
+                match props.next_single_property_change_after_char_pos(
+                    CharPos0::new(charpos),
+                    invisible_sym,
+                ) {
+                    Some(next) if next.get() > charpos => {
+                        charpos = next.get();
+                    }
+                    _ => break,
+                }
+            }
+
+            if all_invisible_without_ellipsis {
+                return None;
+            }
+        }
+
+        Some(value)
     }
 
     /// Test-only helper: split the interleaved `overlay_strings_at` list back

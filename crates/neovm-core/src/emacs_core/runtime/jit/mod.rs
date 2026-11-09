@@ -160,7 +160,7 @@
 #![cfg_attr(not(feature = "jit"), allow(dead_code))]
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::emacs_core::intern::SymId;
 
@@ -253,6 +253,12 @@ pub(crate) mod tier2;
 #[cfg(feature = "jit")]
 pub mod stats;
 
+/// T1-pre: the per-function runtime data now lives in the value layer. These
+/// re-exports keep the historical `emacs_core::jit::*` paths and every upper
+/// impl (which stays in this module) resolving to the same types and layout.
+pub use crate::emacs_core::value::jit_runtime::{
+    CallFeedback, FeedbackVec, NumericFeedback, Runtime, RuntimeState,
+};
 #[cfg(feature = "jit")]
 pub use cache::{note_seam_interp_fallback, try_run_compiled};
 
@@ -287,24 +293,6 @@ pub enum Plan {
 // Phase 1 — feedback. The runtime-observed information later tiers speculate on.
 // ---------------------------------------------------------------------------
 
-/// Type/target feedback observed at one CALL site (the JIT's most important
-/// speculation input — it enables direct-call inlining).
-///
-/// Holds a [`SymId`], NOT a function `Value`: a `SymId` is a stable runtime
-/// index, never a heap pointer, so feedback is **GC-safe** — the collector never
-/// has to trace it, and it never dangles. The optimizing tier turns
-/// `Monomorphic(sym)` into a direct/inlined call guarded by a dependency on that
-/// symbol's function cell (Phase 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallFeedback {
-    /// This site has not executed yet.
-    Uninit,
-    /// Every observed call so far went to the same named function.
-    Monomorphic(SymId),
-    /// Conflicting / non-symbol callees seen — no useful speculation.
-    Megamorphic,
-}
-
 impl CallFeedback {
     /// Pack into one `u64` for lock-free atomic storage. Low 2 bits tag the
     /// variant; a `SymId`'s `u32` rides in the upper bits.
@@ -328,30 +316,6 @@ impl CallFeedback {
             _ => CallFeedback::Megamorphic,
         }
     }
-}
-
-/// Operand types observed at one ARITHMETIC site — the input the lowering
-/// needs to stop emitting a fixnum guard for code that is never fixnum.
-///
-/// `lowering::stack_as_raw` guards fixnum and branches to a deopt block
-/// otherwise, so a float or bignum operand bails the whole compiled body.
-/// `nbody` gets **3.6%** from the JIT and `pidigits` gets **-6.5%** — the
-/// compiler needs to know which sites are worth lowering that way.
-///
-/// The default (`FixnumOnly`) is the zero slot, and it means exactly what the
-/// lowering already assumes, so a site that never runs or only ever sees
-/// fixnums needs no recording at all: the arithmetic opcodes record on their
-/// SLOW arm only, which they already branch to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NumericFeedback {
-    /// Never seen a non-fixnum operand pair (or never executed).
-    FixnumOnly,
-    /// Every non-fixnum pair so far was floats (fixnums alongside are fine —
-    /// they promote). Lowerable as `f64`.
-    Float,
-    /// A bignum, marker or non-number operand: nothing an unboxed lowering
-    /// can take. (A fixnum overflow or zero divisor records nothing.)
-    Other,
 }
 
 impl NumericFeedback {
@@ -461,16 +425,6 @@ impl ReoptLevel {
     }
 }
 
-/// A per-function feedback vector — one slot per bytecode instruction, lazily
-/// allocated on first use (when the instruction count is known). Slots for
-/// non-call instructions stay [`CallFeedback::Uninit`]. Lock-free
-/// (`AtomicU64`), `Send + Sync` — sound to hold inline on a GC-managed function
-/// alongside the concurrent collector (the mutator is the only writer).
-#[derive(Debug, Default)]
-pub struct FeedbackVec {
-    slots: OnceLock<Box<[AtomicU64]>>,
-}
-
 impl FeedbackVec {
     #[inline]
     pub const fn new() -> Self {
@@ -552,130 +506,6 @@ impl Clone for FeedbackVec {
     fn clone(&self) -> Self {
         Self::new()
     }
-}
-
-/// Per-SOURCE runtime tiering + profiling state, shared by every
-/// `ByteCodeFunction` instance that `make-closure` derives from one prototype
-/// (see [`Runtime`], the handle). NOT part of the dumped representation
-/// (`DumpByteCodeFunction`) — pure runtime state, started cold each session.
-/// Relaxed atomics: the mutator is the only writer today, and being `Sync`
-/// keeps the heap object sound alongside the concurrent collector.
-#[derive(Debug)]
-pub struct RuntimeState {
-    /// Coarse invocation hotness (saturating at `u32::MAX`). The feedback that
-    /// later phases use to decide when to tier a function up.
-    heat: AtomicU32,
-    /// The `cache::rejection_epoch()` at which the JIT rejected this body as
-    /// `NotCompilable` (0 = never). While it equals the live epoch the
-    /// dispatcher answers `Interpret` outright: the cache would answer
-    /// `NotCompilable` and fall back to the interpreter anyway, so the seam
-    /// trip it saves (argument copy, root save/restore, probe) is pure waste.
-    /// `cache::clear` bumps the epoch (the cache would retry, so does this);
-    /// a grown `make-closure` prefix resets it with its eviction. Without the
-    /// `jit` feature there is no cache to reject anything, so it is only ever
-    /// written.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    native_rejected_epoch: AtomicU64,
-    /// Heat at which a DEFERRED body is compiled (0 = not deferred): one the
-    /// profitability gate refused (`NotProfitable`), or one whose leaf a
-    /// deopt invalidated (`jit::reopt`: the end of its re-profile window).
-    /// Either way the body already proved hot, so once the deferral expires
-    /// `dispatch_sized` answers `Compiled` at once. For the profit gate: a
-    /// call-heavy body RUNS faster native but its compile is dear (org editing probe, 2026-09-05: ~38M
-    /// instructions per admitted body vs ~830 saved per native entry), so it
-    /// pays off only past ~18k calls: the gate was +6.4% on a 5-pass session
-    /// and −8.8% on a 50-pass one. Deferring to `profit_defer_factor() ×
-    /// hot_threshold()` lets long sessions win without taxing short ones.
-    /// The dispatcher answers `Interpret` without a cache probe until then.
-    profit_deferred_heat: AtomicU32,
-    /// Everything the interpreter observed about this source
-    /// ([`feedback::SourceFeedback`]); compiles read it through their
-    /// snapshot.
-    feedback: feedback::SourceFeedback,
-    /// Process-unique identity assigned on first JIT compilation attempt (0 =
-    /// unassigned). Keys this function's entry in the per-thread compiled-code
-    /// cache ([`cache`]). Monotonic and never reused, so a freed function's
-    /// stale cache entry can never be mis-looked-up after the (non-moving) GC
-    /// reuses its address — a new function gets a new id. Reset to 0 on clone.
-    compiled_id: AtomicU64,
-    /// Set by the AOT preload prepopulate (R2-C3) when this function's leaf was
-    /// inserted into the compiled cache at startup: `dispatch` then serves the
-    /// prewarmed native leaf FROM CALL 1 instead of interpreting until the heat
-    /// threshold — the piece that lets the AOT preload cover ONE-SHOT startup
-    /// elisp, which never gets hot. One relaxed load on the dispatch path,
-    /// never set in the default (AOT-off) configuration.
-    aot_prewarmed: std::sync::atomic::AtomicBool,
-    /// Set once this body has been compiled and its numeric feedback read.
-    ///
-    /// Feedback is an input to COMPILATION; once it has been consumed every
-    /// further record is dead weight. That is not a micro-optimization on a
-    /// body whose arithmetic is all non-fixnum: there the opcodes' "slow" arm
-    /// is the ONLY arm, so `pidigits` was paying the recording on every
-    /// arithmetic operation it performs — 1.4% of the row. Gating on `heat`
-    /// instead does NOT work: a body entered through the armed or speculated
-    /// paths barely bumps it (`pidigits` sat at heat 1332 after 333 calls).
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    numeric_feedback_consumed: std::sync::atomic::AtomicBool,
-    /// Slice C1 of the JIT call seam: the compiled leaf the interpreter's
-    /// `Bcall` arm enters directly, as a raw `*const CompiledLeaf`. Zero = empty.
-    /// Dereferencing requires the arming mutator's TLS cache to remain live,
-    /// and `leaf_slot_epoch` to equal `cache::leaf_slot_epoch()`.
-    ///
-    /// P7.11's shared-source/local-activation split must replace this slot
-    /// before several mutators enter the same source concurrently: the epoch
-    /// supplies neither cache ownership nor an atomic pointer/epoch pair.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    leaf_slot: AtomicU64,
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    leaf_slot_epoch: AtomicU64,
-    /// Widest `make-closure` patch seen for this source: the number of leading
-    /// constant slots that hold PER-INSTANCE captured values (the prototype
-    /// carries placeholder symbols `V0..Vn` there — `byte-compile-make-closure`).
-    /// A shared native leaf must never bake, speculate on, or symbol-tag those
-    /// slots; it loads them through the executing callee's constant vector at
-    /// run time (`compile.rs` "dynamic prefix"). Monotone; recorded by
-    /// `builtin_make_closure`, which also evicts any leaf compiled under a
-    /// narrower prefix. GNU keeps no such record because GNU byte-code objects
-    /// carry no JIT state at all (native-comp attaches to the subr); this port
-    /// hung tiering state on the object `make-closure` copies, so the patch
-    /// width must be visible to the code that shares that state.
-    patched_prefix: AtomicU32,
-    /// Deopt-driven invalidations of this source (saturating): the backoff
-    /// input of `jit::reopt`.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    reopt_count: std::sync::atomic::AtomicU8,
-    /// Counted T2 invalidations, saturating and independent of P0.4's ladder.
-    /// Sources may be shared by mutators; Relaxed RMWs preserve this monotone
-    /// observational ban without publishing leaf pointers or Lisp state.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    t2_reopts: std::sync::atomic::AtomicU8,
-    /// Permanent AOT exclusion after this source requested a JIT re-tier.
-    /// Shared by mutators: monotone Relaxed stores/loads publish no code
-    /// pointer or Lisp state; each mutator owns its upgrade/cache.
-    /// Independent of heat, whose observational updates can race.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    aot_retiered: std::sync::atomic::AtomicBool,
-    /// [`ReoptLevel`] as `u8`: the ceiling every later compile of this source
-    /// respects. Monotone.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    reopt_level: std::sync::atomic::AtomicU8,
-    /// What deopts taught this source about each pc, allocated on the first
-    /// mark: among others, the `Op::Call` pcs that must not be spliced,
-    /// MIR-inlined or intrinsified ([`retreat::RetreatBit::NoInline`]).
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    site_retreat: retreat::SiteRetreatTable,
-    /// [`HofCallerBit`] as `u8`, computed once on the first callback credit:
-    /// whether this source has a `mapc`/`mapcar` site the default front's
-    /// HOF-only path would select, so callback work may count as its heat.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    hof_caller: std::sync::atomic::AtomicU8,
-    /// Test-only: pin this function to the Tier-0 interpreter regardless of
-    /// hotness (the benchmark harness measures native vs interpreter in ONE
-    /// process — a hot copy and a forced-cold copy — to cancel the
-    /// cross-process CPU-frequency variance that wrecks a two-process A/B).
-    /// Absent from the production library (only the test binary carries it).
-    #[cfg(test)]
-    force_interpret: std::sync::atomic::AtomicBool,
 }
 
 /// [`RuntimeState::hof_caller`]'s cached answer.
@@ -1020,30 +850,6 @@ impl RuntimeState {
     /// `NEOVM_JIT_THRESHOLD` still overrides per process.
     pub const HOT_THRESHOLD: u32 = 1_000;
 
-    #[inline]
-    pub const fn new() -> Self {
-        Self {
-            heat: AtomicU32::new(0),
-            native_rejected_epoch: AtomicU64::new(0),
-            profit_deferred_heat: AtomicU32::new(0),
-            feedback: feedback::SourceFeedback::new(),
-            compiled_id: AtomicU64::new(0),
-            aot_prewarmed: std::sync::atomic::AtomicBool::new(false),
-            numeric_feedback_consumed: std::sync::atomic::AtomicBool::new(false),
-            leaf_slot: AtomicU64::new(0),
-            leaf_slot_epoch: AtomicU64::new(0),
-            patched_prefix: AtomicU32::new(0),
-            reopt_count: std::sync::atomic::AtomicU8::new(0),
-            t2_reopts: std::sync::atomic::AtomicU8::new(0),
-            aot_retiered: std::sync::atomic::AtomicBool::new(false),
-            reopt_level: std::sync::atomic::AtomicU8::new(0),
-            site_retreat: retreat::SiteRetreatTable::new(),
-            hof_caller: std::sync::atomic::AtomicU8::new(HofCallerBit::Unknown as u8),
-            #[cfg(test)]
-            force_interpret: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
     /// Number of leading constant slots that are per-instance (`make-closure`
     /// patched) for this source; 0 for a plain function.
     #[inline]
@@ -1332,22 +1138,27 @@ impl RuntimeState {
 
     /// This function's compiled-cache id, assigning a fresh process-unique one
     /// on first call (idempotent under races). Used only by [`cache`].
+    ///
+    /// This is the single production caller of the lower writer
+    /// [`set_compiled_id_word`] (T1 privacy ledger A2, a MINT). See the
+    /// `SAFETY` note below for the mint and attach invariants.
     #[inline]
     pub fn compiled_id_or_assign(&self) -> u64 {
-        let cur = self.compiled_id.load(Ordering::Acquire);
+        let cur = self.compiled_id_word();
         if cur != 0 {
             return cur;
         }
         // `+ 1` keeps 0 reserved for "unassigned".
         let fresh = NEXT_COMPILED_ID.fetch_add(1, Ordering::Relaxed) + 1;
-        match self
-            .compiled_id
-            .compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => fresh,
-            // Another thread won the race; adopt its id, discard ours.
-            Err(actual) => actual,
-        }
+        // SAFETY: `fresh` is this crate's fresh mint for THIS source
+        // (`NEXT_COMPILED_ID` is monotone, never reused, never caller-supplied
+        // and `+ 1` skips the reserved 0), and `self` is the source's own
+        // `RuntimeState`: `ByteCodeFunction::runtime` is crate-private and only
+        // ever constructed for its own function, then shared by that source's
+        // clones (the A2/A3 attach seal). Storing a foreign word would let one
+        // function's cache entry select another source's executable code; that
+        // cannot happen through this caller.
+        unsafe { crate::emacs_core::value::jit_runtime::set_compiled_id_word(self, fresh) }
     }
 
     /// This function's compiled-cache id if one was ALREADY assigned (it has been
@@ -1356,7 +1167,7 @@ impl RuntimeState {
     /// for the many never-compiled bound functions it walks past.
     #[inline]
     pub fn compiled_id(&self) -> Option<u64> {
-        let cur = self.compiled_id.load(Ordering::Acquire);
+        let cur = self.compiled_id_word();
         (cur != 0).then_some(cur)
     }
 
@@ -1397,28 +1208,6 @@ impl RuntimeState {
     #[cfg(all(feature = "jit", test))]
     pub(crate) fn force_interpret_for_test(&self) -> bool {
         self.force_interpret.load(Ordering::Relaxed)
-    }
-
-    /// The leaf armed for the direct stack entry, if it was armed under
-    /// `epoch` (the current `cache::leaf_slot_epoch()`); a stale slot reads
-    /// as empty and is re-armed through the cache by the tier-up entry.
-    #[cfg(feature = "jit")]
-    #[inline]
-    pub(crate) fn armed_leaf_slot(&self, epoch: u64) -> Option<*const compile::CompiledLeaf> {
-        let ptr = self.leaf_slot.load(Ordering::Relaxed);
-        (ptr != 0 && self.leaf_slot_epoch.load(Ordering::Relaxed) == epoch)
-            .then_some(ptr as *const compile::CompiledLeaf)
-    }
-
-    /// Arm the direct stack entry with a leaf resolved from the cache under
-    /// `epoch` on the same mutator that later probes it. These Relaxed stores
-    /// do not publish a consistent pair to other mutators; the cache owner and
-    /// its Cell-based deopt storage remain thread-confined (P7.11).
-    #[cfg(feature = "jit")]
-    #[inline(always)]
-    pub(crate) fn arm_leaf_slot(&self, leaf: *const compile::CompiledLeaf, epoch: u64) {
-        self.leaf_slot_epoch.store(epoch, Ordering::Relaxed);
-        self.leaf_slot.store(leaf as u64, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1657,14 +1446,6 @@ impl RuntimeState {
             .map_or(0, retreat::SiteRetreat::count)
     }
 
-    /// Empty the interpreter's direct-entry leaf slot: only this source's
-    /// slot can hold this source's leaf, so an invalidation disarms it here
-    /// instead of bumping the global `cache::leaf_slot_epoch`.
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    pub(crate) fn disarm_leaf_slot(&self) {
-        self.leaf_slot.store(0, Ordering::Relaxed);
-    }
-
     /// Stop serving this source as AOT-prewarmed: `dispatch_sized` would
     /// otherwise answer `Compiled` from call 1 and skip a re-profile window.
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
@@ -1677,30 +1458,6 @@ impl Default for RuntimeState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The per-function handle to [`RuntimeState`], living inline on
-/// `ByteCodeFunction` (only when the `jit` feature is on). One pointer; derefs
-/// to the shared state.
-///
-/// SHARED ACROSS `make-closure` INSTANCES (cite-and-overturn of the earlier
-/// "a cloned function starts cold — profiling is per-instance" rule, which
-/// `ByteCodeFunction::clone` enforced by resetting this to `Runtime::new()`):
-/// `make-closure` clones the prototype for EVERY closure instantiation, so
-/// per-instance heat meant closure-shaped code — font-lock keyword lambdas,
-/// jit-lock, hooks, i.e. interactive editing — never accumulated heat and never
-/// tiered, while a threshold-1 soak compiled 11.6K distinct instances of ~500
-/// sources. The clone IS faithful to GNU (`Fmake_closure` memcpys the whole
-/// prototype vector too); the divergence was hanging mutable tiering state on
-/// the object being copied. Sharing the state by SOURCE (the same identity
-/// `source_id` already preserves through `make-closure`) is the GNU-shaped
-/// fix: heat, feedback, compiled id AND the patched-prefix record all ride the
-/// same handle, so heat and compiled artifact are shared TOGETHER — sharing
-/// heat alone would make every instance tier at once and compile its own copy
-/// (the `NEOVM_JIT_GATE_RELAX` 21%-slower byte-compile precedent).
-#[derive(Debug)]
-pub struct Runtime {
-    shared: std::sync::Arc<RuntimeState>,
 }
 
 impl Runtime {
@@ -1796,4 +1553,33 @@ pub(crate) fn carrier_tls_fingerprint(h: &mut u64) {
     }
     #[cfg(not(feature = "jit"))]
     let _ = h;
+}
+
+/// Test helpers for the armed-leaf slot. Production arming goes through the
+/// lower `unsafe set_leaf_slot_word` from the single `cache::arm_leaf_slot`
+/// call site; tests keep the old typed read/write spellings.
+#[cfg(all(feature = "jit", test))]
+impl RuntimeState {
+    pub(crate) fn armed_leaf_slot(&self, epoch: u64) -> Option<*const compile::CompiledLeaf> {
+        self.armed_leaf_word(epoch)
+            .map(|word| word.get() as *const compile::CompiledLeaf)
+    }
+}
+
+/// Compile-contract seam for the writer MINTs (T1 privacy ledger A1/A2).
+///
+/// `set_leaf_slot_word` and `set_compiled_id_word` are `unsafe`; a safe call
+/// to either must be rejected with E0133. Present only in `contract-fixtures`
+/// builds; never a production surface.
+#[cfg(feature = "contract-fixtures")]
+#[doc(hidden)]
+pub mod contract_fixture {
+    pub use crate::emacs_core::value::jit_runtime::{
+        Runtime, set_compiled_id_word, set_leaf_slot_word,
+    };
+
+    /// A fresh, unattached source state for the negative fixture.
+    pub fn fixture_runtime() -> Runtime {
+        Runtime::new()
+    }
 }

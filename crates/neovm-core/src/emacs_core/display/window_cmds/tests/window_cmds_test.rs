@@ -32,6 +32,41 @@ mod frame_resize_test;
 mod initial_gui_lifecycle_test;
 
 #[test]
+fn gui_frame_position_requests_move_the_native_window() {
+    let mut ev = Context::new();
+    let buf = ev.buffers.create_buffer("*scratch*");
+    ev.buffers.set_current(buf);
+    let root = ev.frames.create_frame("Root", 800, 600, buf);
+    ev.frames
+        .get_mut(root)
+        .unwrap()
+        .set_window_system(Some(Value::symbol("neo")));
+    let host = RecordingDisplayHost::new();
+    let positions = host.positions.clone();
+    ev.set_display_host(Box::new(host));
+    let results = ev.eval_str_each(
+        "(set-frame-position nil 0 0) \
+         (set-frame-size-and-position-pixelwise nil 400 300 120 80) \
+         (modify-frame-parameters nil '((left . 10) (top . 20))) \
+         (modify-frame-parameters nil '((left . 30))) \
+         (modify-frame-parameters nil '((top . 50))) \
+         (set-frame-position nil -10 40) \
+         (modify-frame-parameters nil '((top . 60))) \
+         (modify-frame-parameters nil '((left . (- 0)))) \
+         (frame-position)",
+    );
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // Only fully absolute requests reach the host.  A lone edge would take
+    // the other edge from the stored position, which is not read back from
+    // the native window and here is the unresolved far-edge -10; a far-edge
+    // offset needs the window's outer size and the workarea.
+    assert_eq!(
+        *positions.borrow(),
+        vec![(root, 0, 0), (root, 120, 80), (root, 10, 20)]
+    );
+}
+
+#[test]
 fn alpha_lower_limit_variable_projects_without_replaying_alpha_policy() {
     let mut ev = Context::new();
     let host = RecordingDisplayHost::new();
@@ -348,6 +383,7 @@ struct RecordingDisplayHost {
     native_x11_ids: Rc<RefCell<Vec<(crate::window::FrameId, (u64, u64))>>>,
     initial_gui_defaults: Option<crate::emacs_core::display_host::InitialGuiFrameDefaults>,
     finished: Rc<RefCell<Vec<GuiFrameHostRequest>>>,
+    positions: Rc<RefCell<Vec<(crate::window::FrameId, i32, i32)>>>,
 }
 
 impl RecordingDisplayHost {
@@ -462,6 +498,16 @@ impl DisplayHost for RecordingDisplayHost {
             .iter()
             .find(|(id, _)| *id == frame_id)
             .map(|(_, ids)| *ids)
+    }
+
+    fn set_gui_frame_position(
+        &mut self,
+        frame_id: crate::window::FrameId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), String> {
+        self.positions.borrow_mut().push((frame_id, x, y));
+        Ok(())
     }
 
     fn set_gui_frame_fullscreen(

@@ -3,8 +3,10 @@
 //! successful ordinary out-call cannot silently satisfy these regressions.
 
 use super::*;
+use crate::emacs_core::bytecode::ByteCodeFunctionExt;
 use crate::emacs_core::bytecode::opcode::Op;
 use crate::emacs_core::error::{Flow, FlowRef};
+use crate::emacs_core::eval::subr_abi::SubrValueExt;
 use crate::emacs_core::eval::{Context, push_scratch_gc_root};
 use crate::emacs_core::intern::intern;
 use crate::emacs_core::jit::compile::lowering::RegallocPolicy;
@@ -320,8 +322,9 @@ fn inline_named_runtime_attention_guard_leaves_before_virtual_entry() {
 
 #[test]
 fn inline_named_runtime_assigned_argument_is_resumed_without_losing_original_call_args() {
+    use crate::emacs_core::eval::subr_abi::SubrFn;
     use crate::emacs_core::eval::{SubrEntry, register_global_subr_entry};
-    use crate::tagged::header::{SubrDispatchKind, SubrFn};
+    use crate::tagged::header::SubrDispatchKind;
 
     let _knobs = Knobs::enter();
     let mut ctx = Context::new();
@@ -353,7 +356,7 @@ fn inline_named_runtime_assigned_argument_is_resumed_without_losing_original_cal
     );
     ctx.set_function(
         "named-runtime-signal-capture",
-        Value::subr_from_sym_id(observer),
+        <Value as SubrValueExt>::subr_from_sym_id(observer),
     );
     ctx.set_variable("signal-hook-function", Value::from_sym_id(observer));
     ctx.set_variable("named-runtime-observed-call", Value::NIL);

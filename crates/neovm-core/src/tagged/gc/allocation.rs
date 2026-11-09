@@ -388,7 +388,10 @@ impl TaggedHeap {
     }
 
     /// Allocate a buffer reference.
-    pub fn alloc_buffer(&mut self, id: crate::buffer::BufferId) -> TaggedValue {
+    pub fn alloc_buffer(
+        &mut self,
+        id: crate::emacs_core::value::buffer_vocab::BufferId,
+    ) -> TaggedValue {
         let obj = Box::new(BufferObj {
             header: VecLikeHeader::new(VecLikeType::Buffer),
             id,
@@ -440,7 +443,7 @@ impl TaggedHeap {
     }
 
     /// Allocate a process reference.
-    pub fn alloc_process(&mut self, id: crate::emacs_core::process::ProcessId) -> TaggedValue {
+    pub fn alloc_process(&mut self, id: crate::heap_types::ProcessId) -> TaggedValue {
         let obj = Box::new(ProcessObj {
             header: VecLikeHeader::new(VecLikeType::Process),
             id,
@@ -475,7 +478,7 @@ impl TaggedHeap {
         width: i32,
         height: i32,
         xwidget_id: u32,
-        webview_id: neomacs_display_protocol::WebViewId,
+        webview_id: neovm_display_identity::WebViewId,
     ) -> TaggedValue {
         let obj = Box::new(XwidgetObj {
             header: VecLikeHeader::new(VecLikeType::Xwidget),
@@ -581,10 +584,7 @@ impl TaggedHeap {
     }
 
     /// Allocate a GC-managed video-session handle.
-    pub fn alloc_video_handle(
-        &mut self,
-        video_id: neomacs_display_protocol::VideoId,
-    ) -> TaggedValue {
+    pub fn alloc_video_handle(&mut self, video_id: neovm_display_identity::VideoId) -> TaggedValue {
         let obj = Box::new(VideoObj {
             header: VecLikeHeader::new(VecLikeType::VideoHandle),
             video_id,
@@ -604,7 +604,7 @@ impl TaggedHeap {
     }
 
     /// Take video ids whose last Lisp handle was reclaimed by the sweep.
-    pub fn take_pending_video_destroys(&mut self) -> Vec<neomacs_display_protocol::VideoId> {
+    pub fn take_pending_video_destroys(&mut self) -> Vec<neovm_display_identity::VideoId> {
         std::mem::take(&mut self.pending_video_destroys)
     }
 
@@ -660,7 +660,7 @@ impl TaggedHeap {
     #[inline(never)]
     pub fn alloc_bytecode(
         &mut self,
-        data: crate::emacs_core::bytecode::ByteCodeFunction,
+        data: crate::tagged::bytecode::chunk::ByteCodeFunction,
     ) -> TaggedValue {
         let ptr = self.bytecode_arena.alloc_slot();
         unsafe {
@@ -705,7 +705,7 @@ impl TaggedHeap {
     #[inline(never)]
     pub fn alloc_bytecode_instance(
         &mut self,
-        proto: &crate::emacs_core::bytecode::ByteCodeFunction,
+        proto: &crate::tagged::bytecode::chunk::ByteCodeFunction,
         constants: LispValueVec,
         code: TaggedValue,
     ) -> TaggedValue {
@@ -714,8 +714,8 @@ impl TaggedHeap {
             "instantiating an unmaterialized pdump stub"
         );
         #[cfg(test)]
-        crate::emacs_core::bytecode::chunk::note_bytecode_function_clone_for_test();
-        let crate::emacs_core::bytecode::ByteCodeFunction {
+        crate::tagged::bytecode::chunk::note_bytecode_function_clone_for_test();
+        let crate::tagged::bytecode::chunk::ByteCodeFunction {
             source_id,
             ops,
             ops_sealed,

@@ -328,6 +328,12 @@ fn bytecode_obj_is_only_named_by_its_chokepoints() {
         "tagged/gc/gc_thread.rs",
         "tagged/gc/incremental.rs",
         "tagged/gc/mark_sweep.rs",
+        // The mapped-stub image walker: the GC-side reader of a lazy stub's
+        // PATCHED image words. It exists precisely so the collector legs do
+        // not materialize or read the empty ByteCodeFunction vectors; the
+        // pdump writer and every loader validation stay upper (this module
+        // holds only the layout type, flags and the synchronous walker).
+        "tagged/pdump_image.rs",
         // The gc-memory-telemetry heap walker sizes objects by header type,
         // like the sweep above; it is diagnostics only (default-off feature).
         "tagged/gc/memory_inventory.rs",
@@ -439,4 +445,30 @@ fn jit_compile_stays_an_orchestrator_after_the_domain_split() {
         "runtime/jit/compile.rs is {lines} lines (ceiling {CEILING}); put the new code in the \
          jit/compile/ child module for its role instead of growing the orchestrator"
     );
+}
+
+/// The display identity vocabulary moved to the serde-only
+/// `neovm-display-identity` leaf (N4). The object headers embed it by value,
+/// so their layout is the extraction ABI. These are the sizes/offsets measured
+/// before the move; a failure is a header layout change and stops the cut.
+/// There is no `WebViewObj`: the browser identity lives on `XwidgetObj`.
+#[test]
+fn tagged_display_identity_headers_keep_the_pre_move_layout() {
+    const _: () = {
+        use crate::tagged::header::{FontObj, FontObjectData, VideoObj, XwidgetObj};
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert!(size_of::<FontObjectData>() == 192 && align_of::<FontObjectData>() == 8);
+        assert!(offset_of!(FontObjectData, identity) == 0);
+
+        assert!(size_of::<FontObj>() == 216 && align_of::<FontObj>() == 8);
+        assert!(offset_of!(FontObj, header) == 0);
+        assert!(offset_of!(FontObj, data) == 24);
+
+        assert!(size_of::<VideoObj>() == 32 && align_of::<VideoObj>() == 8);
+        assert!(offset_of!(VideoObj, video_id) == 24);
+
+        assert!(size_of::<XwidgetObj>() == 88 && align_of::<XwidgetObj>() == 8);
+        assert!(offset_of!(XwidgetObj, webview_id) == 76);
+    };
 }

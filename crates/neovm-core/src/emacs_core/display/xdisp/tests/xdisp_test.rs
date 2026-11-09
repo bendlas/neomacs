@@ -1856,8 +1856,210 @@ fn test_invisible_p() {
 #[test]
 fn test_line_pixel_height() {
     crate::test_utils::init_test_tracing();
-    let result = builtin_line_pixel_height(&vec![]).unwrap();
+    let mut ev = crate::emacs_core::Context::new();
+    let result = builtin_line_pixel_height(&mut ev, &[]).unwrap();
     assert_eq!(result, Value::fixnum(1));
+}
+
+#[test]
+fn line_pixel_height_on_a_gui_frame_is_the_line_height_not_one() {
+    crate::test_utils::init_test_tracing();
+    let mut ev = crate::emacs_core::Context::new();
+    let buf = ev.buffers.create_buffer("*lph*");
+    ev.buffers.set_current(buf);
+    let fid = ev.frames.create_frame("GUI", 800, 600, buf);
+    let frame = ev.frames.get_mut(fid).unwrap();
+    frame.set_window_system(Some(Value::symbol("neo")));
+    frame.char_height = 14.0;
+    assert!(ev.frames.select_frame(fid));
+    let result = builtin_line_pixel_height(&mut ev, &[]).unwrap();
+    assert_eq!(result, Value::fixnum(14));
+}
+
+/// A selected GUI frame (14-pixel lines) showing TEXT with point at POINT.
+fn line_pixel_height_gui_context(
+    text: &str,
+    point: i64,
+) -> (
+    Context,
+    crate::window::FrameId,
+    crate::window::WindowId,
+    crate::buffer::BufferId,
+) {
+    let mut ev = crate::emacs_core::Context::new();
+    let buf = ev.buffers.create_buffer("*lph*");
+    ev.buffers.set_current(buf);
+    ev.buffers.get_mut(buf).unwrap().insert(text);
+    ev.eval_str(&format!("(goto-char {point})")).unwrap();
+    let fid = ev.frames.create_frame("GUI", 800, 600, buf);
+    let frame = ev.frames.get_mut(fid).unwrap();
+    frame.set_window_system(Some(Value::symbol("neo")));
+    frame.char_height = 14.0;
+    assert!(ev.frames.select_frame(fid));
+    let (_, wid) = resolve_live_window_identity(&ev.frames, None)
+        .unwrap()
+        .expect("selected window");
+    (ev, fid, wid, buf)
+}
+
+fn line_pixel_height_row(
+    row: i64,
+    y: i64,
+    height: i64,
+    start: i64,
+    end: i64,
+) -> crate::window::DisplayRowSnapshot {
+    crate::window::DisplayRowSnapshot {
+        row,
+        y,
+        height,
+        start_buffer_pos: Some(LispCharPos1::new(start)),
+        end_buffer_pos: Some(LispCharPos1::new(end)),
+        ..Default::default()
+    }
+}
+
+/// Commit "a\nb\n" rows as a redisplay at the current point: position 3
+/// ("b") is a 14-pixel glyph on a row that something taller made 30 pixels.
+fn commit_line_pixel_height_snapshot(
+    ev: &mut Context,
+    fid: crate::window::FrameId,
+    wid: crate::window::WindowId,
+    buf: crate::buffer::BufferId,
+) {
+    crate::emacs_core::window_cmds::remember_selected_window_point_in_state(
+        &mut ev.frames,
+        &mut ev.buffers,
+        fid,
+    );
+    let freshness = ev.window_display_snapshot_freshness(fid, wid, buf).unwrap();
+    let modiff = ev.buffers.get(buf).unwrap().modified_tick();
+    ev.frames
+        .get_mut(fid)
+        .unwrap()
+        .commit_redisplay_cache_for_test(vec![crate::window::WindowDisplaySnapshot {
+            window_id: wid,
+            regions_materialized: true,
+            points: vec![crate::window::DisplayPointSnapshot {
+                role: crate::window::DisplayPointRole::Glyph,
+                buffer_pos: LispCharPos1::new(3),
+                x: 0,
+                y: 14,
+                width: 8,
+                height: 14,
+                row: 1,
+                col: 0,
+            }],
+            rows: vec![
+                line_pixel_height_row(0, 0, 14, 1, 2),
+                line_pixel_height_row(1, 14, 30, 3, 4),
+            ],
+            buffer_modiff: Some(modiff),
+            layout_freshness: Some(freshness),
+            ..Default::default()
+        }]);
+}
+
+#[test]
+fn line_pixel_height_on_a_gui_frame_uses_the_height_of_the_row_at_point() {
+    crate::test_utils::init_test_tracing();
+    let (mut ev, fid, wid, buf) = line_pixel_height_gui_context("a\nb\n", 3);
+    commit_line_pixel_height_snapshot(&mut ev, fid, wid, buf);
+    assert!(
+        ev.fresh_window_display_snapshot(fid, wid, buf).is_some(),
+        "the test snapshot must be fresh so the snapshot path answers"
+    );
+
+    // GNU's line_bottom_y measures the row, not the glyph at point.
+    let result = builtin_line_pixel_height(&mut ev, &[]).unwrap();
+    assert_eq!(result, Value::fixnum(30));
+}
+
+#[test]
+fn line_pixel_height_ignores_rows_laid_out_for_an_older_point() {
+    crate::test_utils::init_test_tracing();
+    let (mut ev, fid, wid, buf) = line_pixel_height_gui_context("a\nb\n", 3);
+    // The rows were laid out with point at 1.  `goto-char` then moves only
+    // the buffer's point, not the window's point marker.
+    ev.eval_str("(goto-char 1)").unwrap();
+    commit_line_pixel_height_snapshot(&mut ev, fid, wid, buf);
+    ev.eval_str("(goto-char 3)").unwrap();
+
+    // Point-dependent display (the current line number face) can change a
+    // row, so those rows must not answer; with no frontend the answer is the
+    // frame's line height, not the stale row's 30.
+    let result = builtin_line_pixel_height(&mut ev, &[]).unwrap();
+    assert_eq!(result, Value::fixnum(14));
+}
+
+#[test]
+fn line_pixel_height_lays_out_the_line_at_point_outside_the_window() {
+    use crate::window::{WindowLayoutQuery, WindowLayoutQueryOutcome, WindowLayoutQueryScope};
+    use std::sync::{Arc, Mutex};
+
+    crate::test_utils::init_test_tracing();
+    // Point is inside "bb" on the second source line; there are no current
+    // rows (as when point sits before window-start after `goto-char`).
+    let (mut ev, _fid, wid, _buf) = line_pixel_height_gui_context("aa\nbb\n", 5);
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&starts);
+    ev.install_window_layout_query(move |_, _, _, scope| {
+        let WindowLayoutQueryScope::Rows { start, .. } = scope else {
+            panic!("line-pixel-height lays out rows from point's line, got {scope:?}");
+        };
+        seen.lock().unwrap().push(start.as_i64());
+        let snapshot = crate::window::WindowDisplaySnapshot {
+            window_id: wid,
+            rows: vec![line_pixel_height_row(0, 0, 30, 4, 6)],
+            ..Default::default()
+        };
+        WindowLayoutQueryOutcome::Ready(WindowLayoutQuery::new(start, Some(snapshot)))
+    });
+
+    let result = builtin_line_pixel_height(&mut ev, &[]).unwrap();
+    assert_eq!(result, Value::fixnum(30));
+    assert_eq!(
+        *starts.lock().unwrap(),
+        vec![4],
+        "rows start at point's line"
+    );
+}
+
+#[test]
+fn line_pixel_height_inside_a_layout_query_falls_back_instead_of_signaling() {
+    use crate::window::{WindowLayoutQuery, WindowLayoutQueryOutcome};
+    use std::sync::{Arc, Mutex};
+
+    crate::test_utils::init_test_tracing();
+    let (mut ev, _fid, wid, _buf) = line_pixel_height_gui_context("aa\nbb\n", 5);
+    // Lisp that a layout query runs (a mode-line `:eval`, a fontification
+    // function) calls `line-pixel-height` while the outer query is active.
+    let nested = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&nested);
+    ev.install_window_layout_query(move |ctx, _, _, scope| {
+        *seen.lock().unwrap() = Some(
+            builtin_line_pixel_height(ctx, &[])
+                .map_err(|flow| format!("{flow:?}"))
+                .map(|value| value.as_fixnum()),
+        );
+        let crate::window::WindowLayoutQueryScope::Rows { start, .. } = scope else {
+            panic!("expected a Rows query, got {scope:?}");
+        };
+        let snapshot = crate::window::WindowDisplaySnapshot {
+            window_id: wid,
+            rows: vec![line_pixel_height_row(0, 0, 30, 4, 6)],
+            ..Default::default()
+        };
+        WindowLayoutQueryOutcome::Ready(WindowLayoutQuery::new(start, Some(snapshot)))
+    });
+
+    let result = builtin_line_pixel_height(&mut ev, &[]).unwrap();
+    assert_eq!(result, Value::fixnum(30));
+    assert_eq!(
+        *nested.lock().unwrap(),
+        Some(Ok(Some(14))),
+        "the nested call answers the frame's line height"
+    );
 }
 
 #[test]
@@ -7268,7 +7470,10 @@ fn test_long_line_optimizations_p() {
 #[test]
 fn test_wrong_arity() {
     crate::test_utils::init_test_tracing();
-    assert!(builtin_line_pixel_height(&vec![Value::fixnum(1)]).is_err());
+    {
+        let mut ev = crate::emacs_core::Context::new();
+        assert!(builtin_line_pixel_height(&mut ev, &[Value::fixnum(1)]).is_err());
+    }
     {
         let mut ev = crate::emacs_core::Context::new();
         assert!(builtin_invisible_p(&mut ev, vec![]).is_err());
@@ -7403,6 +7608,96 @@ fn display_prop_replacing_p_matches_gnu_taxonomy() {
             display_prop_replacing_p(head(name), true),
             "({name} …) replaces on a GUI frame"
         );
+    }
+}
+
+/// Point adjustment must agree with redisplay on `(disable-eval …)` values:
+/// inside that wrapper the neomacs media heads are not display specs (H1), so
+/// a media spec that redisplay will not draw does not make its text
+/// intangible either, while GNU's own replacing specs still do.
+#[test]
+fn display_prop_replacing_p_does_not_take_media_heads_under_disable_eval() {
+    let sym = Value::symbol;
+    let disable_eval = |spec: Value| Value::list(vec![sym("disable-eval"), spec]);
+    for name in ["video", "webkit", "surface"] {
+        let margin_nil = Value::list(vec![
+            Value::list(vec![sym("margin"), Value::NIL]),
+            Value::list(vec![sym(name), Value::keyword("id"), Value::fixnum(1)]),
+        ]);
+        let when_t = Value::list(vec![sym("when"), Value::T, sym(name)]);
+        for spec in [margin_nil, when_t] {
+            assert!(
+                display_prop_replacing_p(spec, true),
+                "a plain {spec:?} replaces on a GUI frame"
+            );
+            assert!(
+                !display_prop_replacing_p(disable_eval(spec), true),
+                "({name} …) must not replace under disable-eval"
+            );
+        }
+    }
+    // GNU heads keep replacing under the wrapper.
+    assert!(display_prop_replacing_p(
+        disable_eval(Value::list(vec![sym("image"), Value::keyword("file")])),
+        true,
+    ));
+    assert!(display_prop_replacing_p(
+        disable_eval(Value::list(vec![sym("space"), Value::keyword("width")])),
+        false,
+    ));
+}
+
+/// GNU's `display_prop_intangible_p` runs `handle_display_spec` with IT NULL,
+/// and under `(disable-eval …)` `handle_single_display_spec` takes any `when`
+/// FORM but `t` as nil without evaluating it (src/xdisp.c): such a clause
+/// replaces nothing, so it cannot make its text intangible either. A plain
+/// value keeps the structural reading (a non-nil FORM holds).
+#[test]
+fn display_prop_replacing_p_takes_only_a_literal_t_when_form_under_disable_eval() {
+    let sym = Value::symbol;
+    let disable_eval = |spec: Value| Value::list(vec![sym("disable-eval"), spec]);
+    // `(when FORM . "x")`.
+    let when_string = |form: Value| Value::cons(sym("when"), Value::cons(form, Value::string("x")));
+    let form = Value::list(vec![sym("ignore")]);
+    for frame_window_p in [false, true] {
+        let shapes: [fn(Value) -> Value; 3] = [
+            |spec| spec,
+            |spec| Value::vector(vec![spec]),
+            |spec| Value::list(vec![spec]),
+        ];
+        for shape in shapes {
+            assert!(
+                display_prop_replacing_p(shape(when_string(form)), frame_window_p),
+                "a plain non-nil FORM holds structurally"
+            );
+            assert!(
+                !display_prop_replacing_p(disable_eval(shape(when_string(form))), frame_window_p),
+                "under disable-eval a FORM other than t is nil"
+            );
+            assert!(
+                display_prop_replacing_p(
+                    disable_eval(shape(when_string(Value::T))),
+                    frame_window_p
+                ),
+                "under disable-eval a literal t still holds"
+            );
+            assert!(
+                !display_prop_replacing_p(
+                    disable_eval(shape(when_string(Value::from_sym_id(
+                        crate::emacs_core::intern::intern_uninterned("t")
+                    )))),
+                    frame_window_p
+                ),
+                "under disable-eval an uninterned t is not t"
+            );
+            assert!(
+                !display_prop_replacing_p(
+                    disable_eval(shape(when_string(Value::NIL))),
+                    frame_window_p
+                ),
+                "a nil FORM never holds"
+            );
+        }
     }
 }
 

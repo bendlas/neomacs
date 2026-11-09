@@ -7,6 +7,9 @@
 #[path = "../src/common.rs"]
 mod common;
 
+#[path = "oracle_backend_quit_binding.rs"]
+mod oracle_backend_quit_binding;
+
 #[path = "oracle_backtrace_local_remake.rs"]
 mod oracle_backtrace_local_remake;
 
@@ -63,6 +66,9 @@ mod oracle_face_theme;
 
 #[path = "oracle_fill_column_stipple.rs"]
 mod oracle_fill_column_stipple;
+
+#[path = "oracle_find_file_directory.rs"]
+mod oracle_find_file_directory;
 
 #[path = "oracle_font_coverage.rs"]
 mod oracle_font_coverage;

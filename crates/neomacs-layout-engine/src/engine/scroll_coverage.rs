@@ -205,6 +205,8 @@ impl ScrollCoverage {
             })
     }
 
+    /// Validate completed worker coverage and publish bounded prepared rows.
+    /// Reject stale admissions and do not publish incomplete bridge coverage.
     pub(super) fn drain(
         &mut self,
         destination: &mut PreparedViewports,
@@ -275,9 +277,20 @@ impl ScrollCoverage {
             };
             admission.retained.key.window_start = char_pos.get() as i64;
         }
+        // Small-font rows can reach the matrix's row limit before its pixel
+        // bottom. Match both bounds of the canonical viewport walk.
+        let capacity = admission
+            .retained
+            .matrix
+            .rows
+            .iter()
+            .skip(admission.row_base)
+            .filter(|row| !RetainedWindowMatrix::is_chrome_role(row.role))
+            .count();
         let mut height = 0.0;
         let visible = rows
             .iter()
+            .take(capacity)
             .take_while(|row| {
                 let take = height < regions.text_body.height;
                 if take {
@@ -289,9 +302,7 @@ impl ScrollCoverage {
         let fills_viewport = height >= regions.text_body.height;
         // A suffix can start in a visual continuation: it certifies scroll
         // coverage, not a fresh viewport starting at that buffer character.
-        let complete_viewport = !bridge
-            && (fills_viewport
-                || rows.len() == admission.retained.matrix.rows.len() - admission.row_base);
+        let complete_viewport = !bridge && (fills_viewport || visible == capacity);
         if !bridge {
             rows.truncate(visible);
         }
@@ -333,6 +344,7 @@ impl ScrollCoverage {
         snapshot.rows = body.geometry.rows;
         snapshot.body_rows = body.geometry.body_rows;
         snapshot.logical_cursor = None;
+        snapshot.logical_cursor_dimensions = None;
         snapshot.phys_cursor = None;
         // Geometry remains private; keep the captured source identity separately
         // so bounded measurement can validate it together with the read certificate.
@@ -374,6 +386,19 @@ impl ScrollCoverage {
 }
 
 impl LayoutEngine {
+    /// Retire original evaluator leases independently of presentation acceptance.
+    /// Idle and aborted attempts still process deleted owners, including when
+    /// every remaining frame is hidden or no selected frame exists.
+    pub(super) fn retire_removed_frame_owners(
+        &mut self,
+        evaluator: &neovm_core::emacs_core::Context,
+    ) {
+        self.frame_visual_histories
+            .retain_live(|frame| evaluator.frame_manager().get(frame).is_some());
+        self.prepared_viewports
+            .retain_live_frames(|frame| evaluator.frame_manager().get(frame).is_some());
+    }
+
     /// A completed idle page needs one fresh immutable transport publication.
     pub fn take_scroll_coverage_publication(&mut self) -> bool {
         std::mem::take(&mut self.scroll_coverage.publication_pending)
@@ -385,6 +410,7 @@ impl LayoutEngine {
         &mut self,
         evaluator: &neovm_core::emacs_core::Context,
     ) -> Option<ScrollCoverageProgress> {
+        self.retire_removed_frame_owners(evaluator);
         self.prepared_viewports.retire_invalid_dependencies();
         if !self.prepared_viewports.invalidated.is_empty() {
             // Retire the old render-thread certificate even before a new

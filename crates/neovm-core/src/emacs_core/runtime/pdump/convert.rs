@@ -1,5 +1,7 @@
 //! Conversions between runtime types and pdump snapshot types.
 
+use crate::emacs_core::bytecode::ByteCodeFunctionExt;
+use crate::emacs_core::eval::subr_abi::SubrValueExt;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -37,6 +39,7 @@ use crate::emacs_core::chartable::{
 use crate::emacs_core::coding::{CodingSystemInfo, CodingSystemManager, EolType};
 use crate::emacs_core::custom::CustomManager;
 use crate::emacs_core::eval::Context;
+use crate::emacs_core::eval::subr_abi::SubrObj;
 use crate::emacs_core::fontset::{
     FontDefinitionMetadata, FontRepertory, FontSpecEntry, FontsetDataSnapshot,
     FontsetRangeEntrySnapshot, FontsetRegistrySnapshot, StoredFontSpec, restore_fontset_registry,
@@ -70,7 +73,7 @@ use crate::tagged::gc::with_tagged_heap;
 use crate::tagged::header::{
     ByteCodeObj, ByteCodeSlotObject, ByteCodeSlotObjects, CLOSURE_MIN_SLOTS, CharTableObj,
     ConsCell, FloatObj, HeapObjectKind, LambdaObj, LispValueVec, MacroObj, MarkerObj, OverlayObj,
-    RecordObj, StringObj, SubCharTableObj, SubrObj, VecLikeHeader, VectorObj,
+    RecordObj, StringObj, SubCharTableObj, VecLikeHeader, VectorObj,
 };
 use crate::tagged::value::TaggedValue;
 
@@ -1082,7 +1085,7 @@ impl<'a> LoadDecoder<'a> {
             VecLikeType::ByteCode => {
                 // Self-contained bytecode: the extras region after the
                 // struct carries what the descriptor used to (see
-                // `mapped_heap::BytecodeExtras`).
+                // `tagged::pdump_image::BytecodeExtras`).
                 //
                 // Extras present => the LAZY STUB was BAKED into the image
                 // at dump time (v15): the mapped bytes already ARE
@@ -1924,10 +1927,10 @@ impl<'a> LoadDecoder<'a> {
             DumpHeapObject::Subr { name, .. } => {
                 let name_id = load_name_id(name);
                 if let Some(sym_id) = intern::canonical_symbol_for_name(name_id) {
-                    Value::subr_from_sym_id(sym_id)
+                    <Value as SubrValueExt>::subr_from_sym_id(sym_id)
                 } else {
                     let n = intern::resolve_name(name_id);
-                    Value::subr_from_sym_id(intern::intern(n))
+                    <Value as SubrValueExt>::subr_from_sym_id(intern::intern(n))
                 }
             }
             DumpHeapObject::Free => Value::NIL,
@@ -1955,7 +1958,7 @@ impl<'a> LoadDecoder<'a> {
     }
 
     /// Rebuild a ByteCodeFunction from the image extras region (see
-    /// `mapped_heap::BytecodeExtras`) — the self-contained replacement for
+    /// `tagged::pdump_image::BytecodeExtras`) — the self-contained replacement for
     /// the object-extra descriptor. Runs after the value-fixup pass, so the
     /// metadata and extra-slot words read as final tagged values.
     fn populate_bytecode_from_extras(
@@ -1966,7 +1969,8 @@ impl<'a> LoadDecoder<'a> {
         // (The lazy materializer `materialize_bytecode_from_extras_at` below
         // is the loader-state-free twin of this pass; keep their decode
         // logic in lockstep.)
-        use crate::emacs_core::pdump::mapped_heap::{
+        use crate::emacs_core::pdump::mapped_heap::unnamed_params;
+        use crate::tagged::pdump_image::{
             BC_FLAG_HAS_DOCSTRING, BC_FLAG_HAS_GNU, BC_FLAG_HAS_REST, BytecodeExtras,
         };
         let Some(extras_span) = self.bytecode_extras_span(id) else {
@@ -2031,7 +2035,7 @@ impl<'a> LoadDecoder<'a> {
         }
         let header: BytecodeExtras = bytemuck::pod_read_unaligned(&bytes[..header_len]);
         StackDepth::try_from(header.max_stack).map_err(DumpError::BytecodeStackDepth)?;
-        header.unnamed_params()?;
+        unnamed_params(&header)?;
         let flags = header.flags;
 
         // v14 STUB-FINALIZE: the placeholder already wrote the lazy stub;
@@ -2547,11 +2551,11 @@ impl<'a> LoadDecoder<'a> {
                 // Convert NameId -> canonical SymId for the PVEC_SUBR-like
                 // object constructor.
                 if let Some(sym_id) = intern::canonical_symbol_for_name(name_id) {
-                    Value::subr_from_sym_id(sym_id)
+                    <Value as SubrValueExt>::subr_from_sym_id(sym_id)
                 } else {
                     // Fallback: intern the name to get a canonical SymId.
                     let name = intern::resolve_name(name_id);
-                    Value::subr_from_sym_id(intern::intern(name))
+                    <Value as SubrValueExt>::subr_from_sym_id(intern::intern(name))
                 }
             }
             DumpValue::ByteCode(id) => self.heap_ref_to_value(tagged_heap_ref(id)),
@@ -2587,10 +2591,10 @@ impl<'a> LoadDecoder<'a> {
             DumpValue::Subr(s) => {
                 let name_id = load_name_id(&s);
                 if let Some(sym_id) = intern::canonical_symbol_for_name(name_id) {
-                    Value::subr_from_sym_id(sym_id)
+                    <Value as SubrValueExt>::subr_from_sym_id(sym_id)
                 } else {
                     let name = intern::resolve_name(name_id);
-                    Value::subr_from_sym_id(intern::intern(name))
+                    <Value as SubrValueExt>::subr_from_sym_id(intern::intern(name))
                 }
             }
             DumpValue::ByteCode(id) => self.heap_ref_to_value(tagged_heap_ref(&id)),
@@ -2708,7 +2712,8 @@ fn dump_lisp_string(string: &LispString) -> DumpLispString {
 /// # Safety
 /// `value` must satisfy the preconditions above.
 pub(crate) unsafe fn materialize_bytecode_from_extras_at(value: Value) -> ByteCodeFunction {
-    use crate::emacs_core::pdump::mapped_heap::{
+    use crate::emacs_core::pdump::mapped_heap::unnamed_params;
+    use crate::tagged::pdump_image::{
         BC_FLAG_HAS_ARGLIST, BC_FLAG_HAS_DOC_FORM, BC_FLAG_HAS_DOCSTRING, BC_FLAG_HAS_ENV,
         BC_FLAG_HAS_GNU, BC_FLAG_HAS_INTERACTIVE, BC_FLAG_HAS_REST, BC_FLAG_LEXICAL,
         BC_FLAG_OPS_SEALED, BytecodeExtras,
@@ -2737,8 +2742,7 @@ pub(crate) unsafe fn materialize_bytecode_from_extras_at(value: Value) -> ByteCo
     let optional = ids.split_off(header.n_required as usize);
     // SAFETY: stub finalization checked the tag, depth and fixed-up arglist
     // mode before publishing any stub to the evaluator or GC.
-    let params = header
-        .unnamed_params()
+    let params = unnamed_params(&header)
         .expect("load-validated parameter metadata")
         .unwrap_or_else(|| {
             FunctionParams::Named(LambdaParams {
@@ -2882,7 +2886,7 @@ pub(crate) unsafe fn stub_interactive_probe(
     obj: *const crate::tagged::header::ByteCodeObj,
     extras_len: usize,
 ) -> crate::emacs_core::value::BytecodeInteractiveProbe {
-    use crate::emacs_core::pdump::mapped_heap::{
+    use crate::tagged::pdump_image::{
         BC_FLAG_HAS_DOC_FORM, BC_FLAG_HAS_DOCSTRING, BC_FLAG_HAS_INTERACTIVE, BytecodeExtras,
     };
     let base = obj as *const u8;
@@ -2921,15 +2925,15 @@ pub(crate) unsafe fn stub_params_required_only(
     obj: *const crate::tagged::header::ByteCodeObj,
     extras_len: usize,
 ) -> bool {
-    use crate::emacs_core::pdump::mapped_heap::{BC_FLAG_HAS_REST, BytecodeExtras};
+    use crate::emacs_core::pdump::mapped_heap::unnamed_params;
+    use crate::tagged::pdump_image::{BC_FLAG_HAS_REST, BytecodeExtras};
     debug_assert!(extras_len >= std::mem::size_of::<BytecodeExtras>());
     let extras_ptr = unsafe {
         (obj as *const u8).add(std::mem::size_of::<crate::tagged::header::ByteCodeObj>())
     };
     let header: BytecodeExtras =
         unsafe { std::ptr::read_unaligned(extras_ptr.cast::<BytecodeExtras>()) };
-    header
-        .unnamed_params()
+    unnamed_params(&header)
         .expect("load-validated parameter metadata")
         .map_or(
             header.n_optional == 0 && header.flags & BC_FLAG_HAS_REST == 0,
@@ -2947,17 +2951,15 @@ pub(crate) unsafe fn stub_required_only_arity(
     obj: *const crate::tagged::header::ByteCodeObj,
     extras_len: usize,
 ) -> Option<usize> {
-    use crate::emacs_core::pdump::mapped_heap::{BC_FLAG_HAS_REST, BytecodeExtras};
+    use crate::emacs_core::pdump::mapped_heap::unnamed_params;
+    use crate::tagged::pdump_image::{BC_FLAG_HAS_REST, BytecodeExtras};
     debug_assert!(extras_len >= std::mem::size_of::<BytecodeExtras>());
     let extras_ptr = unsafe {
         (obj as *const u8).add(std::mem::size_of::<crate::tagged::header::ByteCodeObj>())
     };
     let header: BytecodeExtras =
         unsafe { std::ptr::read_unaligned(extras_ptr.cast::<BytecodeExtras>()) };
-    match header
-        .unnamed_params()
-        .expect("load-validated parameter metadata")
-    {
+    match unnamed_params(&header).expect("load-validated parameter metadata") {
         Some(params) => params.fixed_arity(),
         None => (header.n_optional == 0 && header.flags & BC_FLAG_HAS_REST == 0)
             .then_some(header.n_required as usize),
@@ -3362,9 +3364,9 @@ fn dump_heap_object_from_value(encoder: &mut DumpEncoder, value: Value) -> DumpH
             let ptr = value.as_veclike_ptr().expect("subr") as *const SubrObj;
             let subr = unsafe { &*ptr };
             DumpHeapObject::Subr {
-                name: dump_name_id(subr.name),
-                min_args: subr.min_args,
-                max_args: subr.max_args,
+                name: dump_name_id(subr.metadata().name_id()),
+                min_args: subr.metadata().min_args(),
+                max_args: subr.metadata().max_args(),
             }
         }
         _ => DumpHeapObject::Free,

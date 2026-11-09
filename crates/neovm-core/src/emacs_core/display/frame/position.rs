@@ -97,6 +97,27 @@ impl FramePositionSpec {
     }
 }
 
+/// The absolute display position a top-level window should move to, or
+/// `None` unless both edges are absolute.
+///
+/// GNU's `gui_set_frame_parameters_1` (src/frame.c) also moves the window
+/// for a lone `left` or `top`, taking the other edge from `f->left_pos` /
+/// `f->top_pos`, which GNU keeps equal to the native position.  Neomacs does
+/// not read the native position back, so the stored edge can be stale (moved
+/// by the user or the window manager) or an unresolved far-edge offset;
+/// moving with it would put the window in the wrong place.  A far-edge or
+/// proportional edge needs the window's outer size and the workarea, which
+/// the evaluator does not have either.
+pub(crate) fn absolute_window_position(
+    left: Option<FramePositionSpec>,
+    top: Option<FramePositionSpec>,
+) -> Option<(i32, i32)> {
+    match (left?.0, top?.0) {
+        (PositionKind::Absolute(x), PositionKind::Absolute(y)) => Some((x, y)),
+        _ => None,
+    }
+}
+
 /// Resolve only after size/font changes, then publish numeric parent-local
 /// coordinates. Renderers never have to interpret Lisp position expressions.
 ///

@@ -1544,7 +1544,14 @@ fn display_element_run(
         if v.is_nil() { None } else { Some((v, None)) }
     })?;
 
-    let element = match super::display_spec::display_spec_kind(display) {
+    // This fallback takes only a bare `(space …)` or `(image …)` value, which
+    // is eval-enabled (GNU `handle_display_spec`).  Unlike GNU it does not
+    // unwrap `(disable-eval …)`: a wrapped value has that head, classifies
+    // as `Other`, and is left alone here.
+    let element = match super::display_spec::display_spec_kind(
+        display,
+        super::display_spec::DisplayEval::Enabled,
+    ) {
         super::display_spec::DisplaySpecKind::Space => {
             fallback_space_element(eval, frame, display.cons_cdr(), cur_column)?
         }
@@ -1962,7 +1969,14 @@ fn string_display_element_run(
     )
     .ok()?;
 
-    let element = match super::display_spec::display_spec_kind(display) {
+    // This fallback takes only a bare `(space …)` or `(image …)` value, which
+    // is eval-enabled (GNU `handle_display_spec`).  Unlike GNU it does not
+    // unwrap `(disable-eval …)`: a wrapped value has that head, classifies
+    // as `Other`, and is left alone here.
+    let element = match super::display_spec::display_spec_kind(
+        display,
+        super::display_spec::DisplayEval::Enabled,
+    ) {
         super::display_spec::DisplaySpecKind::Space => {
             fallback_space_element(eval, frame, display.cons_cdr(), cur_col)?
         }
@@ -5557,8 +5571,9 @@ pub(crate) fn display_prop_replacing_p(spec: Value, frame_window_p: bool) -> boo
     let mut replacing = false;
     // The shape decode (single spec / list of specs / vector of specs, minus a
     // `(disable-eval …)` wrapper) lives in ONE place -- see `display_spec`.
-    display_spec::DisplayPropertySpecs::of(spec).for_each(|single| {
-        if display_single_spec_replacing_p(single, frame_window_p) {
+    let specs = display_spec::DisplayPropertySpecs::of(spec);
+    specs.for_each(|single| {
+        if display_single_spec_replacing_p(single, specs.eval, frame_window_p) {
             replacing = true;
             return ControlFlow::Break(());
         }
@@ -5570,24 +5585,34 @@ pub(crate) fn display_prop_replacing_p(spec: Value, frame_window_p: bool) -> boo
 /// Replacing-determination for a *single* `display` spec, mirroring the
 /// `it == NULL` paths of GNU `xdisp.c:handle_single_display_spec`. The head
 /// taxonomy comes from [`display_spec::display_spec_kind`], so this reads as the
-/// decision alone.
-fn display_single_spec_replacing_p(spec: Value, frame_window_p: bool) -> bool {
-    match display_spec::display_spec_kind(spec).replaces_text(frame_window_p) {
+/// decision alone. `eval` is the policy of the `display` value SPEC belongs to.
+fn display_single_spec_replacing_p(
+    spec: Value,
+    eval: display_spec::DisplayEval,
+    frame_window_p: bool,
+) -> bool {
+    match display_spec::display_spec_kind(spec, eval).replaces_text(frame_window_p) {
         Some(replacing) => replacing,
         // `(when FORM . VALUE)`: a nil FORM disables the spec; otherwise the
         // decision is VALUE's. Resolved structurally rather than evaluated -- see
-        // the note on `display_prop_replacing_p`.
+        // the note on `display_prop_replacing_p`. Under `disable-eval` GNU takes
+        // any FORM but `t` as nil without evaluating it (xdisp.c,
+        // `handle_single_display_spec`), so only a literal `t` holds there.
         None => match display_spec::display_spec_when_parts(spec) {
             // GNU continues with its SINGLE-spec arms on VALUE -- it does not
             // re-enter `handle_display_spec` -- so `(when t . SPEC)` never treats
             // SPEC as a list of specs.
             Some((form, value)) => {
-                !form.is_nil() && display_single_spec_replacing_p(value, frame_window_p)
+                let holds = match eval {
+                    display_spec::DisplayEval::Enabled => !form.is_nil(),
+                    display_spec::DisplayEval::Disabled => form.is_t(),
+                };
+                holds && display_single_spec_replacing_p(value, eval, frame_window_p)
             }
             // `((margin AREA) VALUE)`: replacing iff VALUE is itself replacing
             // (typically a string). An AREA GNU rejects displays nothing.
             None => display_spec::display_spec_margin_value(spec)
-                .is_some_and(|value| display_single_spec_replacing_p(value, frame_window_p)),
+                .is_some_and(|value| display_single_spec_replacing_p(value, eval, frame_window_p)),
         },
     }
 }
@@ -5685,10 +5710,73 @@ pub(crate) fn builtin_invisible_p(eval: &mut super::eval::Context, args: Vec<Val
 
 /// (line-pixel-height) -> integer
 ///
-/// Batch-compatible behavior returns 1.
-pub(crate) fn builtin_line_pixel_height(args: &[Value]) -> EvalResult {
+/// GNU `Fline_pixel_height` (xdisp.c) lays out the screen line at point in
+/// the selected window and returns its height.  Terminal and batch rows are
+/// one line tall, so those frames answer 1.  Packages divide pixel extents by
+/// this value to count lines (dashboard's vertical centering does), so a
+/// constant 1 on a GUI frame inflated those counts by the font height.
+pub(crate) fn builtin_line_pixel_height(
+    eval: &mut super::eval::Context,
+    args: &[Value],
+) -> EvalResult {
     expect_args("line-pixel-height", &args, 0)?;
-    Ok(Value::fixnum(1))
+    Ok(Value::fixnum(
+        selected_line_pixel_height(eval)?.unwrap_or(1),
+    ))
+}
+
+fn selected_line_pixel_height(eval: &mut super::eval::Context) -> Result<Option<i64>, Flow> {
+    let Some((fid, wid)) = resolve_live_window_identity(&eval.frames, None)? else {
+        return Ok(None);
+    };
+    let Some(frame) = eval.frames.get(fid) else {
+        return Ok(None);
+    };
+    if frame.effective_window_system().is_none() {
+        return Ok(None);
+    }
+    let line_height = crate::window::frame_line_height(frame);
+    let Some(buffer_id) = frame.find_window(wid).and_then(|window| window.buffer_id()) else {
+        return Ok(Some(line_height));
+    };
+    let Some(pos) = eval
+        .buffers
+        .get(buffer_id)
+        .map(|buffer| buffer.point_lisp_char_pos())
+    else {
+        return Ok(Some(line_height));
+    };
+    // `goto-char` moves the buffer's point but not the selected window's
+    // point marker, which the snapshot freshness token records.  Sync it, as
+    // a layout query does, so rows laid out for an older point are rejected.
+    if eval
+        .frames
+        .selected_frame()
+        .is_some_and(|frame| frame.id == fid)
+    {
+        crate::emacs_core::window_cmds::remember_selected_window_point_in_state(
+            &mut eval.frames,
+            &mut eval.buffers,
+            fid,
+        );
+    }
+    let row_height = |snapshot: &WindowDisplaySnapshot| {
+        let point = snapshot.point_for_buffer_pos(pos)?;
+        Some(
+            snapshot
+                .row_metrics(point.row)
+                .map_or(point.height, |row| row.height),
+        )
+    };
+    if let Some(snapshot) = eval.fresh_window_display_snapshot(fid, wid, buffer_id)
+        && let Some(height) = row_height(snapshot)
+    {
+        return Ok(Some(height));
+    }
+    let measured = motion::screen_line_height_at(eval, fid, wid, buffer_id, pos)?;
+    // The frame's line height answers only when no frontend can lay the
+    // window out, or when this call runs inside another layout query.
+    Ok(Some(measured.unwrap_or(line_height)))
 }
 
 /// (window-text-pixel-size &optional WINDOW FROM TO X-LIMIT Y-LIMIT MODE) -> (WIDTH . HEIGHT)

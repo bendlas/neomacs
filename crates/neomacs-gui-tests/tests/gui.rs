@@ -31,6 +31,9 @@ mod coding_save;
 #[path = "colrv1_emoji.rs"]
 mod colrv1_emoji;
 
+#[path = "commit_editing.rs"]
+mod commit_editing;
+
 #[path = "compact_frame_geometry.rs"]
 mod compact_frame_geometry;
 
@@ -51,6 +54,9 @@ mod display_line_numbers;
 
 #[path = "display_window_geometry.rs"]
 mod display_window_geometry;
+
+#[path = "eof_scrolling.rs"]
+mod eof_scrolling;
 
 #[path = "dual_width_fixed_pitch.rs"]
 mod dual_width_fixed_pitch;

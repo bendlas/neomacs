@@ -135,13 +135,18 @@ fn cached_primary_selection_text() -> Option<String> {
     NEOMACS_PRIMARY_SELECTION_TEXT.with(|slot| slot.borrow().clone())
 }
 
+/// GNU NS reports monitor geometry in points, the unit frame sizes use;
+/// the frontend snapshot holds device pixels.
 fn monitor_geometry_value(monitor: &NeomacsMonitorInfo) -> Value {
-    Value::list(vec![
-        Value::fixnum(monitor.x as i64),
-        Value::fixnum(monitor.y as i64),
-        Value::fixnum(monitor.width as i64),
-        Value::fixnum(monitor.height as i64),
-    ])
+    // A broken scale factor keeps the old device-pixel values rather than
+    // signaling, so init files that read monitor attributes keep loading.
+    let rect = display::monitor_rect_in_display_pixels(monitor).unwrap_or([
+        monitor.x as i64,
+        monitor.y as i64,
+        monitor.width as i64,
+        monitor.height as i64,
+    ]);
+    Value::list(rect.map(Value::fixnum).to_vec())
 }
 
 fn monitor_mm_size_value(monitor: &NeomacsMonitorInfo) -> Value {
@@ -151,16 +156,35 @@ fn monitor_mm_size_value(monitor: &NeomacsMonitorInfo) -> Value {
     ])
 }
 
-fn monitor_alist_value(monitor: &NeomacsMonitorInfo, frames: Value) -> Value {
-    Value::list(vec![
+/// Whether monitor alists carry `scale-factor`. GNU adds it only on PGTK,
+/// whose geometry is in device pixels (frame.c, `#ifdef HAVE_PGTK`); NS and
+/// X builds omit it. Callers such as `org--get-display-dpi` divide the
+/// geometry by it when present.
+#[derive(Clone, Copy)]
+enum MonitorScaleFactor {
+    Omit,
+    Report,
+}
+
+fn monitor_alist_value(
+    monitor: &NeomacsMonitorInfo,
+    frames: Value,
+    scale_factor: MonitorScaleFactor,
+) -> Value {
+    let mut attributes = vec![
         Value::cons(Value::symbol("geometry"), monitor_geometry_value(monitor)),
         Value::cons(Value::symbol("workarea"), monitor_geometry_value(monitor)),
         Value::cons(Value::symbol("mm-size"), monitor_mm_size_value(monitor)),
-        Value::cons(Value::symbol("frames"), frames),
-        Value::cons(
+    ];
+    // GNU's order: mm-size, scale-factor, frames.
+    if let MonitorScaleFactor::Report = scale_factor {
+        attributes.push(Value::cons(
             Value::symbol("scale-factor"),
             Value::make_float(monitor.scale),
-        ),
+        ));
+    }
+    attributes.extend([
+        Value::cons(Value::symbol("frames"), frames),
         Value::cons(
             Value::symbol("name"),
             monitor
@@ -170,7 +194,8 @@ fn monitor_alist_value(monitor: &NeomacsMonitorInfo, frames: Value) -> Value {
                 .unwrap_or(Value::NIL),
         ),
         Value::cons(Value::symbol("source"), Value::string("Neomacs")),
-    ])
+    ]);
+    Value::list(attributes)
 }
 
 pub(crate) fn builtin_neomacs_frame_geometry(args: Vec<Value>) -> EvalResult {
@@ -210,6 +235,23 @@ pub(crate) fn builtin_neomacs_display_monitor_attributes_list(
         return Ok(Value::NIL);
     }
 
+    // The monitor snapshot comes from the one graphical frontend, so its
+    // backend decides, whichever frame is selected. Wayland is the PGTK case:
+    // device-pixel geometry plus a scale factor.
+    let on_wayland = eval.frames.frame_list().into_iter().any(|fid| {
+        eval.frames.get(fid).is_some_and(|frame| {
+            matches!(
+                frame.display_identity(),
+                crate::window::FrameDisplayIdentity::Graphical(identity)
+                    if identity.backend() == neomacs_display_protocol::GraphicalBackend::Wayland
+            )
+        })
+    });
+    let scale_factor = if on_wayland {
+        MonitorScaleFactor::Report
+    } else {
+        MonitorScaleFactor::Omit
+    };
     let mut alists = Vec::with_capacity(monitor_values.len());
     for (index, monitor) in monitor_values.iter().enumerate() {
         let frame_list = if index == 0 {
@@ -217,7 +259,7 @@ pub(crate) fn builtin_neomacs_display_monitor_attributes_list(
         } else {
             Value::NIL
         };
-        alists.push(monitor_alist_value(monitor, frame_list));
+        alists.push(monitor_alist_value(monitor, frame_list, scale_factor));
     }
     Ok(Value::list(alists))
 }

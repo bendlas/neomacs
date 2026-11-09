@@ -1328,7 +1328,12 @@ pub fn write_string_to_file(content: &str, filename: &str, append: bool) -> std:
     } else {
         FileWriteMode::Truncate
     };
-    let file = write_bytes_to_file_with_mode(content.as_bytes(), Path::new(filename), mode)?;
+    let file = write_bytes_to_file_with_mode(
+        content.as_bytes(),
+        Path::new(filename),
+        mode,
+        DEFAULT_FILE_CREATION_MODE,
+    )?;
     drop(file);
     Ok(())
 }
@@ -1418,15 +1423,34 @@ impl WriteRegionCompletion {
     }
 }
 
+/// The permission bits GNU `write_region` passes to open(2) for an ordinary
+/// write (`mode = auto_saving ? auto_save_mode_bits : 0666`,
+/// src/fileio.c:5645).  The process umask still applies.
+const DEFAULT_FILE_CREATION_MODE: u32 = 0o666;
+
 /// Write raw bytes to a file, returning the open `File` handle so the caller
 /// can optionally `sync_all()` before the handle is dropped.
+///
+/// CREATION_MODE is the permission argument of open(2): the umask masks it,
+/// and it only matters when this write creates the file, since an existing
+/// file keeps its modes.  GNU's MS-DOS/Windows build ignores the computed
+/// bits (`mode = S_IREAD | S_IWRITE`, src/fileio.c:5642-5646), which is the
+/// platform default there.
 fn write_bytes_to_file_with_mode(
     content: &[u8],
     filename: &Path,
     mode: FileWriteMode,
+    creation_mode: u32,
 ) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(creation_mode);
+    }
+    #[cfg(not(unix))]
+    let _ = creation_mode;
     match mode {
         FileWriteMode::Truncate => {
             options.create(true).truncate(true);
@@ -3537,19 +3561,25 @@ fn case_probe_parent(_path: &Path) -> Option<PathBuf> {
 }
 
 fn file_modes_path(path: &Path, nofollow: bool) -> Option<u32> {
+    stat_file_modes(path, nofollow).ok()
+}
+
+/// The mode bits `file_modes_path` reports, keeping the error of a failed
+/// stat for callers that, like GNU, tell its errno values apart.
+fn stat_file_modes(path: &Path, nofollow: bool) -> std::io::Result<u32> {
     let meta = if nofollow {
-        fs::symlink_metadata(path).ok()?
+        fs::symlink_metadata(path)?
     } else {
-        fs::metadata(path).ok()?
+        fs::metadata(path)?
     };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        Some(meta.permissions().mode() & 0o7777)
+        Ok(meta.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
     {
-        Some(if meta.permissions().readonly() {
+        Ok(if meta.permissions().readonly() {
             0o444
         } else {
             0o644
@@ -5776,6 +5806,86 @@ fn expect_inserted_char_count(value: &Value) -> Result<i64, Flow> {
     Ok(inserted)
 }
 
+/// INSERTED as GNU takes it from a file name handler's value
+/// (src/fileio.c:4168-4170): N from `(FILE N)` when N is a fixnum in
+/// `[0, ZV - PT]`; 0 otherwise.  jka-compr, for one, reports a count that
+/// can exceed `ZV - PT`, and then gets no `format-decode` or hooks.
+fn handler_reported_inserted_chars(buf: &crate::buffer::Buffer, handler_result: Value) -> i64 {
+    let count = if handler_result.is_cons() && handler_result.cons_cdr().is_cons() {
+        handler_result.cons_cdr().cons_car().as_fixnum()
+    } else {
+        None
+    };
+    let room = buf
+        .point_max_char_pos()
+        .saturating_offset_from(buf.point_char_pos())
+        .get();
+    match (count, i64::try_from(room)) {
+        (Some(count), Ok(room)) if (0..=room).contains(&count) => count,
+        _ => 0,
+    }
+}
+
+/// The rest of `insert-file-contents` once a file name handler has done the
+/// reading.  GNU's handler branch does `goto handled` (src/fileio.c:4163-4171)
+/// rather than returning, so the handler's insertion still gets the VISIT
+/// bookkeeping (:5148-5169), `after-insert-file-set-coding`, `format-decode`
+/// and `after-insert-file-functions` (:5174-5306).  No coding system was
+/// decided here, so `last-coding-system-used` stays whatever the handler left
+/// (:5171-5172).  The handler's own value is returned unless it is nil
+/// (:5331-5332).
+fn finish_handled_insert_file_contents(
+    eval: &mut Context,
+    filename: &crate::heap_types::LispString,
+    handler_result: Value,
+    visit: bool,
+    replace_requested: bool,
+    empty_undo_list_p: bool,
+) -> EvalResult {
+    // GNU continues with whatever buffer is current after the handler.
+    let current_id = current_buffer_id_or_error(&eval.buffers)?;
+    let inserted = handler_reported_inserted_chars(
+        eval.buffers
+            .get(current_id)
+            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?,
+        handler_result,
+    );
+
+    if visit {
+        if empty_undo_list_p {
+            let _ = eval
+                .buffers
+                .configure_buffer_undo_list(current_id, Value::NIL);
+        }
+        // SAVE_MODIFF = MODIFF; BUF_AUTOSAVE_MODIFF = MODIFF;
+        // save_length = Z - BEG (:5160-5162).  The modtime, file name and
+        // lock are left to the handler (:5153-5158 and :5163-5168 only run
+        // without one).
+        let _ = eval.buffers.set_buffer_modified_flag(current_id, false);
+        let _ = eval.buffers.set_buffer_auto_saved(current_id);
+        if let Some(buf) = eval.buffers.get_mut(current_id) {
+            let size = i64::try_from(buf.total_char_len().get()).unwrap_or(i64::MAX);
+            buf.set_buffer_local("buffer-saved-size", Value::fixnum(size));
+        }
+    }
+
+    let roots = eval.save_specpdl_roots();
+    eval.push_specpdl_root(handler_result);
+    let pipeline_result =
+        run_after_insert_file_pipeline(eval, current_id, visit, replace_requested, inserted);
+    eval.restore_specpdl_roots(roots);
+    let inserted = pipeline_result?;
+
+    if handler_result.is_nil() {
+        Ok(Value::list(vec![
+            Value::heap_string(filename.clone()),
+            Value::fixnum(inserted),
+        ]))
+    } else {
+        Ok(handler_result)
+    }
+}
+
 fn run_after_insert_file_pipeline(
     eval: &mut Context,
     current_id: crate::buffer::BufferId,
@@ -6629,6 +6739,40 @@ pub(crate) fn builtin_insert_file_contents(
     expect_min_args("insert-file-contents", &args, 1)?;
     expect_max_args("insert-file-contents", &args, 5)?;
 
+    let visit = args.get(1).is_some_and(|v| v.is_truthy());
+    let replace_requested = args.get(4).is_some_and(|v| !v.is_nil());
+    // GNU decides this on entry (src/fileio.c:4125-4127), before a file name
+    // handler gets to insert anything into the buffer.
+    let empty_undo_list_p = eval
+        .buffers
+        .current_buffer()
+        .is_some_and(|buf| visit && buf.get_undo_list().is_nil() && buf.is_text_empty());
+
+    // GNU refuses these before expanding the name or calling a file name
+    // handler (src/fileio.c:4143-4147).
+    {
+        let current_id = current_buffer_id_or_error(&eval.buffers)?;
+        let buf = eval
+            .buffers
+            .get(current_id)
+            .ok_or_else(|| signal("error", vec![Value::string("No current buffer")]))?;
+        if visit && buf.base_buffer.is_some() {
+            return Err(signal(
+                "error",
+                vec![Value::string(
+                    "Cannot do file visiting in an indirect buffer",
+                )],
+            ));
+        }
+        if crate::emacs_core::editfns::buffer_read_only_active_in_state(eval.variables(), &[], buf)
+        {
+            return Err(signal(
+                LispCondition::BufferReadOnly,
+                vec![Value::make_buffer(current_id)],
+            ));
+        }
+    }
+
     let coding_val = eval.visible_variable_value_or_nil("coding-system-for-read");
     let coding_system_for_read: Option<String> = match coding_val.kind() {
         ValueKind::Nil => None,
@@ -6659,15 +6803,15 @@ pub(crate) fn builtin_insert_file_contents(
         None,
         handler_args,
     )? {
-        return Ok(result);
+        return finish_handled_insert_file_contents(
+            eval,
+            &resolved,
+            result,
+            visit,
+            replace_requested,
+            empty_undo_list_p,
+        );
     }
-    let visit = args.get(1).is_some_and(|v| v.is_truthy());
-    let replace_requested = args.get(4).is_some_and(|v| !v.is_nil());
-
-    let empty_undo_list_p = eval
-        .buffers
-        .current_buffer()
-        .is_some_and(|buf| visit && buf.get_undo_list().is_nil() && buf.is_text_empty());
 
     let current_id = current_buffer_id_or_error(&eval.buffers)?;
     {
@@ -6683,27 +6827,12 @@ pub(crate) fn builtin_insert_file_contents(
                 vec![Value::string("Attempt to visit less than an entire file")],
             ));
         }
-        if visit && buf.base_buffer.is_some() {
-            return Err(signal(
-                "error",
-                vec![Value::string(
-                    "Cannot do file visiting in an indirect buffer",
-                )],
-            ));
-        }
         if visit && !replace_requested && !buf.is_text_empty() {
             return Err(signal(
                 "error",
                 vec![Value::string(
                     "Cannot do file visiting in a non-empty buffer",
                 )],
-            ));
-        }
-        if crate::emacs_core::editfns::buffer_read_only_active_in_state(eval.variables(), &[], buf)
-        {
-            return Err(signal(
-                LispCondition::BufferReadOnly,
-                vec![Value::make_buffer(current_id)],
             ));
         }
     }
@@ -7548,21 +7677,26 @@ fn write_region_without_handler(
 
     // --- Write encoded bytes and handle fsync ---
     let write_result = (|| {
-        let file = write_bytes_to_file_with_mode(&encoded.bytes, &resolved_path, append_mode)
-            .map_err(|err| {
-                // GNU `Fwrite_region` reports *any* open failure via
-                // `report_file_errno ("Opening output file", filename, open_errno)`
-                // (fileio.c:5656) — the action is always "Opening output file",
-                // never "Writing to" (which GNU reserves for `a_write` errors).
-                // `get_file_errno_data` then handles errno specially: a MUSTBENEW
-                // =`excl` collision is EEXIST -> `(file-already-exists "File exists"
-                // FILENAME)` (action omitted), ENOENT -> `file-missing`, etc.
-                signal_file_action_error_value(
-                    err,
-                    "Opening output file",
-                    Value::heap_string(resolved.clone()),
-                )
-            })?;
+        let file = write_bytes_to_file_with_mode(
+            &encoded.bytes,
+            &resolved_path,
+            append_mode,
+            DEFAULT_FILE_CREATION_MODE,
+        )
+        .map_err(|err| {
+            // GNU `Fwrite_region` reports *any* open failure via
+            // `report_file_errno ("Opening output file", filename, open_errno)`
+            // (fileio.c:5656) — the action is always "Opening output file",
+            // never "Writing to" (which GNU reserves for `a_write` errors).
+            // `get_file_errno_data` then handles errno specially: a MUSTBENEW
+            // =`excl` collision is EEXIST -> `(file-already-exists "File exists"
+            // FILENAME)` (action omitted), ENOENT -> `file-missing`, etc.
+            signal_file_action_error_value(
+                err,
+                "Opening output file",
+                Value::heap_string(resolved.clone()),
+            )
+        })?;
 
         // fsync after write unless write-region-inhibit-fsync is non-nil.
         let inhibit_fsync = eval
@@ -7763,6 +7897,158 @@ pub(crate) fn builtin_find_file_noselect(
 // src/fileio.c:6406-6408), which is also the gate Fdo_auto_save applies
 // to every buffer.  do-auto-save therefore never names a buffer.
 
+/// The permission bits GNU `auto_save_1` (src/fileio.c:6249-6273) stores in
+/// `auto_save_mode_bits`, which `write_region` then passes to open(2) for
+/// the auto-save file.
+///
+/// They are the visited file's modes plus owner read/write ("make sure we can
+/// overwrite it later"), so an auto-save file never grants more access than
+/// the file it backs up.  A buffer without a visited file, or whose visited
+/// file does not exist yet, gets the ordinary 0666.  The umask still applies,
+/// and an auto-save file that already exists keeps its own modes.
+fn auto_save_creation_mode(
+    eval: &mut super::eval::Context,
+    visited_file: Option<&LispString>,
+) -> Result<u32, Flow> {
+    let Some(visited_file) = visited_file else {
+        return Ok(DEFAULT_FILE_CREATION_MODE);
+    };
+    // `emacs_fstatat (AT_FDCWD, filename, &st, 0)`, which follows symlinks.
+    let modes = match stat_file_modes(&lisp_file_name_to_path_buf(visited_file), false) {
+        Ok(modes) => Some(i64::from(modes)),
+        // "Remote files don't cooperate with fstatat": GNU then asks
+        // `file-modes`, and keeps 0666 unless the answer is a fixnum.
+        Err(_) => auto_save_file_modes(eval, visited_file)?,
+    };
+    Ok(modes.map_or(DEFAULT_FILE_CREATION_MODE, |modes| {
+        ((modes | 0o600) & 0o777) as u32
+    }))
+}
+
+/// GNU `Ffile_modes (filename, Qnil)` (src/fileio.c:3644-3664), as
+/// `auto_save_1` calls it: the file name handler's answer when there is one,
+/// otherwise a stat that follows symlinks.
+///
+/// A failed stat is nil only for ENOENT and ENOTDIR; any other errno (EACCES,
+/// ELOOP...) signals (`file_metadata_errno`, src/fileio.c:325-336), and
+/// `Fdo_auto_save` then writes nothing for that buffer.  This port's
+/// `file-modes` answers nil for every failed stat, so it cannot be called
+/// here: an unreadable private file would get a 0666 auto-save file.
+fn auto_save_file_modes(
+    eval: &mut super::eval::Context,
+    visited_file: &LispString,
+) -> Result<Option<i64>, Flow> {
+    let absname = expand_and_dir_to_file_lisp_for_file_predicate(eval, visited_file)?;
+    let operation = Value::symbol("file-modes");
+    let handler = find_file_name_handler_lisp_for_eval(eval, &absname, operation);
+    if !handler.is_nil() {
+        let modes = eval.funcall_general(
+            handler,
+            vec![operation, Value::heap_string(absname), Value::NIL],
+        )?;
+        return Ok(modes.as_fixnum());
+    }
+    match stat_file_modes(&lisp_file_name_to_path_buf(&absname), false) {
+        Ok(modes) => Ok(Some(i64::from(modes))),
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(None)
+        }
+        Err(err) => Err(signal_file_action_error_value(
+            err,
+            "Getting attributes",
+            Value::heap_string(absname),
+        )),
+    }
+}
+
+/// GNU `auto_save_1` (src/fileio.c:6249-6273), run with BUF_ID current:
+/// compute the auto-save file's modes, then write the buffer to TARGET.
+///
+/// The text is copied only after the modes are known, as GNU's
+/// `write_region` reads the buffer only once `auto_save_1` has asked for
+/// them.  A `file-modes` or `expand-file-name` handler may edit the buffer
+/// meanwhile, and the file must hold the text whose modification tick
+/// `do-auto-save` then records as auto-saved.
+fn auto_save_1(
+    eval: &mut super::eval::Context,
+    buf_id: crate::buffer::BufferId,
+    visited_file: Option<&LispString>,
+    target: &LispString,
+) -> Result<(), Flow> {
+    let creation_mode = auto_save_creation_mode(eval, visited_file)?;
+    // A handler that killed the buffer leaves nothing to write.
+    let Some(buf) = eval.buffers.get(buf_id) else {
+        return Ok(());
+    };
+    let mut content = Vec::new();
+    buf.copy_emacs_byte_range_to(buf.full_emacs_byte_range(), &mut content);
+    write_bytes_to_file_with_mode(
+        &content,
+        &lisp_file_name_to_path_buf(target),
+        FileWriteMode::Truncate,
+        creation_mode,
+    )
+    .map_err(|err| {
+        // The same report as `write-region`'s: GNU's `write_region` signals
+        // `("Opening output file" ...)` when open(2) fails
+        // (src/fileio.c:5656).
+        signal_file_action_error_value(
+            err,
+            "Opening output file",
+            Value::heap_string(target.clone()),
+        )
+    })?;
+    Ok(())
+}
+
+/// GNU `auto_save_error` (src/fileio.c:6233-6245), the handler
+/// `Fdo_auto_save` gives `internal_condition_case`: ring the bell, then
+/// display the error as an `auto-save` warning of level `:error`, "Auto-saving
+/// BUFFER: MESSAGE", where BUFFER is the current buffer, the one being
+/// auto-saved.  An error raised by the warning itself escapes `do-auto-save`,
+/// as in GNU.
+///
+/// `display-warning` is Lisp, autoloaded from warnings.el as in GNU.  A bare
+/// `Context` that has not loaded the Lisp layer has no way to display it, and
+/// drops the report.
+fn auto_save_error(eval: &mut super::eval::Context, flow: &Flow) -> Result<(), Flow> {
+    let Some(sig) = flow.as_signal() else {
+        return Ok(());
+    };
+    // `ring_bell (XFRAME (selected_frame))`.
+    let _ = crate::emacs_core::builtins::dispatch_builtin(eval, "ding", vec![]);
+    if !eval.obarray.fboundp("display-warning") {
+        return Ok(());
+    }
+    // The error object and the message are fresh heap values that must
+    // survive the allocations of `error-message-string` and `format`.
+    let roots = eval.save_specpdl_roots();
+    let result = (|| {
+        let error_data = crate::emacs_core::error::make_signal_binding_value(sig);
+        eval.push_specpdl_root(error_data);
+        let error_message =
+            crate::emacs_core::print::builtin_error_message_string(eval, vec![error_data])?;
+        eval.push_specpdl_root(error_message);
+        let format_string = Value::string("Auto-saving %s: %s");
+        eval.push_specpdl_root(format_string);
+        let buffer_name = eval
+            .buffers
+            .current_buffer()
+            .map_or(Value::NIL, |buf| buf.name_value());
+        let message = crate::emacs_core::builtins::builtin_format(
+            eval,
+            vec![format_string, buffer_name, error_message],
+        )?;
+        eval.funcall_general(
+            Value::symbol("display-warning"),
+            vec![Value::symbol("auto-save"), message, Value::symbol(":error")],
+        )?;
+        Ok(())
+    })();
+    eval.restore_specpdl_roots(roots);
+    result
+}
+
 /// `(do-auto-save &optional NO-MESSAGE CURRENT)` -> nil
 ///
 /// Auto-save all buffers that need it.
@@ -7777,6 +8063,8 @@ pub(crate) fn builtin_do_auto_save(
 
     let _no_message = args.first().is_some_and(|v| v.is_truthy());
     let current_only = args.get(1).is_some_and(|v| v.is_truthy());
+    // GNU's `old`: the buffer current on entry, before `auto-save-hook`.
+    let old_buffer = eval.buffers.current_buffer_id();
 
     // GNU `Fdo_auto_save` runs this before inspecting or snapshotting any
     // buffer, so edits made by the hook belong to this auto-save pass.  Use
@@ -7800,7 +8088,7 @@ pub(crate) fn builtin_do_auto_save(
 
     for buf_id in buffer_ids {
         // Gather info from the buffer (immutable borrow)
-        let (auto_save_name, file_name, content_bytes, content_len) = {
+        let (auto_save_name, file_name) = {
             let Some(buf) = eval.buffers.get(buf_id) else {
                 continue;
             };
@@ -7848,15 +8136,7 @@ pub(crate) fn builtin_do_auto_save(
                 continue;
             }
             let visit_name = buf.file_name_lisp_string().cloned();
-            let mut bytes = Vec::new();
-            buf.copy_emacs_byte_range_to(buf.full_emacs_byte_range(), &mut bytes);
-
-            (
-                auto_name,
-                visit_name,
-                bytes,
-                buf.total_emacs_byte_len().get() as i64,
-            )
+            (auto_name, visit_name)
         };
 
         // Determine which file to write to
@@ -7874,21 +8154,32 @@ pub(crate) fn builtin_do_auto_save(
             continue;
         };
 
-        // Write the buffer content to the target file
-        if write_bytes_to_file_with_mode(
-            &content_bytes,
-            &lisp_file_name_to_path_buf(&target_path),
-            FileWriteMode::Truncate,
-        )
-        .is_ok()
-        {
-            // Mark the buffer as auto-saved
+        // GNU makes the buffer current, runs `auto_save_1` under
+        // `internal_condition_case (auto_save_1, Qt, auto_save_error)`, marks
+        // the buffer auto-saved whether or not that succeeded, and selects
+        // OLD again (`set_buffer_internal`, src/fileio.c:6453 and 6478-6482).
+        // A `file-modes` handler therefore runs in the buffer being
+        // auto-saved.  An error while reading the visited file's modes (a
+        // stat failing with EACCES, a handler signaling) or while writing
+        // abandons this buffer's write and is reported as a warning; the pass
+        // goes on with the next buffer, and this one is not retried before
+        // its next change.
+        eval.set_current_buffer_unrecorded(buf_id)?;
+        let result = match auto_save_1(eval, buf_id, file_name.as_ref(), &target_path) {
+            Err(flow) if flow.is_signal() => auto_save_error(eval, &flow),
+            other => other,
+        };
+        if result.is_ok() {
             let _ = eval.buffers.set_buffer_auto_saved(buf_id);
-            // Update buffer-saved-size
             if let Some(buf) = eval.buffers.get_mut(buf_id) {
-                buf.set_buffer_local("buffer-saved-size", Value::fixnum(content_len));
+                let saved_size = buf.total_emacs_byte_len().get() as i64;
+                buf.set_buffer_local("buffer-saved-size", Value::fixnum(saved_size));
             }
         }
+        if let Some(old_buffer) = old_buffer {
+            eval.restore_current_buffer_if_live(old_buffer);
+        }
+        result?;
     }
 
     // GNU `Fdo_auto_save` ends with `record_auto_save`, regardless of whether

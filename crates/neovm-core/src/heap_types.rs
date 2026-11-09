@@ -4,11 +4,17 @@
 //! dump/load code share the same payload structs without reviving old heap
 //! module boundaries.
 
+pub(crate) mod byte_positions;
+pub(crate) mod overlay_storage;
 pub(crate) mod threading;
 
-use crate::buffer::text_props::{EmptyTextProperties, TextPropertiesRef};
-use crate::buffer::{BufferId, CharLen, CharPos0, CharRange, EmacsBytePos, TextPropertyTable};
+use self::byte_positions::EmacsBytePos;
 use crate::emacs_core::emacs_char;
+use crate::emacs_core::value::buffer_vocab::BufferId;
+use crate::emacs_core::value::positions::{CharLen, CharPos0, CharRange};
+use crate::emacs_core::value::text_props::{
+    EmptyTextProperties, TextPropertiesRef, TextPropertyTable,
+};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
@@ -16,6 +22,40 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// The position cache's byte-mutation stamp, installed by the evaluator above
+/// this layer. The cache owns the epoch cell and the conversions that fill it;
+/// heap payload mutations only notify it. The upper cache's fill path refuses
+/// to store while this table is empty, so a mutation that skipped notification
+/// can never leave a stale entry behind. The hook reads the calling thread's
+/// own TLS epoch, so it stays correct on every mutator and carrier thread.
+static NOTE_STRING_BYTES_CHANGED: OnceLock<fn()> = OnceLock::new();
+
+/// Hand the upper position cache its byte-mutation stamp. One-time process
+/// hook, installed next to the scratch-root hooks by evaluator construction
+/// and by image restore; a later install is the same function pointer and is
+/// ignored.
+pub(crate) fn install_string_bytes_changed_hook(hook: fn()) {
+    let _ = NOTE_STRING_BYTES_CHANGED.set(hook);
+}
+
+/// Whether an evaluator has published the byte-mutation stamp. The position
+/// cache's fill path consults this (an acquire load) before storing: without
+/// the hook a later mutation could not invalidate the entry. Once set, the
+/// hook never goes away.
+#[inline]
+pub(crate) fn string_bytes_changed_hook_installed() -> bool {
+    NOTE_STRING_BYTES_CHANGED.get().is_some()
+}
+
+/// Some string's bytes changed: notify the upper position cache, if an
+/// evaluator has installed it.
+#[inline]
+fn note_string_bytes_changed() {
+    if let Some(hook) = NOTE_STRING_BYTES_CHANGED.get() {
+        hook();
+    }
+}
 
 /// A Lisp string.
 ///
@@ -1050,7 +1090,7 @@ impl LispString {
             self.size = len;
             self.size_byte = SIZE_BYTE_UNIBYTE_NORMAL;
         }
-        crate::emacs_core::string_pos_cache::note_string_bytes_changed();
+        note_string_bytes_changed();
     }
 
     /// Mutable text-property interval tree attached to this string.
@@ -1188,7 +1228,7 @@ impl LispString {
     /// `clear_contents_to_unibyte` restores its known shape and invalidates
     /// the cache directly, without scanning the zeroed bytes.
     fn recompute_size(&mut self, byte_len: usize) {
-        crate::emacs_core::string_pos_cache::note_string_bytes_changed();
+        note_string_bytes_changed();
         if self.size_byte >= 0 {
             // multibyte
             let data = if byte_len == 0 {
@@ -1411,11 +1451,11 @@ impl Clone for LispString {
 /// Rust-owned string payloads retain the Lisp objects in their interval plists.
 /// Heap strings and Context-held copies have the same tracing obligation.
 impl crate::gc_trace::GcTrace for LispString {
-    fn trace_roots(&self, roots: &mut Vec<crate::emacs_core::value::Value>) {
+    fn trace_roots(&self, roots: &mut Vec<crate::tagged::value::TaggedValue>) {
         self.intervals().for_each_root(|root| roots.push(root));
     }
 
-    fn trace_roots_with(&self, visit: &mut dyn FnMut(crate::emacs_core::value::Value)) {
+    fn trace_roots_with(&self, visit: &mut dyn FnMut(crate::tagged::value::TaggedValue)) {
         self.intervals().for_each_root(visit);
     }
 }
@@ -1622,13 +1662,13 @@ pub struct OverlayData {
     /// before the owning mutator publishes a fresh allocation; observer
     /// copies and loaded images preserve it (see [`OverlaySerial`]).
     pub serial: OverlaySerial,
-    pub plist: crate::emacs_core::value::Value,
+    pub plist: crate::tagged::value::TaggedValue,
     pub buffer: Option<BufferId>,
     pub start: usize,
     pub end: usize,
     /// Runtime-only authority for lazily shifted live endpoints. Detached and
     /// deserialized overlays materialize `start`/`end` and carry no handle.
-    pub(crate) position_handle: Option<crate::buffer::overlay_index::OverlayPositionHandle>,
+    pub(crate) position_handle: Option<self::overlay_storage::OverlayPositionHandle>,
     pub front_advance: bool,
     pub rear_advance: bool,
 }
@@ -1638,7 +1678,7 @@ pub struct OverlayData {
 ///
 /// Keeping this distinct from [`OverlayData`] makes it impossible for callers
 /// outside `neovm-core` to forge or retain the runtime-only position handle.
-/// [`Value::make_overlay`](crate::emacs_core::value::Value::make_overlay)
+/// [`Value::make_overlay`](crate::tagged::value::TaggedValue::make_overlay)
 /// converts this value into the live heap representation with no position
 /// authority until an overlay list attaches it.
 #[derive(Clone, Debug)]
@@ -1646,7 +1686,7 @@ pub struct OverlayDataInit {
     /// `Mint` for a new Lisp object; `Preserved` for observer copies,
     /// buffered copies and image loads.
     pub serial: OverlaySerialSource,
-    pub plist: crate::emacs_core::value::Value,
+    pub plist: crate::tagged::value::TaggedValue,
     pub buffer: Option<BufferId>,
     pub start: usize,
     pub end: usize,
@@ -1690,7 +1730,7 @@ impl Clone for OverlayData {
 
 impl OverlayData {
     pub(crate) fn current_range(&self) -> (usize, usize) {
-        crate::buffer::overlay_index::current_overlay_range(self)
+        self::overlay_storage::current_overlay_range(self)
             .map(|range| (range.start().get(), range.end().get()))
             .unwrap_or((self.start, self.end))
     }
@@ -1954,3 +1994,9 @@ mod signed_string_positions_tests;
 #[cfg(test)]
 #[path = "heap_types/tests/character_count_kind.rs"]
 mod character_count_kind_tests;
+
+/// Unique identifier for a process.
+///
+/// This is identity data only. The process layer owns ID issuance, process
+/// table access and OS operations; an ID grants none of that authority.
+pub type ProcessId = u64;

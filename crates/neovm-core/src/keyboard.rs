@@ -882,8 +882,18 @@ enum InputMethodEvent {
     Translated(Value),
 }
 
+/// GNU `read_key_sequence`'s `fix_current_buffer` distinction: the command
+/// loop follows the selected window, while Lisp key readers retain the caller's
+/// current buffer even when another buffer is displayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeySequenceBufferSelection {
+    CurrentBuffer,
+    SelectedWindow,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ReadKeySequenceOptions {
+    pub buffer_selection: KeySequenceBufferSelection,
     pub prompt: Value,
     pub dont_downcase_last: bool,
     pub can_return_switch_frame: bool,
@@ -977,6 +987,14 @@ pub(crate) enum CommandKeySequenceEnd {
 }
 
 impl ReadKeySequenceOptions {
+    pub(crate) fn for_command_loop() -> Self {
+        Self {
+            buffer_selection: KeySequenceBufferSelection::SelectedWindow,
+            can_return_switch_frame: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn new(
         prompt: Value,
         continue_echo: bool,
@@ -984,6 +1002,7 @@ impl ReadKeySequenceOptions {
         can_return_switch_frame: bool,
     ) -> Self {
         Self {
+            buffer_selection: KeySequenceBufferSelection::CurrentBuffer,
             prompt,
             dont_downcase_last,
             can_return_switch_frame,
@@ -995,6 +1014,7 @@ impl ReadKeySequenceOptions {
 impl Default for ReadKeySequenceOptions {
     fn default() -> Self {
         Self {
+            buffer_selection: KeySequenceBufferSelection::CurrentBuffer,
             prompt: Value::NIL,
             dont_downcase_last: false,
             can_return_switch_frame: false,
@@ -4953,6 +4973,22 @@ impl crate::emacs_core::eval::Context {
                     }
                 }
 
+                // Timers/process filters can display another buffer during
+                // the input wait while restoring the previously current one.
+                // GNU reconciles it at the first event, before consulting maps
+                // (keyboard.c, `if (NILP (first_event))`). Do not do this for
+                // Lisp-facing reads or after a mouse event selected its buffer.
+                if options.buffer_selection == KeySequenceBufferSelection::SelectedWindow
+                    && self
+                        .command_loop
+                        .keyboard
+                        .kboard
+                        .current_key_sequence
+                        .raw_events()
+                        .is_empty()
+                {
+                    self.sync_current_buffer_to_selected_window();
+                }
                 self.command_loop
                     .keyboard
                     .push_key_sequence_input_event(emacs_event);
@@ -5339,57 +5375,6 @@ impl crate::emacs_core::eval::Context {
         }
     }
 
-    /// Move GNU `THREAD_EVENT`s queued for the main thread from the
-    /// World-shared thread manager into this Context's keyboard queue.
-    ///
-    /// GNU's `thread_signal_callback` stores the event in the process-wide
-    /// kbd buffer (`src/thread.c:1007-1013`); the main Context is this
-    /// port's command loop, so its reader is where that buffer becomes
-    /// Lisp-visible.  FIFO with the other input: the event is appended.
-    ///
-    /// Only the main thread's reader owns that conversion.  A Green worker
-    /// shares the World's manager but has no command loop, and its waits must
-    /// not steal the main thread's events.
-    pub(crate) fn stage_pending_thread_events(&mut self) {
-        if self.threads.current_thread_id() != 0 {
-            return;
-        }
-        // The command loop is the main thread (id 0): drain ITS record only.
-        for pending in self.threads.take_thread_events(0) {
-            self.command_loop
-                .keyboard
-                .pending_input_events
-                .push_back(InputEvent::ThreadEvent {
-                    sender: pending.sender,
-                    error_symbol: pending.error_symbol,
-                    data: pending.data,
-                });
-        }
-    }
-
-    /// The Lisp object behind one `THREAD_EVENT` field, on this evaluator's
-    /// mutator.
-    ///
-    /// The event's [`SharedRoot`](crate::tagged::transport::SharedRoot) keeps
-    /// the object alive; the input event owns that root for as long as the
-    /// copied value is used.  A foreign-heap root is impossible in a World
-    /// (one heap per World), so report it as an internal error instead of
-    /// assuming a value this evaluator cannot legally touch.
-    fn thread_event_value(
-        &self,
-        root: &crate::tagged::transport::SharedRoot,
-    ) -> Result<Value, crate::emacs_core::error::Flow> {
-        match self.materialize(root) {
-            Ok(local) => Ok(local.value()),
-            Err(err) => Err(crate::emacs_core::error::signal(
-                "error",
-                vec![Value::string(format!(
-                    "THREAD_EVENT carried a value from another heap: {err}"
-                ))],
-            )),
-        }
-    }
-
     /// Read a single input event, blocking if necessary.
     ///
     /// Mirrors GNU Emacs `read_char()` (keyboard.c:2489).
@@ -5398,10 +5383,10 @@ impl crate::emacs_core::eval::Context {
     fn drain_ready_input_event_for_read_char(
         &mut self,
         idle_policy: IdleTransitionPolicy,
-    ) -> Option<InputEvent> {
+    ) -> Result<Option<InputEvent>, crate::emacs_core::error::Flow> {
         loop {
             self.service_leading_internal_frontend_events();
-            self.stage_pending_thread_events();
+            self.stage_pending_thread_events()?;
             if let Some(event) = self
                 .command_loop
                 .keyboard
@@ -5409,20 +5394,22 @@ impl crate::emacs_core::eval::Context {
                 .pop_visible_front()
             {
                 idle_policy.stop_idle(self);
-                return Some(event);
+                return Ok(Some(event));
             }
 
-            let rx = self.input_rx.as_ref()?;
+            let Some(rx) = self.input_rx.as_ref() else {
+                return Ok(None);
+            };
             match rx.try_recv() {
                 Ok(event) => self
                     .command_loop
                     .keyboard
                     .pending_input_events
                     .push_back(event),
-                Err(crossbeam_channel::TryRecvError::Empty) => return None,
+                Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.handle_display_terminal_disconnect();
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -6223,7 +6210,7 @@ impl crate::emacs_core::eval::Context {
             if self.sync_pending_resize_events() {
                 self.redisplay()?;
             }
-            if let Some(event) = self.drain_ready_input_event_for_read_char(idle_policy) {
+            if let Some(event) = self.drain_ready_input_event_for_read_char(idle_policy)? {
                 if let Some(value) = self.handle_read_char_input_event_with_idle_policy(
                     event,
                     tty_input_decoding,
@@ -6271,7 +6258,7 @@ impl crate::emacs_core::eval::Context {
                 self.redisplay()?;
             }
 
-            if let Some(event) = self.drain_ready_input_event_for_read_char(idle_policy) {
+            if let Some(event) = self.drain_ready_input_event_for_read_char(idle_policy)? {
                 if let Some(value) = self.handle_read_char_input_event_with_idle_policy(
                     event,
                     tty_input_decoding,

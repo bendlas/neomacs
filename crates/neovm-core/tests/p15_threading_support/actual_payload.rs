@@ -38,13 +38,20 @@ impl StringRoots<'_> {
     }
 }
 
-pub(crate) mod buffer {
-    pub use neovm_core::buffer::BufferId;
+// Mirror the payload's canonical lower vocabulary path, using the real
+// identity type. This glue grants no buffer manager or issuance authority.
+pub(crate) mod emacs_core {
+    pub mod value {
+        pub mod buffer_vocab {
+            pub use neovm_core::emacs_core::value::buffer_vocab::BufferId;
+        }
+    }
 }
 
 pub(crate) mod tagged {
+    pub mod transport { pub use neovm_core::tagged::transport::{SharedRoot, SharedRootError}; }
     pub mod gc {
-        pub use neovm_core::tagged::gc::HeapIdentity;
+        pub use neovm_core::tagged::gc::{HeapIdentity, TaggedHeap};
     }
     pub mod value {
         pub use neovm_core::tagged::value::TaggedValue;

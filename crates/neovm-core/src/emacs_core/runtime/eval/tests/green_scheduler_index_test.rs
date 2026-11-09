@@ -754,6 +754,61 @@ fn waking_a_waiter_releases_every_wait_object_index() {
     assert_eq!(state.ready.valid_count(), 3, "all three turns are queued");
 }
 
+/// The verdict must describe the state that produced it. A stale index can be
+/// re-synced by a transition after the no-owner decision; a check that drops
+/// the deciding lock and re-takes it afterwards would then pass and print the
+/// GNU deadlock message. `pick_next` evaluates the predicate under the
+/// deciding lock and carries the result out, so the later transition cannot
+/// rewrite the verdict. Release-only: in debug the per-transition checker
+/// panics on the injected stale entry first, by design.
+#[cfg(not(debug_assertions))]
+#[test]
+fn the_no_owner_verdict_carries_the_index_state_that_produced_it() {
+    let worker = ThreadKey::Worker(NonZeroU64::new(1).expect("nonzero"));
+    let condition = ConditionId::new(7);
+    let stale_state = || {
+        let mut state = ControlState::default();
+        // Worker parks on the condition; Main parks on the worker, but the
+        // released SCHEDIDX left Main behind in the condition waiter set.
+        let _ = state.waits.insert(worker, Wait::Condition(condition));
+        let _ = state.waits.insert(ThreadKey::Main, Wait::Join(worker));
+        state
+            .waits
+            .condition_waiters
+            .entry(condition)
+            .or_default()
+            .insert(ThreadKey::Main);
+        state
+    };
+
+    // The old shape: decide no-owner, let a transition re-sync the stale
+    // entry, then check the index from a fresh lock -- the check now passes.
+    {
+        let mut state = stale_state();
+        assert!(Control::pick(&mut state).is_none(), "no owner can run");
+        Control::set_wait(&mut state, ThreadKey::Main, Wait::Condition(condition));
+        assert!(
+            state.verify_invariants().is_ok(),
+            "a post-decision re-sync hides the stale entry from a later check"
+        );
+    }
+
+    // The production decision evaluates the predicate inside that lock.
+    let control = Control::default();
+    {
+        let mut state = control.state();
+        *state = stale_state();
+    }
+    match control.pick_next() {
+        PickNext::NoRunnable(Err(error)) => {
+            assert_eq!(error.kind, WaitIndexKind::ConditionWaiters);
+            assert_eq!(error.key, Some(ThreadKey::Main));
+        }
+        PickNext::NoRunnable(Ok(())) => panic!("the stale condition entry must be reported"),
+        PickNext::Owner(_) => panic!("no owner can run"),
+    }
+}
+
 /// The deadline index is keyed by `(wait_end, ThreadKey)`: expiry admits the
 /// earliest deadline first and keeps key order for ties.
 #[test]
@@ -852,8 +907,8 @@ fn wake_one_picks_the_smallest_waiting_key() {
     );
 }
 
-/// The production scheduler must not grow direct `waits.insert` or raw
-/// `ready` queue writes again (peer amendment 4; the seams are the only
+/// The production scheduler must not grow direct `waits.insert`/`waits.remove`
+/// or raw `ready` queue writes again (peer amendment 4; the seams are the only
 /// writers). The cfg(test) module is exempt.
 #[test]
 fn production_wait_writes_go_through_the_seams() {
@@ -885,6 +940,25 @@ fn production_wait_writes_go_through_the_seams() {
     assert!(
         inserts[0] > set_wait && inserts[0] < set_wait_end,
         "the only wait-map write must sit inside fn set_wait"
+    );
+
+    let removes: Vec<usize> = production
+        .match_indices("waits.remove(")
+        .map(|(offset, _)| offset)
+        .collect();
+    assert_eq!(
+        removes.len(),
+        1,
+        "production may remove wait-map entries only inside remove_key"
+    );
+    let remove_key = production.find("fn remove_key(").expect("remove_key seam");
+    let remove_key_end = remove_key
+        + production[remove_key..]
+            .find("\n    }")
+            .expect("remove_key end");
+    assert!(
+        removes[0] > remove_key && removes[0] < remove_key_end,
+        "the only wait-map removal must sit inside fn remove_key"
     );
     for raw in [
         "ready.push_back(",

@@ -283,3 +283,87 @@ fn raw_unibyte_setter_and_snapshot_restore_keep_exact_informational_names() {
     );
     assert_eq!(family(restored.iter().next().unwrap()), Some("A\u{FFFD}B"));
 }
+
+fn encoded_entry(family: &str, encoding: &str) -> FontSpecEntry {
+    FontSpecEntry::Font(StoredFontSpec {
+        family: Some(intern(family)),
+        registry: None,
+        lang: None,
+        weight: None,
+        slant: None,
+        width: None,
+        definition: Some(FontDefinitionMetadata {
+            encoding: intern(encoding),
+            repertory: None,
+        }),
+    })
+}
+
+/// Detached workers see the same charset-priority order as the evaluator's
+/// lookups.  Non-preferred encodings keep their definition order, and an
+/// `ExplicitNone` stop and everything after it stay in place.
+#[test]
+fn shared_capture_follows_the_preferred_charsets() {
+    let mut data = FontsetData::default();
+    for entry in [
+        encoded_entry("gb", "chinese-gb2312"),
+        encoded_entry("big5", "big5"),
+        encoded_entry("jis", "japanese-jisx0208"),
+        FontSpecEntry::ExplicitNone,
+        encoded_entry("after-stop", "japanese-jisx0208"),
+    ] {
+        data.update_target(
+            FontsetTarget::Range('月' as u32, '月' as u32),
+            entry,
+            FontsetAddMode::Append,
+        );
+    }
+    let order = |data: &FontsetData| -> Vec<Option<String>> {
+        CapturedFontsetChain::from_data(revision(), data, '月')
+            .iter()
+            .map(|entry| family(entry).map(str::to_owned))
+            .collect()
+    };
+    let names = |names: &[&str]| -> Vec<Option<String>> {
+        names
+            .iter()
+            .map(|name| (*name != "STOP").then(|| (*name).to_owned()))
+            .collect()
+    };
+
+    publish_charset_preference(vec![
+        intern("japanese-jisx0208"),
+        intern("japanese-jisx0212"),
+    ]);
+    assert_eq!(
+        order(&data),
+        names(&["jis", "gb", "big5", "STOP", "after-stop"])
+    );
+
+    publish_charset_preference(vec![intern("chinese-gb2312")]);
+    assert_eq!(
+        order(&data),
+        names(&["gb", "big5", "jis", "STOP", "after-stop"])
+    );
+}
+
+/// Characters that share a range share one reordered chain per preference.
+#[test]
+fn shared_capture_reorders_a_range_once_for_all_its_characters() {
+    let mut data = FontsetData::default();
+    for entry in [
+        encoded_entry("gb", "chinese-gb2312"),
+        encoded_entry("jis", "japanese-jisx0208"),
+    ] {
+        data.update_target(
+            FontsetTarget::Range('月' as u32, '水' as u32),
+            entry,
+            FontsetAddMode::Append,
+        );
+    }
+    publish_charset_preference(vec![intern("japanese-jisx0208")]);
+    let first = CapturedFontsetChain::from_data(revision(), &data, '月');
+    let second = CapturedFontsetChain::from_data(revision(), &data, '水');
+    assert_eq!(family(first.iter().next().unwrap()), Some("jis"));
+    assert!(Arc::ptr_eq(&first.specific.0, &second.specific.0));
+}

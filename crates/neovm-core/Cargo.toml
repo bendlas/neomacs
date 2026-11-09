@@ -11,7 +11,9 @@ description = "Core runtime structures for NeoVM"
 autotests = false
 
 [dependencies]
+neovm-display-identity.workspace = true
 neovm-host-abi.workspace = true
+neovm-value.workspace = true
 neomacs-display-protocol.workspace = true
 neomacs-video-model.workspace = true
 enumflags2.workspace = true
@@ -45,7 +47,6 @@ strum.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-log.workspace = true
-tracing-appender.workspace = true
 stacker.workspace = true
 dns-lookup.workspace = true
 hostname.workspace = true

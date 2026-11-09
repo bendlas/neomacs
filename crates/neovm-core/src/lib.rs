@@ -15,14 +15,16 @@ pub mod host_input;
 mod image_identity;
 pub mod keyboard;
 mod keyboard_input;
-pub mod logging;
+pub use neovm_value::logging;
 pub mod tagged;
 #[cfg(test)]
 #[path = "tests/test_utils_test.rs"]
 pub mod test_utils;
 #[cfg(debug_assertions)]
 pub(crate) mod tls_fingerprint;
-mod tls_scope;
+// The thread-local restoration guard lives in the lower value crate. The
+// re-export keeps the historical `crate::tls_scope` path for every core user.
+pub(crate) use neovm_value::tls_scope;
 pub mod window;
 
 // Curated facade: the front door for consumers of the Lisp engine. The

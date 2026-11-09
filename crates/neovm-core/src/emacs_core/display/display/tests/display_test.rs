@@ -32,6 +32,41 @@ use neomacs_display_protocol::SelectionOwner;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
+/// Popup navigation follows the selected window after callbacks display another buffer.
+#[test]
+fn popup_key_reader_follows_selected_buffer_after_async_display() {
+    use crate::emacs_core::eval::RedisplayHookPolicyGuard;
+    use crate::test_utils::input_wait::InputGateOwner;
+    let _policy = RedisplayHookPolicyGuard::legacy();
+    let mut ctx = crate::test_utils::runtime_startup_context();
+    let old = ctx.buffers.create_buffer("*popup-old*");
+    ctx.buffers.set_current(old);
+    let frame = ctx.frames.create_frame("F1", 80, 24, old);
+    assert!(ctx.frames.select_frame(frame));
+    let _input_owner = InputGateOwner::install(&mut ctx);
+    ctx.eval_str(r#"(progn
+        (setq timer-list nil timer-idle-list nil unread-command-events nil popup-read-timer-fired nil)
+        (use-local-map (make-sparse-keymap))
+        (local-set-key "a" 'popup-old-command)
+        (with-current-buffer (get-buffer-create "*popup-new*")
+          (fundamental-mode)
+          (use-local-map (make-sparse-keymap))
+          (local-set-key "a" 'popup-new-command))
+        (run-at-time 0.01 nil
+          (lambda ()
+            (save-current-buffer (switch-to-buffer "*popup-new*"))
+            (setq popup-read-timer-fired t unread-command-events (list ?a)))))"#).unwrap();
+    let (keys, binding) = super::read_popup_menu_key_sequence(&mut ctx).unwrap();
+    assert_eq!(ctx.eval_symbol("popup-read-timer-fired").unwrap(), Value::T);
+    assert_eq!(keys, vec![Value::fixnum('a' as i64)]);
+    assert_eq!(binding, Value::symbol("popup-new-command"));
+    assert_eq!(
+        ctx.eval_str("(eq (current-buffer) (window-buffer))")
+            .unwrap(),
+        Value::T
+    );
+}
+
 fn builtin_x_popup_menu(eval: &mut Context, args: Vec<Value>) -> EvalResult {
     super::builtin_x_popup_menu_batch(eval, args)
 }
@@ -3360,6 +3395,82 @@ fn graphical_display_dimensions_use_monitor_extent() {
         Value::fixnum(expected.1)
     );
     set_neomacs_monitor_info(vec![]);
+}
+
+#[test]
+fn monitor_attributes_geometry_uses_frame_pixel_units() {
+    crate::test_utils::init_test_tracing();
+    use crate::emacs_core::builtins::{NeomacsMonitorInfo, set_neomacs_monitor_info};
+    let mut eval = crate::emacs_core::Context::new();
+    crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
+    set_neomacs_monitor_info(vec![NeomacsMonitorInfo {
+        x: 3024,
+        y: 0,
+        width: 3024,
+        height: 1964,
+        scale: 2.0,
+        width_mm: 0,
+        height_mm: 0,
+        name: Some("Retina".into()),
+    }]);
+    let list = crate::emacs_core::builtins::builtin_neomacs_display_monitor_attributes_list(
+        &mut eval,
+        vec![],
+    )
+    .unwrap();
+    set_neomacs_monitor_info(vec![]);
+    let expected = if cfg!(target_os = "macos") {
+        "(geometry 1512 0 1512 982)"
+    } else {
+        "(geometry 3024 0 3024 1964)"
+    };
+    let printed = crate::emacs_core::print::print_value(&list);
+    assert!(printed.contains(expected), "{printed}");
+}
+
+fn printed_monitor_attributes(eval: &mut crate::emacs_core::Context, args: Vec<Value>) -> String {
+    let list =
+        crate::emacs_core::builtins::builtin_neomacs_display_monitor_attributes_list(eval, args);
+    crate::emacs_core::print::print_value(&list.expect("monitor attributes"))
+}
+
+#[test]
+fn monitor_attributes_report_scale_factor_only_for_wayland_frames() {
+    crate::test_utils::init_test_tracing();
+    use crate::emacs_core::builtins::{NeomacsMonitorInfo, set_neomacs_monitor_info};
+    let mut eval = crate::emacs_core::Context::new();
+    let selected = crate::emacs_core::window_cmds::ensure_selected_frame_id(&mut eval);
+    set_neomacs_monitor_info(vec![NeomacsMonitorInfo {
+        x: 0,
+        y: 0,
+        width: 3024,
+        height: 1964,
+        scale: 2.0,
+        width_mm: 0,
+        height_mm: 0,
+        name: None,
+    }]);
+    // GNU's NS and X builds omit it; only PGTK reports it.
+    let without = printed_monitor_attributes(&mut eval, vec![]);
+    // The selected frame stays non-graphical (an emacsclient -t frame); a
+    // Wayland frame elsewhere still makes the frontend's monitors PGTK-shaped.
+    let scratch = eval.buffers.create_buffer("*scratch*");
+    let wayland = eval.frames.create_frame("wayland", 800, 600, scratch);
+    eval.frames
+        .get_mut(wayland)
+        .expect("Wayland frame")
+        .set_display_identity(crate::window::FrameDisplayIdentity::wayland("wayland-0"));
+    eval.frames.select_frame(selected);
+    let with = printed_monitor_attributes(&mut eval, vec![]);
+    let with_frame_arg = printed_monitor_attributes(&mut eval, vec![Value::make_frame(wayland.0)]);
+    set_neomacs_monitor_info(vec![]);
+    assert!(!without.contains("scale-factor"), "{without}");
+    for printed in [&with, &with_frame_arg] {
+        // GNU's order: mm-size, scale-factor, frames.
+        let scale = printed.find("(scale-factor . 2.0)").expect(printed);
+        assert!(printed.find("(mm-size").unwrap() < scale, "{printed}");
+        assert!(scale < printed.find("(frames").unwrap(), "{printed}");
+    }
 }
 
 #[test]

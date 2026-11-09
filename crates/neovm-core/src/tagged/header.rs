@@ -12,8 +12,10 @@
 //! macros, bytecode, buffers, markers, overlays, records, etc.
 
 use super::value::TaggedValue;
+use crate::emacs_core::intern::NameId;
+use crate::emacs_core::intern::SymId;
 use malachite::integer::Integer;
-use neomacs_display_protocol::{VideoId, WebViewId};
+use neovm_display_identity::{VideoId, WebViewId};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -1870,7 +1872,7 @@ pub struct MacroObj {
 #[repr(C)]
 pub struct ByteCodeObj {
     pub header: VecLikeHeader,
-    pub data: crate::emacs_core::bytecode::ByteCodeFunction,
+    pub data: crate::tagged::bytecode::chunk::ByteCodeFunction,
     /// The Lisp objects GNU keeps in closure slots 1 and 2, handed out by
     /// `aref` (see [`ByteCodeSlotObjects`]). Outside `data` on purpose: a
     /// lazy pdump stub is materialized by overwriting `data`, and these
@@ -2005,7 +2007,7 @@ pub struct FontObjectData {
     /// Exact backend identity retained from realization.  This is deliberately
     /// not reduced to file/index: native selectors and variation coordinates
     /// are required to reopen the same font instance.
-    pub identity: neomacs_display_protocol::font::ResolvedFontIdentity,
+    pub identity: neovm_display_identity::font::ResolvedFontIdentity,
 }
 
 /// Heap-allocated opened-font pseudovector (`PVEC_FONT`).
@@ -2033,7 +2035,7 @@ pub struct MarkerObj {
 #[repr(C)]
 pub struct BufferObj {
     pub header: VecLikeHeader,
-    pub id: crate::buffer::BufferId,
+    pub id: crate::emacs_core::value::buffer_vocab::BufferId,
 }
 
 /// Heap-allocated window reference (wraps a u64 id).
@@ -2050,7 +2052,7 @@ pub struct WindowObj {
 #[repr(C)]
 pub struct ProcessObj {
     pub header: VecLikeHeader,
-    pub id: crate::emacs_core::process::ProcessId,
+    pub id: crate::heap_types::ProcessId,
 }
 
 /// Heap-allocated frame reference (wraps a u64 id).
@@ -2308,102 +2310,6 @@ pub struct XwidgetViewObj {
     pub hidden: bool,
 }
 
-/// Heap-allocated built-in function (like GNU's PVEC_SUBR).
-/// Contains a GNU-shaped fixed-arity or variadic entry point together with
-/// arity metadata stored on the SubrObj itself.
-pub type SubrFnMany = fn(
-    &mut crate::emacs_core::eval::Context,
-    Vec<super::value::TaggedValue>,
-) -> crate::emacs_core::error::EvalResult;
-/// Variadic native subroutine that does not need evaluator state.
-///
-/// Keeping this shape distinct avoids erasing the implementation's actual
-/// dependency behind an adapter closure that accepts and discards `Context`.
-pub type SubrFnManyNoContext =
-    fn(Vec<super::value::TaggedValue>) -> crate::emacs_core::error::EvalResult;
-pub type SubrFnManySlice = fn(
-    &mut crate::emacs_core::eval::Context,
-    &[super::value::TaggedValue],
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn0 =
-    fn(&mut crate::emacs_core::eval::Context) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn1 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn2 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn3 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn4 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn5 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn6 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn7 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-pub type SubrFn8 = fn(
-    &mut crate::emacs_core::eval::Context,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-    super::value::TaggedValue,
-) -> crate::emacs_core::error::EvalResult;
-
-#[derive(Clone, Copy)]
-pub enum SubrFn {
-    Many(SubrFnMany),
-    ManyNoContext(SubrFnManyNoContext),
-    ManySlice(SubrFnManySlice),
-    A0(SubrFn0),
-    A1(SubrFn1),
-    A2(SubrFn2),
-    A3(SubrFn3),
-    A4(SubrFn4),
-    A5(SubrFn5),
-    A6(SubrFn6),
-    A7(SubrFn7),
-    A8(SubrFn8),
-}
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntoPrimitive, TryFromPrimitive)]
 pub enum SubrDispatchKind {
@@ -2443,22 +2349,141 @@ impl From<bool> for SubrInteractivity {
 }
 
 #[repr(C)]
-pub struct SubrObj {
-    pub header: VecLikeHeader,
+pub struct SubrMetadata {
+    pub(super) header: VecLikeHeader,
     /// The canonical symbol identity for this primitive function.
-    pub sym_id: crate::emacs_core::intern::SymId,
+    pub(super) sym_id: SymId,
     /// The runtime-local name atom for the subr's public name.
-    pub name: crate::emacs_core::intern::NameId,
+    pub(super) name: NameId,
     /// Minimum number of arguments.
-    pub min_args: u16,
+    pub(super) min_args: u16,
     /// Maximum number of arguments (None = unlimited/&rest).
-    pub max_args: Option<u16>,
+    pub(super) max_args: Option<u16>,
     /// How the evaluator should dispatch this public subr surface.
-    pub dispatch_kind: SubrDispatchKind,
+    pub(super) dispatch_kind: SubrDispatchKind,
     /// GNU `Lisp_Subr::intspec.string` presence, used directly by `commandp`.
-    pub interactivity: SubrInteractivity,
-    /// Native Rust entry point for the builtin, if fully registered.
-    pub function: Option<SubrFn>,
+    pub(super) interactivity: SubrInteractivity,
+}
+
+impl SubrMetadata {
+    pub const FIELD_OFFSETS: [usize; 7] = [
+        std::mem::offset_of!(Self, header),
+        std::mem::offset_of!(Self, sym_id),
+        std::mem::offset_of!(Self, name),
+        std::mem::offset_of!(Self, min_args),
+        std::mem::offset_of!(Self, max_args),
+        std::mem::offset_of!(Self, dispatch_kind),
+        std::mem::offset_of!(Self, interactivity),
+    ];
+    /// Pure metadata, not authorization to install or invoke a native entry.
+    pub fn new(
+        sym_id: SymId,
+        name: NameId,
+        min_args: u16,
+        max_args: Option<u16>,
+        dispatch_kind: SubrDispatchKind,
+        interactivity: SubrInteractivity,
+    ) -> Self {
+        Self {
+            header: VecLikeHeader::new(VecLikeType::Subr),
+            sym_id,
+            name,
+            min_args,
+            max_args,
+            dispatch_kind,
+            interactivity,
+        }
+    }
+    #[inline(always)]
+    pub fn header(&self) -> &VecLikeHeader {
+        &self.header
+    }
+    #[inline(always)]
+    pub fn symbol_id(&self) -> SymId {
+        self.sym_id
+    }
+    #[inline(always)]
+    pub fn name_id(&self) -> NameId {
+        self.name
+    }
+    #[inline(always)]
+    pub fn min_args(&self) -> u16 {
+        self.min_args
+    }
+    #[inline(always)]
+    pub fn max_args(&self) -> Option<u16> {
+        self.max_args
+    }
+    #[inline(always)]
+    pub fn dispatch_kind(&self) -> SubrDispatchKind {
+        self.dispatch_kind
+    }
+    #[inline(always)]
+    pub fn interactivity(&self) -> SubrInteractivity {
+        self.interactivity
+    }
+}
+
+/// Storage for the single upper-selected entry ABI. The collector sees only
+/// the actual first metadata subobject, never an invented entry specialization.
+#[repr(C)]
+pub struct SubrObj<Entry: Copy + 'static> {
+    pub(super) metadata: SubrMetadata,
+    pub(super) function: Option<Entry>,
+}
+impl<Entry: Copy + 'static> SubrObj<Entry> {
+    pub const METADATA_OFFSET: usize = std::mem::offset_of!(Self, metadata);
+    pub const FUNCTION_OFFSET: usize = std::mem::offset_of!(Self, function);
+    /// # Safety
+    /// The caller is the canonical upper constructor for the sole native entry
+    /// specialization. Its metadata names the actual registered/catalog entry
+    /// (or the exact pre-install fallback); the initialized payload is Copy,
+    /// static, and has the exact size/alignment/offsets of SubrStorageLayout.
+    /// Entry refresh obeys the existing selected reader/writer lock and native
+    /// registration publication protocol. No competing registration write may
+    /// overlap initialization. The tagged object must not outlive its allocation.
+    pub unsafe fn new_unchecked(metadata: SubrMetadata, function: Option<Entry>) -> Self {
+        Self { metadata, function }
+    }
+    #[inline(always)]
+    pub fn metadata(&self) -> &SubrMetadata {
+        &self.metadata
+    }
+    #[inline(always)]
+    pub fn function(&self) -> Option<Entry> {
+        self.function
+    }
+    /// Borrow the native entry without copying its discriminant or payload.
+    #[inline(always)]
+    pub fn function_ref(&self) -> &Option<Entry> {
+        &self.function
+    }
+}
+
+/// Non-instantiated description of the native allocation footprint.
+/// No object is ever cast to this type, and its opaque tail is never read.
+#[repr(C)]
+pub struct SubrStorageLayout {
+    metadata: SubrMetadata,
+    entry_abi_words: [usize; 2],
+}
+impl SubrStorageLayout {
+    pub const METADATA_OFFSET: usize = std::mem::offset_of!(Self, metadata);
+    pub const ENTRY_OFFSET: usize = std::mem::offset_of!(Self, entry_abi_words);
+    pub const fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Self>()
+    }
+    /// # Safety
+    /// The pointer is the unique, detached, heap-owned allocation created with
+    /// the asserted canonical subr Layout, not a leaked static or mapped object.
+    /// Its fully initialized metadata and Copy entry require no destructor.
+    pub(crate) unsafe fn deallocate(ptr: *mut VecLikeHeader) {
+        // SAFETY: the owning sweep establishes exclusivity and the allocation
+        // layout/no-drop construction invariant; no entry bytes are inspected.
+        unsafe {
+            std::alloc::dealloc(ptr.cast::<u8>(), Self::layout());
+        }
+    }
 }
 
 /// Heap-allocated arbitrary-precision integer (mirrors GNU

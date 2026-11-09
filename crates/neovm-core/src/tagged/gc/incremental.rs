@@ -1037,7 +1037,7 @@ impl TaggedHeap {
                 // struct vectors, and nothing allocates under GC.
                 if data.is_pdump_stub() {
                     unsafe {
-                        crate::emacs_core::pdump::mapped_heap::for_each_stub_bytecode_child(
+                        crate::tagged::pdump_image::for_each_stub_bytecode_child(
                             obj,
                             data.closure_slot_count,
                             |child| self.mark_or_push_child(child, "bytecode-stub-image"),
@@ -1949,7 +1949,11 @@ impl TaggedHeap {
                         self.pending_video_destroys.push(video_id);
                         unsafe { drop(Box::from_raw(obj)) };
                     }
-                    VecLikeType::Subr => unsafe { drop(Box::from_raw(ptr as *mut SubrObj)) },
+                    VecLikeType::Subr => {
+                        // SAFETY: this sweep owns the detached managed allocation;
+                        // static/mapped subrs never enter this ownership list.
+                        unsafe { SubrStorageLayout::deallocate(ptr) }
+                    }
                     VecLikeType::Bignum => unsafe {
                         // Residual-Box seam only: page bignums never enter
                         // the intrusive lists this fn sweeps (`alloc_bignum`

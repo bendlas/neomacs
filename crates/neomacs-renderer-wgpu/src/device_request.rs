@@ -60,6 +60,20 @@ fn with_error_handler((device, queue): (wgpu::Device, wgpu::Queue)) -> (wgpu::De
     (device, queue)
 }
 
+/// The limits requested from an adapter's device.
+///
+/// Texture dimensions follow the adapter because window surfaces can exceed
+/// wgpu's default 8192 cap (e.g. a 5K HiDPI display). Every other limit starts
+/// from the WebGPU defaults and is clamped to what the adapter supports.
+/// Without the clamp, an adapter reporting zero compute limits rejects the
+/// entire device request even though the renderer never creates a compute
+/// pipeline.
+fn requested_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits::default()
+        .using_resolution(adapter_limits.clone())
+        .or_worse_values_from(adapter_limits)
+}
+
 /// Create the renderer's device and queue with platform interop enabled when
 /// the selected adapter can support it.
 ///
@@ -74,8 +88,9 @@ pub async fn request_renderer_device(
         label: Some(label),
         required_features: requested_features(adapter),
         // Window surfaces are sized by the display, not by wgpu's default
-        // 8192 cap, so request the adapter's own texture dimension limits.
-        required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+        // 8192 cap, so texture dimensions come from the adapter; everything
+        // else is the WebGPU defaults clamped to the adapter.
+        required_limits: requested_limits(&adapter.limits()),
         memory_hints: Default::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         trace: wgpu::Trace::Off,
@@ -100,12 +115,22 @@ pub async fn request_renderer_device(
         _ => {}
     }
 
+    let adapter_info = adapter.get_info();
     adapter
         .request_device(&descriptor)
         .await
         .map(with_error_handler)
-        .map_err(|error| format!("failed to create renderer device: {error}"))
+        .map_err(|error| {
+            format!(
+                "failed to create renderer device on adapter {:?} (backend={:?}, type={:?}): {error}",
+                adapter_info.name, adapter_info.backend, adapter_info.device_type
+            )
+        })
 }
+
+#[cfg(test)]
+#[path = "device_request/tests/device_request_test.rs"]
+mod tests;
 
 #[cfg(target_os = "linux")]
 mod linux {

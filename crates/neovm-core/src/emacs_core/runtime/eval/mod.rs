@@ -50,9 +50,7 @@ use super::value::*;
 use crate::buffer::{BufferId, BufferManager, CharPos0, EmacsBytePos, LispCharPos1};
 use crate::face::{FaceTable, FontSlant, FontWeight, FontWidth};
 use crate::gc_trace::GcTrace;
-use crate::tagged::header::{
-    CLOSURE_ARGLIST, SubrDispatchKind, SubrFn, SubrInteractivity, SubrObj,
-};
+use crate::tagged::header::{CLOSURE_ARGLIST, SubrDispatchKind, SubrInteractivity};
 use crate::window::{
     BodyRedisplayRevision, ForcedBodyRedisplay, FrameFullscreen, FrameManager, WindowId,
     WindowLayoutQueryAdapter,
@@ -61,6 +59,9 @@ use crate::window::{
 pub(crate) mod world;
 pub use world::{ContextShutdownError, ObarrayWriteAccess, OutstandingWorldViews, WorldEra};
 pub(crate) use world::{ObarrayView, OwnedRootRegistryView, WorldSlot, WorldView};
+
+pub(crate) mod subr_abi;
+use subr_abi::{SubrFn, SubrObj, SubrValueExt};
 
 mod callback;
 mod command_error;
@@ -563,7 +564,7 @@ struct RedisplayBufferSignature {
 /// retains Rust-only dispatch data and the complete interactive spec.
 #[derive(Clone, Copy)]
 pub(crate) struct SubrEntry {
-    pub(crate) function: Option<crate::tagged::header::SubrFn>,
+    pub(crate) function: Option<subr_abi::SubrFn>,
     pub(crate) min_args: u16,
     pub(crate) max_args: Option<u16>,
     pub(crate) dispatch_kind: crate::tagged::header::SubrDispatchKind,
@@ -678,6 +679,36 @@ fn set_builtin_sym_bit(sym_id: SymId, on: bool) {
     }
 }
 
+/// Upper policy for static subr entry writes. The lower registration writer
+/// owns the entry lock; the compiler's process-immutable selectors decide
+/// whether that writer must take it. Test builds synchronize every writer
+/// because per-thread compiler overrides may select Sink on another thread.
+/// The production condition is decided once, before the first write during
+/// Context setup, exactly as the compiler selectors are.
+#[cfg(feature = "jit")]
+fn static_subr_entry_write_sync() -> crate::tagged::value::StaticSubrEntrySync {
+    use crate::tagged::value::StaticSubrEntrySync;
+    #[cfg(test)]
+    {
+        StaticSubrEntrySync::Locked
+    }
+    #[cfg(not(test))]
+    {
+        use crate::emacs_core::jit::compile::{OptMode, jit_opt_mode, jit_opt_passes};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| jit_opt_mode() == OptMode::Opt && jit_opt_passes().sink) {
+            StaticSubrEntrySync::Locked
+        } else {
+            StaticSubrEntrySync::Direct
+        }
+    }
+}
+
+#[cfg(not(feature = "jit"))]
+fn static_subr_entry_write_sync() -> crate::tagged::value::StaticSubrEntrySync {
+    crate::tagged::value::StaticSubrEntrySync::Direct
+}
+
 /// Register a subr entry in the global static table.
 pub(crate) fn register_global_subr_entry(sym_id: SymId, entry: SubrEntry) {
     set_builtin_sym_bit(sym_id, entry.dispatch_kind == SubrDispatchKind::Builtin);
@@ -698,14 +729,19 @@ pub(crate) fn register_global_subr_entry(sym_id: SymId, entry: SubrEntry) {
         }
         table[idx] = inline;
     });
-    crate::tagged::value::update_static_subr_object_entry(
-        sym_id,
-        entry.function,
-        entry.min_args,
-        entry.max_args,
-        entry.dispatch_kind,
-        SubrInteractivity::from(entry.interactive_spec.is_some()),
-    );
+    // SAFETY: cached objects use the sole SubrFn factory; registration retains
+    // the existing selected lock and publishes its Release generation below.
+    unsafe {
+        crate::tagged::value::update_static_subr_object_entry(
+            sym_id,
+            entry.function,
+            entry.min_args,
+            entry.max_args,
+            entry.dispatch_kind,
+            SubrInteractivity::from(entry.interactive_spec.is_some()),
+            static_subr_entry_write_sync(),
+        );
+    }
     callback::publish_native_registration();
 }
 
@@ -855,19 +891,20 @@ pub(crate) fn subr_entry_from_value(function: Value) -> Option<(SymId, SubrEntry
         return None;
     }
     let subr = unsafe { &*(ptr as *const SubrObj) };
-    if subr.function.is_none() && subr.dispatch_kind == SubrDispatchKind::Builtin {
+    if subr.function_ref().is_none() && subr.metadata().dispatch_kind() == SubrDispatchKind::Builtin
+    {
         return None;
     }
     #[cfg(feature = "vm-profile")]
-    crate::emacs_core::bytecode::vm::vm_profile::bump_subr(subr.sym_id);
+    crate::emacs_core::bytecode::vm::vm_profile::bump_subr(subr.metadata().symbol_id());
     Some((
-        subr.sym_id,
+        subr.metadata().symbol_id(),
         SubrEntry {
-            function: subr.function,
-            min_args: subr.min_args,
-            max_args: subr.max_args,
-            dispatch_kind: subr.dispatch_kind,
-            interactive_spec: lookup_global_subr_entry(subr.sym_id)
+            function: subr.function(),
+            min_args: subr.metadata().min_args(),
+            max_args: subr.metadata().max_args(),
+            dispatch_kind: subr.metadata().dispatch_kind(),
+            interactive_spec: lookup_global_subr_entry(subr.metadata().symbol_id())
                 .and_then(|entry| entry.interactive_spec),
         },
     ))
@@ -888,18 +925,19 @@ pub(crate) fn subr_call_entry_from_value(function: Value) -> Option<(SymId, Subr
         return None;
     }
     let subr = unsafe { &*(ptr as *const SubrObj) };
-    if subr.function.is_none() && subr.dispatch_kind == SubrDispatchKind::Builtin {
+    if subr.function_ref().is_none() && subr.metadata().dispatch_kind() == SubrDispatchKind::Builtin
+    {
         return None;
     }
     #[cfg(feature = "vm-profile")]
-    crate::emacs_core::bytecode::vm::vm_profile::bump_subr(subr.sym_id);
+    crate::emacs_core::bytecode::vm::vm_profile::bump_subr(subr.metadata().symbol_id());
     Some((
-        subr.sym_id,
+        subr.metadata().symbol_id(),
         SubrEntry {
-            function: subr.function,
-            min_args: subr.min_args,
-            max_args: subr.max_args,
-            dispatch_kind: subr.dispatch_kind,
+            function: subr.function(),
+            min_args: subr.metadata().min_args(),
+            max_args: subr.metadata().max_args(),
+            dispatch_kind: subr.metadata().dispatch_kind(),
             interactive_spec: None,
         },
     ))
@@ -6170,7 +6208,7 @@ impl Context {
     ) -> EvalResult {
         if super::builtins::is_canonical_symbol_id(sym_id) {
             let invalid_fn = if self.subr_is_special_form_id(sym_id) {
-                Value::subr_from_sym_id(sym_id)
+                <Value as SubrValueExt>::subr_from_sym_id(sym_id)
             } else {
                 value_from_symbol_id(sym_id)
             };
@@ -7051,7 +7089,7 @@ impl Context {
             lookup_global_subr_entry(canonical)?;
             canonical
         };
-        let function = Value::subr_from_sym_id(resolved);
+        let function = <Value as SubrValueExt>::subr_from_sym_id(resolved);
         self.dispatch_subr_value(function, args)
     }
 

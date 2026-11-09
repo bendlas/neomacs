@@ -4,12 +4,13 @@
 //! prototype's. Neomacs builds the instance without an owned argument
 //! vector and without a whole-function temporary; these tests pin the
 //! observable result.
+use crate::emacs_core::bytecode::ByteCodeFunctionExt;
 use crate::emacs_core::bytecode::{ByteCodeFunction, Op};
 use crate::emacs_core::error::FlowResultExt as _;
 use crate::emacs_core::eval::Context;
+use crate::emacs_core::eval::subr_abi::SubrFn;
 use crate::emacs_core::intern::intern;
 use crate::emacs_core::value::{LambdaParams, Value};
-use crate::tagged::header::SubrFn;
 
 fn eval(ctx: &mut Context, src: &str) -> Value {
     let v = ctx.eval_str(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));

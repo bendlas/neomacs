@@ -23,7 +23,8 @@ use super::geometry_hints::apply_window_geometry_hints;
 use super::state::{
     FpsCounter, GuiChromeInteractionState, IdleDimState, ImeCursorArea, PendingPointerDamage,
     PointerAppearanceState, PresentedInteractionKey, PresentedPointerHit, PresentedPressCapture,
-    TypingSpeedState, WindowChrome, effective_window_scale_factor, window_size_from_emacs_pixels,
+    TypingSpeedState, WindowChrome, effective_window_scale_factor,
+    window_position_from_emacs_pixels, window_size_from_emacs_pixels,
 };
 #[cfg(feature = "neo-term")]
 use super::terminal_expansion::TerminalExpansion;
@@ -449,6 +450,8 @@ pub(super) enum FrameLifecycle {
         last_ime_cursor_area: Option<ImeCursorArea>,
         chrome: WindowChrome,
         geometry_hints: Option<GuiFrameGeometryHints>,
+        /// Outer position requested before the native window went active.
+        pending_position: Option<(i32, i32)>,
     },
     /// Window with a live winit native window and wgpu surface.
     Active {
@@ -1716,6 +1719,21 @@ impl GuiFrameWindowState {
         }
     }
 
+    pub(super) fn set_outer_position(&mut self, x: i32, y: i32) {
+        match &mut self.lifecycle {
+            FrameLifecycle::Active { native, .. } => {
+                native
+                    .window
+                    .set_outer_position(window_position_from_emacs_pixels(x, y));
+            }
+            FrameLifecycle::Pending {
+                pending_position, ..
+            } => {
+                *pending_position = Some((x, y));
+            }
+        }
+    }
+
     pub(super) fn apply_geometry_hints(&mut self, geometry_hints: GuiFrameGeometryHints) {
         match &mut self.lifecycle {
             FrameLifecycle::Active { native, .. } => {
@@ -1971,6 +1989,8 @@ pub(crate) struct PendingWindow {
     /// Create the window override-redirect (GNU's `x-no-window-manager`).
     pub override_redirect: bool,
     pub visibility: WindowVisibility,
+    /// Outer position requested before the native window exists.
+    pub position: Option<(i32, i32)>,
 }
 
 impl GuiFrameWindowManager {
@@ -2062,6 +2082,12 @@ impl GuiFrameWindowManager {
         native.refresh_content_geometry();
         let key = self.primary_frame_key();
         if let Some(window_state) = self.windows.get_mut(&key) {
+            let pending_position = match window_state.lifecycle {
+                FrameLifecycle::Pending {
+                    pending_position, ..
+                } => pending_position,
+                FrameLifecycle::Active { .. } => None,
+            };
             let winit_id = native.window.id();
             let surface_state = native.surface_state();
             self.primary_winit_id = Some(winit_id);
@@ -2071,6 +2097,9 @@ impl GuiFrameWindowManager {
                 ime_enabled: window_state.lifecycle.ime_enabled(),
                 last_ime_cursor_area: window_state.lifecycle.last_ime_cursor_area(),
             };
+            if let Some((x, y)) = pending_position {
+                window_state.set_outer_position(x, y);
+            }
             window_state.render.set_surface_state(surface_state);
             self.sync_primary_mapping();
         }
@@ -2122,6 +2151,7 @@ impl GuiFrameWindowManager {
             geometry_hints,
             override_redirect,
             visibility,
+            position: None,
         });
     }
 
@@ -2147,8 +2177,31 @@ impl GuiFrameWindowManager {
         found
     }
 
-    /// Schedule a window for destruction.
+    /// Move a frame's outer window, or keep the position for a window whose
+    /// native creation is still pending.  False when the frame is unknown.
+    pub(super) fn set_outer_position(&mut self, emacs_frame_id: u64, x: i32, y: i32) -> bool {
+        if let Some(window) = self.get_mut(emacs_frame_id) {
+            window.set_outer_position(x, y);
+            return true;
+        }
+        let mut found = false;
+        for pending in self
+            .pending_creates
+            .iter_mut()
+            .filter(|pending| pending.emacs_frame_id == emacs_frame_id)
+        {
+            pending.position = Some((x, y));
+            found = true;
+        }
+        found
+    }
+
+    /// Schedule a window for destruction.  A creation still queued for the
+    /// frame is dropped: `process_creates` can run after `process_destroys`,
+    /// and would otherwise make a window for a frame that no longer exists.
     pub fn request_destroy(&mut self, emacs_frame_id: u64) {
+        self.pending_creates
+            .retain(|pending| pending.emacs_frame_id != emacs_frame_id);
         self.pending_destroys.push(emacs_frame_id);
     }
 
@@ -2183,6 +2236,11 @@ impl GuiFrameWindowManager {
                 .with_surface_size(window_size_from_emacs_pixels(req.width, req.height))
                 .with_transparent(true)
                 .with_decorations(self.chrome_defaults.decorations_enabled);
+            // Place the window where Lisp asked before it first appears.
+            let attrs = match req.position {
+                Some((x, y)) => attrs.with_position(window_position_from_emacs_pixels(x, y)),
+                None => attrs,
+            };
             let attrs = crate::window_chrome::WindowChromeController::prepare(
                 attrs,
                 self.chrome_defaults.decorations_enabled,
