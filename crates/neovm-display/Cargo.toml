@@ -48,6 +48,7 @@ static_assertions.workspace = true
 strum.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+x11rb.workspace = true
 # B3 TEST-SUPPORT-VIS: pub only in the test-support build; product visibility
 # is unchanged (the re-export stays pub(crate) in ordinary builds).
 visibility = { version = "0.1.1", optional = true }

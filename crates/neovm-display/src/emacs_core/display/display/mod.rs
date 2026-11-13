@@ -28,6 +28,7 @@ mod desktop;
 #[doc(hidden)]
 pub use desktop::monitor_rect_in_display_pixels;
 mod tooltip;
+mod x11_compat;
 #[doc(hidden)]
 pub use neovm_edit::emacs_core::edit_host::EditHost;
 #[doc(hidden)]
@@ -444,6 +445,58 @@ pub fn display_window_system_symbol_in_state(
 const GUI_X_DISPLAY_PLANES: i64 = 24;
 const GUI_X_DISPLAY_COLOR_CELLS: i64 = 16_777_216;
 const GUI_X_VISUAL_CLASS: &str = "true-color";
+
+/// The X display name backing FRAME-ARG, when it is an X11-backed GUI frame.
+///
+/// `None` for non-X frames (terminal frames, Wayland frames) and for invalid
+/// designators, so callers fall through to the synthetic answers.
+fn gui_x_display_for_frame(eval: &Context, frame_arg: Option<&Value>) -> Option<String> {
+    let frame = match frame_arg {
+        Some(value) if !value.is_nil() => {
+            let id = value.as_frame_id()?;
+            eval.frame_manager().get(FrameId(id))
+        }
+        _ => eval.frame_manager().selected_frame(),
+    };
+    frame
+        .and_then(|frame| frame.display_identity().x_display())
+        .map(str::to_owned)
+}
+
+/// Live root-relative origin of FRAME's native X11 window, in device pixels.
+///
+/// Neomacs never selects `StructureNotify` on its own frame window, so an
+/// external `ConfigureWindow` (EXWM repositioning a workspace or floating
+/// frame, or reparenting it into a floating container) is invisible to the
+/// Lisp `left`/`top` parameters.  GNU reads the window-manager-updated native
+/// edges instead; ask the server for the live position so `frame-edges`
+/// answers what X actually has and `window-inside-absolute-pixel-edges` (which
+/// EXWM uses to place managed clients) lands on the right monitor.
+///
+/// Returns `None` for child frames, non-X frames, or when the server query
+/// fails, so callers fall back to the Lisp-derived origin.
+pub(crate) fn gui_frame_native_root_position(
+    eval: &Context,
+    fid: FrameId,
+) -> Option<(f32, f32)> {
+    let frame = eval.frame_manager().get(fid)?;
+    if frame.parent_frame.as_frame_id().is_some() {
+        return None;
+    }
+    let display = frame.display_identity().x_display()?.to_owned();
+    let (_, outer_window_id) = eval
+        .display_host
+        .as_ref()
+        .and_then(|host| host.native_x11_window_ids(fid))?;
+    x11_compat::window_root_position(&display, outer_window_id as u32)
+        .ok()
+        .map(|(x, y)| (x as f32, y as f32))
+}
+
+/// Signal a hard X connection/protocol failure in GNU's shape.
+fn x11_signal(error: x11_compat::X11Error) -> Flow {
+    signal("error", vec![Value::string(error.message())])
+}
 
 fn gui_x_query_target_eval(
     eval: &mut neovm_eval::emacs_core::eval::Context,
@@ -2663,6 +2716,24 @@ pub fn builtin_x_focus_frame(eval: &mut Context, args: Vec<Value>) -> EvalResult
         .and_then(|frame| frame.effective_window_system())
         .is_some_and(gui_window_system_active_value)
     {
+        // GNU `x-focus-frame' moves the X input focus to the frame's X window.
+        // A window manager (EXWM) reparents that window and then relies on
+        // this call to route keyboard input to the frame, so a no-op here
+        // leaves the frame without key events.
+        let x_display = eval
+            .frame_manager()
+            .get(fid)
+            .and_then(|frame| frame.display_identity().x_display())
+            .map(str::to_owned);
+        if let Some(display) = x_display
+            && let Some((window, _)) = eval
+                .display_host
+                .as_ref()
+                .and_then(|host| host.native_x11_window_ids(fid))
+            && let Err(error) = x11_compat::focus_window(&display, window as u32)
+        {
+            return Err(x11_signal(error));
+        }
         Ok(Value::NIL)
     } else {
         Err(x_window_system_frame_error())
@@ -2771,6 +2842,36 @@ pub fn builtin_x_get_atom_name(args: Vec<Value>) -> EvalResult {
     expect_args_range("x-get-atom-name", &args, 1, 2)?;
     if let Some(frame) = args.get(1) {
         expect_optional_window_system_frame_arg(frame)?;
+    }
+    Err(x_window_system_frame_error())
+}
+
+/// (x-get-atom-name ATOM &optional FRAME) with an evaluator context.
+///
+/// A live X11 frame transparently queries the server; all other contexts keep
+/// GNU's "Window system frame should be used" shape.
+#[doc(hidden)]
+pub fn builtin_x_get_atom_name_eval(
+    eval: &mut neovm_eval::emacs_core::eval::Context,
+    args: Vec<Value>,
+) -> EvalResult {
+    expect_args_range("x-get-atom-name", &args, 1, 2)?;
+    if let Some(frame) = args.get(1) {
+        expect_optional_window_system_frame_arg(frame)?;
+    }
+    if let Some(display) = gui_x_display_for_frame(eval, args.get(1)) {
+        let Some(atom) = args[0].as_int() else {
+            return Err(signal(
+                LispCondition::WrongTypeArgument,
+                vec![Value::symbol("integerp"), args[0]],
+            ));
+        };
+        let atom = u32::try_from(atom).unwrap_or(0);
+        return match x11_compat::atom_name(&display, atom) {
+            Ok(Some(name)) => Ok(Value::string(name)),
+            Ok(None) => Ok(Value::NIL),
+            Err(error) => Err(x11_signal(error)),
+        };
     }
     Err(x_window_system_frame_error())
 }
@@ -3064,6 +3165,21 @@ pub fn builtin_x_server_version(
     eval: &mut neovm_eval::emacs_core::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if gui_x_query_target_eval(eval, "x-server-version", &args)?
+        && let Some(display) = gui_x_display_for_frame(eval, args.first())
+    {
+        match x11_compat::server_info(&display) {
+            Ok(info) => {
+                let (major, minor, release) = info.version;
+                return Ok(Value::list(vec![
+                    Value::fixnum(i64::from(major)),
+                    Value::fixnum(i64::from(minor)),
+                    Value::fixnum(i64::from(release)),
+                ]));
+            }
+            Err(error) => return Err(x11_signal(error)),
+        }
+    }
     x_optional_display_query_error_eval(eval, "x-server-version", args)
 }
 
@@ -3175,6 +3291,14 @@ pub fn builtin_x_display_screens(
     eval: &mut neovm_eval::emacs_core::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if gui_x_query_target_eval(eval, "x-display-screens", &args)?
+        && let Some(display) = gui_x_display_for_frame(eval, args.first())
+    {
+        match x11_compat::server_info(&display) {
+            Ok(info) => return Ok(Value::fixnum(info.screens as i64)),
+            Err(error) => return Err(x11_signal(error)),
+        }
+    }
     x_optional_display_query_error_eval(eval, "x-display-screens", args)
 }
 
@@ -3205,6 +3329,14 @@ pub fn builtin_x_server_vendor(
     eval: &mut neovm_eval::emacs_core::eval::Context,
     args: Vec<Value>,
 ) -> EvalResult {
+    if gui_x_query_target_eval(eval, "x-server-vendor", &args)?
+        && let Some(display) = gui_x_display_for_frame(eval, args.first())
+    {
+        match x11_compat::server_info(&display) {
+            Ok(info) => return Ok(Value::string(info.vendor)),
+            Err(error) => return Err(x11_signal(error)),
+        }
+    }
     x_optional_display_query_error_eval(eval, "x-server-vendor", args)
 }
 
@@ -3405,6 +3537,14 @@ pub fn builtin_x_display_pixel_width(
     args: Vec<Value>,
 ) -> EvalResult {
     if gui_x_query_target_eval(eval, "x-display-pixel-width", &args)? {
+        // The winit monitor snapshot can be empty (for example a nested Xephyr
+        // server before any monitor event); fall back to the X server's own
+        // root geometry, which is what GNU reports.
+        if let Some(display) = gui_x_display_for_frame(eval, args.first())
+            && let Ok((width, _)) = x11_compat::screen_size(&display)
+        {
+            return Ok(Value::fixnum(width));
+        }
         return Ok(Value::fixnum(graphical_desktop_extent()?.width));
     }
     x_optional_display_query_error_eval(eval, "x-display-pixel-width", args)
@@ -3420,6 +3560,14 @@ pub fn builtin_x_display_pixel_height(
     args: Vec<Value>,
 ) -> EvalResult {
     if gui_x_query_target_eval(eval, "x-display-pixel-height", &args)? {
+        if let Ok(extent) = graphical_desktop_extent() {
+            return Ok(Value::fixnum(extent.height));
+        }
+        if let Some(display) = gui_x_display_for_frame(eval, args.first())
+            && let Ok((_, height)) = x11_compat::screen_size(&display)
+        {
+            return Ok(Value::fixnum(height));
+        }
         return Ok(Value::fixnum(graphical_desktop_extent()?.height));
     }
     x_optional_display_query_error_eval(eval, "x-display-pixel-height", args)

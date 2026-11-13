@@ -2490,6 +2490,11 @@ pub struct GuiFrameHostRequest {
     pub visibility: neovm_value::display_vocab::FrameVisibility,
     pub decorated: bool,
     pub fullscreen: Option<FrameFullscreen>,
+    /// GNU's `x-no-window-manager`: create a new top-level window
+    /// override-redirect so a window manager never adopts Emacs's own frames
+    /// (notably EXWM, which otherwise tiles its floating frames as clients).
+    /// Ignored by resize requests.
+    pub override_redirect: bool,
 }
 
 impl GuiFrameHostRequest {
@@ -2509,6 +2514,10 @@ impl GuiFrameHostRequest {
             fullscreen: frame
                 .known_parameter(neovm_value::display_vocab::FrameParam::Fullscreen)
                 .and_then(|value| FrameFullscreen::from_symbol_value(&value)),
+            // Override-redirect is a creation-time X property already applied
+            // when the window was created; finalizing a live frame does not
+            // recreate the native window.
+            override_redirect: false,
         }
     }
 }

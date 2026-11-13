@@ -2601,6 +2601,8 @@ pub(crate) fn request_live_gui_frame_resize_and_keep_pending(
         visibility,
         decorated,
         fullscreen: None,
+        // A resize never recreates the native window.
+        override_redirect: false,
     })
     .map_err(|message| signal("error", vec![Value::string(message)]))?;
 

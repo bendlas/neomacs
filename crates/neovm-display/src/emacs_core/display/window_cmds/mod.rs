@@ -6280,6 +6280,8 @@ pub(crate) fn resize_live_gui_frame(
             visibility,
             decorated,
             fullscreen: None,
+            // A resize never recreates the native window.
+            override_redirect: false,
         })
         .map_err(|message| signal("error", vec![Value::string(message)]))?;
     }
@@ -6365,6 +6367,8 @@ pub(crate) fn request_live_gui_frame_resize(
             visibility,
             decorated,
             fullscreen: None,
+            // A resize never recreates the native window.
+            override_redirect: false,
         })
         .map_err(|message| signal("error", vec![Value::string(message)]))?;
         return Ok(());
@@ -7618,8 +7622,14 @@ pub fn builtin_x_create_frame(
             .frame_manager()
             .selected_frame()
             .is_some_and(|frame| frame.effective_window_system().is_none());
+    // GNU's `x-no-window-manager`: create the window override-redirect so a
+    // window manager (EXWM) never adopts Neomacs's own frames as clients.
+    // Resolved before the borrow split because the flag is Lisp state.
+    let override_redirect = eval
+        .visible_variable_value_or_nil("x-no-window-manager")
+        .is_truthy();
     let (frames, buffers, display_host) = eval.frame_manager_buffers_and_display_host_mut();
-    let result = x_create_frame_impl(frames, buffers, display_host, args);
+    let result = x_create_frame_impl(frames, buffers, display_host, args, override_redirect);
     eval.sync_keyboard_terminal_owner();
     if let Ok(value) = &result
         && let Some(id) = value.as_frame_id()
@@ -7690,6 +7700,7 @@ pub(crate) fn x_create_frame_impl(
     buffers: &mut BufferManager,
     display_host: &mut Option<Box<dyn neovm_eval::emacs_core::eval::DisplayHost>>,
     args: Vec<Value>,
+    override_redirect: bool,
 ) -> EvalResult {
     expect_args("x-create-frame", &args, 1)?;
 
@@ -8075,6 +8086,7 @@ pub(crate) fn x_create_frame_impl(
             visibility,
             decorated,
             fullscreen: parsed.fullscreen,
+            override_redirect,
         })
         .map_err(|message| signal("error", vec![Value::string(message)]))?;
     }
