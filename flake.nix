@@ -25,6 +25,7 @@
     # built against that revision. Following our nixpkgs would force an
     # expensive source rebuild.
     nix-wpe-webkit.url = "github:eval-exec/nix-wpe-webkit";
+    nix-wpe-webkit.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
