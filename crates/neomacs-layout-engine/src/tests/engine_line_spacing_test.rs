@@ -1297,6 +1297,25 @@ fn hidden_partial_cursor_on_reused_row_matches_fresh() {
     );
 }
 
+/// Body-text row starts after the same scroll the partial-edit fixture uses.
+fn partial_edit_body_starts(text: &str) -> Vec<i64> {
+    let (mut eval, frame, buffer, window) = incr_editing_frame(text, 800, 240);
+    realize_test_gui_frame(&mut eval, frame);
+    scroll_window_to(&mut eval, frame, window, buffer, 1, 21);
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    crate::font::metrics::test_catalog::enable_metrics(&mut engine);
+    engine.layout_frame_rust(&mut eval, frame);
+    let mut starts: Vec<i64> = engine
+        .retained_window_matrices
+        .values()
+        .flat_map(|matrix| matrix.matrix.rows.iter())
+        .filter(|row| row.enabled && row.role == neomacs_display_protocol::GlyphRowRole::Text)
+        .map(|row| row.start_charpos as i64)
+        .collect();
+    starts.sort_unstable();
+    starts
+}
+
 /// Hidden point rows above or below a localized edit must retain canonical
 /// cursor facts while the edit plan actually reuses retained rows.
 #[test]
@@ -1314,8 +1333,32 @@ fn hidden_partial_edit_cursor_on_reused_rows_matches_fresh() {
     let _restore = Restore;
     set_edit_sync_mode_for_test(Some(EditSyncMode::Sync));
     set_prove_first_for_test(Some(true));
-    for dirty_line in [2, 9, 14] {
-        let (mut eval, frame, buffer, window) = incr_editing_frame(&"abc\n".repeat(80), 800, 240);
+    let text = "abc\n".repeat(80);
+    let starts = partial_edit_body_starts(&text);
+    let origin = *starts.first().expect("the 800x240 window has a body row");
+    let last = *starts.last().expect("the 800x240 window has a body row");
+    // `dirty_line` N inserts at the start of buffer line N+1 (`goto-char` N*4+1).
+    let last_in_window = (last - origin) / 4;
+    assert!(
+        last_in_window < 14,
+        "buffer line 15 is below this window: body_starts={starts:?} rows={}",
+        starts.len()
+    );
+    assert!(
+        last_in_window > 9,
+        "dirty_line 9 must stay inside the window, and dedup must keep it distinct \
+         from the last visible line: body_starts={starts:?}"
+    );
+    // In-window lines replay as a partial edit. Line 15 (dirty_line 14) is
+    // below the matrix, so the edit is a full layout and still matches fresh.
+    let mut in_window = vec![2, 9, last_in_window];
+    in_window.dedup();
+    let cases = in_window
+        .into_iter()
+        .map(|line| (line, 1))
+        .chain(std::iter::once((14, 0)));
+    for (dirty_line, edit_windows) in cases {
+        let (mut eval, frame, buffer, window) = incr_editing_frame(&text, 800, 240);
         realize_test_gui_frame(&mut eval, frame);
         eval.buffer_manager_mut()
             .current_buffer_mut()
@@ -1333,10 +1376,21 @@ fn hidden_partial_edit_cursor_on_reused_rows_matches_fresh() {
         engine.layout_frame_rust(&mut eval, frame);
         assert_eq!(
             engine.last_layout_stats().edit_windows,
-            1,
+            edit_windows,
             "dirty_line={dirty_line}"
         );
-        assert!(engine.last_layout_stats().reused_rows > 0);
+        if edit_windows == 1 {
+            assert!(
+                engine.last_layout_stats().reused_rows > 0,
+                "dirty_line={dirty_line}"
+            );
+        } else {
+            assert_eq!(
+                engine.last_layout_stats().full_windows,
+                1,
+                "an edit below the window is a full layout: dirty_line={dirty_line}"
+            );
+        }
         let actual = eval
             .frame_manager()
             .get(frame)
@@ -1433,11 +1487,50 @@ fn retained_string_face_payload_mutation_matches_fresh_layout() {
     }
 }
 
-/// A moved point or translated retained row cannot certify an old explicit
-/// selection. Hidden overrides must be reselected, and retry must discard rows.
+/// Line box of a relative `:height` on the catalog primary face.
+///
+/// The test frame sets the default face to absolute `:height` 100. At the GNU
+/// X11 fallback of 100 DPI that is 14 px, and a relative height multiplies it.
+/// The cursor copies this face's realized line box (`ascent + descent` of the
+/// font selected for the glyph), not `12 * scale`.
+///
+/// GNU's physical cursor height is that row's box. `display_line` sets
+/// `row->height = it->max_ascent + it->max_descent` (src/xdisp.c:25984) and
+/// `display_and_set_cursor` copies it with
+/// `w->phys_cursor_height = glyph_row->height` (src/xdisp.c:35193), GNU Emacs
+/// 31.1 a360712c9d. The pixel count is UNATTESTED: this is a GUI row, not a
+/// TTY probe.
+fn realized_relative_face_line_box(relative_height: f32) -> u32 {
+    let font_size =
+        crate::font::sizing::face_height_to_gnu_x11_fallback_pixels(100) * relative_height;
+    let mut metrics = crate::font::metrics::test_catalog::metrics_service();
+    let measured = metrics
+        .vertical_metrics_for_realized_face_char(
+            'X',
+            crate::font::metrics::RealizedFaceFontSelection::new(
+                "monospace",
+                400,
+                false,
+                font_size,
+            ),
+        )
+        .expect("catalog primary face has a line box");
+    let rounded = measured.line_height.round();
+    assert!(
+        (measured.line_height - rounded).abs() < 0.01,
+        "relative :height {relative_height} line box must be a whole pixel, got {}",
+        measured.line_height
+    );
+    rounded as u32
+}
+
+/// An 80px frame fits one tall overlay row and not both. Moving point onto
+/// the second overlay scrolls. `set-window-start` of 4 then does not move
+/// the window, so the redisplay is cursor-only. That is why the selection
+/// test uses a 200px frame for a real start change.
 #[test]
-fn hidden_explicit_cursor_reselects_after_point_and_start_changes() {
-    let (mut eval, frame, _, window) =
+fn eighty_px_frame_scrolls_before_the_explicit_start_change() {
+    let (mut eval, frame, _, _window) =
         incr_editing_frame("ab\ncd\nef\ngh\nij\nkl\nmn\nop\n", 800, 80);
     realize_test_gui_frame(&mut eval, frame);
     eval.buffer_manager_mut()
@@ -1448,11 +1541,77 @@ fn hidden_explicit_cursor_reselects_after_point_and_start_changes() {
     let mut engine = crate::font::metrics::test_catalog::layout_engine();
     crate::font::metrics::test_catalog::enable_metrics(&mut engine);
     engine.layout_frame_rust(&mut eval, frame);
+    let window_start = |eval: &mut Context| {
+        eval.eval_str("(window-start)")
+            .unwrap()
+            .as_fixnum()
+            .expect("window-start")
+    };
+    eval.eval_str("(set-window-point (selected-window) 2)")
+        .unwrap();
+    let FrameLayoutAttempt::Prepared(_) = engine.redisplay_frame_attempt(&mut eval, frame) else {
+        panic!("point 2");
+    };
+    let start_before_scroll = window_start(&mut eval);
+    eval.eval_str("(set-window-point (selected-window) 5)")
+        .unwrap();
+    let FrameLayoutAttempt::Prepared(_) = engine.redisplay_frame_attempt(&mut eval, frame) else {
+        panic!("point 5");
+    };
+    let start_after_scroll = window_start(&mut eval);
+    assert_ne!(
+        start_before_scroll, start_after_scroll,
+        "point 5 scrolls an 80px frame that cannot show both overlay rows"
+    );
+    eval.eval_str("(set-window-start (selected-window) 4 t)")
+        .unwrap();
+    let FrameLayoutAttempt::Prepared(_) = engine.redisplay_frame_attempt(&mut eval, frame) else {
+        panic!("set-window-start");
+    };
+    assert_eq!(
+        window_start(&mut eval),
+        start_after_scroll,
+        "set-window-start 4 does not move a window that already scrolled"
+    );
+    assert_eq!(engine.last_layout_stats().full_windows, 0);
+    assert_eq!(engine.last_layout_stats().cursor_only_windows, 1);
+}
+
+/// A moved point or translated retained row cannot certify an old explicit
+/// selection. Hidden overrides must be reselected, and retry must discard rows.
+#[test]
+fn hidden_explicit_cursor_reselects_after_point_and_start_changes() {
+    // An 80px frame cannot show both overlay rows under the mode line. Moving
+    // point to 5 scrolls, so a later `set-window-start` of 4 does not move the
+    // window and the redisplay is cursor-only. That is the product behavior
+    // `eighty_px_frame_scrolls_before_the_explicit_start_change` pins. 200px
+    // keeps both rows on screen until the start is set explicitly, so this
+    // loop's third step is a real start change.
+    let (mut eval, frame, _, window) =
+        incr_editing_frame("ab\ncd\nef\ngh\nij\nkl\nmn\nop\n", 800, 200);
+    realize_test_gui_frame(&mut eval, frame);
+    eval.buffer_manager_mut()
+        .current_buffer_mut()
+        .unwrap()
+        .set_buffer_local("cursor-type", Value::NIL);
+    eval.eval_str("(progn (overlay-put (make-overlay 1 1) 'before-string (propertize \"X\" 'cursor 2 'face '(:height 2.0))) (overlay-put (make-overlay 4 4) 'before-string (propertize \"X\" 'cursor 2 'face '(:height 1.5))))").unwrap();
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    crate::font::metrics::test_catalog::enable_metrics(&mut engine);
+    engine.layout_frame_rust(&mut eval, frame);
     let mut last = None;
+    // :height 2.0 selects the first overlay while point is in [1, 3).
+    // :height 1.5 selects the second overlay from point 5. Both boxes come
+    // from the realized primary face, not from 12px times the scale.
+    let tall = realized_relative_face_line_box(2.0);
+    let short = realized_relative_face_line_box(1.5);
+    assert!(
+        tall > short,
+        "the 2.0 face must be taller than the 1.5 face"
+    );
     for (change, height) in [
-        ("(set-window-point (selected-window) 2)", 24),
-        ("(set-window-point (selected-window) 5)", 18),
-        ("(set-window-start (selected-window) 4 t)", 18),
+        ("(set-window-point (selected-window) 2)", tall),
+        ("(set-window-point (selected-window) 5)", short),
+        ("(set-window-start (selected-window) 4 t)", short),
     ] {
         eval.eval_str(change).unwrap();
         let FrameLayoutAttempt::Prepared(prepared) =

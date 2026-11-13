@@ -18438,7 +18438,7 @@ fn layout_frame_rust_mixed_window_scroll_bars_keep_shared_border_owned() {
 }
 
 #[test]
-fn layout_frame_rust_bottom_divider_does_not_separate_root_from_minibuffer() {
+fn layout_frame_rust_bottom_divider_separates_root_from_owned_minibuffer() {
     let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
@@ -18466,12 +18466,36 @@ fn layout_frame_rust_bottom_divider_does_not_separate_root_from_minibuffer() {
         .last_frame_display_state
         .as_ref()
         .expect("display state");
-    assert!(
-        state.borders.iter().all(
-            |border| border.window_id.get() != selected_window.0 as i64 || border.height != 6.0
-        ),
-        "GNU does not draw a bottom window divider between a bottommost root window and the minibuffer"
-    );
+    let info = state
+        .window_infos
+        .iter()
+        .find(|info| info.window_id.get() == selected_window.0 as i64)
+        .expect("root window info");
+    let neomacs_display_protocol::PresentedWindowGeometry::Complete { regions, .. } = info.geometry
+    else {
+        panic!("root window has complete geometry");
+    };
+    let bottom = regions
+        .bottom_divider
+        .expect("divider above owned minibuffer");
+    assert_eq!(bottom.height, 6.0);
+    // The divider is emitted as first/inner/last color bands. Assert its
+    // coverage, without requiring those bands to be one six-pixel quad.
+    let x = bottom.x + bottom.width / 2.0;
+    for row in 0..6 {
+        let y = bottom.y + row as f32 + 0.5;
+        assert!(
+            state.borders.iter().any(|border| {
+                border.window_id.get() == selected_window.0 as i64
+                    && x >= border.x
+                    && x < border.x + border.width
+                    && y >= border.y
+                    && y < border.y + border.height
+            }),
+            "GNU retains the complete divider above an owned minibuffer: row {row}, borders {:?}",
+            state.borders
+        );
+    }
 }
 
 #[test]
@@ -35333,45 +35357,34 @@ fn an_unloadable_image_replacement_still_covers_its_range() {
     );
 }
 
-/// A `display` spec the renderer cannot resolve DECLINES the replacement: the
-/// covered text displays normally, exactly once, and the walk resumes at the
-/// covered range's end E exactly once.
+/// A unibyte `display` string REPLACES its covered range, and the walk resumes
+/// at that range's end exactly once.
 ///
-/// This is the render-time fallback branch
-/// (`BufferDisplayPropertyTextReplacementRenderOutcome::Fallback`,
-/// display_property_render.rs), which had NO coverage of any kind before this
-/// pin. It is GNU-shaped rather than a compromise: `handle_display_prop`
-/// returning 0 for a spec `handle_single_display_spec` will not take means the
-/// covered text is simply displayed, i.e. the frame was never pushed.
+/// GNU Emacs 31.1 (`a360712c9d`) `handle_single_display_spec` treats any string
+/// as a replacing spec: after margin stripping, `valid_p` includes
+/// `STRINGP(value)` (`src/xdisp.c:6512`) and the iterator is installed with
+/// `it->method = GET_FROM_STRING` (`src/xdisp.c:6563`). A TTY frame (`emacs -nw`,
+/// 24x80) draws bytes 200 and 201 as the octal escapes `\310\311` in place of
+/// the covered text `def`, then `g`. `9ee9383fc9` made this engine resolve those
+/// bytes the same way instead of declining them in `as_utf8_str`.
 ///
-/// Reaching it needs a degenerate spec. Every well-formed media spec resolves
-/// (an image falls back to the `[img]` placeholder, see
-/// [`an_unloadable_image_replacement_still_covers_its_range`]; xwidget and
-/// surface specs are self-contained and take the `direct_replacement`
-/// short-circuit), so the reachable case is a spec that CLASSIFIES as a string
-/// replacement and then cannot be read as one: a unibyte string whose bytes are
-/// not valid UTF-8, which `as_utf8_str` rejects.
-///
-/// TRIPWIRE — do not weaken this to "renders something". The resume is the
-/// whole point: this branch is where a future producer-owned exit breaks FIRST,
-/// because the producer cannot know at production time that resolution will
-/// decline, so a producer that popped past the covered range on its own would
-/// double-advance here (the fallback item spans the covered range and publishes
-/// its own end). Asserting the covered text appears once and `g` follows once
-/// is what catches that.
+/// TRIPWIRE — do not weaken this to "renders something", and do not put `def`
+/// back on the row. The replacement occupies 1-based [4,7) once, and `g`
+/// follows it once. A producer that also popped past the covered range would
+/// double-advance, so `g` would be missing or doubled.
 #[test]
-fn an_unresolvable_display_replacement_declines_and_resumes_at_the_covered_end() {
-    // The spec covers 1-based [4,7) — "def". Resolution declines, so the row is
-    // the untouched line: "def" appears once (not dropped, not doubled) and "g"
-    // follows it once (the walk resumed at E, not at the covered start).
+fn unibyte_display_string_replaces_its_covered_text_and_resumes_at_the_covered_end() {
+    // The spec covers 1-based [4,7) — "def". GNU draws the two raw bytes as
+    // octal escapes and resumes at "g". The trailing space is the row's
+    // newline cell, same as the other display-property row pins.
     assert_eq!(
         display_prop_first_row_text(
             "abcdefghij\n",
             "(put-text-property 4 7 'display (unibyte-string 200 201))",
         ),
-        "abcdefghij ",
-        "a display spec that cannot be resolved is not a replacement: the \
-         covered text displays once and the walk resumes at the covered end"
+        "abc\\310\\311ghij ",
+        "a unibyte display string replaces its covered text and the walk \
+         resumes at the covered end"
     );
 }
 
@@ -38562,3 +38575,6 @@ mod narrow_root_eob_test;
 
 #[path = "overlay_string_word_wrap_progress_test.rs"]
 mod overlay_string_word_wrap_progress_test;
+
+#[path = "divider_corner_review_test.rs"]
+mod divider_corner_review_test;
