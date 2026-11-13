@@ -29,6 +29,7 @@ use neomacs_display_protocol::types::FaceId;
 #[cfg(test)]
 use neomacs_display_protocol::types::Rect;
 use neovm_core::buffer::position::LispCharPos1;
+use neovm_core::window::display::WindowDisplayContextExt;
 use neovm_core::window::{DisplayPointSnapshot, DisplayRowSnapshot};
 
 pub(crate) mod chrome_memo;
@@ -328,7 +329,7 @@ impl RetainedWindowKey {
                 neovm_core::window::WindowId(p.window_id as u64),
                 neovm_core::buffer::BufferId(p.buffer_id),
             ),
-            char_table_revision: neovm_core::window::CharTableLayoutRevision::current(),
+            char_table_revision: neovm_core::window::current_char_table_layout_revision(),
             symbol_property_revision:
                 neovm_core::emacs_core::symbol::SymbolPropertyRevision::current(),
             display_table: evaluator

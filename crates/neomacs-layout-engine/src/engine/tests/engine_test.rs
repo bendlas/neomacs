@@ -32,7 +32,7 @@ use crate::display_row::append_context::DisplayRowLineWrap;
 #[tracing_test::traced_test]
 #[test]
 fn debug_logging_renders_mode_line_with_ellipsis_across_preview_byte_limit() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.eval_str("(setq mode-line-format (list (concat (make-string 118 ?a) \"…END\")))")
         .unwrap();
     let buffer = eval.buffer_manager().current_buffer().unwrap().id();
@@ -207,13 +207,13 @@ use neovm_core::emacs_core::image_catalog::{
     AxisSize, ImageCatalog, ImageLookup, ImageResolveRequest, ImageSizeLimit, ImageSizeSpec,
     PendingImage, ReadyImage,
 };
-use neovm_core::emacs_core::load::{
-    apply_runtime_startup_state, create_bootstrap_evaluator_cached_with_features,
-};
+use neovm_core::emacs_core::load::apply_runtime_startup_state;
+use neovm_core::emacs_core::load_boot::create_bootstrap_evaluator_cached_with_features;
 use neovm_core::emacs_core::value::{StringTextPropertyRun, list_to_vec};
 use neovm_core::emacs_core::{Context, Value};
 use neovm_core::face::FaceTable;
 use neovm_core::heap_types::LispString;
+use neovm_core::window::geometry::DisplayGeometryExt;
 use neovm_core::window::{
     DisplayPointSnapshot, DisplayRowSnapshot, WindowCursorSnapshot, WindowDisplaySnapshot,
     WindowVisibleBufferSpan,
@@ -278,7 +278,7 @@ fn resize_mini_windows_mode_parses_gnu_values() {
 
 #[test]
 fn minibuffer_growth_stops_at_maximum_achievable_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer = eval.buffer_manager().current_buffer().expect("buffer").id();
     let id = eval
         .frame_manager_mut()
@@ -737,6 +737,92 @@ fn cursor_capture_state_captures_once_and_refines_matching_main_char_width() {
     assert_eq!(captured.slot_width, Some(12.5));
 }
 
+fn cursor_word_wrap_boundary() -> crate::display_row::walk_state::WordWrapBreakCandidate {
+    let mut boundary = crate::display_row::walk_state::WordWrapBreakCandidate::default();
+    boundary.record_at(
+        crate::display_source::DisplaySourceResumeCursor::AfterOverlayStrings(
+            crate::display_source::DisplaySourceTextPosition::new(5, 5),
+        ),
+        0,
+        (None, None),
+        Default::default(),
+        crate::display_row::builder::DisplayRowPosition::new(5.0, 5),
+        None,
+    );
+    boundary
+}
+
+#[test]
+fn cursor_word_wrap_rewind_preserves_prior_row_and_prefix_candidates() {
+    for (row, column) in [(0, 7), (1, 3)] {
+        let mut state = CursorCaptureState::new();
+        state.capture_once(cursor_info_at(column as f32, row));
+        state.rewind_word_wrap(1, cursor_word_wrap_boundary(), 3);
+        let captured = state.captured().expect("retained prefix cursor");
+        assert_eq!((captured.display_row_offset, captured.col), (row, column));
+    }
+    let mut state = CursorCaptureState::new();
+    state.capture_once(cursor_info_at(7.0, 1));
+    state.rewind_word_wrap(1, cursor_word_wrap_boundary(), 7);
+    assert!(state.is_missing());
+    state.capture_once(cursor_info_at(2.0, 2));
+    assert_eq!(state.captured().unwrap().display_row_offset, 2);
+
+    // A source-prefix origin with no fitting following glyph belongs to the
+    // row being closed, rather than being captured anew on the next row.
+    let mut pending = CursorCaptureState::new();
+    pending.defer_zero_width_to_next_glyph(cursor_info_at(5.0, 1));
+    pending.rewind_word_wrap(1, cursor_word_wrap_boundary(), 4);
+    let origin = pending.captured().expect("closed-row origin fallback");
+    assert_eq!((origin.display_row_offset, origin.col), (1, 5));
+    assert!(!pending.should_capture_visible_glyph_at(5, 4));
+}
+
+#[test]
+fn cursor_word_wrap_rewind_restores_earlier_string_fallback() {
+    let mut state = CursorCaptureState::new();
+    state.capture_approximation_once(cursor_info_at(1.0, 1));
+    let context = DisplayStringCursorContext::for_overlay(
+        CharPos0::new(0),
+        CharPos0::new(0),
+        CharPos0::new(0),
+    );
+    for column in [2.0, 7.0] {
+        state.capture_display_string_cursor(
+            context
+                .resolve(Value::T, cursor_info_at(column, 1))
+                .unwrap(),
+        );
+    }
+    assert_eq!(state.captured().unwrap().col, 7);
+    state.rewind_word_wrap(1, cursor_word_wrap_boundary(), 3);
+    assert_eq!(state.captured().unwrap().col, 2);
+}
+
+#[test]
+fn cursor_word_wrap_rewind_reclassifies_a_discarded_following_glyph() {
+    let mut state = CursorCaptureState::new();
+    state.defer_zero_width_to_next_glyph(cursor_info_at(5.0, 1));
+    state.capture_once(cursor_info_at(7.0, 1));
+    let context = DisplayStringCursorContext::for_overlay(
+        CharPos0::new(3),
+        CharPos0::new(3),
+        CharPos0::new(3),
+    );
+    state.capture_display_string_cursor(context.resolve(Value::T, cursor_info_at(2.0, 1)).unwrap());
+    assert_eq!(
+        state.captured().unwrap().col,
+        7,
+        "an exact glyph suppresses attachment fallback"
+    );
+    state.rewind_word_wrap(1, cursor_word_wrap_boundary(), 3);
+    assert_eq!(
+        state.captured().unwrap().col,
+        2,
+        "a removed following glyph leaves the retained prefix fallback eligible"
+    );
+}
+
 #[test]
 fn cursor_capture_state_rejects_integer_override_without_point_row_proof() {
     let mut state = CursorCaptureState::new();
@@ -816,7 +902,7 @@ fn gnu_box_cursor_uses_frame_cursor_foreground_as_last_contrast_fallback() {
 
 #[test]
 fn display_row_prefix_request_tracks_pending_prefix_mode() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let mut request = DisplayRowPrefixRequest::initial(true, true);
 
     assert!(request.is_requested());
@@ -925,7 +1011,7 @@ fn display_row_prefix_request_tracks_pending_prefix_mode() {
 
 #[test]
 fn display_row_prefix_request_builds_typed_prefix_source() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let line_value = Value::string("line");
     let line_source = DisplayRowPrefixRequest::Line
         .source_for_value(line_value, CharPos0::new(4))
@@ -967,7 +1053,7 @@ fn display_row_prefix_request_builds_typed_prefix_source() {
 
 #[test]
 fn overlay_string_render_source_exposes_typed_render_inputs() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let text = Value::string("overlay");
     let overlay_id = Value::symbol("overlay-id");
     let source = OverlayStringRenderSource::new(
@@ -1246,7 +1332,7 @@ fn line_number_render_state_renders_blank_gutter_on_continuation_rows() {
 
 #[test]
 fn captured_cursor_info_builds_from_active_face_state() {
-    let eval = Context::new();
+    let eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let resolver = crate::neovm_bridge::FaceResolver::new(
         eval.face_table(),
         0x00FFFFFF,
@@ -1300,7 +1386,7 @@ fn captured_cursor_info_builds_from_active_face_state() {
 
 #[test]
 fn captured_cursor_info_builds_display_box_from_active_face_state() {
-    let eval = Context::new();
+    let eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let resolver = crate::neovm_bridge::FaceResolver::new(
         eval.face_table(),
         0x00FFFFFF,
@@ -1356,7 +1442,7 @@ fn captured_cursor_info_builds_display_box_from_active_face_state() {
 
 #[test]
 fn captured_cursor_info_builds_line_break_from_active_face_state() {
-    let eval = Context::new();
+    let eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let resolver = crate::neovm_bridge::FaceResolver::new(
         eval.face_table(),
         0x00FFFFFF,
@@ -1636,7 +1722,7 @@ fn captured_cursor_info_builds_logical_cursor_position() {
 
 #[test]
 fn captured_text_window_cursor_publish_context_publishes_captured_cursor() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -1705,7 +1791,7 @@ fn captured_text_window_cursor_publish_context_publishes_captured_cursor() {
 
 #[test]
 fn visual_text_window_cursor_publish_context_publishes_decorative_cursor_from_display_point() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -1881,7 +1967,7 @@ fn install_test_gnu_line_number_face_inheritance(eval: &mut Context) {
 fn graphic_frame_publication_is_atomic_while_default_font_is_unrealized() {
     use neovm_core::face::{Face, FaceHeight};
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -1925,7 +2011,7 @@ fn graphic_frame_publication_is_atomic_while_default_font_is_unrealized() {
 
 #[test]
 fn graphic_frame_opened_size_matches_installed_face_and_realized_font() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -2265,7 +2351,7 @@ fn assert_replacement_slot_between_neighbors(
 
 #[test]
 fn tab_line_pointer_provenance_preserves_nested_source_string() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -2329,7 +2415,7 @@ fn tab_line_pointer_provenance_preserves_nested_source_string() {
 
 #[test]
 fn accepted_presentation_publishes_identical_evaluator_and_renderer_window_regions() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -2805,7 +2891,7 @@ fn accepted_presentation_publishes_identical_evaluator_and_renderer_window_regio
 
 #[test]
 fn presentation_spatial_maps_blank_body_rows_to_their_buffer_position() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -2871,7 +2957,7 @@ fn presentation_spatial_maps_blank_body_rows_to_their_buffer_position() {
 
 #[test]
 fn skipped_zero_body_window_still_publishes_known_regions_and_cell_origin() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -3261,7 +3347,7 @@ fn backend_layout_with_buffer_and_window_setup(
     setup_window: impl FnOnce(&mut neovm_core::window::Window),
 ) -> (Context, LayoutEngine, neovm_core::window::FrameId) {
     backend_layout_in_context(
-        Context::new(),
+        neovm_core::emacs_core::eval_hook_installers::new_context(),
         kind,
         frame_name,
         text,
@@ -3280,7 +3366,7 @@ fn backend_composition_layout_trace(
     frame_height: u32,
     setup: impl FnOnce(&mut neovm_core::buffer::Buffer, BufferId, &str),
 ) -> BackendLayoutTrace {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     crate::test_composition::install_rules(&mut eval);
     let (eval, engine, frame_id) = backend_layout_in_context(
         eval,
@@ -3357,7 +3443,7 @@ fn backend_layout_in_context(
 #[cfg(feature = "perf-probes")]
 fn layout_bench_warm() {
     use std::time::{Duration, Instant};
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -3422,7 +3508,7 @@ fn layout_bench_warm() {
 /// full-rebuild is caught by the same metric (spec §7 overarching NO-GO).
 #[test]
 fn phase0a_layout_stats_reports_full_rebuild_baseline() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -3547,9 +3633,9 @@ fn measure_incremental_relayout(
 /// and the layout row statistics these tests assert.
 fn bind_minibuffer_buffer(eval: &mut Context, frame_id: neovm_core::window::FrameId) {
     let minibuffer = eval
-        .buffers
+        .buffer_manager_mut()
         .find_buffer_by_name(" *Minibuf-0*")
-        .unwrap_or_else(|| eval.buffers.create_buffer(" *Minibuf-0*"));
+        .unwrap_or_else(|| eval.buffer_manager_mut().create_buffer(" *Minibuf-0*"));
     if let Some(frame) = eval.frame_manager_mut().get_mut(frame_id)
         && let Some(leaf) = frame.minibuffer_leaf.as_mut()
     {
@@ -3570,7 +3656,7 @@ fn incr_editing_frame(
     BufferId,
     neovm_core::window::WindowId,
 ) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -5134,7 +5220,7 @@ fn layout_trace_with_buffer_and_window_setup(
     setup: impl FnOnce(&mut neovm_core::buffer::Buffer, BufferId, &str),
     setup_window: impl FnOnce(&mut neovm_core::window::Window),
 ) -> BackendLayoutTrace {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -5212,7 +5298,7 @@ fn layout_frame_rust_renders_face_inherited_from_text_category() {
     use neomacs_display_protocol::face::UnderlineStyle;
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let category = eval
         .eval_str(
             r#"(let ((category (make-symbol "helpful-navigate-button")))
@@ -5342,7 +5428,7 @@ fn layout_frame_rust_lays_out_wrapped_long_line() {
 /// the `right-arrow` truncation bitmap in the RIGHT fringe of the truncated row.
 #[test]
 fn layout_frame_rust_truncated_row_sets_right_arrow_fringe() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -5413,7 +5499,7 @@ fn layout_frame_rust_truncated_row_sets_right_arrow_fringe() {
 /// row, and the `left-curly-arrow` on the continuation row's LEFT fringe.
 #[test]
 fn layout_frame_rust_continued_row_sets_curly_arrow_fringe() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -5512,7 +5598,7 @@ fn layout_frame_rust_continued_row_sets_curly_arrow_fringe() {
 /// and rendered the covered space INLINE, shifting the line's text right.
 #[test]
 fn layout_frame_rust_list_wrapped_left_fringe_spec_draws_in_fringe_not_inline() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -5793,7 +5879,7 @@ fn a_window_showing_no_line_numbers_publishes_no_line_number_field_at_all() {
 /// under it.
 #[test]
 fn a_minibuffer_window_publishes_no_line_number_field_even_when_its_buffer_enables_them() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root_id = eval
         .buffer_manager()
         .current_buffer()
@@ -6519,7 +6605,7 @@ fn layout_frame_rust_display_table_maps_char_to_glyph_vector() {
 fn layout_frame_rust_display_table_preserves_each_glyph_face() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -6797,7 +6883,7 @@ fn layout_frame_rust_display_table_preserves_face_segments_when_truncated() {
 
 #[test]
 fn layout_frame_rust_display_table_newline_glyph_uses_face_and_breaks_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -6902,7 +6988,7 @@ fn layout_frame_rust_display_table_face_preserves_attributes_and_height() {
     use neomacs_display_protocol::face::FaceAttributes;
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -7359,7 +7445,7 @@ fn layout_frame_rust_keeps_ordinary_prefix_advances_inside_mixed_emoji_run() {
     let prefix = "* 2026-08-30, Sunday, Beijing, Beijing, CN:";
     let mixed = format!("{prefix} ✨  🌡️+22°C 🌬️↘2m/s");
     let text = format!("{prefix}\n{mixed}\n");
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -7454,7 +7540,7 @@ fn layout_frame_rust_vscroll_shifts_body_rows_up_and_exposes_extra_row() {
     let layout = |vscroll: i32| -> (Vec<f32>, Option<i64>) {
         // A GUI (window-system) frame: the vscroll content-up shift is graphical
         // (a TTY frame keeps the historical shrink -- see the geometry unit test).
-        let mut eval = Context::new();
+        let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
         convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
         let buf_id = eval
             .buffer_manager()
@@ -7793,7 +7879,7 @@ fn empty_line_extend_cursor(
     point_byte: usize,
     line_numbers: bool,
 ) -> (neomacs_display_protocol::frame_glyphs::PhysCursor, f32) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -7901,7 +7987,7 @@ fn empty_line_extend_cursor_sits_at_text_start_not_window_edge() {
 
 #[test]
 fn line_break_extend_fill_reaches_tty_reserved_right_column() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -7998,7 +8084,7 @@ fn line_break_extend_fill_reaches_tty_reserved_right_column() {
 /// face, erasing the highlight.
 #[test]
 fn split_window_line_break_extend_fill_reaches_right_column() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8097,7 +8183,7 @@ fn split_window_line_break_extend_fill_reaches_right_column() {
 
 #[test]
 fn overlay_string_extend_fill_reaches_tty_reserved_right_column() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8181,7 +8267,7 @@ fn extend_fill_does_not_bleed_onto_the_following_blank_line() {
     // The `:extend` face here covers line 1's newline (`[0,2)` = 'x' + '\n'), so
     // line 1 fills to the edge; the blank line 2's own newline is NOT covered,
     // so it resolves to the non-extending default face and must stay unfilled.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8260,7 +8346,7 @@ fn extend_fill_covers_a_blank_line_whose_own_newline_is_covered() {
     //
     // Buffer "x\n\n" with the face on [0,3) covers 'x', line 1's newline AND
     // line 2's own newline -- so BOTH rows must fill.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8351,7 +8437,7 @@ fn boxed_face_value(color: &str) -> Value {
 fn adjacent_distinct_boxed_faces_share_an_open_internal_boundary() {
     use neomacs_display_protocol::face::BoxVerticalEdges;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8407,7 +8493,7 @@ fn adjacent_distinct_boxed_faces_share_an_open_internal_boundary() {
 fn boxed_extend_fill_preserves_box_with_open_vertical_edges() {
     use neomacs_display_protocol::face::{BoxType, BoxVerticalEdges};
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8496,7 +8582,7 @@ fn boxed_extend_fill_preserves_box_with_open_vertical_edges() {
 fn boxed_extend_fill_owns_the_right_edge_when_the_run_ends_at_zv() {
     use neomacs_display_protocol::face::{BoxType, BoxVerticalEdges};
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8553,7 +8639,7 @@ fn boxed_extend_fill_owns_the_right_edge_when_the_run_ends_at_zv() {
 fn boxed_extend_fill_owns_the_right_edge_when_the_next_source_face_is_unboxed() {
     use neomacs_display_protocol::face::BoxVerticalEdges;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -8609,7 +8695,7 @@ fn fill_column_indicator_shows_when_text_length_equals_the_column() {
     // pixel x (char_width) against a pen advanced by the MEASURED glyph width,
     // which drifts past the nominal grid for a full-length line (10 chars ×
     // 16.255 vs 10 × 16.0). The decision is now column-based.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -9362,7 +9448,7 @@ fn hscroll_cursor_backend_layout_trace(kind: BufferTextBackendKind) -> BackendLa
 fn edit_redisplay_backend_layout_trace(
     kind: BufferTextBackendKind,
 ) -> (BackendLayoutTrace, BackendLayoutTrace) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, kind);
     let buf_id = eval
         .buffer_manager()
@@ -9430,7 +9516,7 @@ fn printed_eval_result(eval: &mut Context, form: &str) -> String {
 }
 
 fn fontification_edit_backend_trace(kind: BufferTextBackendKind) -> FontificationBackendTrace {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, kind);
     let buf_id = eval
         .buffer_manager()
@@ -9592,7 +9678,7 @@ fn trace_has_nonzero_bidi_level(trace: &BackendLayoutTrace) -> bool {
 }
 
 fn assert_echo_message_renders_in_minibuffer_window(use_gui_metrics: bool) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -9675,7 +9761,7 @@ fn assert_echo_message_renders_in_minibuffer_window(use_gui_metrics: bool) {
 
 #[test]
 fn minibuffer_echo_suppresses_line_numbers_enabled_in_its_buffer() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root_id = eval
         .buffer_manager()
         .current_buffer()
@@ -9739,7 +9825,7 @@ fn minibuffer_echo_suppresses_line_numbers_enabled_in_its_buffer() {
 
 #[test]
 fn layout_frame_rust_preserves_propertized_echo_message_faces() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     crate::test_composition::install_rules(&mut eval);
     let buf_id = eval
         .buffer_manager()
@@ -9828,7 +9914,7 @@ fn layout_frame_rust_preserves_propertized_echo_message_faces() {
 /// window.
 #[test]
 fn inactive_echo_area_owns_cursor_at_message_end_when_requested() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root = eval
         .buffer_manager()
         .current_buffer()
@@ -9878,7 +9964,7 @@ fn inactive_echo_area_owns_cursor_at_message_end_when_requested() {
 
 #[test]
 fn inactive_echo_area_grows_to_contain_tall_display_image() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::fixnum(10));
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -9958,7 +10044,7 @@ fn inactive_echo_area_grows_to_contain_tall_display_image() {
 }
 
 fn assert_multiline_echo_message_resizes_minibuffer_rows(use_gui_metrics: bool) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -10011,7 +10097,7 @@ fn assert_multiline_echo_message_resizes_minibuffer_rows(use_gui_metrics: bool) 
 
 #[test]
 fn layout_frame_rust_publishes_increasing_display_positions() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -10074,7 +10160,7 @@ fn layout_frame_rust_publishes_increasing_display_positions() {
 
 #[test]
 fn layout_frame_rust_tracks_multibyte_sample_positions() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -10242,7 +10328,7 @@ fn implemented_text_backends_match_layout_frame_invisible_text_output() {
 
 #[test]
 fn point_after_large_fold_keeps_visually_valid_window_start() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -10308,7 +10394,7 @@ fn point_after_large_fold_keeps_visually_valid_window_start() {
 
 #[test]
 fn visibility_retry_never_places_window_start_inside_unmeasured_fold() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -10395,7 +10481,7 @@ fn visibility_retry_never_places_window_start_inside_unmeasured_fold() {
 #[test]
 fn replacing_display_measurement_preserves_conservative_bottom_scroll() {
     let layout_after_tail_insert = |with_replacement: bool| {
-        let mut eval = Context::new();
+        let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
         let buf_id = eval
             .buffer_manager()
             .current_buffer()
@@ -10409,9 +10495,19 @@ fn replacing_display_measurement_preserves_conservative_bottom_scroll() {
         {
             let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
             buf.insert(&text);
-            buf.set_buffer_local("scroll-conservatively", Value::fixnum(101));
             buf.goto_emacs_byte_pos(EmacsBytePos::new(text.len()));
         }
+        // GNU's buffer-local spelling: setq-local declares the variable
+        // buffer-local before writing the binding.  The old
+        // `Buffer::set_buffer_local` wrote an alist entry without the
+        // declaration, which only the default-only read (which consulted the
+        // raw alist) could see; the visible read asks the declared binding
+        // exactly as set_buffer_internal's swap does (xdisp.c:20532-20535).
+        eval.eval_str(
+            "(progn (make-local-variable 'scroll-conservatively) \
+                    (set 'scroll-conservatively 101))",
+        )
+        .expect("buffer-local scroll-conservatively");
         let frame_id = eval.frame_manager_mut().create_frame(
             "conservative-scroll-across-display-replacement",
             640,
@@ -10546,7 +10642,7 @@ fn run_describe_char_scenario(
     image_height: i64,
     wrapped_paragraph: bool,
 ) -> (usize, usize) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::clone(&requests),
@@ -10674,7 +10770,7 @@ fn run_describe_char_scenario(
 /// the image display property, and its point sits at EOB beyond the small
 /// Help window's visible span.  Returns max nested depth over both windows.
 fn run_help_window_scenario(conservatively: i64) -> usize {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::clone(&requests),
@@ -10846,7 +10942,7 @@ fn viewport_retries_iterate_without_nesting_layout_window_rust() {
 
 #[test]
 fn distant_point_with_unrelated_overlay_does_not_exhaust_visibility_retries() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -10910,7 +11006,7 @@ fn distant_point_with_unrelated_overlay_does_not_exhaust_visibility_retries() {
 /// rather than ask for the same placement forever.
 #[test]
 fn point_placement_with_a_foreign_current_buffer_terminates_and_shows_point() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11020,7 +11116,7 @@ fn spent_visibility_budget_ends_the_leaf_at_its_start() {
     std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(move || {
-            let mut eval = Context::new();
+            let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
             let buf_id = eval
                 .buffer_manager()
                 .current_buffer()
@@ -11110,7 +11206,7 @@ fn spent_visibility_budget_ends_the_leaf_at_its_start() {
 
 #[test]
 fn layout_frame_rust_renders_invisible_ellipsis_through_row_builder() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11175,7 +11271,7 @@ fn layout_frame_rust_renders_invisible_ellipsis_through_row_builder() {
 
 #[test]
 fn buffer_remapped_default_gets_distinct_face_for_leading_invisible_ellipsis() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11462,7 +11558,7 @@ fn implemented_text_backends_match_glyphless_display_geometry() {
 
 #[test]
 fn layout_frame_rust_renders_buffer_glyphless_chars_as_glyphless() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11513,7 +11609,7 @@ fn layout_frame_rust_renders_buffer_glyphless_chars_as_glyphless() {
 
 #[test]
 fn layout_frame_rust_renders_buffer_control_chars_with_caret_notation() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11569,7 +11665,7 @@ fn layout_frame_rust_renders_buffer_control_chars_with_caret_notation() {
 fn layout_frame_rust_control_char_caret_uses_escape_glyph_foreground() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11697,7 +11793,7 @@ fn layout_frame_rust_control_char_caret_uses_escape_glyph_foreground() {
 fn layout_frame_rust_escape_glyph_lands_in_background_over_inverse_base() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11768,7 +11864,7 @@ fn layout_frame_rust_escape_glyph_lands_in_background_over_inverse_base() {
 fn layout_frame_rust_normal_text_keeps_base_face_not_escape_glyph() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -11859,7 +11955,7 @@ fn layout_frame_rust_normal_text_keeps_base_face_not_escape_glyph() {
 fn layout_frame_rust_nbsp_uses_nobreak_space_foreground() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12010,7 +12106,7 @@ fn layout_frame_rust_nbsp_underline_follows_nobreak_space_foreground() {
     use neomacs_display_protocol::face::UnderlineStyle;
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12114,7 +12210,7 @@ fn layout_frame_rust_nbsp_underline_follows_nobreak_space_foreground() {
 fn layout_frame_rust_overline_strike_follow_face_foreground() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12198,7 +12294,7 @@ fn layout_frame_rust_overline_strike_follow_face_foreground() {
 fn layout_frame_rust_nonprintable_char_shows_escape_glyph_octal() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12301,7 +12397,7 @@ fn layout_frame_rust_nonprintable_char_shows_escape_glyph_octal() {
 fn layout_frame_rust_nobreak_hyphen_uses_nobreak_hyphen_foreground() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12402,7 +12498,7 @@ fn layout_frame_rust_nobreak_hyphen_uses_nobreak_hyphen_foreground() {
 
 #[test]
 fn layout_frame_rust_renders_line_prefix_through_row_builder() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12493,7 +12589,7 @@ fn layout_frame_rust_renders_line_prefix_through_row_builder() {
 fn layout_frame_rust_remaps_named_faces_on_line_and_wrap_prefix_strings() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -12649,7 +12745,7 @@ fn layout_frame_rust_remaps_named_faces_on_line_and_wrap_prefix_strings() {
 
 #[test]
 fn layout_frame_rust_preserves_nobreak_chars_when_ascii_display_is_disabled() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("nobreak-char-display", Value::T);
     eval.store_variable_by_name("nobreak-char-ascii-display", Value::NIL);
     let buf_id = eval
@@ -12698,7 +12794,7 @@ fn layout_frame_rust_preserves_nobreak_chars_when_ascii_display_is_disabled() {
 
 #[test]
 fn layout_frame_rust_uses_ascii_nobreak_glyphs_when_explicitly_enabled() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("nobreak-char-display", Value::T);
     eval.store_variable_by_name("nobreak-char-ascii-display", Value::T);
     let buf_id = eval
@@ -12743,7 +12839,7 @@ fn layout_frame_rust_uses_ascii_nobreak_glyphs_when_explicitly_enabled() {
 
 #[test]
 fn layout_frame_rust_renders_nobreak_chars_in_escape_mode_as_mapped_text() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("nobreak-char-display", Value::fixnum(2));
     let buf_id = eval
         .buffer_manager()
@@ -13223,7 +13319,7 @@ fn implemented_text_backends_match_redisplay_fontification_after_edit() {
 
 #[test]
 fn layout_frame_rust_publishes_face_scaled_advances_for_inline_plist_faces() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13372,7 +13468,7 @@ fn layout_frame_rust_publishes_face_scaled_advances_for_inline_plist_faces() {
 
 #[test]
 fn layout_frame_rust_cursor_width_uses_current_glyph_advance_not_next_glyph() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13465,7 +13561,7 @@ fn layout_frame_rust_cursor_width_uses_current_glyph_advance_not_next_glyph() {
 
 #[test]
 fn layout_frame_rust_places_cursor_at_newline_terminated_row_end() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13524,7 +13620,7 @@ fn layout_frame_rust_places_cursor_at_newline_terminated_row_end() {
 
 #[test]
 fn layout_frame_rust_emits_neomacs_visual_cursors_without_moving_phys_cursor() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13576,7 +13672,7 @@ fn layout_frame_rust_emits_neomacs_visual_cursors_without_moving_phys_cursor() {
 
 #[test]
 fn layout_frame_rust_visual_cursor_uses_display_point_geometry() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13692,7 +13788,7 @@ fn layout_frame_rust_visual_cursor_uses_display_point_geometry() {
 
 #[test]
 fn layout_frame_rust_visual_hbar_uses_full_display_point_box() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13754,7 +13850,7 @@ fn layout_frame_rust_visual_hbar_uses_full_display_point_box() {
 
 #[test]
 fn layout_frame_rust_records_row_metrics_for_plain_text_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13796,7 +13892,7 @@ fn layout_frame_rust_records_row_metrics_for_plain_text_rows() {
 
 #[test]
 fn layout_frame_rust_uses_buffer_default_face_height_for_body_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13856,7 +13952,7 @@ fn layout_frame_rust_uses_buffer_default_face_height_for_body_rows() {
 
 #[test]
 fn layout_frame_rust_applies_extra_line_spacing_once_to_newline_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13893,7 +13989,7 @@ fn layout_frame_rust_applies_extra_line_spacing_once_to_newline_rows() {
 
 #[test]
 fn layout_frame_rust_applies_display_height_to_buffer_text_faces() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -13977,7 +14073,7 @@ fn layout_frame_rust_applies_display_height_to_buffer_text_faces() {
 
 #[test]
 fn layout_frame_rust_applies_display_height_to_overlay_strings() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14053,7 +14149,7 @@ fn layout_frame_rust_applies_display_height_to_overlay_strings() {
 
 #[test]
 fn layout_frame_rust_advances_overlay_newline_by_measured_row_height() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14144,7 +14240,7 @@ fn layout_frame_rust_advances_overlay_newline_by_measured_row_height() {
 
 #[test]
 fn layout_frame_rust_captures_cursor_inside_invisible_text_without_rescan() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14210,7 +14306,7 @@ fn layout_frame_rust_captures_cursor_inside_invisible_text_without_rescan() {
 
 #[test]
 fn layout_frame_rust_preserves_logical_cursor_when_window_cursor_is_nil() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14275,7 +14371,7 @@ fn layout_frame_rust_preserves_logical_cursor_when_window_cursor_is_nil() {
 /// x stays byte-identical to the preceding glyph's already-rounded right edge
 /// for EVERY font size (no ±1px double-rounding drift).
 fn display_replacement_cursor_probe_at_height(height: i64) -> (i64, i64, i64, i64) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14400,7 +14496,7 @@ fn layout_frame_rust_display_replacement_cursor_aligns_glyph_edge_across_font_si
 
 #[test]
 fn layout_frame_rust_captures_cursor_at_display_replacement_slot_without_rescan() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14468,7 +14564,7 @@ fn layout_frame_rust_captures_cursor_at_display_replacement_slot_without_rescan(
 
 #[test]
 fn layout_frame_rust_records_display_point_for_display_replacement_slot() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14525,7 +14621,7 @@ fn layout_frame_rust_records_display_point_for_display_replacement_slot() {
 
 #[test]
 fn layout_frame_rust_emits_display_string_replacement_glyphs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14614,7 +14710,7 @@ fn boxed_display_replacement_inherits_real_source_boundaries() {
 
 #[test]
 fn fixed_pitch_display_replacement_prefix_keeps_following_text_aligned() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -14982,7 +15078,7 @@ fn wrapped_display_replacement_cursor_stays_at_opening_slot() {
     let text = format!("{prefix}:\nnext\n");
     let replacement_start = prefix.len();
     let point_pos = replacement_start + 1;
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -15047,7 +15143,7 @@ fn wrapped_display_replacement_cursor_stays_at_opening_slot() {
 
 #[test]
 fn layout_frame_rust_renders_display_replacement_tabs_as_stretches() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -15108,7 +15204,7 @@ fn layout_frame_rust_renders_display_replacement_tabs_as_stretches() {
 
 #[test]
 fn layout_frame_rust_ignores_replacing_display_properties_inside_display_replacement_string() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -15182,7 +15278,7 @@ fn layout_frame_rust_ignores_replacing_display_properties_inside_display_replace
 
 #[test]
 fn layout_frame_rust_honors_display_replacement_string_face_properties() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -15321,7 +15417,7 @@ impl ImageCatalog for MidRowImageHost {
 /// repro's: a whole-row-wide image at the far end of a full row of text.
 #[test]
 fn layout_frame_rust_wraps_a_mid_row_image_onto_the_next_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(MidRowImageHost));
     let buf_id = eval
         .buffer_manager()
@@ -15468,7 +15564,7 @@ fn layout_frame_rust_wraps_a_mid_row_image_onto_the_next_row() {
 /// (`tmp/midrow-image/wrapfix-nil.txt`, `wrapfix-t.txt`).
 #[test]
 fn layout_frame_rust_crops_a_mid_row_image_on_a_window_wrapping_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(MidRowImageHost));
     let buf_id = eval
         .buffer_manager()
@@ -15579,7 +15675,7 @@ fn layout_frame_rust_crops_a_mid_row_image_on_a_window_wrapping_row() {
 /// exactly above `last_visible_x / 4` -- `tmp/midrow-image/crop-truncate.txt`.
 #[test]
 fn layout_frame_rust_crops_a_mid_row_image_on_a_truncating_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(MidRowImageHost));
     let buf_id = eval
         .buffer_manager()
@@ -15680,7 +15776,7 @@ fn layout_frame_rust_crops_a_mid_row_image_on_a_truncating_row() {
 /// the word on the first line (`case-3.txt`).
 #[test]
 fn layout_frame_rust_word_wrap_takes_the_preceding_word_with_the_image() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(MidRowImageHost));
     let buf_id = eval
         .buffer_manager()
@@ -15806,7 +15902,7 @@ fn layout_frame_rust_word_wrap_takes_the_preceding_word_with_the_image() {
 
 #[test]
 fn layout_frame_rust_emits_inline_image_glyphs_for_display_image_specs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::clone(&requests),
@@ -15901,7 +15997,7 @@ fn layout_frame_rust_emits_inline_image_glyphs_for_display_image_specs() {
 /// native-size image.
 #[test]
 fn layout_frame_rust_resolves_telega_cell_sized_images_before_catalog_lookup() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::clone(&requests),
@@ -15977,7 +16073,7 @@ fn layout_frame_rust_resolves_telega_cell_sized_images_before_catalog_lookup() {
 /// form to split one multi-line photo into one image glyph per text row.
 #[test]
 fn layout_frame_rust_crops_compound_display_images_to_the_requested_slice() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(RecordingImageDisplayHost::default()));
     let buf_id = eval
         .buffer_manager()
@@ -16055,7 +16151,7 @@ fn layout_frame_rust_crops_compound_display_images_to_the_requested_slice() {
 
 #[test]
 fn layout_frame_rust_renders_display_image_fallback_placeholder_through_row_builder() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -16124,7 +16220,7 @@ fn layout_frame_rust_renders_display_image_fallback_placeholder_through_row_buil
 
 #[test]
 fn layout_frame_rust_emits_inline_video_glyphs_for_display_video_specs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let video_requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -16208,7 +16304,7 @@ fn layout_frame_rust_emits_inline_video_glyphs_for_display_video_specs() {
 
 #[test]
 fn layout_frame_rust_emits_inline_webkit_glyphs_for_display_webkit_specs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let webkit_requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -16558,7 +16654,7 @@ fn inline_xwidget_glyph_in_frame(
     width: i32,
     height: i32,
 ) -> Option<InlineXwidgetGlyph> {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::new(Mutex::new(Vec::new())),
         video_requests: Arc::new(Mutex::new(Vec::new())),
@@ -16666,7 +16762,7 @@ fn inline_xwidget_glyph_in_right_split(
     width: i32,
     height: i32,
 ) -> Option<InlineXwidgetGlyph> {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::new(Mutex::new(Vec::new())),
         video_requests: Arc::new(Mutex::new(Vec::new())),
@@ -16924,7 +17020,7 @@ fn layout_frame_rust_keeps_an_xwidget_taller_than_its_window_partially_visible()
 
 #[test]
 fn layout_frame_rust_emits_inline_xwidget_glyphs_for_gnu_display_xwidget_specs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let webkit_requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -17005,7 +17101,7 @@ fn layout_frame_rust_emits_inline_xwidget_glyphs_for_gnu_display_xwidget_specs()
 
 #[test]
 fn layout_frame_rust_emits_inline_surface_glyphs_for_display_surface_specs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17074,7 +17170,7 @@ fn layout_frame_rust_emits_inline_surface_glyphs_for_display_surface_specs() {
 /// through the display host (memoized by spec content, the video pattern).
 #[test]
 fn layout_frame_rust_emits_inline_surface_glyphs_for_declarative_shader_specs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let surface_requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::new(Mutex::new(Vec::new())),
@@ -17170,7 +17266,7 @@ fn layout_frame_rust_emits_inline_surface_glyphs_for_declarative_shader_specs() 
 /// the display host into `(kind, cache id)` on the memoized request.
 #[test]
 fn declarative_surface_channel0_resolves_image_and_video_sources() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let surface_requests = Arc::new(Mutex::new(Vec::new()));
     let video_requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
@@ -17265,7 +17361,7 @@ fn declarative_surface_channel0_resolves_image_and_video_sources() {
 
 #[test]
 fn layout_frame_rust_captures_cursor_inside_hscroll_skipped_text_without_rescan() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17318,7 +17414,7 @@ fn layout_frame_rust_captures_cursor_inside_hscroll_skipped_text_without_rescan(
 }
 
 fn assert_layout_frame_rust_tab_cursor_width(x_stretch_cursor: bool, cursor_type: Value) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17413,7 +17509,7 @@ fn layout_frame_rust_expands_tab_hbar_cursor_width_when_x_stretch_cursor_is_t() 
 
 #[test]
 fn layout_frame_rust_emits_buffer_tab_as_stretch_glyph() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17474,7 +17570,7 @@ fn layout_frame_rust_emits_buffer_tab_as_stretch_glyph() {
 
 #[test]
 fn layout_frame_rust_tab_stops_are_window_relative_in_split_windows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17546,7 +17642,7 @@ fn layout_frame_rust_tab_stops_are_window_relative_in_split_windows() {
 
 #[test]
 fn layout_frame_rust_display_space_align_keeps_suffix_text_in_split_windows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17635,7 +17731,7 @@ fn layout_frame_rust_display_space_align_keeps_suffix_text_in_split_windows() {
 
 #[test]
 fn layout_frame_rust_tty_display_space_align_stays_one_cell_high() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17723,7 +17819,7 @@ fn layout_frame_rust_tty_display_space_align_stays_one_cell_high() {
 
 #[test]
 fn layout_frame_rust_emits_pixel_window_divider_geometry() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17808,7 +17904,7 @@ fn layout_frame_rust_emits_pixel_window_divider_geometry() {
 
 #[test]
 fn layout_frame_rust_gui_zero_width_divider_uses_pixel_vertical_border() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -17956,7 +18052,7 @@ fn layout_frame_rust_gui_zero_width_divider_uses_pixel_vertical_border() {
 
 #[test]
 fn layout_frame_rust_zero_width_border_preserves_horizontal_scroll_bar_hit_area() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18051,7 +18147,7 @@ fn layout_frame_rust_zero_width_border_preserves_horizontal_scroll_bar_hit_area(
 
 #[test]
 fn layout_frame_rust_vertical_scroll_bar_keeps_mode_line_border_draggable() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18142,7 +18238,7 @@ fn layout_frame_rust_vertical_scroll_bar_keeps_mode_line_border_draggable() {
 
 #[test]
 fn layout_frame_rust_left_scroll_bar_uses_leading_edge_resize_handle() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18253,7 +18349,7 @@ fn layout_frame_rust_left_scroll_bar_uses_leading_edge_resize_handle() {
 
 #[test]
 fn layout_frame_rust_mixed_window_scroll_bars_keep_shared_border_owned() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left_buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18343,7 +18439,7 @@ fn layout_frame_rust_mixed_window_scroll_bars_keep_shared_border_owned() {
 
 #[test]
 fn layout_frame_rust_bottom_divider_does_not_separate_root_from_minibuffer() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18380,7 +18476,7 @@ fn layout_frame_rust_bottom_divider_does_not_separate_root_from_minibuffer() {
 
 #[test]
 fn layout_frame_rust_emits_display_space_as_stretch_glyph() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18481,7 +18577,7 @@ fn display_space_relative_height_spec(factor: i64, ascent_percent: i64) -> Value
 /// `:align-to` was dropped and the stretch collapsed to one column.
 #[test]
 fn issue_204_align_to_centers_image_by_its_resolved_width() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let mut params = test_window_params();
     params.space_image_catalog = Some(crate::types::SharedImageCatalog(std::rc::Rc::new(
         FixedSizeImageCatalog {
@@ -18526,7 +18622,7 @@ fn issue_204_align_to_centers_image_by_its_resolved_width() {
 /// centring on a made-up image size.
 #[test]
 fn issue_204_align_to_image_operand_falls_back_without_a_catalog() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let params = test_window_params();
 
     let image = Value::list(vec![
@@ -18564,7 +18660,7 @@ fn issue_204_align_to_image_operand_falls_back_without_a_catalog() {
 /// x 0 (GUI fringes, margins, scroll bars).
 #[test]
 fn align_to_raw_number_rebases_to_the_frame_absolute_pen() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let mut params = test_window_params();
     // The window sits at frame x 10; margins/fringes put the text area's left
     // edge at frame x 40. Char cell 8px.
@@ -18602,7 +18698,7 @@ fn align_to_raw_number_rebases_to_the_frame_absolute_pen() {
 /// edits followed.
 #[test]
 fn completed_image_decode_invalidates_the_retained_window_key() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let params = test_window_params();
     let layout_box = WindowLayoutBox::resolve(&params, Default::default(), Default::default());
 
@@ -18670,7 +18766,7 @@ impl ImageCatalog for RecordingImageCatalog {
 /// the key decides which decode is scheduled for those pixels.
 #[test]
 fn space_image_operand_keys_the_catalog_with_the_frame_foreground() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let mut params = test_window_params();
     params.default_fg = 0x00_aa_00_00;
     params.frame_foreground = 0x00_12_34_56;
@@ -18714,7 +18810,7 @@ fn space_image_operand_keys_the_catalog_with_the_frame_foreground() {
 
 #[test]
 fn display_space_relative_width_uses_displayed_character_width() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let params = test_window_params();
     let geometry = DisplaySpaceGeometry::from_display_space_spec(
         &display_space_relative_width_spec(2),
@@ -18732,7 +18828,7 @@ fn display_space_relative_width_uses_displayed_character_width() {
 
 #[test]
 fn display_space_relative_width_truncates_to_integer_pixels() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let params = test_window_params();
     let spec = Value::list(vec![
         Value::symbol("space"),
@@ -18752,7 +18848,7 @@ fn display_space_relative_width_truncates_to_integer_pixels() {
 
 #[test]
 fn display_space_geometry_uses_relative_height_and_percent_ascent() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let params = test_window_params();
     let geometry = DisplaySpaceGeometry::from_display_space_spec(
         &display_space_relative_height_spec(2, 25),
@@ -18777,7 +18873,7 @@ fn display_space_geometry_uses_relative_height_and_percent_ascent() {
 
 #[test]
 fn display_space_geometry_accepts_pixel_ascent_expression() {
-    let _eval = Context::new();
+    let _eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let params = test_window_params();
     let spec = Value::list(vec![
         Value::symbol("space"),
@@ -18806,7 +18902,7 @@ fn scaled_face_plist() -> Value {
 }
 
 fn assert_layout_frame_rust_display_space_cursor_width(x_stretch_cursor: bool, cursor_type: Value) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18896,7 +18992,7 @@ fn assert_layout_frame_rust_display_space_cursor_width(x_stretch_cursor: bool, c
 
 #[test]
 fn layout_frame_rust_display_space_width_uses_canonical_column_width() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -18967,7 +19063,7 @@ fn layout_frame_rust_display_space_width_uses_canonical_column_width() {
 
 #[test]
 fn layout_frame_rust_records_display_point_for_display_space_slot() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19048,7 +19144,7 @@ fn layout_frame_rust_expands_display_space_hbar_cursor_width_when_x_stretch_curs
 
 #[test]
 fn layout_frame_rust_keeps_mixed_width_advances_correct_after_mid_line_face_change() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19172,7 +19268,7 @@ fn layout_frame_rust_keeps_mixed_width_advances_correct_after_mid_line_face_chan
 
 #[test]
 fn layout_frame_rust_keeps_face_positions_after_truncated_multibyte_line() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19309,7 +19405,7 @@ fn layout_frame_rust_keeps_mixed_width_positions_correct_after_sequential_window
         buffer.char_after_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(byte_pos))
     }
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19540,7 +19636,7 @@ fn layout_frame_rust_keeps_mixed_width_positions_correct_across_family_switches(
         buffer.char_after_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(byte_pos))
     }
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19800,7 +19896,7 @@ fn layout_frame_rust_word_wrap_snapshot_stays_sorted_after_rewind() {
         buffer.char_after_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(byte_pos))
     }
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19871,7 +19967,7 @@ fn layout_frame_rust_word_wrap_snapshot_stays_sorted_after_rewind() {
 
 #[test]
 fn layout_frame_rust_reads_far_enough_for_last_visible_truncated_line() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -19942,7 +20038,7 @@ fn layout_frame_rust_reads_far_enough_for_last_visible_truncated_line() {
 
 #[test]
 fn layout_frame_rust_retries_window_when_point_starts_below_visible_span() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20174,7 +20270,7 @@ fn next_window_start_for_partially_visible_point_row_scrolls_enough_to_fit_row()
 
 #[test]
 fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20291,7 +20387,7 @@ fn next_window_start_for_point_line_continuation_advances_last_visible_row() {
 
 #[test]
 fn next_window_start_for_point_line_continuation_ignores_newline_terminated_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20333,7 +20429,7 @@ fn next_window_start_for_point_line_continuation_ignores_newline_terminated_rows
 #[test]
 fn next_window_start_for_point_line_continuation_ignores_tail_clipping_when_point_row_is_not_last_visible_row()
  {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20528,7 +20624,7 @@ fn layout_frame_rust_converges_visibility_for_wrapped_rows_in_one_redisplay() {
         buffer.char_after_emacs_byte_pos(neovm_core::buffer::EmacsBytePos::new(byte_pos))
     }
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20623,7 +20719,7 @@ fn layout_frame_rust_converges_visibility_for_wrapped_rows_in_one_redisplay() {
 
 #[test]
 fn layout_frame_rust_converges_visibility_for_point_line_tail_clipping() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20687,7 +20783,7 @@ fn layout_frame_rust_converges_visibility_for_point_line_tail_clipping() {
 
 #[test]
 fn layout_frame_rust_keeps_visible_eob_cursor_on_short_trailing_newline_buffer() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20808,7 +20904,7 @@ fn incremental_newline_insert_moves_phys_cursor_to_empty_eob_row() {
 
 #[test]
 fn layout_frame_rust_keeps_visible_eob_cursor_across_redisplay_with_scroll_step() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20877,7 +20973,7 @@ fn layout_frame_rust_keeps_visible_eob_cursor_across_redisplay_with_scroll_step(
 
 #[test]
 fn layout_frame_rust_keeps_default_scratch_message_at_top_when_eob_is_visible() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -20947,7 +21043,7 @@ fn layout_frame_rust_keeps_default_scratch_message_at_top_when_eob_is_visible() 
 
 #[test]
 fn layout_frame_rust_formats_mode_line_from_current_redisplay_geometry() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21039,7 +21135,7 @@ fn layout_frame_rust_formats_mode_line_from_current_redisplay_geometry() {
 
 #[test]
 fn layout_frame_rust_honors_window_mode_line_format_none() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21102,7 +21198,7 @@ fn layout_frame_rust_honors_window_mode_line_format_none() {
 
 #[test]
 fn layout_frame_rust_uses_window_mode_line_format_override() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21172,7 +21268,7 @@ fn layout_frame_rust_uses_window_mode_line_format_override() {
 #[test]
 fn layout_frame_rust_grows_mode_line_height_for_tall_display_element() {
     fn mode_line_height_for(build_format: impl FnOnce() -> Value) -> i64 {
-        let mut eval = Context::new();
+        let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
         let buf_id = eval
             .buffer_manager()
             .current_buffer()
@@ -21230,7 +21326,7 @@ fn layout_frame_rust_grows_mode_line_height_for_tall_display_element() {
 
 #[test]
 fn tall_chrome_publishes_the_same_body_used_by_text_and_scrollbar_rendering() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21319,7 +21415,7 @@ fn tall_chrome_publishes_the_same_body_used_by_text_and_scrollbar_rendering() {
 /// matrix row and immediately retries before `update_frame` on a mismatch.
 #[test]
 fn layout_frame_rust_retries_tall_tab_line_before_publishing_body_geometry() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21411,7 +21507,7 @@ fn layout_frame_rust_retries_tall_tab_line_before_publishing_body_geometry() {
 /// published tab-line row and the body partition below it.
 #[test]
 fn layout_frame_rust_tab_line_can_be_shorter_than_default_face() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21484,7 +21580,7 @@ fn layout_frame_rust_tab_line_can_be_shorter_than_default_face() {
 fn layout_frame_rust_evaluates_mode_line_exactly_once_per_redisplay() {
     use crate::display_status_line::mode_line_eval_count;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21517,7 +21613,7 @@ fn layout_frame_rust_evaluates_mode_line_exactly_once_per_redisplay() {
 /// must not make an otherwise complete frame retry forever.
 #[test]
 fn layout_frame_rust_accepts_late_chrome_window_cache_writes() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21648,7 +21744,7 @@ fn layout_frame_rust_abandons_stale_chrome_when_eval_kills_target_buffer() {
 
 #[test]
 fn layout_frame_rust_advances_live_output_through_mode_line_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21689,7 +21785,7 @@ fn layout_frame_rust_advances_live_output_through_mode_line_rows() {
 
 #[test]
 fn layout_frame_rust_renders_header_line_text_for_non_nil_header_line_format() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21736,7 +21832,7 @@ fn layout_frame_rust_applies_buffer_glyphless_table_to_header_line_strings() {
     // GNU tabulated-list.el installs this buffer-local table so a graphical
     // sort triangle in the header line becomes its TTY acronym.  Window chrome
     // is still displayed in the window buffer's character environment.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -21828,7 +21924,7 @@ fn layout_frame_rust_applies_buffer_glyphless_table_to_header_line_strings() {
 
 #[test]
 fn layout_frame_rust_places_window_chrome_images_inside_each_window_clip() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.set_display_host(Box::new(RecordingImageDisplayHost::default()));
     let buffer_id = eval
         .buffer_manager()
@@ -21942,7 +22038,7 @@ fn layout_frame_rust_places_window_chrome_images_inside_each_window_clip() {
 
 #[test]
 fn layout_frame_rust_uses_full_window_row_space_for_header_text_and_mode_line() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -22000,7 +22096,7 @@ fn layout_frame_rust_uses_full_window_row_space_for_header_text_and_mode_line() 
 
 #[test]
 fn layout_frame_rust_advances_live_output_through_tab_line_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -22058,7 +22154,7 @@ fn layout_frame_rust_advances_live_output_through_tab_line_rows() {
 
 #[test]
 fn lisp_string_automatic_composition_uses_live_rules_in_all_chrome_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.eval_str(
         r##"(progn
           (setq auto-composition-mode t
@@ -22120,7 +22216,7 @@ fn lisp_string_automatic_composition_uses_live_rules_in_all_chrome_rows() {
 
 #[test]
 fn chrome_composition_preserves_original_string_boundaries_and_storage() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.eval_str(
         r##"(progn
       (setq auto-composition-mode t auto-composition-function 'auto-compose-chars
@@ -22172,7 +22268,7 @@ fn chrome_composition_preserves_original_string_boundaries_and_storage() {
 
 #[test]
 fn margin_string_automatic_composition_uses_the_displayed_buffer_rules() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval.buffer_manager().current_buffer().expect("buffer").id();
     eval.buffer_manager_mut()
         .get_mut(buf_id)
@@ -22220,7 +22316,7 @@ fn margin_string_automatic_composition_uses_the_displayed_buffer_rules() {
 
 #[test]
 fn layout_frame_rust_tab_line_unicode_uses_shared_display_row_builder() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     crate::test_composition::install_rules(&mut eval);
     let buf_id = eval
         .buffer_manager()
@@ -22298,7 +22394,7 @@ fn layout_frame_rust_tab_line_unicode_uses_shared_display_row_builder() {
 
 #[test]
 fn layout_frame_rust_baseline_buffer_text_uses_main_buffer_wide_and_cluster_glyphs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     crate::test_composition::install_rules(&mut eval);
     let buf_id = eval
         .buffer_manager()
@@ -22358,7 +22454,7 @@ fn layout_frame_rust_baseline_buffer_text_uses_main_buffer_wide_and_cluster_glyp
 
 #[test]
 fn buffer_text_source_shadow_matches_main_buffer_simple_unicode_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -22435,7 +22531,7 @@ fn buffer_text_source_shadow_matches_main_buffer_simple_unicode_row() {
 
 #[test]
 fn buffer_text_source_shadow_matches_main_buffer_tab_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -22518,7 +22614,7 @@ fn buffer_text_source_shadow_matches_main_buffer_tab_row() {
 /// AFTER the trailing spaces on the main row only.
 #[test]
 fn buffer_text_source_shadow_matches_main_buffer_trailing_whitespace_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -22808,7 +22904,7 @@ fn layout_main_text_rows_with_width_and_frame_kind(
     f32,
     f32,
 ) {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -25093,7 +25189,7 @@ fn face_boundary_on_zero_width_extender_keeps_row_glyphs() {
     let text = "a\u{FE0F}bc\nnext\n";
     // char-cell metrics, matching the -nw TTY frontend where the blank row
     // was observed (1x1 cells).
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -25166,7 +25262,7 @@ fn align_to_stretch_past_the_right_edge_truncates_like_gnu() {
     // truncation glyph (xdisp.c display_line; the issue's `EEEE-000  $` vs
     // Neomacs's `EEEE-000FF$`).
     let text = "EEEE\u{0020}FFFF tail\n";
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -25704,7 +25800,7 @@ fn space_width_spec_row_routes_and_matches_pipeline() {
 
 #[test]
 fn layout_frame_rust_preserves_multiline_overlay_output_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -25774,7 +25870,7 @@ fn layout_frame_rust_preserves_multiline_overlay_output_rows() {
 
 #[test]
 fn layout_frame_rust_renders_overlay_string_tabs_as_stretches() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -25849,7 +25945,7 @@ fn layout_frame_rust_renders_overlay_string_tabs_as_stretches() {
 
 #[test]
 fn layout_frame_rust_aligns_dired_filenames_after_nerd_icon_tabs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     // A bare Context lacks fontset.el's encoding table. GNU treats an
     // unmatched family-only rule as ASCII, excluding this private-use icon.
     // Install the Unicode encoding entry and identify the registry explicitly.
@@ -26065,7 +26161,7 @@ fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
         neovm_core::face::realization::enabled(),
         "this native Nerd-font conformance test requires NEOVM_FACE_REALIZATION_LIFECYCLE to be enabled"
     );
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     // A bare Context lacks fontset.el's encoding table. GNU treats an
     // unmatched family-only rule as ASCII, excluding this private-use icon.
     // Install the Unicode encoding entry and identify the registry explicitly.
@@ -26222,7 +26318,7 @@ fn layout_frame_rust_nerd_font_alias_icon_uses_resolved_monospace_cell_width() {
 
 #[test]
 fn layout_frame_rust_overlay_after_string_display_replacement_renders_once() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26320,7 +26416,7 @@ fn layout_frame_rust_overlay_after_string_display_replacement_renders_once() {
 
 #[test]
 fn layout_frame_rust_renders_overlay_string_glyphless_chars_as_glyphless() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26386,7 +26482,7 @@ fn layout_frame_rust_renders_overlay_string_glyphless_chars_as_glyphless() {
 
 #[test]
 fn layout_frame_rust_places_cursor_inside_overlay_string_text_run() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26458,7 +26554,7 @@ fn layout_frame_rust_places_cursor_inside_overlay_string_text_run() {
 /// line.  The result string must not pull the physical cursor to itself.
 #[test]
 fn overlay_cursor_property_does_not_override_visible_point_outside_attachment_coverage() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26527,7 +26623,7 @@ fn overlay_cursor_property_does_not_override_visible_point_outside_attachment_co
 /// otherwise visible point glyph.
 #[test]
 fn integer_overlay_cursor_property_covers_overlay_start_not_after_string_attachment() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26595,7 +26691,7 @@ fn integer_overlay_cursor_property_covers_overlay_start_not_after_string_attachm
 /// line must not win merely because its numeric range reaches point.
 #[test]
 fn integer_overlay_cursor_coverage_does_not_cross_the_point_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26662,7 +26758,7 @@ fn integer_overlay_cursor_coverage_does_not_cross_the_point_row() {
 /// buffer glyph at the same attachment.
 #[test]
 fn noninteger_overlay_cursor_marker_yields_to_visible_point_glyph() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26726,7 +26822,7 @@ fn noninteger_overlay_cursor_marker_yields_to_visible_point_glyph() {
 
 #[test]
 fn layout_frame_rust_renders_zero_length_eob_before_string_rows() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26794,7 +26890,7 @@ fn layout_frame_rust_renders_row_start_before_string_at_point_min() {
     // buffer char (`get_overlay_strings_1`, `src/xdisp.c`). vertico's "n/m"
     // candidate count is exactly such a before-string at point-min; it must
     // render at the very start of the first row, ahead of the buffer text.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -26892,7 +26988,7 @@ fn layout_frame_rust_renders_row_start_before_string_at_point_min() {
 /// away the prompt row.
 #[test]
 fn child_frame_redisplay_after_eob_delete_keeps_vertico_prompt_row() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let parent_buffer = eval
         .buffer_manager()
         .current_buffer()
@@ -27054,7 +27150,7 @@ fn child_frame_redisplay_after_eob_delete_keeps_vertico_prompt_row() {
 
 #[test]
 fn parent_redisplay_after_child_posframe_does_not_emit_buffer_transition() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let parent_buffer = eval
         .buffer_manager()
         .current_buffer()
@@ -27109,7 +27205,7 @@ fn parent_redisplay_after_child_posframe_does_not_emit_buffer_transition() {
 
 #[test]
 fn accepted_layout_consumes_scoped_navigation_into_typed_transition_hints() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let first_buffer = eval
         .buffer_manager()
         .current_buffer()
@@ -27213,7 +27309,7 @@ fn accepted_layout_consumes_scoped_navigation_into_typed_transition_hints() {
 
 #[test]
 fn layout_frame_rust_renders_magit_blame_heading_before_string_with_trailing_newline() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27309,7 +27405,7 @@ fn layout_frame_rust_resolves_overlay_face_through_char_property_aliases() {
     // `(face font-lock-face)` alias installed by font-lock applies to overlays
     // as well as ordinary text properties.  Magit's blame highlight style
     // relies on exactly this path.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27388,7 +27484,7 @@ fn layout_frame_rust_canonical_nil_overlay_face_blocks_its_alias() {
     // including nil, before consulting `char-property-alias-alist`.  Thus an
     // overlay carrying both `face nil` and a non-nil `font-lock-face` does not
     // contribute a face through the alias.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27473,7 +27569,7 @@ fn layout_frame_rust_line_height_t_lets_overlay_string_content_define_row_height
     // two-pixel display space followed by a newline whose `line-height` is t.
     // GNU makes the newline contribute no default font height, so the visible
     // two-pixel stretch is the complete display-row height.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27641,7 +27737,7 @@ fn layout_frame_rust_extends_overlay_string_face_across_content_only_row() {
     // supplies the two visible pixels; the newline suppresses its default
     // height. The resulting row is a two-pixel horizontal rule spanning the
     // text area, not a one-cell vertical block.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27744,7 +27840,7 @@ fn overlay_newline_continuation_reserves_a_blank_line_number_text_prefix() {
     // the continuation display row below it.  The continuation is still part
     // of the same logical buffer line, so it must reserve the line-number lane
     // without repeating the number.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27847,7 +27943,7 @@ fn overlay_newline_at_visible_row_limit_does_not_overflow_an_ended_row() {
     // When that newline consumes the final visible display row, redisplay must
     // stop before attempting to append or wrap the underlying buffer text:
     // there is no longer a live output row to finish.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -27915,7 +28011,7 @@ fn layout_frame_rust_suppresses_left_fringe_display_spec_before_string() {
     // covered text in the text area (it renders a bitmap in the fringe instead),
     // so the literal "fringe" string must NOT appear inline. We don't draw the
     // fringe bitmap yet, but the text area must match GNU: nothing for the spec.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28019,7 +28115,7 @@ fn layout_overlay_before_string_in_left_margin_area(
     // character has GNU's `((margin left-margin) CONTENT)` display form.  The
     // content belongs to the row's left-margin glyph area; it must neither be
     // dropped nor leak into the text flow.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28123,7 +28219,7 @@ fn layout_frame_rust_renders_overlay_before_string_in_left_margin_area() {
 fn layout_frame_rust_remaps_named_face_on_buffer_owned_margin_string() {
     use neomacs_display_protocol::types::Color;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28226,7 +28322,7 @@ fn layout_frame_rust_renders_left_margin_marker_in_nested_split_window() {
     // The real git-gutter failure lives in a window right of Treemacs and below
     // another editor window.  A root-window fixture cannot catch parameters or
     // output state that are accidentally borrowed from a sibling/root window.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28351,7 +28447,7 @@ fn layout_frame_rust_keeps_changed_margin_marker_among_dense_empty_gutter_overla
     // same overlay shape except that its margin content is "+".  The real
     // misc.el failure only appears with this dense, large-buffer stream: the
     // line-2 marker must survive without shifting either row's text origin.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28496,7 +28592,7 @@ fn layout_frame_rust_resolves_standard_fringe_bitmap_spec() {
     // `define-fringe-bitmap` call) — now resolves to a real bitmap descriptor.
     // Before seeding the standard bitmaps, `record_fringe_bitmap_layout` returned
     // None for `right-arrow` (its index 1..24 slot was empty), so nothing drew.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28592,7 +28688,7 @@ fn layout_frame_rust_fills_empty_line_fringe_below_buffer_end() {
     // `empty-line` bitmap in the LEFT fringe. GNU's redisplay tail fills these
     // (xdisp.c sets `row->indicate_empty_line_p`); before this change neomacs
     // left bare frame background below the last line.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28692,7 +28788,7 @@ fn layout_frame_rust_fills_empty_line_fringe_below_buffer_end() {
 fn layout_frame_rust_omits_empty_line_fringe_when_indicator_off() {
     // Control: with `indicate-empty-lines` OFF, no filler rows carry the
     // empty-line bitmap (proves the filler path is gated on the buffer-local).
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28740,7 +28836,7 @@ fn layout_frame_rust_omits_empty_line_fringe_when_indicator_off() {
 
 #[test]
 fn layout_frame_rust_renders_eob_overlay_strings_in_gnu_interleaved_order() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28819,7 +28915,7 @@ fn layout_frame_rust_renders_eob_overlay_strings_in_gnu_interleaved_order() {
 
 #[test]
 fn layout_frame_rust_overlay_before_string_uses_overlay_string_base_face() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -28939,7 +29035,7 @@ fn layout_frame_rust_merges_overlay_face_with_text_property_face() {
     // overlay faces LAST (overlays win on conflict but both contribute). A char
     // carrying both a text-property face and an overlay face must render the
     // merged face, not either contribution alone.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29031,7 +29127,7 @@ fn layout_frame_rust_paint_only_overlay_preserves_cjk_glyph_geometry() {
     // may select different paint, but it must not change that metric when the
     // face leaves every font attribute unspecified.  `show-paren-mode` creates
     // exactly this shape: a one-character background-only overlay on `《`.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29167,7 +29263,7 @@ fn layout_frame_rust_paint_only_overlay_preserves_cjk_glyph_geometry() {
 fn layout_frame_rust_overlay_face_nil_cancels_text_underline() {
     use neomacs_display_protocol::face::UnderlineStyle;
 
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29238,7 +29334,7 @@ fn layout_frame_rust_applies_face_only_overlay_starting_mid_run() {
     // only by text-property changes, so an overlay starting mid-run never split
     // it and the overlay face never painted (C-s "counter" left the match
     // unhighlighted because the overlay began inside the "my-counter" run).
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29332,7 +29428,7 @@ fn layout_frame_rust_applies_face_only_overlay_starting_mid_run() {
 
 #[test]
 fn layout_frame_rust_continues_eob_before_string_after_overlong_line() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29403,7 +29499,7 @@ fn layout_frame_rust_continues_eob_before_string_after_overlong_line() {
 
 #[test]
 fn layout_frame_rust_honors_display_space_align_in_overlay_strings() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29504,7 +29600,7 @@ fn layout_frame_rust_grows_minibuffer_for_eob_before_string_like_gnu() {
     // EOB `before-string`, so `resize_mini_window` grows the parent minibuffer
     // to display it. With the unclamped walk measurement (no estimator), the
     // minibuffer grows and renders the overlay's `before-string` lines.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::fixnum(10));
 
@@ -29604,7 +29700,7 @@ fn layout_active_minibuffer_rows(
     max_mini_lines: i64,
     use_gui_metrics: bool,
 ) -> Vec<String> {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::fixnum(max_mini_lines));
 
@@ -29661,7 +29757,7 @@ fn layout_active_minibuffer_rows(
 
 #[test]
 fn visible_gui_minibuffer_reports_positive_posn_at_point_height() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root_buffer = eval
         .buffer_manager()
         .current_buffer()
@@ -29711,7 +29807,7 @@ fn visible_gui_minibuffer_reports_positive_posn_at_point_height() {
 
 #[test]
 fn visible_gui_minibuffer_window_end_is_bounded_by_point_max_at_eob() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root_buffer = eval
         .buffer_manager()
         .current_buffer()
@@ -29760,7 +29856,7 @@ fn visible_gui_minibuffer_window_end_is_bounded_by_point_max_at_eob() {
 
 #[test]
 fn synchronous_window_end_query_observes_only_the_target_without_publishing_a_presentation() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -29879,7 +29975,7 @@ fn synchronous_window_end_query_observes_only_the_target_without_publishing_a_pr
 
 #[test]
 fn synchronous_window_end_query_on_child_frame_does_not_touch_parent_frame() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let parent_buffer = eval
         .buffer_manager()
         .current_buffer()
@@ -29992,7 +30088,7 @@ fn synchronous_window_end_query_on_child_frame_does_not_touch_parent_frame() {
 
 #[test]
 fn synchronous_window_end_query_preserves_redisplay_only_window_state() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buffer_id = eval
         .buffer_manager()
         .current_buffer()
@@ -30135,7 +30231,7 @@ fn active_minibuffer_grows_for_multiline_content_gui() {
 
 #[test]
 fn active_minibuffer_that_grows_to_fit_resets_start_to_point_min() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::make_float(0.25));
 
@@ -30199,7 +30295,7 @@ fn active_minibuffer_that_grows_to_fit_resets_start_to_point_min() {
 
 #[test]
 fn minibuffer_relayout_discards_fast_path_classification_from_rejected_attempt() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::fixnum(10));
 
@@ -30270,7 +30366,7 @@ fn resetting_speculative_frame_output_discards_fast_path_classification() {
 
 #[test]
 fn active_minibuffer_resize_uses_buffer_local_max_mini_window_height() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::fixnum(10));
 
@@ -31182,7 +31278,7 @@ fn layout_frame_rust_shrinks_frame_tab_bar_from_stale_reserved_height() {
 
 #[test]
 fn layout_frame_rust_logs_invalid_named_face_references_like_gnu_emacs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.eval_str(r#"(insert (propertize "invalid face" 'face 'neomacs-missing-display-face))"#)
         .expect("insert propertized buffer text");
     let buffer_id = eval
@@ -31214,7 +31310,7 @@ fn layout_frame_rust_logs_invalid_named_face_references_like_gnu_emacs() {
 
 #[test]
 fn layout_frame_rust_suppresses_invalid_references_inside_named_face_inheritance() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.eval_str(
         r#"(insert
             (propertize "quoted inherit"
@@ -31526,7 +31622,7 @@ fn child_frame_resolves_faces_and_width_independently_from_parent() {
 /// name, so agents can assert on them from snapshot JSON/text.
 #[test]
 fn window_info_carries_buffer_name_and_faces_carry_lisp_names() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     convert_current_buffer_text_backend(&mut eval, BufferTextBackendKind::GapBuffer);
     let buf_id = eval
         .buffer_manager()
@@ -32529,7 +32625,7 @@ fn multi_window_edit_matches_full_rebuild_for_both_windows() {
         neovm_core::window::WindowId,
         neovm_core::window::WindowId,
     ) {
-        let mut eval = Context::new();
+        let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
         let left_buf = eval
             .buffer_manager()
             .current_buffer()
@@ -32990,7 +33086,7 @@ fn cursor_only_reused_multiface_body_face_ids_are_registered_in_frame_faces() {
 /// so checking only for missing face ids could not detect this corruption.
 #[test]
 fn cursor_only_two_windows_keep_fresh_tab_line_face_out_of_later_retained_body_namespace() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left = eval.buffer_manager().current_buffer().expect("buf").id();
     let right = eval
         .buffer_manager_mut()
@@ -33130,7 +33226,7 @@ fn cursor_only_two_windows_keep_fresh_tab_line_face_out_of_later_retained_body_n
 /// non-selected windows no longer full-rebuilding every frame).
 #[test]
 fn non_selected_unchanged_window_reuses_via_cursor_only() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let left = eval.buffer_manager().current_buffer().expect("buf").id();
     eval.buffer_manager_mut()
         .get_mut(left)
@@ -33371,7 +33467,7 @@ fn edit_below_reuse_bails_on_pointer_range_crossing_the_edit() {
 /// while its text glyphs stay intact.
 #[test]
 fn gui_overlay_arrow_draws_left_fringe_bitmap_not_text() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -33455,7 +33551,7 @@ fn gui_overlay_arrow_draws_left_fringe_bitmap_not_text() {
 /// character resolves to the first surviving buffer glyph after the arrow.
 #[test]
 fn tty_overlay_arrow_moves_cursor_past_covered_buffer_glyphs() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -33519,7 +33615,7 @@ fn tty_overlay_arrow_moves_cursor_past_covered_buffer_glyphs() {
 /// point and snap the cursor back to column zero.
 #[test]
 fn tty_overlay_arrow_moves_empty_line_cursor_past_appended_arrow_cells() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -33588,6 +33684,190 @@ fn tty_overlay_arrow_moves_empty_line_cursor_past_appended_arrow_cells() {
         cursor.x,
         state.char_width * 2.0,
         "TTY publication derives its terminal column from cursor x, which must follow the arrow"
+    );
+}
+
+/// GNU reads `overlay-arrow-variable-list` and the listed marker symbols with
+/// the window's buffer current: `overlay_arrow_in_current_buffer_p` walks the
+/// list with `find_symbol_value` (xdisp.c:17074-17083), and redisplay has
+/// already run `set_buffer_internal` for that window.  A BUFFER-LOCAL
+/// `overlay-arrow-position` is therefore the value that draws; the global
+/// default stays nil here, so a default-only read sees no arrow at all.
+#[test]
+fn tty_overlay_arrow_reads_the_window_buffers_local_position() {
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
+    let buf_id = eval
+        .buffer_manager()
+        .current_buffer()
+        .expect("current buffer")
+        .id();
+    {
+        let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
+        buf.insert("alpha\nbeta\ngamma\n");
+    }
+    let default = eval
+        .eval_str(
+            "(progn (set (make-local-variable 'overlay-arrow-position) \
+                          (copy-marker 7)) \
+                    (default-value 'overlay-arrow-position))",
+        )
+        .expect("buffer-local overlay-arrow-position");
+    assert!(
+        default.is_nil(),
+        "the test is vacuous unless the global default stays nil: {default:?}"
+    );
+
+    let frame_id = eval
+        .frame_manager_mut()
+        .create_frame("tty-arrow-local", 400, 200, buf_id);
+    let selected_window = eval
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    engine.layout_frame_rust(&mut eval, frame_id);
+
+    let state = engine
+        .last_frame_display_state
+        .as_ref()
+        .expect("display state");
+    let entry = state
+        .window_matrices
+        .iter()
+        .find(|entry| entry.window_id.get() == selected_window.0 as i64)
+        .expect("window matrix entry");
+    let beta = entry
+        .matrix
+        .rows
+        .iter()
+        .find(|row| row.enabled && row.role == GlyphRowRole::Text && row.start_charpos == 6)
+        .unwrap_or_else(|| panic!("no beta row: {:#?}", entry.matrix.rows));
+    let text = row_text(&beta.glyphs[GlyphArea::Text.index()]);
+    assert!(
+        text.starts_with("=>ta"),
+        "GNU draws the buffer-local marker's arrow; got {text:?}"
+    );
+}
+
+/// The same GNU read covers `overlay-arrow-string`: `term/calc.el:1362` makes
+/// it buffer-local, and `overlay_arrow_string_or_property` falls back to
+/// `Voverlay_arrow_string` with the window's buffer current
+/// (xdisp.c:17057-17065), so the local spelling is the one drawn.
+#[test]
+fn tty_overlay_arrow_reads_the_window_buffers_local_string() {
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
+    let buf_id = eval
+        .buffer_manager()
+        .current_buffer()
+        .expect("current buffer")
+        .id();
+    {
+        let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
+        buf.insert("alpha\nbeta\ngamma\n");
+    }
+    eval.eval_str(
+        "(progn (set (make-local-variable 'overlay-arrow-string) \">>\") \
+                (setq overlay-arrow-position (copy-marker 7)))",
+    )
+    .expect("buffer-local overlay-arrow-string");
+
+    let frame_id =
+        eval.frame_manager_mut()
+            .create_frame("tty-arrow-local-string", 400, 200, buf_id);
+    let selected_window = eval
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    engine.layout_frame_rust(&mut eval, frame_id);
+
+    let state = engine
+        .last_frame_display_state
+        .as_ref()
+        .expect("display state");
+    let entry = state
+        .window_matrices
+        .iter()
+        .find(|entry| entry.window_id.get() == selected_window.0 as i64)
+        .expect("window matrix entry");
+    let beta = entry
+        .matrix
+        .rows
+        .iter()
+        .find(|row| row.enabled && row.role == GlyphRowRole::Text && row.start_charpos == 6)
+        .unwrap_or_else(|| panic!("no beta row: {:#?}", entry.matrix.rows));
+    let text = row_text(&beta.glyphs[GlyphArea::Text.index()]);
+    assert!(
+        text.starts_with(">>ta"),
+        "GNU draws the buffer-local arrow string; got {text:?}"
+    );
+}
+
+/// A live dynamic binding is visible too: GNU's C global read sees a
+/// `specbind` (`find_symbol_value`), and `overlay-arrow-string` is an ordinary
+/// DEFVAR_LISP, so a `let` around redisplay changes the drawn arrow without
+/// touching any buffer.
+#[test]
+fn tty_overlay_arrow_honours_a_dynamic_let_on_the_string() {
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
+    let buf_id = eval
+        .buffer_manager()
+        .current_buffer()
+        .expect("current buffer")
+        .id();
+    {
+        let buf = eval.buffer_manager_mut().get_mut(buf_id).expect("buffer");
+        buf.insert("alpha\nbeta\ngamma\n");
+    }
+    // Make the string buffer-local first: the `let' then has to reach the
+    // buffer's binding (the case a default-only read loses), and the global
+    // default "=>" must not be what gets drawn.
+    eval.eval_str(
+        "(progn (make-local-variable 'overlay-arrow-string) \
+                (setq overlay-arrow-position (copy-marker 7)) nil)",
+    )
+    .expect("overlay-arrow-position");
+
+    let frame_id = eval
+        .frame_manager_mut()
+        .create_frame("tty-arrow-let-string", 400, 200, buf_id);
+    let selected_window = eval
+        .frame_manager()
+        .get(frame_id)
+        .expect("frame")
+        .selected_window;
+
+    let scope = eval.specpdl().len();
+    eval.specbind_uncached(
+        neovm_core::emacs_core::intern::intern("overlay-arrow-string"),
+        Value::string(">>"),
+    )
+    .expect("dynamic overlay-arrow-string binding");
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    engine.layout_frame_rust(&mut eval, frame_id);
+    eval.unbind_to(scope);
+
+    let state = engine
+        .last_frame_display_state
+        .as_ref()
+        .expect("display state");
+    let entry = state
+        .window_matrices
+        .iter()
+        .find(|entry| entry.window_id.get() == selected_window.0 as i64)
+        .expect("window matrix entry");
+    let beta = entry
+        .matrix
+        .rows
+        .iter()
+        .find(|row| row.enabled && row.role == GlyphRowRole::Text && row.start_charpos == 6)
+        .unwrap_or_else(|| panic!("no beta row: {:#?}", entry.matrix.rows));
+    let text = row_text(&beta.glyphs[GlyphArea::Text.index()]);
+    assert!(
+        text.starts_with(">>ta"),
+        "GNU draws the dynamically bound arrow string; got {text:?}"
     );
 }
 
@@ -34183,14 +34463,159 @@ fn p45_cursor_shadow_tracks_point_across_a_word_wrap_break() {
 
     assert_eq!(cursor_at(3), (0, 3), "inside the first word");
     assert_eq!(cursor_at(4), (0, 4), "the candidate space itself");
-    // CURRENT BEHAVIOUR, pinned as-is: point on the word that moved down is
-    // placed in the broken row's filler column rather than at the start of the
-    // continuation row. GNU puts it at the continuation row's first column, so
-    // this is an open parity question — recorded here rather than "fixed" mid
-    // rung, because the shadow's job is to detect a CHANGE in what the per-char
-    // feeder's removal does to cursor capture.
-    assert_eq!(cursor_at(5), (0, 5), "the word that moved to the next row");
+    // GNU Emacs 31.1 GUI, ten-column text area: every character of the
+    // relocated word belongs to the continuation row (xdisp.c:26379,26830).
+    assert_eq!(cursor_at(5), (1, 0), "the word that moved to the next row");
     assert_eq!(cursor_at(10), (1, 5), "the last character of the word");
+}
+
+/// Cursor-only replay and a fresh walk must agree when point visits every
+/// character of a word that was rolled off the preceding visual row.
+#[test]
+fn word_wrap_moved_word_cursor_matches_full_and_replay() {
+    const TEXT: &str = "aaaa bbbbbb\n";
+    let mut fresh_cursors = Vec::new();
+    for point in (3..=10).chain((3..10).rev()) {
+        let fresh = layout_trace_with_buffer_setup(TEXT, 88, 240, |buffer, _, _| {
+            buffer.set_buffer_local("truncate-lines", Value::NIL);
+            buffer.set_buffer_local("word-wrap", Value::T);
+            buffer.goto_emacs_byte_pos(EmacsBytePos::new(point));
+        });
+        let cursor = fresh.phys_cursor.as_ref().expect("fresh cursor");
+        fresh_cursors.push((point, cursor.row, cursor.col));
+    }
+    let (mut eval, frame_id, buffer_id, _) = incr_editing_frame(TEXT, 88, 240);
+    {
+        let buffer = eval.buffer_manager_mut().get_mut(buffer_id).unwrap();
+        buffer.set_buffer_local("truncate-lines", Value::NIL);
+        buffer.set_buffer_local("word-wrap", Value::T);
+        buffer.goto_emacs_byte_pos(EmacsBytePos::new(10));
+    }
+    let mut engine = crate::font::metrics::test_catalog::layout_engine();
+    engine.layout_frame_rust(&mut eval, frame_id);
+    let mut replayed_cursors = Vec::new();
+    let mut moved_word_replays = Vec::new();
+    for point in (3..=10).chain((3..10).rev()) {
+        eval.buffer_manager_mut()
+            .get_mut(buffer_id)
+            .unwrap()
+            .goto_emacs_byte_pos(EmacsBytePos::new(point));
+        engine.layout_frame_rust(&mut eval, frame_id);
+        if (5..=10).contains(&point) {
+            let count = engine.last_layout_stats().cursor_only_windows;
+            moved_word_replays.push((point, count));
+            assert_eq!(
+                count,
+                1,
+                "point {point} in the moved word must exercise cursor-only reuse: {:?}",
+                engine.last_layout_stats()
+            );
+        }
+        let trace = selected_window_layout_trace(&eval, &engine, frame_id);
+        let cursor = trace.phys_cursor.as_ref().expect("replayed cursor");
+        replayed_cursors.push((point, cursor.row, cursor.col));
+    }
+    assert_eq!(
+        moved_word_replays.len(),
+        11,
+        "cover forward and reverse word movement"
+    );
+    eprintln!("moved-word cursor-only replay counts: {moved_word_replays:?}");
+    let expected: Vec<_> = (3..=10)
+        .chain((3..10).rev())
+        .map(|point| {
+            if point < 5 {
+                (point, 0, point as i64)
+            } else {
+                (point, 1, (point - 5) as i64)
+            }
+        })
+        .collect();
+    assert_eq!(
+        fresh_cursors, expected,
+        "GNU keeps the entire moved word on its continuation row"
+    );
+    assert_eq!(
+        fresh_cursors, replayed_cursors,
+        "fresh and retained rows must place point on the same moved word"
+    );
+}
+
+/// GNU keeps a zero-width origin before the source break in the old row's
+/// filler, while an origin in the relocated word follows its visible glyph.
+#[test]
+fn word_wrap_zero_width_cursor_respects_the_source_break() {
+    for (text, point, expected) in [
+        ("aaaa Xbbbbbb\n", 5, (0, 5)),
+        ("aaaa Xbbbbbb\n", 6, (1, 0)),
+        ("aaaa bXbbbbb\n", 6, (1, 1)),
+        ("aaaa bXbbbbb\n", 7, (1, 1)),
+    ] {
+        let trace = layout_trace_with_buffer_setup(text, 88, 240, |buffer, _, _| {
+            let table = Value::make_char_table(Value::symbol("display-table"), Value::NIL, 6);
+            neovm_core::emacs_core::chartable::ct_set_single(
+                &table,
+                'X' as i64,
+                Value::vector(vec![]),
+            );
+            buffer.set_buffer_local("buffer-display-table", table);
+            buffer.set_buffer_local("truncate-lines", Value::NIL);
+            buffer.set_buffer_local("word-wrap", Value::T);
+            buffer.goto_emacs_byte_pos(EmacsBytePos::new(point));
+        });
+        let cursor = trace.phys_cursor.as_ref().expect("zero-width cursor");
+        assert_eq!(
+            (cursor.row, cursor.col),
+            expected,
+            "text={text:?}, point={point}"
+        );
+    }
+}
+
+/// GNU's empty-vector origin stays at its original row end when a before
+/// string and the following buffer glyph are rolled onto the continuation.
+#[test]
+fn word_wrap_zero_width_cursor_with_moved_before_string_matches_gnu() {
+    for (point, expected) in [(5, (0, 5)), (6, (1, 2))] {
+        let trace =
+            layout_trace_with_buffer_setup("aaaa Xbbbbbb\n", 88, 240, |buffer, buffer_id, _| {
+                let table = Value::make_char_table(Value::symbol("display-table"), Value::NIL, 6);
+                neovm_core::emacs_core::chartable::ct_set_single(
+                    &table,
+                    'X' as i64,
+                    Value::vector(vec![]),
+                );
+                buffer.set_buffer_local("buffer-display-table", table);
+                buffer.set_buffer_local("truncate-lines", Value::NIL);
+                buffer.set_buffer_local("word-wrap", Value::T);
+                let overlay = Value::make_overlay(neovm_core::heap_types::OverlayDataInit {
+                    serial: neovm_core::heap_types::OverlaySerialSource::Mint,
+                    plist: Value::NIL,
+                    buffer: Some(buffer_id),
+                    start: 6,
+                    end: 7,
+                    front_advance: false,
+                    rear_advance: false,
+                });
+                buffer.overlays_mut().insert_overlay(overlay);
+                buffer
+                    .overlays_mut()
+                    .overlay_put(overlay, Value::symbol("before-string"), Value::string("zz"))
+                    .unwrap();
+                buffer.goto_emacs_byte_pos(EmacsBytePos::new(point));
+            });
+        let cursor = trace.phys_cursor.as_ref().expect("origin cursor");
+        let first = trace
+            .points
+            .iter()
+            .find(|point| point.buffer_pos == LispCharPos1::ONE)
+            .unwrap();
+        assert_eq!(
+            (cursor.row, cursor.col, cursor.x),
+            (expected.0, expected.1, first.x + expected.1 * first.width),
+            "point={point}"
+        );
+    }
 }
 
 /// Trailing-whitespace highlighting across a WRAPPED boundary.
@@ -36774,7 +37199,7 @@ fn redisplay_fontifies_visible_text_after_a_large_invisible_span() {
 /// of the font, never on "old height + one line".
 #[test]
 fn inactive_echo_area_grows_a_sub_line_mini_window_to_one_line_of_the_font() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     eval.store_variable_by_name("resize-mini-windows", Value::symbol("grow-only"));
     eval.store_variable_by_name("max-mini-window-height", Value::fixnum(10));
     let root = eval
@@ -36878,7 +37303,7 @@ fn buffer_display_keeps_first_replacement_while_evaluating_later_clauses() {
 /// `display-graphic-p` reduces to.
 #[test]
 fn line_prefix_when_clauses_are_decided_by_evaluating_their_forms() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root = eval
         .buffer_manager()
         .current_buffer()
@@ -36943,7 +37368,7 @@ fn line_prefix_when_clauses_are_decided_by_evaluating_their_forms() {
 /// time.
 #[test]
 fn buffer_align_to_under_line_numbers_measures_from_the_field_edge() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root = eval
         .buffer_manager()
         .current_buffer()
@@ -37043,7 +37468,7 @@ fn buffer_align_to_under_line_numbers_measures_from_the_field_edge() {
 /// evaluation whatever the first/last rule does.
 #[test]
 fn a_when_clause_whose_form_is_nil_leaves_the_prefix_out() {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let root = eval
         .buffer_manager()
         .current_buffer()
@@ -37527,7 +37952,7 @@ fn borrowed_and_snapshot_views_agree_on_composition_span_queries() {
     // layout path — issue #445/#446's machinery sits on both sides. Pin the
     // contract: identical answers on every position, both queries, INCLUDING
     // a position that sits ON a span start (the historical divergence).
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -37597,7 +38022,7 @@ fn wide_char_cut_at_truncation_edge_leaves_both_cells_to_the_marker() {
     // cells with the truncation glyph (xdisp.c:26611-26641): the cut is
     // recorded as the row's WideCut flag and the marker installer fills the
     // padding cells with the marker. {
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -37663,7 +38088,7 @@ fn ligature_rule_composes_through_the_font_shape_driver() {
     // Issue #447: a ligature.el-style composition rule (font-shape-gstring
     // over a matched run) on a GUI frame must compose the matched sequence
     // into a composed glyph shaped through the font.
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let buf_id = eval
         .buffer_manager()
         .current_buffer()
@@ -37773,7 +38198,7 @@ fn unchanged_frame_layout_consults_the_image_catalog_once_per_pass() {
     // This pins the historical full-walk cadence: the fixture shares its
     // image buffer with the mini-window, whose retained replay avoids a lookup.
     crate::incremental_layout::set_mini_window_still_for_test(Some(false));
-    let mut eval = Context::new();
+    let mut eval = neovm_core::emacs_core::eval_hook_installers::new_context();
     let requests = Arc::new(Mutex::new(Vec::new()));
     eval.set_display_host(Box::new(RecordingImageDisplayHost {
         requests: Arc::clone(&requests),
@@ -38134,3 +38559,6 @@ mod overlay_string_window_wrap_test;
 #[cfg(test)]
 #[path = "narrow_root_eob_test.rs"]
 mod narrow_root_eob_test;
+
+#[path = "overlay_string_word_wrap_progress_test.rs"]
+mod overlay_string_word_wrap_progress_test;

@@ -1136,6 +1136,46 @@ impl FontMetricsService {
         self.font_resolver.resolve_entity(query)
     }
 
+    pub fn list_font_entities(
+        &self,
+        query: &crate::font::resolver::FontEntityQuery,
+        constraints: &crate::font::resolver::FontEntityListConstraints,
+        prefer: Option<(
+            &crate::font::resolver::FontEntityQuery,
+            &crate::font::resolver::FontEntityListConstraints,
+        )>,
+        maximum: Option<usize>,
+    ) -> Vec<crate::font::resolver::ResolvedFontEntity> {
+        self.font_resolver
+            .list_entities(query, constraints, prefer, maximum)
+    }
+
+    /// The actual platform owner of this service's native catalog.
+    pub fn font_backend_kind(&self) -> FontBackendKind {
+        self.font_resolver.backend_kind()
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn try_visit_font_entities<E>(
+        &self,
+        query: &crate::font::resolver::FontEntityQuery,
+        constraints: &crate::font::resolver::FontEntityListConstraints,
+        prefer: Option<(
+            &crate::font::resolver::FontEntityQuery,
+            &crate::font::resolver::FontEntityListConstraints,
+        )>,
+        maximum: Option<usize>,
+        filter: Option<
+            &mut dyn FnMut(&crate::font::resolver::ListedFontCandidate) -> Result<bool, E>,
+        >,
+        visitor: &mut dyn FnMut(
+            crate::font::resolver::ResolvedFontEntity,
+        ) -> std::ops::ControlFlow<()>,
+    ) -> Result<(), E> {
+        self.font_resolver
+            .try_visit_entities(query, constraints, prefer, maximum, filter, visitor)
+    }
+
     /// Inspect the exact selected face without fontset or family fallback.
     /// A failed materialization is unknown coverage, not a missing glyph.
     pub fn font_has_char_in_match(

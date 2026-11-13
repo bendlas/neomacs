@@ -73,6 +73,9 @@ mod oracle_find_file_directory;
 #[path = "oracle_font_coverage.rs"]
 mod oracle_font_coverage;
 
+#[path = "oracle_font_xlfd_patterns.rs"]
+mod oracle_font_xlfd_patterns;
+
 #[path = "oracle_frame_bar_parameters.rs"]
 mod oracle_frame_bar_parameters;
 
@@ -121,11 +124,17 @@ mod oracle_pixel_measurement;
 #[path = "oracle_prefix_help.rs"]
 mod oracle_prefix_help;
 
+#[path = "oracle_read_file_name_completion_ignore_case.rs"]
+mod oracle_read_file_name_completion_ignore_case;
+
 #[path = "oracle_shift_selection.rs"]
 mod oracle_shift_selection;
 
 #[path = "oracle_tab_line.rs"]
 mod oracle_tab_line;
+
+#[path = "oracle_thread_signal.rs"]
+mod oracle_thread_signal;
 
 #[path = "oracle_tls_loopback.rs"]
 mod oracle_tls_loopback;

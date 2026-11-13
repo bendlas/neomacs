@@ -2,15 +2,14 @@ use super::*;
 use crate::emacs_core::subr::{NativeFn, SubrArity, SubrSpec};
 
 #[test]
-fn gnu_policy_is_the_default_and_only_explicit_off_restores_legacy() {
-    for value in [None, Some(OsStr::new("")), Some(OsStr::new("unknown"))] {
-        assert_eq!(parse_redisplay_hooks(value), RedisplayHookPolicy::Gnu);
-    }
-    for value in ["off", "0", "false", "no"] {
-        assert_eq!(
-            parse_redisplay_hooks(Some(OsStr::new(value))),
-            RedisplayHookPolicy::Legacy
-        );
+fn explicit_policy_is_required_and_invalid_values_preserve_baseline() {
+    for value in [
+        None,
+        Some(OsStr::new("")),
+        Some(OsStr::new("off")),
+        Some(OsStr::new("unknown")),
+    ] {
+        assert_eq!(parse_redisplay_hooks(value), RedisplayHookPolicy::Legacy);
     }
     for value in ["on", "1", "true", "yes"] {
         assert_eq!(
@@ -22,11 +21,11 @@ fn gnu_policy_is_the_default_and_only_explicit_off_restores_legacy() {
 
 #[cfg(unix)]
 #[test]
-fn non_unicode_policy_falls_back_to_the_gnu_default() {
+fn non_unicode_policy_is_baseline() {
     use std::os::unix::ffi::OsStrExt;
     assert_eq!(
         parse_redisplay_hooks(Some(OsStr::from_bytes(&[0xff]))),
-        RedisplayHookPolicy::Gnu
+        RedisplayHookPolicy::Legacy
     );
 }
 

@@ -17,6 +17,8 @@ use crate::window_output::{
     TextWindowOutputBegin, TextWindowOutputTarget, WindowOutputEmitter, begin_text_window_output,
 };
 use neovm_core::buffer::LispCharPos1;
+use neovm_core::window::DisplayFrameManagerExt;
+use neovm_core::window::display::WindowDisplayContextExt;
 
 #[derive(Debug)]
 pub(super) enum MeasurementFailure {

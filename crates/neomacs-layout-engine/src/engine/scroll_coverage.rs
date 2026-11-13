@@ -19,22 +19,32 @@ use crate::row_layout::worker::{RowJobTicket, RowWorker};
 use crate::window_output::prepared_body::position_buffer_rows;
 use neovm_core::buffer::CharPos0;
 use neovm_core::tagged::collection_reads::{self, CollectionReads};
+use neovm_core::window::DisplayFrameExt;
+use neovm_core::window::DisplayFrameManagerExt;
 use neovm_core::window::{FrameId, WindowId};
 
 /// Keep speculative work bounded, including cyclic user lists. Recheck at
 /// admission because custom marker variables need not bump display ticks.
-pub(super) fn inactive_overlay_arrows(evaluator: &neovm_core::emacs_core::Context) -> bool {
-    let mut tail = evaluator
-        .variable_value(crate::fixed_symbols::OVERLAY_ARROW_VARIABLE_LIST.id())
-        .unwrap_or(Value::NIL);
+pub(super) fn inactive_overlay_arrows(
+    evaluator: &neovm_core::emacs_core::Context,
+    buffer_id: Option<neovm_core::buffer::BufferId>,
+) -> bool {
+    // The same GNU reads as the renderer: the list and each listed symbol are
+    // `find_symbol_value` with the window's buffer current
+    // (xdisp.c:17074-17083).  A buffer-local arrow must keep worker pages
+    // from being reused, or the redisplay that draws it could be skipped.
+    let read = |id| match buffer_id {
+        Some(buffer_id) => crate::neovm_bridge::visible_display_value(evaluator, buffer_id, id),
+        None => crate::neovm_bridge::visible_value(evaluator, id),
+    };
+    let mut tail =
+        read(crate::fixed_symbols::OVERLAY_ARROW_VARIABLE_LIST.id()).unwrap_or(Value::NIL);
     for _ in 0..32 {
         if !tail.is_cons() {
             return true;
         }
         if let Some(sym) = tail.cons_car().as_bare_symbol_id()
-            && evaluator
-                .variable_value(sym)
-                .is_some_and(|value| !value.is_nil())
+            && read(sym).is_some_and(|value| !value.is_nil())
         {
             return false;
         }
@@ -1198,7 +1208,7 @@ impl LayoutEngine {
             crate::display_property::DisplayPropertyTarget::Graphical,
             evaluator.symbol_mode(),
         );
-        if !inactive_overlay_arrows(evaluator) {
+        if !inactive_overlay_arrows(evaluator, Some(buffer_id)) {
             return Err(RowProgramError::Unsupported);
         }
         // The complete body kernel will widen this domain; these policies
